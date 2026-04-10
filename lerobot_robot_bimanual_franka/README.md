@@ -1,0 +1,1 @@
+A python package for bimanual franka TRI setup. Made for LeRobot

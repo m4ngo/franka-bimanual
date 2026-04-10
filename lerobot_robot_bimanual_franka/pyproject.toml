@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lerobot_robot_bimanual_franka"
+version = "0.1.0"
+description = "Bimanual Franka TRI robot integration for LeRobot"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+	"lerobot",
+]
+
+[tool.setuptools.packages.find]
+include = ["lerobot_robot_bimanual_franka", "lerobot_robot_bimanual_franka.*"]
