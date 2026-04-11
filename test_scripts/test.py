@@ -20,14 +20,14 @@ from time import sleep
 #     # right.move(motion, asynchronous=False)
 
 def test_gripper(wsg: WSG):
-    # wsg.home()
-    # wsg.grip(40)
-    # wsg.release()
-    print(wsg.get_position())
+    wsg.move(40, False)
+    # print(wsg.position)
 
 def test_grippers():
-    test_gripper(WSG(TCP_IP="192.168.2.21"))  # left
-    test_gripper(WSG(TCP_IP="192.168.2.20"))  # right
+    # test_gripper(WSG(TCP_IP="192.168.2.21"))  # left
+    # test_gripper(WSG(TCP_IP="192.168.2.20"))  # right
+    WSG(TCP_IP="192.168.2.21").move(50, False)  # left
+    WSG(TCP_IP="192.168.2.20").move(50, True)  # right
 
 # test_franka_arms()
 test_grippers()

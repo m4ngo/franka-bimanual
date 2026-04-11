@@ -1,8 +1,3 @@
-from typing import Any
-
-from lerobot.cameras import make_cameras_from_configs
-from lerobot.motors import Motor, MotorNormMode
-from lerobot.motors.feetech import FeetechMotorsBus, OperatingMode
 from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
@@ -22,7 +17,7 @@ class BimanualFranka(Robot):
         self.use_ee_delta = self.config.use_ee_delta
 
         self.robot_manager = MultiRobotWrapper()
-        self.grippers = {}
+        self.grippers: dict[str, WSG] = {}
         self.grippers["l"] = WSG(TCP_IP=self.config.l_gripper_ip)
         self.grippers["r"] = WSG(TCP_IP=self.config.r_gripper_ip)
         
@@ -41,24 +36,47 @@ class BimanualFranka(Robot):
 
     @property
     def _motors_ft(self) -> dict[str, type]:
+        if self.use_ee_delta:
+            return {
+            "l_x": float,
+            "l_y": float,
+            "l_z": float,
+            "l_roll": float,
+            "l_pitch": float,
+            "l_yaw": float,
+            "l_gripper": float,
+
+            "r_x": float,
+            "r_y": float,
+            "r_z": float,
+            "r_roll": float,
+            "r_pitch": float,
+            "r_yaw": float,
+            "r_gripper": float,
+            }
+
+        return self._motors_ft_joints
+    
+    @property
+    def _motors_ft_joints(self) -> dict[str, type]:
         return {
-            "l_joint_1.pos": float,
-            "l_joint_2.pos": float,
-            "l_joint_3.pos": float,
-            "l_joint_4.pos": float,
-            "l_joint_5.pos": float,
-            "l_joint_6.pos": float,
-            "l_joint_7.pos": float,
-            "l_gripper.pos": float,
+            "l_joint_1": float,
+            "l_joint_2": float,
+            "l_joint_3": float,
+            "l_joint_4": float,
+            "l_joint_5": float,
+            "l_joint_6": float,
+            "l_joint_7": float,
+            "l_gripper": float,
             
-            "r_joint_1.pos": float,
-            "r_joint_2.pos": float,
-            "r_joint_3.pos": float,
-            "r_joint_4.pos": float,
-            "r_joint_5.pos": float,
-            "r_joint_6.pos": float,
-            "r_joint_7.pos": float,
-            "r_gripper.pos": float,
+            "r_joint_1": float,
+            "r_joint_2": float,
+            "r_joint_3": float,
+            "r_joint_4": float,
+            "r_joint_5": float,
+            "r_joint_6": float,
+            "r_joint_7": float,
+            "r_gripper": float,
         }
 
     @property
@@ -69,7 +87,7 @@ class BimanualFranka(Robot):
 
     @property
     def observation_features(self) -> dict:
-        return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft_joints, **self._cameras_ft}
     
     @property
     def action_features(self) -> dict:
@@ -78,7 +96,7 @@ class BimanualFranka(Robot):
     @property
     def is_connected(self) -> bool:
         # return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
-        return self.robot_manager.num_processes > 0
+        return self.robot_manager.num_processes == 2
     
     def connect(self, calibrate: bool = True) -> None:
         self.robot_manager.add_robot("l", self.config.l_server_ip, self.config.l_robot_ip, self.config.l_port)
@@ -97,7 +115,8 @@ class BimanualFranka(Robot):
         # for cam in self.cameras.values():
         #     cam.disconnect()
         self.robot_manager.shutdown()
-        # grippers don't need cleanup... WSG wrapper should handle automatically
+        for gripper in self.grippers.values():
+            gripper.close()
 
     @property
     def is_calibrated(self) -> bool:
@@ -123,12 +142,12 @@ class BimanualFranka(Robot):
 
         # Read arm position
         # obs_dict: RobotObservation = self.bus.sync_read("Present_Position")
-        obs = {}
+        obs: RobotObservation = {}
         for s in ["l", "r"]:
             joints: np.ndarray = self.robot_manager.current_joint_positions(s)
             obs_dict: RobotObservation = {f"{i}": joints[i - 1] for i in range(1, len(joints) + 1)}
-            obs_dict = {f"{s}_joint_{motor}.pos": val for motor, val in obs_dict.items()}
-            obs_dict[f"{s}_gripper.pos"] = self.grippers[s].position
+            obs_dict = {f"{s}_joint_{motor}": val for motor, val in obs_dict.items()}
+            obs_dict[f"{s}_gripper"] = self.grippers[s].position
             obs = {**obs, **obs_dict}
 
         # Capture images from cameras
@@ -138,9 +157,27 @@ class BimanualFranka(Robot):
         return obs
     
     def send_action(self, action: RobotAction) -> RobotAction:
-        goal_pos: RobotAction = {key.removesuffix(".pos"): val for key, val in action.items()}
+        # goal_pos: RobotAction = {key.removesuffix(".pos"): val for key, val in action.items()}
 
         # Send goal position to the arm
-        # self.bus.sync_write("Goal_Position", goal_pos)
+        # self.bus.sync_write("Goal_Position", goal_pos)    
+        # 
+        for s in ["l", "r"]:    
+            self.grippers[s].move(action[f"{s}_gripper"], blocking=False)
+
+            if self.use_ee_delta:
+                ee: list = [
+                    action[f"{s}_x"],
+                    action[f"{s}_y"],
+                    action[f"{s}_z"],
+                    action[f"{s}_roll"],
+                    action[f"{s}_pitch"],
+                    action[f"{s}_yaw"],
+                    ]
+                self.robot_manager.move_ee_delta(s, ee, True)
+                continue
+
+            joints: list = [action[f"{s}_joint_{i}"] for i in range(1,8)]
+            self.robot_manager.move_joints(s, joints, True)
 
         return action

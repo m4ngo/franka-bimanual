@@ -1,7 +1,5 @@
-import multiprocessing as mp  
 from multiprocessing import Queue, Process  
-import pickle  
-from typing import Any, Tuple, cast  
+from typing import Any, cast  
 
 import numpy as np
 from numpy.typing import NDArray
@@ -83,6 +81,9 @@ class MultiRobotWrapper:
           
     def add_robot(self, name: str, server_ip: str, robot_ip: str, port: int):  
         """Add a robot connection"""  
+        if name in self.processes and self.processes[name].is_alive():
+            raise ValueError(f"Robot '{name}' is already connected")
+
         command_queue = Queue()  
         response_queue = Queue()  
           
@@ -98,7 +99,7 @@ class MultiRobotWrapper:
 
     @property
     def num_processes(self) -> int:
-        return len(self.processes)
+        return sum(1 for process in self.processes.values() if process.is_alive())
           
     def move_joints(self, robot_name: str, position: list, asynchronous: bool = False):  
         """Move robot to cartesian position"""  
@@ -158,7 +159,7 @@ class MultiRobotWrapper:
             queues['command_queue'].put(("shutdown", [], {}))  
               
         for name, process in self.processes.items():  
-            process.join()
+            process.join(timeout=5)
         
         self.robots.clear()
         self.processes.clear()
