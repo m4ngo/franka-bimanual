@@ -53,7 +53,8 @@ class WSG:
         self.tcp_sock.send(MESSAGE)
         return self.wait_for_msg(b"FIN HOME\n")
 
-    def get_position(self) -> float | None:
+    @property
+    def position(self) -> float | None:
         """
         Get the current position of the gripper fingers in mm.
         Returns position as a float, or None on error/timeout.

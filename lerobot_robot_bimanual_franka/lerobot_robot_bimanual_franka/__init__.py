@@ -1,4 +1,4 @@
-from .my_cool_robot import MyCoolRobot
-from .my_cool_robot_config import MyCoolRobotConfig
+from .bimanual_franka import BimanualFranka
+from .bimanual_franka_config import BimanualFrankaConfig
 
-__all__ = ["MyCoolRobot", "MyCoolRobotConfig"]
+__all__ = ["BimanualFranka", "BimanualFrankaConfig"]
