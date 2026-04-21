@@ -15,11 +15,14 @@ class BimanualFranka(Robot):
         super().__init__(config)
         self.config = config
         self.use_ee_delta = self.config.use_ee_delta
+        self.active_arms = self.config.active_arms
 
         self.robot_manager = MultiRobotWrapper()
         self.grippers: dict[str, WSG] = {}
-        self.grippers["l"] = WSG(TCP_IP=self.config.l_gripper_ip)
-        self.grippers["r"] = WSG(TCP_IP=self.config.r_gripper_ip)
+        if "l" in self.active_arms:
+            self.grippers["l"] = WSG(TCP_IP=self.config.l_gripper_ip)
+        if "r" in self.active_arms:
+            self.grippers["r"] = WSG(TCP_IP=self.config.r_gripper_ip)
         
         # self.bus = FeetechMotorsBus(
         #     port=self.config.port,
@@ -37,47 +40,32 @@ class BimanualFranka(Robot):
     @property
     def _motors_ft(self) -> dict[str, type]:
         if self.use_ee_delta:
-            return {
-            "l_x": float,
-            "l_y": float,
-            "l_z": float,
-            "l_roll": float,
-            "l_pitch": float,
-            "l_yaw": float,
-            "l_gripper": float,
-
-            "r_x": float,
-            "r_y": float,
-            "r_z": float,
-            "r_roll": float,
-            "r_pitch": float,
-            "r_yaw": float,
-            "r_gripper": float,
-            }
+            features: dict[str, type] = {}
+            for s in self.active_arms:
+                features[f"{s}_x"] = float
+                features[f"{s}_y"] = float
+                features[f"{s}_z"] = float
+                features[f"{s}_roll"] = float
+                features[f"{s}_pitch"] = float
+                features[f"{s}_yaw"] = float
+                features[f"{s}_gripper"] = float
+            return features
 
         return self._motors_ft_joints
     
     @property
     def _motors_ft_joints(self) -> dict[str, type]:
-        return {
-            "l_joint_1": float,
-            "l_joint_2": float,
-            "l_joint_3": float,
-            "l_joint_4": float,
-            "l_joint_5": float,
-            "l_joint_6": float,
-            "l_joint_7": float,
-            "l_gripper": float,
-            
-            "r_joint_1": float,
-            "r_joint_2": float,
-            "r_joint_3": float,
-            "r_joint_4": float,
-            "r_joint_5": float,
-            "r_joint_6": float,
-            "r_joint_7": float,
-            "r_gripper": float,
-        }
+        features: dict[str, type] = {}
+        for s in self.active_arms:
+            features[f"{s}_joint_1"] = float
+            features[f"{s}_joint_2"] = float
+            features[f"{s}_joint_3"] = float
+            features[f"{s}_joint_4"] = float
+            features[f"{s}_joint_5"] = float
+            features[f"{s}_joint_6"] = float
+            features[f"{s}_joint_7"] = float
+            features[f"{s}_gripper"] = float
+        return features
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
@@ -96,11 +84,24 @@ class BimanualFranka(Robot):
     @property
     def is_connected(self) -> bool:
         # return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
-        return self.robot_manager.num_processes == 2
+        return self.robot_manager.num_processes == len(self.active_arms)
     
     def connect(self, calibrate: bool = True) -> None:
-        self.robot_manager.add_robot("l", self.config.l_server_ip, self.config.l_robot_ip, self.config.l_port)
-        self.robot_manager.add_robot("r", self.config.r_server_ip, self.config.r_robot_ip, self.config.r_port)
+        if "l" in self.active_arms:
+            self.robot_manager.add_robot("l", self.config.l_server_ip, self.config.l_robot_ip, self.config.l_port)
+        if "r" in self.active_arms:
+            self.robot_manager.add_robot("r", self.config.r_server_ip, self.config.r_robot_ip, self.config.r_port)
+
+        # Try to confirm at least one robot is alive by querying state early
+        import time
+        time.sleep(1.0)  # Give processes time to initialize
+        for arm in self.active_arms:
+            try:
+                self.robot_manager.current_joint_positions(arm)
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to communicate with robot '{arm}' at {getattr(self.config, f'{arm}_robot_ip')}: {e}"
+                )
 
         if not self.is_calibrated and calibrate:
             self.calibrate()
@@ -109,6 +110,8 @@ class BimanualFranka(Robot):
         #     cam.connect()
 
         self.configure()
+        for s in self.active_arms:
+            self.grippers[s].home()
 
     def disconnect(self) -> None:
         # self.bus.disconnect()
@@ -143,7 +146,7 @@ class BimanualFranka(Robot):
         # Read arm position
         # obs_dict: RobotObservation = self.bus.sync_read("Present_Position")
         obs: RobotObservation = {}
-        for s in ["l", "r"]:
+        for s in self.active_arms:
             joints: np.ndarray = self.robot_manager.current_joint_positions(s)
             obs_dict: RobotObservation = {f"{i}": joints[i - 1] for i in range(1, len(joints) + 1)}
             obs_dict = {f"{s}_joint_{motor}": val for motor, val in obs_dict.items()}
@@ -162,7 +165,7 @@ class BimanualFranka(Robot):
         # Send goal position to the arm
         # self.bus.sync_write("Goal_Position", goal_pos)    
         # 
-        for s in ["l", "r"]:    
+        for s in self.active_arms:
             self.grippers[s].move(action[f"{s}_gripper"], blocking=False)
 
             if self.use_ee_delta:

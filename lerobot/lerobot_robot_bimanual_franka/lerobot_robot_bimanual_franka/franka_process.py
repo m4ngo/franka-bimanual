@@ -1,5 +1,6 @@
 from multiprocessing import Queue, Process  
 from typing import Any, cast  
+from queue import Empty
 
 import numpy as np
 from numpy.typing import NDArray
@@ -26,14 +27,18 @@ class RobotProcess:
         self.response_queue = response_queue  
           
     def run(self):
-        from net_franky import setup_net_franky  
-        setup_net_franky(self.server_ip, self.port)  
-          
-        from net_franky.franky import Robot, JointMotion, CartesianVelocityMotion, ReferenceType, Twist 
-          
-        robot = Robot(self.robot_ip)  
-        robot.recover_from_errors()  
-        robot.relative_dynamics_factor = 0.05  
+        try:
+            from net_franky import setup_net_franky  
+            setup_net_franky(self.server_ip, self.port)  
+              
+            from net_franky.franky import Robot, JointMotion, CartesianVelocityMotion, ReferenceType, Twist 
+              
+            robot = Robot(self.robot_ip)  
+            robot.recover_from_errors()  
+            robot.relative_dynamics_factor = 0.1
+        except Exception as e:
+            self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
+            return  
           
         while True:  
             try:  
@@ -100,58 +105,52 @@ class MultiRobotWrapper:
     @property
     def num_processes(self) -> int:
         return sum(1 for process in self.processes.values() if process.is_alive())
+
+    def _request(self, robot_name: str, command: str, args: list, kwargs: dict, timeout_s: float = 5.0):
+        if robot_name not in self.robots:
+            raise KeyError(f"Robot '{robot_name}' is not registered")
+
+        process = self.processes.get(robot_name)
+        if process is None or not process.is_alive():
+            raise RuntimeError(f"Robot process '{robot_name}' is not alive")
+
+        queues = self.robots[robot_name]
+        queues['command_queue'].put((command, args, kwargs))
+
+        try:
+            status, result = queues['response_queue'].get(timeout=timeout_s)
+        except Empty as e:
+            alive = process.is_alive()
+            raise TimeoutError(
+                f"Timed out waiting for '{command}' response from robot '{robot_name}'. Process alive: {alive}."
+            ) from e
+
+        if status == "error":
+            raise Exception(result)
+
+        return result
           
     def move_joints(self, robot_name: str, position: list, asynchronous: bool = False):  
         """Move robot to cartesian position"""  
         position = _validate_vector("move_joints position", position, 7)
-        queues = self.robots[robot_name]  
-        queues['command_queue'].put(("move_joints", [position, asynchronous], {}))  
-          
-        status, result = queues['response_queue'].get()  
-        if status == "error":  
-            raise Exception(result)  
-        return result
+        return self._request(robot_name, "move_joints", [position, asynchronous], {}, timeout_s=5.0)
     
     def move_ee_delta(self, robot_name: str, position: list, asynchronous: bool = False):
         """Move robot to cartesian position"""  
         position = _validate_vector("move_ee_delta position", position, 6)
-        queues = self.robots[robot_name]  
-        queues['command_queue'].put(("move_ee_delta", [position, asynchronous], {}))  
-          
-        status, result = queues['response_queue'].get()  
-        if status == "error":  
-            raise Exception(result)  
-        return result
+        return self._request(robot_name, "move_ee_delta", [position, asynchronous], {}, timeout_s=5.0)
           
     def get_robot_state(self, robot_name: str):  
         """Get current robot state"""  
-        queues = self.robots[robot_name]  
-        queues['command_queue'].put(("get_state", [], {}))  
-          
-        status, result = queues['response_queue'].get()  
-        if status == "error":  
-            raise Exception(result)  
-        return result
+        return self._request(robot_name, "get_state", [], {}, timeout_s=5.0)
     
     def current_joint_positions(self, robot_name: str):
         """Get current joint positions"""  
-        queues = self.robots[robot_name]  
-        queues['command_queue'].put(("current_joint_positions", [], {}))  
-          
-        status, result = queues['response_queue'].get()  
-        if status == "error":  
-            raise Exception(result)  
-        return result
+        return self._request(robot_name, "current_joint_positions", [], {}, timeout_s=5.0)
           
     def join_motion(self, robot_name: str, timeout: float = 0.0):  
         """Wait for motion to complete"""  
-        queues = self.robots[robot_name]  
-        queues['command_queue'].put(("join_motion", [timeout], {}))  
-          
-        status, result = queues['response_queue'].get()  
-        if status == "error":  
-            raise Exception(result)  
-        return result  
+        return self._request(robot_name, "join_motion", [timeout], {}, timeout_s=max(5.0, timeout + 1.0))
           
     def shutdown(self):  
         """Shutdown all robot processes"""  

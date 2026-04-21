@@ -38,13 +38,14 @@ class Gello(Teleoperator):
     name = "gello"
     RAD_PER_COUNT = 2 * np.pi / (4096 - 1)
     JOINT_NAMES = [
-        "joint_0",
         "joint_1",
         "joint_2",
         "joint_3",
         "joint_4",
         "joint_5",
         "joint_6",
+        "joint_7",
+        "gripper"
     ]
 
     def __init__(self, config: GelloConfig):
@@ -58,13 +59,13 @@ class Gello(Teleoperator):
         self.bus = DynamixelMotorsBus(
             port=self.config.port,
             motors={
-                "joint_0": Motor(1, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_1": Motor(2, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_2": Motor(3, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_3": Motor(4, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_4": Motor(5, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_5": Motor(6, "xl330-m288", MotorNormMode.RANGE_M100_100),
-                "joint_6": Motor(7, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_1": Motor(1, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_2": Motor(2, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_3": Motor(3, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_4": Motor(4, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_5": Motor(5, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_6": Motor(6, "xl330-m288", MotorNormMode.RANGE_M100_100),
+                "joint_7": Motor(7, "xl330-m288", MotorNormMode.RANGE_M100_100),
                 "gripper": Motor(8, "xl330-m288", MotorNormMode.RANGE_M100_100),
             }
         )
@@ -104,10 +105,16 @@ class Gello(Teleoperator):
         self.configure()
 
         if self.config.use_async:
-            # Initial read to populate latest_action
-            raw_action = self.bus.sync_read("Present_Position", normalize=False)
-            self.latest_action = self._process_action(raw_action)
-            self._start_read_thread()
+            if self.is_calibrated:
+                # Initial read to populate latest_action
+                raw_action = self.bus.sync_read("Present_Position", normalize=False)
+                self.latest_action = self._process_action(raw_action)
+                self._start_read_thread()
+            else:
+                logger.info(
+                    "%s connected without calibration; async action stream will start after calibration.",
+                    self,
+                )
 
         logger.info(f"{self} connected.")
 
@@ -177,8 +184,9 @@ class Gello(Teleoperator):
             angle_rad = sign * (float(raw_action[motor]) - offset) * self.RAD_PER_COUNT + ref_pos_rad
             result[motor] = angle_rad
         result["gripper"] = (
-            float(raw_action["gripper"]) - calibration.gripper_open_position
-        ) / (calibration.gripper_closed_position - calibration.gripper_open_position)
+            1.0 - (float(raw_action["gripper"]) - calibration.gripper_open_position)
+            / (calibration.gripper_closed_position - calibration.gripper_open_position)
+        ) * 110.0
         return result
 
     def _read_loop(self) -> None:

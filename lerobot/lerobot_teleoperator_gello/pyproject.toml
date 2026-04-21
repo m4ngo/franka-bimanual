@@ -10,7 +10,10 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["lerobot_teleoperator_gello"]
+packages = [
+    "lerobot_teleoperator_gello",
+    "lerobot_teleoperator_gello.lerobot_teleoperator_gello",
+]
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

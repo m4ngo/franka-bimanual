@@ -5,9 +5,9 @@ import numpy as np
 from net_franky import setup_net_franky
 
 
-SERVER_IP = "192.168.3.10"
-ARM_IP = "192.168.201.10"
-PORT = 18812
+SERVER_IP = "192.168.3.11"
+ARM_IP = "192.168.200.2"
+PORT = 18813
 
 
 def main() -> None:

@@ -98,6 +98,7 @@ class WSG:
         return self._submit(self._read_position)
 
     def move(self, position: int, blocking: bool = True):
+        print("MOVIN TO ", position)
         """
         Move fingers to specific position
         * position 0 :- fully close
