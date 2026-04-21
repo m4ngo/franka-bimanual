@@ -1,9 +1,17 @@
 from multiprocessing import Queue, Process  
 from typing import Any, cast  
 from queue import Empty
+import signal
 
 import numpy as np
 from numpy.typing import NDArray
+
+
+# Proportional joint-velocity controller settings for smooth position tracking.
+JOINT_POSITION_DEADBAND_RAD = 0.003
+JOINT_VELOCITY_GAIN = 1.0
+JOINT_MAX_ABS_VELOCITY_RAD_S = 1.0
+JOINT_PREDICT_DT_S = 0.05
 
 
 def _validate_vector(name: str, values, expected_len: int) -> list[float]:
@@ -28,14 +36,18 @@ class RobotProcess:
           
     def run(self):
         try:
+            # Parent handles Ctrl+C and sends explicit shutdown commands.
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
             from net_franky import setup_net_franky  
             setup_net_franky(self.server_ip, self.port)  
               
-            from net_franky.franky import Robot, JointMotion, CartesianVelocityMotion, ReferenceType, Twist 
+            from net_franky.franky import Robot, JointVelocityMotion, CartesianVelocityMotion, Twist 
               
             robot = Robot(self.robot_ip)  
             robot.recover_from_errors()  
-            robot.relative_dynamics_factor = 0.1
+            robot.relative_dynamics_factor = 0.25
+            last_joint_positions: NDArray[np.float64] = np.asarray(robot.current_joint_positions, dtype=np.float64)
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return  
@@ -46,8 +58,26 @@ class RobotProcess:
                   
                 if command == "move_joints":  
                     joint_target = _validate_vector("move_joints position", args[0], 7)
-                    motion = JointMotion(joint_target, ReferenceType.Absolute)  
+                    target: NDArray[np.float64] = np.asarray(joint_target, dtype=np.float64)
+
+                    if last_joint_positions.shape != (7,):
+                        last_joint_positions = np.asarray(robot.current_joint_positions, dtype=np.float64)
+
+                    joint_error = target - last_joint_positions
+                    if float(np.max(np.abs(joint_error))) <= JOINT_POSITION_DEADBAND_RAD:
+                        self.response_queue.put(("success", False))
+                        continue
+
+                    joint_velocity = JOINT_VELOCITY_GAIN * joint_error
+                    joint_velocity = np.clip(
+                        joint_velocity,
+                        -JOINT_MAX_ABS_VELOCITY_RAD_S,
+                        JOINT_MAX_ABS_VELOCITY_RAD_S,
+                    )
+
+                    motion = JointVelocityMotion(cast(Any, joint_velocity))
                     result = robot.move(motion, asynchronous=args[1])  
+                    last_joint_positions = last_joint_positions + (joint_velocity * JOINT_PREDICT_DT_S)
                     self.response_queue.put(("success", result))
                   
                 elif command == "move_ee_delta":  
@@ -60,17 +90,35 @@ class RobotProcess:
                       
                 elif command == "get_state":  
                     state = robot.get_last_callback_data()  
+                    if isinstance(state, dict) and "q" in state:
+                        q = cast(dict[str, Any], state).get("q")
+                        if isinstance(q, (list, tuple)) and len(q) == 7:
+                            last_joint_positions = np.asarray(q, dtype=np.float64)
                     self.response_queue.put(("success", state))  
 
                 elif command == "current_joint_positions":
                     joints = robot.current_joint_positions
+                    last_joint_positions = np.asarray(joints, dtype=np.float64)
                     self.response_queue.put(("success", joints))  
                       
                 elif command == "join_motion":  
                     result = robot.join_motion(timeout=args[0] if args else None)  
                     self.response_queue.put(("success", result))  
+
+                elif command == "stop_motion":
+                    zero_velocity: NDArray[np.float64] = np.zeros(7, dtype=np.float64)
+                    motion = JointVelocityMotion(cast(Any, zero_velocity))
+                    result = robot.move(motion, asynchronous=False)
+                    last_joint_positions = np.asarray(robot.current_joint_positions, dtype=np.float64)
+                    self.response_queue.put(("success", result))
                       
                 elif command == "shutdown":  
+                    try:
+                        zero_velocity: NDArray[np.float64] = np.zeros(7, dtype=np.float64)
+                        robot.move(JointVelocityMotion(cast(Any, zero_velocity)), asynchronous=False)
+                    except Exception:
+                        # Shutdown should continue even if a final stop command fails.
+                        pass
                     break  
                       
                 else:  
@@ -106,7 +154,7 @@ class MultiRobotWrapper:
     def num_processes(self) -> int:
         return sum(1 for process in self.processes.values() if process.is_alive())
 
-    def _request(self, robot_name: str, command: str, args: list, kwargs: dict, timeout_s: float = 5.0):
+    def _enqueue(self, robot_name: str, command: str, args: list, kwargs: dict):
         if robot_name not in self.robots:
             raise KeyError(f"Robot '{robot_name}' is not registered")
 
@@ -117,6 +165,12 @@ class MultiRobotWrapper:
         queues = self.robots[robot_name]
         queues['command_queue'].put((command, args, kwargs))
 
+    def _collect(self, robot_name: str, command: str, timeout_s: float):
+        process = self.processes.get(robot_name)
+        if process is None:
+            raise RuntimeError(f"Robot process '{robot_name}' is not available")
+
+        queues = self.robots[robot_name]
         try:
             status, result = queues['response_queue'].get(timeout=timeout_s)
         except Empty as e:
@@ -129,6 +183,24 @@ class MultiRobotWrapper:
             raise Exception(result)
 
         return result
+
+    def _request(self, robot_name: str, command: str, args: list, kwargs: dict, timeout_s: float = 5.0):
+        self._enqueue(robot_name, command, args, kwargs)
+        return self._collect(robot_name, command, timeout_s)
+
+    def _request_many(
+        self,
+        requests: list[tuple[str, str, list, dict]],
+        timeout_s: float = 5.0,
+    ) -> dict[str, Any]:
+        for robot_name, command, args, kwargs in requests:
+            self._enqueue(robot_name, command, args, kwargs)
+
+        results: dict[str, Any] = {}
+        for robot_name, command, _, _ in requests:
+            results[robot_name] = self._collect(robot_name, command, timeout_s)
+
+        return results
           
     def move_joints(self, robot_name: str, position: list, asynchronous: bool = False):  
         """Move robot to cartesian position"""  
@@ -139,6 +211,32 @@ class MultiRobotWrapper:
         """Move robot to cartesian position"""  
         position = _validate_vector("move_ee_delta position", position, 6)
         return self._request(robot_name, "move_ee_delta", [position, asynchronous], {}, timeout_s=5.0)
+
+    def move_joints_batch(self, positions_by_robot: dict[str, list], asynchronous: bool = False):
+        requests: list[tuple[str, str, list, dict]] = []
+        for robot_name, position in positions_by_robot.items():
+            validated_position = _validate_vector("move_joints position", position, 7)
+            requests.append((robot_name, "move_joints", [validated_position, asynchronous], {}))
+        return self._request_many(requests, timeout_s=5.0)
+
+    def move_ee_delta_batch(self, positions_by_robot: dict[str, list], asynchronous: bool = False):
+        requests: list[tuple[str, str, list, dict]] = []
+        for robot_name, position in positions_by_robot.items():
+            validated_position = _validate_vector("move_ee_delta position", position, 6)
+            requests.append((robot_name, "move_ee_delta", [validated_position, asynchronous], {}))
+        return self._request_many(requests, timeout_s=5.0)
+
+    def stop_motion(self, robot_name: str, timeout_s: float = 2.0):
+        return self._request(robot_name, "stop_motion", [], {}, timeout_s=timeout_s)
+
+    def stop_all_motion(self, timeout_s: float = 2.0) -> dict[str, Any]:
+        requests: list[tuple[str, str, list, dict]] = []
+        for robot_name, process in self.processes.items():
+            if process.is_alive() and robot_name in self.robots:
+                requests.append((robot_name, "stop_motion", [], {}))
+        if not requests:
+            return {}
+        return self._request_many(requests, timeout_s=timeout_s)
           
     def get_robot_state(self, robot_name: str):  
         """Get current robot state"""  
@@ -154,11 +252,22 @@ class MultiRobotWrapper:
           
     def shutdown(self):  
         """Shutdown all robot processes"""  
+        try:
+            self.stop_all_motion(timeout_s=2.0)
+        except Exception:
+            # Continue shutdown even if stopping fails for one robot.
+            pass
+
         for name, queues in self.robots.items():  
             queues['command_queue'].put(("shutdown", [], {}))  
               
         for name, process in self.processes.items():  
             process.join(timeout=5)
+
+        for process in self.processes.values():
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1)
         
         self.robots.clear()
         self.processes.clear()

@@ -4,7 +4,7 @@ import atexit
 from concurrent.futures import Future, ThreadPoolExecutor
 
 class WSG:
-    def __init__(self, TCP_IP = "192.168.1.20", TCP_PORT = 1000):
+    def __init__(self, TCP_IP = "192.168.1.20", TCP_PORT = 1000, do_print=False):
         self.TCP_IP = TCP_IP
         self.TCP_PORT = TCP_PORT 
         self.BUFFER_SIZE = 1024
@@ -16,6 +16,7 @@ class WSG:
         atexit.register(self.__del__)
         # Acknowledge fast stop from failure if any
         self.ack_fast_stop()
+        self.do_print = do_print
 
     def _submit(self, fn, *args) -> Future:
         if self._closed:
@@ -37,13 +38,16 @@ class WSG:
                 try:
                     return float(decoded.split("=")[1])
                 except (IndexError, ValueError) as e:
-                    print(f"[WSG] Failed to parse position response: {decoded} ({e})")
+                    if self.do_print:
+                        print(f"[WSG] Failed to parse position response: {decoded} ({e})")
                     return None
             elif decoded.startswith("ERR"):
-                print(f"[WSG] Error: {decoded}")
+                if self.do_print:
+                    print(f"[WSG] Error: {decoded}")
                 return None
             if time() - since >= self.timeout:
-                print(f"[WSG] Timeout ({self.timeout} s) occurred.")
+                if self.do_print:
+                    print(f"[WSG] Timeout ({self.timeout} s) occurred.")
                 return None
             sleep(0.1)
 
@@ -56,10 +60,12 @@ class WSG:
                 ret = True
                 break
             elif data.decode("utf-8").startswith("ERR"):
-                print(f"[WSG] Error: {data}")
+                if self.do_print:
+                    print(f"[WSG] Error: {data}")
                 break
             if time() - since >= self.timeout:
-                print(f"[WSG] Timeout ({self.timeout} s) occurred.")
+                if self.do_print:
+                    print(f"[WSG] Timeout ({self.timeout} s) occurred.")
                 break
             sleep(0.1)
         return ret
@@ -98,7 +104,8 @@ class WSG:
         return self._submit(self._read_position)
 
     def move(self, position: int, blocking: bool = True):
-        print("MOVIN TO ", position)
+        if self.do_print:
+            print("MOVIN TO ", position)
         """
         Move fingers to specific position
         * position 0 :- fully close

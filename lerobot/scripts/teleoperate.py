@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -36,8 +37,8 @@ def _build_bimanual_action(
 ) -> dict[str, float]:
     action: dict[str, float] = {}
     for i in range(1, 8):
-        action[f"l_joint_{i}"] = float(left_action[f"joint_{i - 1}"])
-        action[f"r_joint_{i}"] = float(right_action[f"joint_{i - 1}"])
+        action[f"l_joint_{i}"] = float(left_action[f"joint_{i}"])
+        action[f"r_joint_{i}"] = float(right_action[f"joint_{i}"])
     action["l_gripper"] = float(left_action["gripper"])
     action["r_gripper"] = float(right_action["gripper"])
     return action
@@ -61,12 +62,12 @@ def main() -> None:
         use_ee_delta=False
     )
     left_teleop_cfg = GelloConfig(
-        port=os.getenv("GELLO_LEFT_PORT", "/dev/ttyUSB0"),
-        id=os.getenv("GELLO_LEFT_ID", "gello_left"),
+        port=os.getenv("GELLO_LEFT_PORT", "/dev/ttyUSB1"),
+        id=os.getenv("GELLO_LEFT_ID", "gello_teleop_left"),
     )
     right_teleop_cfg = GelloConfig(
-        port=os.getenv("GELLO_RIGHT_PORT", "/dev/ttyUSB1"),
-        id=os.getenv("GELLO_RIGHT_ID", "gello_right"),
+        port=os.getenv("GELLO_RIGHT_PORT", "/dev/ttyUSB0"),
+        id=os.getenv("GELLO_RIGHT_ID", "gello_teleop_right"),
     )
 
     left_teleop = make_teleoperator_from_config(left_teleop_cfg)
@@ -115,10 +116,16 @@ def main() -> None:
     except KeyboardInterrupt:
         logging.info("Teleoperation interrupted by user")
     finally:
-        left_teleop.disconnect()
-        right_teleop.disconnect()
-        if robot.is_connected:
-            robot.disconnect()
+        logging.info("Starting graceful shutdown")
+        previous_sigint_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            left_teleop.disconnect()
+            right_teleop.disconnect()
+            if robot.is_connected:
+                robot.disconnect()
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint_handler)
 
 
 if __name__ == "__main__":

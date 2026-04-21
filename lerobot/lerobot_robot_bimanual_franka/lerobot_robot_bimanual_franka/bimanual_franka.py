@@ -166,21 +166,26 @@ class BimanualFranka(Robot):
         # self.bus.sync_write("Goal_Position", goal_pos)    
         # 
         for s in self.active_arms:
-            self.grippers[s].move(action[f"{s}_gripper"], blocking=False)
+            pos = np.clip(action[f"{s}_gripper"], 0, 110) # constrain between [0, 110], which is default schunk range
+            self.grippers[s].move(pos, blocking=False)
 
-            if self.use_ee_delta:
-                ee: list = [
+        if self.use_ee_delta:
+            ee_by_arm: dict[str, list] = {}
+            for s in self.active_arms:
+                ee_by_arm[s] = [
                     action[f"{s}_x"],
                     action[f"{s}_y"],
                     action[f"{s}_z"],
                     action[f"{s}_roll"],
                     action[f"{s}_pitch"],
                     action[f"{s}_yaw"],
-                    ]
-                self.robot_manager.move_ee_delta(s, ee, True)
-                continue
+                ]
+            self.robot_manager.move_ee_delta_batch(ee_by_arm, True)
+            return action
 
-            joints: list = [action[f"{s}_joint_{i}"] for i in range(1,8)]
-            self.robot_manager.move_joints(s, joints, True)
+        joints_by_arm: dict[str, list] = {}
+        for s in self.active_arms:
+            joints_by_arm[s] = [action[f"{s}_joint_{i}"] for i in range(1,8)]
+        self.robot_manager.move_joints_batch(joints_by_arm, True)
 
         return action
