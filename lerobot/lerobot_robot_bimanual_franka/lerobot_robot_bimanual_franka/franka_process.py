@@ -7,11 +7,12 @@ import numpy as np
 from numpy.typing import NDArray
 
 
-# Proportional joint-velocity controller settings for smooth position tracking.
-JOINT_POSITION_DEADBAND_RAD = 0.003
-JOINT_VELOCITY_GAIN = 1.0
-JOINT_MAX_ABS_VELOCITY_RAD_S = 1.0
-JOINT_PREDICT_DT_S = 0.05
+# PD joint-velocity controller settings for smooth position tracking.
+JOINT_POSITION_DEADBAND_RAD = 0.00
+JOINT_PD_VELOCITY_MAX = 1.0
+JOINT_PD_KP = 1.5
+JOINT_PD_KD = 0.2
+VELOCITY_COMMAND_DURATION_MS = 100
 
 
 def _validate_vector(name: str, values, expected_len: int) -> list[float]:
@@ -42,12 +43,11 @@ class RobotProcess:
             from net_franky import setup_net_franky  
             setup_net_franky(self.server_ip, self.port)  
               
-            from net_franky.franky import Robot, JointVelocityMotion, CartesianVelocityMotion, Twist 
+            from net_franky.franky import Robot, JointVelocityMotion, CartesianVelocityMotion, Twist, Duration 
               
             robot = Robot(self.robot_ip)  
             robot.recover_from_errors()  
-            robot.relative_dynamics_factor = 0.25
-            last_joint_positions: NDArray[np.float64] = np.asarray(robot.current_joint_positions, dtype=np.float64)
+            robot.relative_dynamics_factor = 0.2
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return  
@@ -60,62 +60,60 @@ class RobotProcess:
                     joint_target = _validate_vector("move_joints position", args[0], 7)
                     target: NDArray[np.float64] = np.asarray(joint_target, dtype=np.float64)
 
-                    if last_joint_positions.shape != (7,):
-                        last_joint_positions = np.asarray(robot.current_joint_positions, dtype=np.float64)
+                    current_joint_positions: NDArray[np.float64] = np.asarray(robot.current_joint_positions, dtype=np.float64)
+                    current_joint_velocities: NDArray[np.float64] = np.asarray(robot.current_joint_velocities, dtype=np.float64)
 
-                    joint_error = target - last_joint_positions
+                    joint_error = target - current_joint_positions
                     if float(np.max(np.abs(joint_error))) <= JOINT_POSITION_DEADBAND_RAD:
                         self.response_queue.put(("success", False))
                         continue
 
-                    joint_velocity = JOINT_VELOCITY_GAIN * joint_error
-                    joint_velocity = np.clip(
-                        joint_velocity,
-                        -JOINT_MAX_ABS_VELOCITY_RAD_S,
-                        JOINT_MAX_ABS_VELOCITY_RAD_S,
-                    )
+                    joint_velocity = (JOINT_PD_KP * joint_error) - (JOINT_PD_KD * current_joint_velocities)
 
-                    motion = JointVelocityMotion(cast(Any, joint_velocity))
-                    result = robot.move(motion, asynchronous=args[1])  
-                    last_joint_positions = last_joint_positions + (joint_velocity * JOINT_PREDICT_DT_S)
+                    norm = np.linalg.norm(joint_velocity)
+                    if norm > JOINT_PD_VELOCITY_MAX:
+                        joint_velocity *= JOINT_PD_VELOCITY_MAX / norm
+
+                    motion = JointVelocityMotion(cast(Any, joint_velocity), Duration(VELOCITY_COMMAND_DURATION_MS))
+                    result = robot.move(motion, asynchronous=args[1])
                     self.response_queue.put(("success", result))
                   
-                elif command == "move_ee_delta":  
+                elif command == "move_ee_delta":
                     ee_delta = _validate_vector("move_ee_delta position", args[0], 6)
                     linear: NDArray[np.float64] = np.asarray(ee_delta[:3], dtype=np.float64)
                     angular: NDArray[np.float64] = np.asarray(ee_delta[3:], dtype=np.float64)
-                    motion = CartesianVelocityMotion(Twist(cast(Any, linear), cast(Any, angular)))
-                    result = robot.move(motion, asynchronous=args[1])  
+                    motion = CartesianVelocityMotion(
+                        Twist(cast(Any, linear), cast(Any, angular)),
+                        Duration(VELOCITY_COMMAND_DURATION_MS),
+                    )
+                    result = robot.move(motion, asynchronous=args[1])
                     self.response_queue.put(("success", result))
                       
                 elif command == "get_state":  
-                    state = robot.get_last_callback_data()  
-                    if isinstance(state, dict) and "q" in state:
-                        q = cast(dict[str, Any], state).get("q")
-                        if isinstance(q, (list, tuple)) and len(q) == 7:
-                            last_joint_positions = np.asarray(q, dtype=np.float64)
+                    state = robot.get_last_callback_data()
                     self.response_queue.put(("success", state))  
 
                 elif command == "current_joint_positions":
                     joints = robot.current_joint_positions
-                    last_joint_positions = np.asarray(joints, dtype=np.float64)
                     self.response_queue.put(("success", joints))  
                       
                 elif command == "join_motion":  
-                    result = robot.join_motion(timeout=args[0] if args else None)  
+                    result = robot.join_motion(timeout=args[0] if args else None)
                     self.response_queue.put(("success", result))  
 
                 elif command == "stop_motion":
                     zero_velocity: NDArray[np.float64] = np.zeros(7, dtype=np.float64)
-                    motion = JointVelocityMotion(cast(Any, zero_velocity))
+                    motion = JointVelocityMotion(cast(Any, zero_velocity), Duration(VELOCITY_COMMAND_DURATION_MS))
                     result = robot.move(motion, asynchronous=False)
-                    last_joint_positions = np.asarray(robot.current_joint_positions, dtype=np.float64)
                     self.response_queue.put(("success", result))
                       
                 elif command == "shutdown":  
                     try:
                         zero_velocity: NDArray[np.float64] = np.zeros(7, dtype=np.float64)
-                        robot.move(JointVelocityMotion(cast(Any, zero_velocity)), asynchronous=False)
+                        robot.move(
+                            JointVelocityMotion(cast(Any, zero_velocity), Duration(VELOCITY_COMMAND_DURATION_MS)),
+                            asynchronous=False,
+                        )
                     except Exception:
                         # Shutdown should continue even if a final stop command fails.
                         pass
@@ -124,8 +122,15 @@ class RobotProcess:
                 else:  
                     self.response_queue.put(("error", f"Unknown command: {command}"))  
                       
-            except Exception as e:  
-                self.response_queue.put(("error", str(e)))  
+            except Exception as e:
+                error_text = str(e)
+                if "UDP receive: Timeout" in error_text or "communication_constrains_violation" in error_text:
+                    try:
+                        robot.recover_from_errors()
+                    except Exception:
+                        # Keep surfacing the original exception even if recovery fails.
+                        pass
+                self.response_queue.put(("error", error_text))
 
 class MultiRobotWrapper:  
     def __init__(self):  
@@ -141,7 +146,7 @@ class MultiRobotWrapper:
         response_queue = Queue()  
           
         robot_proc = RobotProcess(server_ip, robot_ip, port, command_queue, response_queue)  
-        process = Process(target=robot_proc.run)  
+        process = Process(target=robot_proc.run)
         process.start()  
           
         self.robots[name] = {  
@@ -242,9 +247,9 @@ class MultiRobotWrapper:
         """Get current robot state"""  
         return self._request(robot_name, "get_state", [], {}, timeout_s=5.0)
     
-    def current_joint_positions(self, robot_name: str):
+    def current_joint_positions(self, robot_name: str, timeout_s: float = 5.0):
         """Get current joint positions"""  
-        return self._request(robot_name, "current_joint_positions", [], {}, timeout_s=5.0)
+        return self._request(robot_name, "current_joint_positions", [], {}, timeout_s=timeout_s)
           
     def join_motion(self, robot_name: str, timeout: float = 0.0):  
         """Wait for motion to complete"""  

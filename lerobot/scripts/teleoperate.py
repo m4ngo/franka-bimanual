@@ -6,6 +6,7 @@ bimanual Franka action command each control step.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import os
 import signal
@@ -44,7 +45,14 @@ def _build_bimanual_action(
     return action
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Calibrate the GELLO teleoperator")
+    parser.add_argument("--portl", required=True, help="Serial device path for left GELLO")
+    parser.add_argument("--portr", required=True, help="Serial device path for right GELLO")
+    return parser.parse_args()
+
 def main() -> None:
+    args = parse_args()
     init_logging()
     logging.info("Starting bimanual Franka <-> dual GELLO teleoperation")
 
@@ -62,11 +70,11 @@ def main() -> None:
         use_ee_delta=False
     )
     left_teleop_cfg = GelloConfig(
-        port=os.getenv("GELLO_LEFT_PORT", "/dev/ttyUSB1"),
+        port=os.getenv("GELLO_LEFT_PORT", args.portl),
         id=os.getenv("GELLO_LEFT_ID", "gello_teleop_left"),
     )
     right_teleop_cfg = GelloConfig(
-        port=os.getenv("GELLO_RIGHT_PORT", "/dev/ttyUSB0"),
+        port=os.getenv("GELLO_RIGHT_PORT", args.portr),
         id=os.getenv("GELLO_RIGHT_ID", "gello_teleop_right"),
     )
 
@@ -80,11 +88,13 @@ def main() -> None:
     left_teleop.connect()
     right_teleop.connect()
     try:
+        logging.info("Attempting robot connection")
         robot.connect()
+        logging.info("Robot connection succeeded!")
     except Exception as exc:  # noqa: BLE001 - report but keep running in open-loop
         logging.warning("Robot connection failed: %s", exc)
 
-    loop_hz = 20
+    loop_hz = 40
     loop_period = 1.0 / loop_hz
 
     try:

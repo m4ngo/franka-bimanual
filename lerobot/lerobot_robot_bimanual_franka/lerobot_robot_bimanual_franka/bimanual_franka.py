@@ -20,9 +20,9 @@ class BimanualFranka(Robot):
         self.robot_manager = MultiRobotWrapper()
         self.grippers: dict[str, WSG] = {}
         if "l" in self.active_arms:
-            self.grippers["l"] = WSG(TCP_IP=self.config.l_gripper_ip)
+            self.grippers["l"] = WSG(name="l", TCP_IP=self.config.l_gripper_ip, do_print=True)
         if "r" in self.active_arms:
-            self.grippers["r"] = WSG(TCP_IP=self.config.r_gripper_ip)
+            self.grippers["r"] = WSG(name="r", TCP_IP=self.config.r_gripper_ip, do_print=True)
         
         # self.bus = FeetechMotorsBus(
         #     port=self.config.port,
@@ -96,11 +96,18 @@ class BimanualFranka(Robot):
         import time
         time.sleep(1.0)  # Give processes time to initialize
         for arm in self.active_arms:
-            try:
-                self.robot_manager.current_joint_positions(arm)
-            except Exception as e:
+            last_error: Exception | None = None
+            for _ in range(3):
+                try:
+                    self.robot_manager.current_joint_positions(arm, timeout_s=10.0)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    time.sleep(1.0)
+            if last_error is not None:
                 raise RuntimeError(
-                    f"Failed to communicate with robot '{arm}' at {getattr(self.config, f'{arm}_robot_ip')}: {e}"
+                    f"Failed to communicate with robot '{arm}' at {getattr(self.config, f'{arm}_robot_ip')}: {last_error}"
                 )
 
         if not self.is_calibrated and calibrate:

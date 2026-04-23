@@ -21,7 +21,7 @@ class GelloConfig(TeleoperatorConfig):
     # Smoothing factor for Exponential Moving Average (EMA).
     # Range [0, 1]. 1 means no smoothing (instant update), 0 means no update (freeze).
     # Lower values smooth out jitter but add latency.
-    smoothing: float = 0.9
+    smoothing: float = 0.99
     # Whether to run device reading in a background thread.
     # This helps when USB communication is slow (e.g. long cables).
     use_async: bool = True

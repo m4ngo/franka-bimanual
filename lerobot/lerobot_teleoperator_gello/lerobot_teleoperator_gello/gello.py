@@ -208,7 +208,7 @@ class Gello(Teleoperator):
                             self.latest_action[k] = alpha * v + (1 - alpha) * self.latest_action[k]
 
             except Exception:
-                time.sleep(0.1)
+                time.sleep(0.05)
 
     def _start_read_thread(self) -> None:
         if self.thread is not None and self.thread.is_alive():
