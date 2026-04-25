@@ -1,27 +1,33 @@
 """Configuration dataclass for the GELLO teleoperator plugin.
 
-Defines GelloConfig with serial port settings, calibration position, joint signs,
-and optional smoothing/async parameters.
+Defines serial port settings, calibration home pose, per-joint signs, and
+optional smoothing/async parameters used by :class:`Gello`.
 """
 
 from dataclasses import dataclass, field
 
 from lerobot.teleoperators.config import TeleoperatorConfig
 
+
 @TeleoperatorConfig.register_subclass("gello")
 @dataclass
 class GelloConfig(TeleoperatorConfig):
-    # Port to connect to the arm
+    # Serial port that the Dynamixel bus is attached to.
     port: str = "/dev/ttyUSB0"
     baudrate: int = 57_600
-    calibration_position: list[float] = field(default_factory=lambda: [0, 0, 0, -1.57, 0, 1.57, 0, 0])
+
+    # Reference joint angles (radians) at the calibration home pose. One entry
+    # per motor in the same order as Gello.JOINT_NAMES.
+    calibration_position: list[float] = field(
+        default_factory=lambda: [0, 0, 0, -1.57, 0, 1.57, 0, 0]
+    )
+    # Per-motor direction: +1 to follow, -1 to invert.
     joint_signs: list[int] = field(default_factory=lambda: [1, 1, 1, -1, 1, -1, 1, -1])
+    # Full closed-to-open travel of the gripper servo, in motor counts.
     gripper_travel_counts: int = 575
 
-    # Smoothing factor for Exponential Moving Average (EMA).
-    # Range [0, 1]. 1 means no smoothing (instant update), 0 means no update (freeze).
-    # Lower values smooth out jitter but add latency.
+    # EMA smoothing factor in [0, 1]. 1.0 = no smoothing (instant update);
+    # values closer to 0 smooth jitter but add latency.
     smoothing: float = 0.99
-    # Whether to run device reading in a background thread.
-    # This helps when USB communication is slow (e.g. long cables).
+    # If True, read motor states in a background thread to hide USB latency.
     use_async: bool = True

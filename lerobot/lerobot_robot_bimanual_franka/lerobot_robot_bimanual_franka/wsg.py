@@ -1,30 +1,52 @@
+"""Schunk WSG gripper driver proportional position control.
+
+A single background thread owns the TCP socket.  At every position-poll tick
+it computes the error between the current finger gap and the requested target,
+then issues MOVE(<target>, <speed>) where speed = Kp * |error|, clamped to
+[SPEED_MIN, SPEED_MAX].  One-shot commands (GRIP, RELEASE, HOME, …) are
+serialised through a small queue that pauses streaming while they execute.
+
+Public API:
+    move(position, blocking=False)  set streaming target (mm)
+    position                        last cached gap in mm, never blocks
+    grip / release / home           blocking one-shot commands
+    ack_fast_stop / set_verbose / bye
+    close
+"""
+
 import socket
-from time import time, sleep
-import atexit
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from time import sleep, time
 
 
 class WSG:
-    """
-    Schunk WSG gripper driver.
+    BUFFER_SIZE = 4096
+    DEFAULT_TIMEOUT_S = 10
 
-    All socket I/O is owned by a single background thread (_io_loop) to
-    eliminate races between move commands and position reads.
+    # Position poll / MOVE dispatch rate (~20 Hz).
+    _POLL_INTERVAL_S = 0.05
 
-    Public API
-    ----------
-    move(position)        — non-blocking, safe to call at any Hz
-    position              — returns last cached value, never blocks
-    grip / release / home — blocking one-shot commands (queued onto _io_loop)
-    """
+    # Proportional speed: speed_mm_s = Kp * |error_mm|, clamped to [MIN, MAX].
+    _MOVE_KP = 50.0          # (mm/s) per mm of error
+    _MOVE_SPEED_MIN = 10.0   # mm/s – avoid imperceptibly slow creep
+    _MOVE_SPEED_MAX = 200.0  # mm/s – hardware-safe ceiling
+    _MOVE_DEAD_ZONE_MM = 3.0 # errors smaller than this are not acted on
 
-    def __init__(self, name="", TCP_IP="192.168.1.20", TCP_PORT=1000, do_print=False):
+    _IO_LOOP_IDLE_S = 0.01
+    _BLOCKING_POLL_S = 0.005
+    _RELEASE_MM = 10
+
+    def __init__(
+        self,
+        name: str = "",
+        TCP_IP: str = "192.168.1.20",
+        TCP_PORT: int = 1000,
+        do_print: bool = False,
+    ):
         self.name = name
         self.TCP_IP = TCP_IP
         self.TCP_PORT = TCP_PORT
-        self.BUFFER_SIZE = 4096
-        self.timeout = 10
+        self.timeout = self.DEFAULT_TIMEOUT_S
         self.do_print = do_print
         self._closed = False
 
@@ -32,104 +54,95 @@ class WSG:
         self.tcp_sock.connect((TCP_IP, TCP_PORT))
         self.tcp_sock.setblocking(True)
 
-        # --- Cached position (written only by _io_loop) ---
         self._cached_position: float | None = None
         self._position_lock = threading.Lock()
 
-        # --- Streaming move state ---
-        self._move_target: int | None = None       # latest requested target
-        self._move_sent: int | None = None         # last target actually sent
+        self._move_target: float | None = None
         self._move_lock = threading.Lock()
-        self._move_event = threading.Event()
 
-        # --- One-shot command queue (home / grip / release / ack) ---
-        # Each item: (bytes_to_send, expected_response_bytes, done_event, result_list)
+        # One-shot command queue: (cmd_bytes, expected_response, done_event, result).
         self._cmd_queue: list[tuple[bytes, bytes, threading.Event, list]] = []
         self._cmd_lock = threading.Lock()
-        self._cmd_event = threading.Event()
 
-        # Single thread that owns the socket.
         self._io_thread = threading.Thread(
             target=self._io_loop, daemon=True, name=f"wsg-io-{name}"
         )
         self._io_thread.start()
 
-        # Acknowledge fast stop from failure if any
         self.ack_fast_stop()
 
     # ------------------------------------------------------------------
-    # Internal: socket owner thread
+    # Internal: IO thread
     # ------------------------------------------------------------------
 
-    def _io_loop(self):
+    def _io_loop(self) -> None:
         """
-        Single thread that owns all socket reads and writes.
-
         Priority order each iteration:
-          1. Drain any one-shot command from the queue (blocking until ACK).
-          2. If a new move target differs from what was sent, send MOVE.
-          3. Poll position at ~10 Hz so `self.position` stays fresh.
-          4. Non-blocking drain to parse any arrived data.
+          1. Execute any queued one-shot command (blocks until its response).
+          2. Poll position and issue a proportional MOVE if error > dead-zone.
+          3. Drain pending bytes and parse response lines.
         """
-        MOVE_INTERVAL_S = 0.05   # 20 Hz max move command rate
-        POS_INTERVAL_S  = 0.05   # 10 Hz position refresh
-        last_move_t = 0.0
-        last_pos_t  = 0.0
-
+        last_poll_t = 0.0
         recv_buf = b""
 
         while not self._closed:
             now = time()
 
-            # 1. One-shot commands take priority (home, grip, release, ack)
+            # 1. One-shot commands (GRIP, RELEASE, HOME, …) take priority.
             cmd_entry = None
             with self._cmd_lock:
                 if self._cmd_queue:
                     cmd_entry = self._cmd_queue.pop(0)
 
             if cmd_entry is not None:
-                cmd_bytes, expected, done_event, result_holder = cmd_entry
+                cmd_bytes, expected, done_event, result = cmd_entry
                 self.tcp_sock.send(cmd_bytes)
                 ok, recv_buf = self._blocking_wait(expected, recv_buf)
-                result_holder.append(ok)
+                result.append(ok)
                 done_event.set()
-                continue  # restart loop — don't interleave with moves
+                continue
 
-            # 2. Send move command if target changed or re-assert interval elapsed
-            with self._move_lock:
-                target = self._move_target
-                sent   = self._move_sent
-
-            if target is not None and (target != sent or now - last_move_t >= MOVE_INTERVAL_S * 5):
-                if now - last_move_t >= MOVE_INTERVAL_S:
-                    cmd = f"MOVE({target})\n".encode()
-                    try:
-                        self.tcp_sock.send(cmd)
-                        with self._move_lock:
-                            self._move_sent = target
-                        last_move_t = now
-                        if self.do_print:
-                            print(f"{self.name}: [WSG] → MOVE({target})")
-                    except OSError as e:
-                        if self.do_print:
-                            print(f"{self.name}: [WSG] send error: {e}")
-
-            # 3. Periodic position poll
-            if now - last_pos_t >= POS_INTERVAL_S:
+            # 2. Position poll + proportional MOVE.
+            if now - last_poll_t >= self._POLL_INTERVAL_S:
                 try:
                     self.tcp_sock.send(b"POS?\n")
-                    last_pos_t = now
                 except OSError as e:
                     if self.do_print:
                         print(f"{self.name}: [WSG] pos send error: {e}")
 
-            # 4. Non-blocking drain — parse whatever arrived
-            recv_buf = self._drain_and_parse(recv_buf)
+                with self._move_lock:
+                    target = self._move_target
+                with self._position_lock:
+                    pos = self._cached_position
 
-            sleep(0.01)
+                if target is not None and pos is not None:
+                    error = target - pos
+                    if abs(error) > self._MOVE_DEAD_ZONE_MM:
+                        speed = min(
+                            self._MOVE_SPEED_MAX,
+                            max(self._MOVE_SPEED_MIN, self._MOVE_KP * abs(error)),
+                        )
+                        try:
+                            self.tcp_sock.send(
+                                f"MOVE({target},{speed:.1f})\n".encode()
+                            )
+                            if self.do_print:
+                                print(
+                                    f"{self.name}: [WSG] MOVE({target}, {speed:.1f})"
+                                    f" err={error:+.1f} mm"
+                                )
+                        except OSError as e:
+                            if self.do_print:
+                                print(f"{self.name}: [WSG] send error: {e}")
+
+                last_poll_t = now
+
+            # 3. Drain and parse incoming bytes.
+            recv_buf = self._drain_and_parse(recv_buf)
+            sleep(self._IO_LOOP_IDLE_S)
 
     def _drain_and_parse(self, buf: bytes) -> bytes:
-        """Non-blocking read; parse complete lines from buffer."""
+        """Pull pending bytes from the socket and parse complete lines."""
         self.tcp_sock.setblocking(False)
         try:
             chunk = self.tcp_sock.recv(self.BUFFER_SIZE)
@@ -143,39 +156,31 @@ class WSG:
         while b"\n" in buf:
             line, buf = buf.split(b"\n", 1)
             self._handle_line(line.strip())
-
         return buf
 
-    def _handle_line(self, line: bytes):
+    def _handle_line(self, line: bytes) -> None:
         """Dispatch a single parsed response line."""
         decoded = line.decode("utf-8", errors="replace")
         if decoded.startswith("POS="):
             try:
-                val = float(decoded.split("=")[1])
                 with self._position_lock:
-                    self._cached_position = val
+                    self._cached_position = float(decoded.split("=")[1])
             except (IndexError, ValueError):
                 pass
         elif decoded.startswith("ERR") and self.do_print:
-            print(f"{self.name}: [WSG] Error: {decoded}")
+            print(f"{self.name}: [WSG] {decoded}")
 
     def _blocking_wait(self, expected: bytes, buf: bytes) -> tuple[bool, bytes]:
-        """
-        Block (within the io thread) until `expected` is seen or timeout.
-        Parses and caches POS lines seen while waiting.
-        Returns (success, remaining_buf).
-        """
-        since = time()
+        """Block inside the IO thread until *expected* is seen or timeout fires."""
+        start = time()
         while True:
             if expected in buf:
-                idx = buf.index(expected) + len(expected)
-                return True, buf[idx:]
+                return True, buf[buf.index(expected) + len(expected):]
 
             try:
                 chunk = self.tcp_sock.recv(self.BUFFER_SIZE)
                 if chunk:
                     buf += chunk
-                    # Parse lines, keep looking for expected token
                     while b"\n" in buf:
                         line, buf = buf.split(b"\n", 1)
                         self._handle_line(line.strip())
@@ -186,20 +191,19 @@ class WSG:
             except OSError:
                 return False, buf
 
-            if time() - since >= self.timeout:
+            if time() - start >= self.timeout:
                 if self.do_print:
-                    print(f"{self.name}: [WSG] Timeout waiting for {expected!r}")
+                    print(f"{self.name}: [WSG] timeout waiting for {expected!r}")
                 return False, buf
 
-            sleep(0.005)
+            sleep(self._BLOCKING_POLL_S)
 
     def _enqueue_cmd(self, cmd: bytes, expected: bytes) -> bool:
-        """Queue a one-shot command and block the *caller* until it completes."""
+        """Submit a one-shot command and block the caller until it completes."""
         done = threading.Event()
         result: list[bool] = []
         with self._cmd_lock:
             self._cmd_queue.append((cmd, expected, done, result))
-        self._cmd_event.set()
         done.wait(timeout=self.timeout + 1)
         return bool(result and result[0])
 
@@ -209,69 +213,70 @@ class WSG:
 
     @property
     def position(self) -> float | None:
-        """
-        Last known finger gap in mm. Updated at ~10 Hz by the io loop.
-        Never blocks — safe to call every observation cycle.
-        """
+        """Last known finger gap in mm; never blocks."""
         with self._position_lock:
             return self._cached_position
 
-    def move(self, position: int, blocking: bool = False):
+    def move(self, position: float, blocking: bool = False):
         """
-        Move fingers toward *position* (mm). Non-blocking by default.
+        Stream a new target position (mm).  Non-blocking by default.
 
-        Safe to call at any frequency — only the latest target is ever sent.
-        The io loop sends at up to 20 Hz; intermediate values are dropped.
+        The background loop issues MOVE(<position>, <speed>) at ~20 Hz with
+        speed proportional to the remaining error, so the gripper accelerates
+        toward the target and decelerates as it closes in.
 
         * position 0   – fully closed
         * position 110 – fully open
         """
         with self._move_lock:
-            self._move_target = int(position)
-        self._move_event.set()
+            self._move_target = float(position)
 
         if blocking:
             return self._enqueue_cmd(
-                f"MOVE({int(position)})\n".encode(), b"FIN MOVE\n"
+                f"MOVE({position},{self._MOVE_SPEED_MAX:.1f})\n".encode(),
+                b"FIN MOVE",
             )
 
-    def ack_fast_stop(self):
-        return self._enqueue_cmd(b"FSACK()\n", b"ACK FSACK\n")
+    def ack_fast_stop(self) -> bool:
+        return self._enqueue_cmd(b"FSACK()\n", b"ACK FSACK")
 
-    def set_verbose(self, verbose=True):
-        """Set verbose True for detailed error messages."""
+    def set_verbose(self, verbose: bool = True) -> bool:
         msg = f"VERBOSE={1 if verbose else 0}\n".encode()
-        return self._enqueue_cmd(msg, msg)
+        return self._enqueue_cmd(msg, msg.rstrip(b"\n"))
 
-    def home(self):
-        """Fully open the gripper (blocking)."""
-        return self._enqueue_cmd(b"HOME()\n", b"FIN HOME\n")
+    def home(self) -> bool:
+        """Reference the gripper fingers (blocking)."""
+        return self._enqueue_cmd(b"HOME()\n", b"FIN HOME")
 
     def home_async(self) -> threading.Thread:
         t = threading.Thread(target=self.home, daemon=True)
         t.start()
         return t
 
-    def grip(self, force, blocking: bool = True):
-        future_fn = lambda: self._enqueue_cmd(
-            f"GRIP({force})\n".encode(), b"FIN GRIP\n"
+    def grip(self, force: float, blocking: bool = True):
+        """Grasp with the given force in N; blocks by default."""
+        action = lambda: self._enqueue_cmd(
+            f"GRIP({force})\n".encode(), b"FIN GRIP"
         )
         if blocking:
-            return future_fn()
-        t = threading.Thread(target=future_fn, daemon=True)
+            return action()
+        t = threading.Thread(target=action, daemon=True)
         t.start()
         return t
 
     def release(self, blocking: bool = True):
-        """Release: open fingers by 10 mm."""
-        future_fn = lambda: self._enqueue_cmd(b"RELEASE(10)\n", b"FIN RELEASE\n")
+        """Release by opening fingers by _RELEASE_MM."""
+        action = lambda: self._enqueue_cmd(
+            f"RELEASE({self._RELEASE_MM})\n".encode(), b"FIN RELEASE"
+        )
         if blocking:
-            return future_fn()
-        t = threading.Thread(target=future_fn, daemon=True)
+            return action()
+        t = threading.Thread(target=action, daemon=True)
         t.start()
         return t
 
-    def bye(self):
+    def bye(self) -> None:
+        """Announce disconnect so the gripper does not raise a FAST STOP."""
         try:
             self.tcp_sock.send(b"BYE()\n")
         except OSError:
@@ -281,8 +286,6 @@ class WSG:
         if self._closed:
             return
         self._closed = True
-        self._move_event.set()
-        self._cmd_event.set()
         try:
             self.bye()
         except Exception:

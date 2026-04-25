@@ -1,7 +1,7 @@
 """GELLO motor ID setup utility.
 
-Assigns Dynamixel motor IDs and baudrate for the GELLO teleoperator one motor
-at a time using the plugin's built-in setup routine.
+Iterates over each Dynamixel motor on the GELLO bus and assigns IDs / baudrate
+using the plugin's built-in setup routine.
 """
 
 import argparse
@@ -12,7 +12,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from lerobot_teleoperator_gello import GelloConfig
+from lerobot_teleoperator_gello import Gello, GelloConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,16 +30,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
-    teleop_cfg = GelloConfig(
-        port=args.port,
-        id=args.id,
-        calibration_dir=args.calibration_dir,
+    teleop = Gello(
+        GelloConfig(
+            port=args.port,
+            id=args.id,
+            calibration_dir=args.calibration_dir,
+        )
     )
-
-    from lerobot_teleoperator_gello import Gello
-
-    teleop = Gello(teleop_cfg)
     teleop.setup_motors()
 
 

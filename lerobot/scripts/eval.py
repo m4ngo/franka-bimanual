@@ -1,46 +1,76 @@
 """Policy evaluation script with rollout tracking.
 
-Runs a trained policy on the robot for multiple rollouts, collecting success/failure
-metrics and timing data. Results are saved to JSON for analysis.
+Runs a trained policy against the bimanual Franka for a configurable number of
+rollouts, letting the operator mark success/failure at runtime and persisting
+per-rollout metrics to JSON for later analysis.
 """
 
-import logging
-from collections import deque
-from dataclasses import asdict, dataclass, field
-from pprint import pformat
-import numpy as np
-import time
-import os
 import json
+import logging
+import os
 import sys
 import termios
+import time
+from collections import deque
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from pprint import pformat
 
-from lerobot.robots import RobotConfig, make_robot_from_config, Robot
+import numpy as np
+
 from lerobot.configs import parser
-from lerobot.utils.import_utils import register_third_party_plugins
-from lerobot.utils.utils import init_logging
+from lerobot.robots import Robot, RobotConfig, make_robot_from_config
 from lerobot.utils.control_utils import is_headless
+from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
+from lerobot.utils.utils import init_logging
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-# Ensure third-party devices are discoverable by lerobot
+# Ensure third-party devices are discoverable by lerobot's config parser.
 from lerobot_robot_bimanual_franka import BimanualFrankaConfig  # noqa: F401
 from lerobot_teleoperator_gello import GelloConfig  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# ---- Constants --------------------------------------------------------------
+
+# Number of joints used by the evaluated policy (currently libero-style 6-DOF,
+# even though the FR3 arm itself is 7-DOF).
+POLICY_NUM_JOINTS = 6
+# Number of joints reported on each arm of the bimanual follower robot.
+ROBOT_NUM_JOINTS = 7
+
+# Duration spent traversing from the current pose to the home pose.
+HOME_MOVE_DURATION_S = 3.0
+# Settling pause after reaching home.
+HOME_SETTLE_S = 0.5
+# Short backoff after an inference error before retrying.
+INFERENCE_ERROR_BACKOFF_S = 0.1
+# Polling interval while waiting for the operator's decision between rollouts.
+DECISION_POLL_S = 0.05
+
+# Location (relative to CWD) used to persist rollout results per task/model.
+ROLLOUTS_DIR = "assets/rollouts"
+
+
+# ---- Config dataclasses -----------------------------------------------------
+
 @dataclass
 class EvalConfig:
-    task: str # e.g. "task1"
-    model_type: str # e.g. "lora" or "fpft"
+    task: str  # e.g. "task1"
+    model_type: str  # e.g. "lora" or "fpft"
     total_steps: int
-    timeout: int = 90 # Seconds before rollout counts as failed
-    home_pose: list[float] = field(default_factory=lambda: [0, -1.57, 1.57, -1.57, -1.57, -1.57])
+    # Seconds before a rollout is automatically counted as failed.
+    timeout: int = 90
+    # Target joint angles used as the per-rollout home pose.
+    home_pose: list[float] = field(
+        default_factory=lambda: [0, -1.57, 1.57, -1.57, -1.57, -1.57]
+    )
     num_rollouts: int = 5
+
 
 @dataclass
 class InferenceConfig:
@@ -65,24 +95,6 @@ class InferenceConfig:
     fps: int = 60
 
 
-def _build_bimanual_action(obs: dict, action: np.ndarray, arm_prefix: str) -> dict[str, float]:
-    action_dict = {
-        f"l_joint_{i}": float(obs[f"l_joint_{i}"]) for i in range(1, 8)
-    } | {
-        f"r_joint_{i}": float(obs[f"r_joint_{i}"]) for i in range(1, 8)
-    }
-    action_dict["l_gripper"] = float(obs["l_gripper"])
-    action_dict["r_gripper"] = float(obs["r_gripper"])
-
-    action_dict[f"{arm_prefix}_joint_1"] = float(action[0])
-    action_dict[f"{arm_prefix}_joint_2"] = float(action[1])
-    action_dict[f"{arm_prefix}_joint_3"] = float(action[2])
-    action_dict[f"{arm_prefix}_joint_4"] = float(action[3])
-    action_dict[f"{arm_prefix}_joint_5"] = float(action[4])
-    action_dict[f"{arm_prefix}_joint_6"] = float(action[5])
-    action_dict[f"{arm_prefix}_gripper"] = float(action[6])
-    return action_dict
-
 @dataclass
 class RolloutResult:
     timestamp: str
@@ -95,63 +107,84 @@ class RolloutResult:
     def to_dict(self):
         return asdict(self)
 
+
+# ---- Rollout results persistence -------------------------------------------
+
+def _results_path(cfg: EvalConfig) -> str:
+    return f"{ROLLOUTS_DIR}/rollout_results_{cfg.task}_{cfg.model_type}.json"
+
+
 def try_load_rollout_results_from_file(eval_config: EvalConfig) -> list[RolloutResult]:
-    results_file = f"assets/rollouts/rollout_results_{eval_config.task}_{eval_config.model_type}.json"
-    if os.path.exists(results_file):
-        with open(results_file, "r") as f:
-            try:
-                data = json.load(f)
-                return [RolloutResult(**d) for d in data]
-            except json.JSONDecodeError:
-                return []
-    return []
+    path = _results_path(eval_config)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r") as f:
+        try:
+            return [RolloutResult(**d) for d in json.load(f)]
+        except json.JSONDecodeError:
+            return []
+
 
 def save_rollout_results_to_file(eval_config: EvalConfig, rollout_results: list[RolloutResult]):
-    results_file = f"assets/rollouts/rollout_results_{eval_config.task}_{eval_config.model_type}.json"
-    os.makedirs(os.path.dirname(results_file), exist_ok=True)
-    with open(results_file, "w") as f:
+    path = _results_path(eval_config)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump([r.to_dict() for r in rollout_results], f, indent=2)
 
-def flush_stdin():
-    """Flushes the standard input buffer to remove stray keypresses."""
+
+# ---- Action construction ----------------------------------------------------
+
+def _build_bimanual_action(obs: dict, action: np.ndarray, arm_prefix: str) -> dict[str, float]:
+    """Construct a full bimanual action where non-controlled arm mirrors *obs*."""
+    action_dict: dict[str, float] = {}
+    for side in ("l", "r"):
+        for i in range(1, ROBOT_NUM_JOINTS + 1):
+            action_dict[f"{side}_joint_{i}"] = float(obs[f"{side}_joint_{i}"])
+        action_dict[f"{side}_gripper"] = float(obs[f"{side}_gripper"])
+
+    # Overlay the policy's output onto the controlled arm (first N joints + gripper).
+    for i in range(POLICY_NUM_JOINTS):
+        action_dict[f"{arm_prefix}_joint_{i + 1}"] = float(action[i])
+    action_dict[f"{arm_prefix}_gripper"] = float(action[POLICY_NUM_JOINTS])
+    return action_dict
+
+
+# ---- Keyboard / stdin helpers ----------------------------------------------
+
+def flush_stdin() -> None:
+    """Discard buffered stdin so stray keypresses do not leak into prompts."""
     try:
         termios.tcflush(sys.stdin, termios.TCIOFLUSH)
     except Exception:
         pass
 
+
 def init_keyboard_listener():
     """
-    Initializes a non-blocking keyboard listener for real-time user interaction.
+    Start a non-blocking keyboard listener that sets event flags during rollout.
 
-    This function sets up a listener for specific keys (1, 2, right arrow, left arrow, escape) to control
-    the program flow during execution, such as stopping evaluation or exiting loops. It gracefully
-    handles headless environments where keyboard listening is not possible.
+    Key bindings:
+        Escape      - stop evaluation
+        Up arrow    - mark current rollout a success
+        Down arrow  - mark current rollout a failure
+        Right arrow - advance to the next rollout
+        Left arrow  - retry / rerecord the current rollout
 
-    The keys are:
-    - Escape: Stop evaluation
-    - up: Rollout was successful, go to home pose and wait for right arrow to continue
-    - down: Rollout was unsuccessful, go to home pose and wait for right arrow to continue
-    - Right arrow: Continue to next rollout
-    - Left arrow: Rerecord the current rollout, got to home pose and wait for right arrow to continue
-
-    Returns:
-        A tuple containing:
-        - The `pynput.keyboard.Listener` instance, or `None` if in a headless environment.
-        - A dictionary of event flags (e.g., `exit_early`) that are set by key presses.
+    Returns ``(listener, events)``; ``listener`` is ``None`` in headless envs.
     """
-    events = {}
-    events["stop_evaluation"] = False
-    events["next_rollout"] = False
-    events["rerecord_rollout"] = False
-    events["success_rollout"] = False
-    events["failure_rollout"] = False
+    events = {
+        "stop_evaluation": False,
+        "next_rollout": False,
+        "rerecord_rollout": False,
+        "success_rollout": False,
+        "failure_rollout": False,
+    }
 
     if is_headless():
         logging.warning(
             "Headless environment detected. On-screen cameras display and keyboard inputs will not be available."
         )
-        listener = None
-        return listener, events
+        return None, events
 
     from pynput import keyboard
 
@@ -173,214 +206,232 @@ def init_keyboard_listener():
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
-
     return listener, events
 
-def move_to_home(robot: Robot, home_pose: list[float], arm_prefix: str, duration: float = 3.0, fps: int = 60):
+
+# ---- Home pose motion -------------------------------------------------------
+
+def move_to_home(
+    robot: Robot,
+    home_pose: list[float],
+    arm_prefix: str,
+    duration: float = HOME_MOVE_DURATION_S,
+    fps: int = 60,
+) -> None:
+    """Linearly interpolate the controlled arm to the home pose at *fps*."""
     logger.info("Moving to home pose...")
-    
-    # Get current state
+
     obs = robot.get_observation()
-    current_joints = np.array([obs[f"{arm_prefix}_joint_{i}"] for i in range(1, 7)])
+    current_joints = np.array(
+        [obs[f"{arm_prefix}_joint_{i}"] for i in range(1, POLICY_NUM_JOINTS + 1)]
+    )
     target_joints = np.array(home_pose)
-    
-    # Calculate steps
+
     steps = int(duration * fps)
-    
     for i in range(steps):
-        # Linear interpolation (LERP)
         alpha = (i + 1) / steps
-        interpolated_joints = current_joints + alpha * (target_joints - current_joints)
-        
-        single_arm_action = np.zeros(7, dtype=float)
-        single_arm_action[:6] = interpolated_joints
-        single_arm_action[6] = 0.0
-        action_dict = _build_bimanual_action(obs, single_arm_action, arm_prefix)
-        
-        robot.send_action(action_dict)
+        interpolated = current_joints + alpha * (target_joints - current_joints)
+
+        # Policy action layout: [joint_1..N, gripper].
+        policy_action = np.zeros(POLICY_NUM_JOINTS + 1, dtype=float)
+        policy_action[:POLICY_NUM_JOINTS] = interpolated
+        # Gripper is held at 0 while homing.
+
+        robot.send_action(_build_bimanual_action(obs, policy_action, arm_prefix))
         precise_sleep(1 / fps)
-        
-    time.sleep(0.5) # Settle time
+
+    time.sleep(HOME_SETTLE_S)
+
+
+# ---- Evaluation loop --------------------------------------------------------
+
+def _reset_events(events: dict) -> None:
+    for k in events:
+        events[k] = False
+
+
+def _prompt_steps_completed(total_steps: int) -> int:
+    """Ask operator how many task steps were completed prior to failure."""
+    # The final step cannot have been completed since the rollout failed.
+    steps_completed = 0
+    while steps_completed < total_steps - 1:
+        response = input(f"Did it pass step '{steps_completed + 1}'? (y/n): ").strip()
+        if response.lower() == "n":
+            break
+        steps_completed += 1
+    return steps_completed
+
+
+def _run_single_rollout(
+    client,
+    robot: Robot,
+    events: dict,
+    inference_config: InferenceConfig,
+) -> tuple[bool | None, float]:
+    """
+    Execute one rollout until the user or timeout terminates it.
+
+    Returns ``(success, robot_active_time)`` where ``success`` is ``None`` when
+    the operator requested a retry and the rollout should be discarded.
+    """
+    eval_config = inference_config.eval
+    fps = inference_config.fps
+
+    action_queue: deque = deque([])
+    rollout_start_wall = time.time()
+    robot_active_time = 0.0
+
+    rollout_success: bool | None = False
+    stop_rollout = False
+    obs = None
+
+    while not stop_rollout:
+        loop_start = time.perf_counter()
+
+        if events["stop_evaluation"]:
+            logger.info("Stop evaluation requested.")
+            # Propagate as success=False so the outer loop's stop handling runs.
+            return False, robot_active_time
+
+        if events["success_rollout"]:
+            logger.info("User marked SUCCESS.")
+            return True, robot_active_time
+        if events["failure_rollout"]:
+            logger.info("User marked FAILURE.")
+            return False, robot_active_time
+        if events["rerecord_rollout"]:
+            logger.info("User requested RETRY. Discarding current rollout.")
+            return None, robot_active_time
+
+        # Hard timeout -> count as failure.
+        if time.time() - rollout_start_wall > eval_config.timeout:
+            logger.info("Timeout reached. Marking as FAILURE.")
+            return False, robot_active_time
+
+        # Fetch a new action chunk if the queue is empty.
+        inference_duration = 0.0
+        if not action_queue:
+            obs = robot.get_observation()
+
+            obs_dict = {
+                "observation/joint_position": [
+                    obs[f"{inference_config.arm_prefix}_joint_{i}"]
+                    for i in range(1, POLICY_NUM_JOINTS + 1)
+                ],
+                "observation/gripper_position": obs[f"{inference_config.arm_prefix}_gripper"],
+                "prompt": inference_config.prompt,
+            }
+
+            t_infer_start = time.perf_counter()
+            try:
+                result = client.infer(obs_dict)
+                action_chunk = result["actions"]
+            except Exception as e:
+                logger.error(f"Inference error: {e}")
+                time.sleep(INFERENCE_ERROR_BACKOFF_S)
+                continue
+            inference_duration = time.perf_counter() - t_infer_start
+
+            if not isinstance(action_chunk, np.ndarray):
+                action_chunk = np.array(action_chunk)
+            if action_chunk.ndim == 1:
+                action_chunk = action_chunk.reshape(1, -1)
+            action_queue.extend(action_chunk)
+
+        if action_queue:
+            action = action_queue.popleft()
+            robot.send_action(_build_bimanual_action(obs, action, inference_config.arm_prefix))
+
+            # Pacing: sleep to maintain fps, excluding inference wait.
+            dt_s = time.perf_counter() - loop_start
+            precise_sleep(1 / fps - dt_s)
+
+            step_total = time.perf_counter() - loop_start
+            # Accumulate "active" time - total minus time spent blocked on inference.
+            robot_active_time += step_total - inference_duration
+        else:
+            precise_sleep(1 / fps)
+
+    # Unreachable; the loop either returns directly or the timeout branch fires.
+    return rollout_success, robot_active_time
 
 
 def evaluation_loop(client, robot: Robot, events: dict, inference_config: InferenceConfig):
     eval_config = inference_config.eval
-    fps = inference_config.fps
-    
+
     rollout_results = try_load_rollout_results_from_file(eval_config)
     logger.info(f"Loaded {len(rollout_results)} rollout results from file.")
 
     move_to_home(robot, eval_config.home_pose, inference_config.arm_prefix)
-    
-    # Ensure we continue from where we left off
+
+    # Continue from wherever we left off in a previous session.
     while len(rollout_results) < eval_config.num_rollouts:
         rollout_idx = len(rollout_results)
         logger.info(f"=== Starting Rollout {rollout_idx + 1}/{eval_config.num_rollouts} ===")
-        
-        # Reset events
-        for k in events:
-            events[k] = False
-        
-        logger.info("Rollout started. Press UP for Success, DOWN for Failure, LEFT to Retry, RIGHT to Skip/Next.")
-        
-        action_queue = deque([])
-        rollout_start_wall = time.time()
-        robot_active_time = 0.0
-        
-        stop_rollout = False
-        rollout_success = False
-        
-        while not stop_rollout:
-            loop_start = time.perf_counter()
-            
-            # 1. Check Global Stop
-            if events["stop_evaluation"]:
-                logger.info("Stop evaluation requested.")
-                return
+        _reset_events(events)
+        logger.info(
+            "Rollout started. Press UP for Success, DOWN for Failure, LEFT to Retry, RIGHT to Skip/Next."
+        )
 
-            # 2. Check Rollout Outcomes
-            if events["success_rollout"]:
-                rollout_success = True
-                stop_rollout = True
-                logger.info("User marked SUCCESS.")
-                break
-            if events["failure_rollout"]:
-                rollout_success = False
-                stop_rollout = True
-                logger.info("User marked FAILURE.")
-                break
-            if events["rerecord_rollout"]:
-                logger.info("User requested RETRY. Discarding current rollout.")
-                stop_rollout = True
-                rollout_success = None # Signal to retry
-                break
-            if events["next_rollout"]:
-                # mid-rollout -> ignore
-                pass
-                
-            # 3. Check Timeout
-            if time.time() - rollout_start_wall > eval_config.timeout:
-                logger.info("Timeout reached. Marking as FAILURE.")
-                rollout_success = False
-                stop_rollout = True
-                break
-                
-            # 4. Inference
-            inference_duration = 0.0
-            if len(action_queue) == 0:
-                obs = robot.get_observation()
-                
-                # Mapping per remote_pi_inference.py
-                obs_dict = {
-                    "observation/joint_position": [
-                        obs[f"{inference_config.arm_prefix}_joint_{i}"] for i in range(1, 7)
-                    ],
-                    "observation/gripper_position": obs[f"{inference_config.arm_prefix}_gripper"],
-                    "prompt": inference_config.prompt,
-                }
-                
-                t_infer_start = time.perf_counter()
-                try:
-                    result = client.infer(obs_dict)
-                    action_chunk = result["actions"]
-                except Exception as e:
-                    logger.error(f"Inference error: {e}")
-                    # Short sleep to avoid busy loop on error
-                    time.sleep(0.1)
-                    continue
-                t_infer_end = time.perf_counter()
-                inference_duration = t_infer_end - t_infer_start
-                
-                if not isinstance(action_chunk, np.ndarray):
-                    action_chunk = np.array(action_chunk)
-                if action_chunk.ndim == 1:
-                    action_chunk = action_chunk.reshape(1, -1)
-                action_queue.extend(action_chunk)
+        rollout_success, robot_active_time = _run_single_rollout(
+            client, robot, events, inference_config
+        )
 
-            # 5. Execute Action
-            if action_queue:
-                action = action_queue.popleft()
-                action_dict = _build_bimanual_action(obs, action, inference_config.arm_prefix)
-                robot.send_action(action_dict)
-                
-                # Pacing
-                loop_end = time.perf_counter()
-                dt_s = loop_end - loop_start
-                precise_sleep(1 / fps - dt_s)
-                
-                # Calculate time for this step
-                step_end = time.perf_counter()
-                step_total = step_end - loop_start
-                
-                # Accumulate active time: Total step time MINUS the time we waited for inference
-                robot_active_time += (step_total - inference_duration)
-                
-            else:
-                # No actions available, just wait
-                precise_sleep(1 / fps)
+        # An evaluation stop was requested mid-rollout.
+        if events["stop_evaluation"]:
+            return
 
-        # Rollout Loop Ended
-        
         if rollout_success is None:
-             # Retry requested
-             events["rerecord_rollout"] = False
-        else: 
+            # Retry: discard this rollout entirely and try again.
+            events["rerecord_rollout"] = False
+        else:
             total_steps = eval_config.total_steps
-            if not rollout_success:
-                # Flush stdin before asking for input to clear any buffered keypresses (like arrow keys)
-                flush_stdin()
-                
-                # Wait for user to input the number of completed steps
-                steps_completed = 0
-                while steps_completed < total_steps - 1: # We know that the last step must be unsuccessful
-                    response = input(f"Did it pass step '{steps_completed + 1}'? (y/n): ").strip()
-                    if response.lower() != 'n':
-                        steps_completed += 1
-                    else:
-                        break
-                score = steps_completed / total_steps
-            else:
-                # Success -> full score
+            if rollout_success:
                 score = 1.0
                 steps_completed = total_steps
-                
-            # Save Result
-            res = RolloutResult(
-                timestamp=time.time(),
-                success=rollout_success,
-                duration=robot_active_time,
-                steps_completed=steps_completed,
-                total_steps=total_steps,
-                score=score,
+            else:
+                # Clear arrow-key presses before prompting for keyboard input.
+                flush_stdin()
+                steps_completed = _prompt_steps_completed(total_steps)
+                score = steps_completed / total_steps
+
+            rollout_results.append(
+                RolloutResult(
+                    timestamp=time.time(),
+                    success=rollout_success,
+                    duration=robot_active_time,
+                    steps_completed=steps_completed,
+                    total_steps=total_steps,
+                    score=score,
+                )
             )
-            rollout_results.append(res)
             save_rollout_results_to_file(eval_config, rollout_results)
-            
-            logger.info(f"Rollout {rollout_idx + 1} Result: Success={rollout_success}, Time={robot_active_time:.3f}s")
-        
-        # Move to home and wait for user input
+            logger.info(
+                f"Rollout {rollout_idx + 1} Result: Success={rollout_success}, Time={robot_active_time:.3f}s"
+            )
+
         move_to_home(robot, eval_config.home_pose, inference_config.arm_prefix)
 
-        # Inter-rollout Wait
         logger.info("Waiting for user input to proceed to next rollout...")
         logger.info("  [RIGHT ARROW] -> Next Rollout")
         logger.info("  [LEFT ARROW]  -> Retry this rollout")
         logger.info("  [ESC]         -> Stop Evaluation")
-        
-        # Reset events before waiting
-        for k in events: events[k] = False
-        
+
+        _reset_events(events)
         while True:
             if events["next_rollout"]:
-                break # Go to outer loop
+                break
             if events["rerecord_rollout"]:
-                # Remove the just-added result and retry
+                # Remove the just-added result and retry at the same index.
                 rollout_results.pop()
                 save_rollout_results_to_file(eval_config, rollout_results)
-                break # Go to outer loop (len is now same as before)
+                break
             if events["stop_evaluation"]:
                 return
-            time.sleep(0.05)
+            time.sleep(DECISION_POLL_S)
+
+
+# ---- Entry points -----------------------------------------------------------
 
 @parser.wrap()
 def run_evaluation(cfg: InferenceConfig):
@@ -388,24 +439,16 @@ def run_evaluation(cfg: InferenceConfig):
 
     init_logging()
     logging.info(pformat(asdict(cfg)))
-    
+
     robot = make_robot_from_config(cfg.robot)
     robot.connect()
-    
+
     client = None
     listener = None
-    
     try:
-        client = WebsocketClientPolicy(
-            host=cfg.ip,
-            port=cfg.port,
-            api_key=None,
-        )
-        
+        client = WebsocketClientPolicy(host=cfg.ip, port=cfg.port, api_key=None)
         listener, events = init_keyboard_listener()
-        
         evaluation_loop(client, robot, events, cfg)
-        
     except KeyboardInterrupt:
         logger.info("Inference stopped by user.")
     except Exception as e:
@@ -421,9 +464,11 @@ def run_evaluation(cfg: InferenceConfig):
         if not is_headless() and listener is not None:
             listener.stop()
 
+
 def main():
     register_third_party_plugins()
     run_evaluation()
+
 
 if __name__ == "__main__":
     main()

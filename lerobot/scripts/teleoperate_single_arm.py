@@ -1,7 +1,7 @@
 """Single-arm teleoperation script for bimanual Franka using one GELLO device.
 
-Controls one selected arm from a single GELLO teleoperator by activating only
-that side in the bimanual Franka implementation.
+Activates only one side of the bimanual Franka so that a single GELLO leader
+can drive the selected arm while the other arm stays idle.
 """
 
 from __future__ import annotations
@@ -23,15 +23,30 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from lerobot_teleoperator_gello import GelloConfig
 from lerobot_robot_bimanual_franka import BimanualFrankaConfig
+from lerobot_teleoperator_gello import GelloConfig
+
+# Number of joints per Franka arm.
+NUM_JOINTS = 7
+# How often to log a debug sample when --debug is set (one log per N steps).
+_DEBUG_LOG_INTERVAL = 20
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Single-arm Franka <-> one GELLO teleoperation")
-    parser.add_argument("--arm", choices=["left", "right"], default="left", help="Arm controlled by GELLO")
-    parser.add_argument("--port", default=os.getenv("GELLO_PORT", "/dev/ttyUSB0"), help="GELLO serial port")
-    parser.add_argument("--id", default=os.getenv("GELLO_ID", "gello_teleop"), help="GELLO calibration id")
+    parser.add_argument(
+        "--arm", choices=["left", "right"], default="left", help="Arm controlled by GELLO"
+    )
+    parser.add_argument(
+        "--port",
+        default=os.getenv("GELLO_PORT", "/dev/ttyUSB1"),
+        help="GELLO serial port",
+    )
+    parser.add_argument(
+        "--id",
+        default=os.getenv("GELLO_ID", "gello_teleop_left"),
+        help="GELLO calibration id",
+    )
     parser.add_argument("--hz", type=float, default=20.0, help="Control loop frequency")
     parser.add_argument("--debug", action="store_true", help="Log command and observation deltas")
     return parser.parse_args()
@@ -57,15 +72,12 @@ def _make_robot_config(active_arm: str) -> BimanualFrankaConfig:
     )
 
 
-def _build_action(
-    teleop_action: dict[str, float],
-    controlled_prefix: str,
-) -> dict[str, float]:
-    action: dict[str, float] = {}
-
-    for idx in range(1, 8):
-        action[f"{controlled_prefix}_joint_{idx}"] = float(teleop_action[f"joint_{idx}"])
-
+def _build_action(teleop_action: dict[str, float], controlled_prefix: str) -> dict[str, float]:
+    """Build a single-arm robot action from a GELLO teleop sample."""
+    action: dict[str, float] = {
+        f"{controlled_prefix}_joint_{i}": float(teleop_action[f"joint_{i}"])
+        for i in range(1, NUM_JOINTS + 1)
+    }
     action[f"{controlled_prefix}_gripper"] = float(teleop_action["gripper"])
     return action
 
@@ -79,12 +91,7 @@ def main() -> None:
     controlled_prefix = "l" if args.arm == "left" else "r"
 
     robot = make_robot_from_config(_make_robot_config(controlled_prefix))
-    teleop = make_teleoperator_from_config(
-        GelloConfig(
-            port=args.port,
-            id=args.id,
-        )
-    )
+    teleop = make_teleoperator_from_config(GelloConfig(port=args.port, id=args.id))
 
     teleop.connect()
     robot.connect()
@@ -107,7 +114,7 @@ def main() -> None:
             robot_action = _build_action(raw_action, controlled_prefix)
             robot.send_action(robot_action)
 
-            if args.debug and step % 20 == 0:
+            if args.debug and step % _DEBUG_LOG_INTERVAL == 0:
                 c_obs = float(obs[f"{controlled_prefix}_joint_1"])
                 c_cmd = float(robot_action[f"{controlled_prefix}_joint_1"])
                 logging.info(

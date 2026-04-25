@@ -1,19 +1,21 @@
 """GELLO teleoperator calibration utility.
 
-Runs the LeRobot calibration routine for the GELLO device, storing joint offsets
-and gripper range to enable accurate teleoperation.
+Invokes the LeRobot calibration routine for the GELLO device so that joint
+offsets and the gripper travel range are saved for later teleoperation runs.
 """
 
 import argparse
 import sys
 from pathlib import Path
 
+# Make the sibling plugin packages importable when running this script directly.
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-from lerobot_teleoperator_gello import GelloConfig  # ensure plugin is imported
 from lerobot.scripts.lerobot_calibrate import CalibrateConfig, calibrate
+
+from lerobot_teleoperator_gello import GelloConfig
 
 
 def parse_args() -> argparse.Namespace:
@@ -31,15 +33,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-
     teleop_cfg = GelloConfig(
         port=args.port,
         id=args.id,
         calibration_dir=args.calibration_dir,
     )
-
-    cfg = CalibrateConfig(teleop=teleop_cfg)
-    calibrate(cfg)
+    calibrate(CalibrateConfig(teleop=teleop_cfg))
 
 
 if __name__ == "__main__":

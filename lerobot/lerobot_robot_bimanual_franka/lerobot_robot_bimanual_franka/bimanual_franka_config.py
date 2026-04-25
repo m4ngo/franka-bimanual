@@ -1,8 +1,11 @@
-from dataclasses import dataclass, field
+"""Configuration dataclass for the bimanual Franka robot plugin."""
 
-from lerobot.cameras import CameraConfig
-from lerobot.cameras.opencv import OpenCVCameraConfig
+from dataclasses import dataclass
+
 from lerobot.robots import RobotConfig
+
+# Arm identifier -> side. Ordered tuple preserves CLI / config ordering.
+_VALID_ARMS: tuple[str, ...] = ("l", "r")
 
 
 @RobotConfig.register_subclass("my_cool_robot")
@@ -17,28 +20,22 @@ class BimanualFrankaConfig(RobotConfig):
     r_gripper_ip: str
     r_port: int
     use_ee_delta: bool
-    active_arms: tuple[str, ...] = ("l", "r")
+    active_arms: tuple[str, ...] = _VALID_ARMS
 
     def __post_init__(self):
+        # Forward to parent __post_init__ if it defines one (RobotConfig may not).
         super_post_init = getattr(super(), "__post_init__", None)
         if callable(super_post_init):
             super_post_init()
 
-        if len(self.active_arms) == 0:
+        if not self.active_arms:
             raise ValueError("active_arms must contain at least one arm: 'l' and/or 'r'.")
 
-        invalid = [arm for arm in self.active_arms if arm not in ("l", "r")]
+        invalid = [arm for arm in self.active_arms if arm not in _VALID_ARMS]
         if invalid:
-            raise ValueError(f"Invalid active arm identifiers: {invalid}. Allowed values are 'l' and 'r'.")
+            raise ValueError(
+                f"Invalid active arm identifiers: {invalid}. Allowed values are {_VALID_ARMS}."
+            )
 
+        # Deduplicate while preserving user-specified order.
         self.active_arms = tuple(dict.fromkeys(self.active_arms))
-    # cameras: dict[str, CameraConfig] = field(
-    #     default_factory=lambda: {
-    #         "cam_1": OpenCVCameraConfig(
-    #             index_or_path=2,
-    #             fps=30,
-    #             width=480,
-    #             height=640,
-    #         ),
-    #     }
-    # )

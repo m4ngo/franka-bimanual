@@ -1,21 +1,21 @@
 """Dataset recording script for robot teleoperation.
 
 Collects demonstration data by recording robot observations and actions during
-teleoperation sessions. Supports optional policy-assisted recording where a
+teleoperation sessions. Optionally supports policy-assisted recording where a
 pretrained model suggests actions that can be accepted or overridden.
 """
 
 import logging
+import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from pprint import pformat
 from typing import Any
-import sys
 
-from lerobot.cameras import (  # noqa: F401
-    CameraConfig,  # noqa: F401
-)
+# Camera configs are imported so that they register with the LeRobot config
+# parser for CLI-based configuration, even though they are not referenced.
+from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense.configuration_realsense import RealSenseCameraConfig  # noqa: F401
 from lerobot.configs import parser
@@ -23,7 +23,10 @@ from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.feature_utils import build_dataset_frame, combine_feature_dicts
 from lerobot.datasets.image_writer import safe_stop_image_writer
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
-from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+from lerobot.datasets.pipeline_features import (
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
 from lerobot.datasets.video_utils import VideoEncodingManager
 from lerobot.policies.factory import make_policy, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
@@ -51,58 +54,55 @@ from lerobot.utils.control_utils import (
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.robot_utils import precise_sleep
-from lerobot.utils.utils import (
-    init_logging,
-    log_say,
-)
+from lerobot.utils.utils import init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 if str(SCRIPT_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPT_ROOT))
 
-# Ensure third-party devices are discoverable by lerobot
+# Register the third-party plugins with the LeRobot config parser.
 from lerobot_robot_bimanual_franka import BimanualFrankaConfig  # noqa: F401
 from lerobot_teleoperator_gello import GelloConfig  # noqa: F401
+
+# Log a warning when the per-step loop runs slower than this multiple of the
+# nominal period (1/fps). Smaller => louder warnings.
+_LOOP_OVERRUN_WARN_RATIO = 2.5
 
 
 @dataclass
 class DatasetRecordConfig:
-    # Dataset identifier. By convention it should match '{hf_username}/{dataset_name}' (e.g. `lerobot/test`).
+    # Dataset identifier. By convention '{hf_username}/{dataset_name}'.
     repo_id: str
-    # A short but accurate description of the task performed during the recording (e.g. "Pick the Lego block and drop it in the box on the right.")
+    # Short description of the task (e.g. "Pick the block and drop it in the box.").
     single_task: str
-    # Root directory where the dataset will be stored (e.g. 'dataset/path').
+    # Root directory where the dataset will be stored.
     root: str | Path | None = None
-    # Limit the frames per second.
+    # Target frames-per-second for the control loop.
     fps: int = 60
-    # Number of seconds for data recording for each episode.
+    # Per-episode recording duration, in seconds.
     episode_time_s: int | float = 60
-    # Number of seconds for resetting the environment after each episode.
+    # Per-episode environment reset duration, in seconds.
     reset_time_s: int | float = 60
-    # Number of episodes to record.
+    # Number of episodes to record in this session.
     num_episodes: int = 50
-    # Encode frames in the dataset into video
+    # Encode captured frames into video.
     video: bool = True
-    # Upload dataset to Hugging Face hub.
+    # Upload dataset to the Hugging Face hub after recording.
     push_to_hub: bool = True
-    # Upload on private repository on the Hugging Face hub.
+    # Make the uploaded repo private.
     private: bool = False
-    # Add tags to your dataset on the hub.
+    # Optional tags to attach to the uploaded dataset.
     tags: list[str] | None = None
-    # Number of subprocesses handling the saving of frames as PNG. Set to 0 to use threads only;
-    # set to ≥1 to use subprocesses, each using threads to write images. The best number of processes
-    # and threads depends on your system. We recommend 4 threads per camera with 0 processes.
-    # If fps is unstable, adjust the thread count. If still unstable, try using 1 or more subprocesses.
+    # Number of subprocesses writing PNG frames. Use 0 for threads-only.
+    # A good starting point is 4 threads/camera with 0 processes, bumped up
+    # only if fps becomes unstable.
     num_image_writer_processes: int = 0
-    # Number of threads writing the frames as png images on disk, per camera.
-    # Too many threads might cause unstable teleoperation fps due to main thread being blocked.
-    # Not enough threads might cause low camera fps.
+    # Number of threads per camera for PNG writing.
     num_image_writer_threads_per_camera: int = 5
-    # Number of episodes to record before batch encoding videos
-    # Set to 1 for immediate encoding (default behavior), or higher for batched encoding
+    # Number of episodes buffered before encoding videos in a batch.
     video_encoding_batch_size: int = 20
-    # Rename map for the observation to override the image and state keys
+    # Rename map overriding image/state keys in the observation.
     rename_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self):
@@ -114,19 +114,20 @@ class DatasetRecordConfig:
 class RecordConfig:
     robot: RobotConfig
     dataset: DatasetRecordConfig
-    # Whether to control the robot with a teleoperator
+    # Teleoperator to drive the robot, if any.
     teleop: TeleoperatorConfig | None = None
-    # Whether to control the robot with a policy
+    # Policy to drive (or assist) the robot, if any.
     policy: PreTrainedConfig | None = None
-    # Display all cameras on screen
+    # Display all cameras on screen while recording.
     display_data: bool = False
-    # Use vocal synthesis to read events.
+    # Read status events aloud via vocal synthesis.
     play_sounds: bool = True
-    # Resume recording on an existing dataset.
+    # Resume recording into an existing dataset.
     resume: bool = False
 
     def __post_init__(self):
-        # HACK: We parse again the cli args here to get the pretrained path if there was one.
+        # HACK: Re-parse the CLI to pick up a --policy.path override so that
+        # policy config can be loaded from a pretrained checkpoint directory.
         policy_path = parser.get_path_arg("policy")
         if policy_path:
             cli_overrides = parser.get_cli_overrides("policy")
@@ -138,7 +139,7 @@ class RecordConfig:
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
-        """This enables the parser to load config from the policy using `--policy.path=local/dir`"""
+        """Enables ``--policy.path=local/dir`` loading via the LeRobot parser."""
         return ["policy"]
 
 
@@ -172,6 +173,13 @@ class RecordConfig:
 """
 
 
+def _split_multi_teleop(teleop: list[Teleoperator]) -> tuple[Teleoperator, KeyboardTeleop]:
+    """Split a pair of teleops into (arm, keyboard); validates composition."""
+    teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
+    teleop_arm = next((t for t in teleop if not isinstance(t, KeyboardTeleop)), None)
+    return teleop_arm, teleop_keyboard
+
+
 @safe_stop_image_writer
 def record_loop(
     robot: Robot,
@@ -179,13 +187,11 @@ def record_loop(
     fps: int,
     teleop_action_processor: RobotProcessorPipeline[
         tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs after teleop
+    ],
     robot_action_processor: RobotProcessorPipeline[
         tuple[RobotAction, RobotObservation], RobotAction
-    ],  # runs before robot
-    robot_observation_processor: RobotProcessorPipeline[
-        RobotObservation, RobotObservation
-    ],  # runs after robot
+    ],
+    robot_observation_processor: RobotProcessorPipeline[RobotObservation, RobotObservation],
     dataset: LeRobotDataset | None = None,
     teleop: Teleoperator | list[Teleoperator] | None = None,
     policy: PreTrainedPolicy | None = None,
@@ -195,20 +201,22 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
 ):
+    """Run one episode's (or reset's) control loop and optionally log to a dataset."""
     if dataset is not None and dataset.fps != fps:
-        raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
+        raise ValueError(
+            f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps})."
+        )
 
     teleop_arm = teleop_keyboard = None
     if isinstance(teleop, list):
-        teleop_keyboard = next((t for t in teleop if isinstance(t, KeyboardTeleop)), None)
-        teleop_arm = next((t for t in teleop if not isinstance(t, KeyboardTeleop)), None)
-
+        teleop_arm, teleop_keyboard = _split_multi_teleop(teleop)
+        # The multi-teleop mode is currently only used by the LeKiwi robot.
         if not (teleop_arm and teleop_keyboard and len(teleop) == 2 and robot.name == "lekiwi_client"):
             raise ValueError(
-                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. Currently only supported for LeKiwi robot."
+                "For multi-teleop, the list must contain exactly one KeyboardTeleop and one arm teleoperator. "
+                "Currently only supported for LeKiwi robot."
             )
 
-    # Reset policy and processor if they are provided
     if policy is not None and preprocessor is not None and postprocessor is not None:
         policy.reset()
         preprocessor.reset()
@@ -216,6 +224,7 @@ def record_loop(
 
     timestamp = 0
     start_episode_t = time.perf_counter()
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -223,16 +232,16 @@ def record_loop(
             events["exit_early"] = False
             break
 
-        # Get robot observation
         obs = robot.get_observation()
-
-        # Applies a pipeline to the raw robot observation, default is IdentityProcessor
+        # Default processor is identity unless the caller supplied one.
         obs_processed = robot_observation_processor(obs)
 
         if policy is not None or dataset is not None:
             observation_frame = build_dataset_frame(dataset.features, obs_processed, prefix=OBS_STR)
 
-        # Get action from either policy or teleop
+        act_processed_policy: RobotAction | None = None
+        act_processed_teleop: RobotAction | None = None
+
         if policy is not None and preprocessor is not None and postprocessor is not None:
             action_values = predict_action(
                 observation=observation_frame,
@@ -244,13 +253,10 @@ def record_loop(
                 task=single_task,
                 robot_type=robot.robot_type,
             )
-
-            act_processed_policy: RobotAction = make_robot_action(action_values, dataset.features)
+            act_processed_policy = make_robot_action(action_values, dataset.features)
 
         elif policy is None and isinstance(teleop, Teleoperator):
             act = teleop.get_action()
-
-            # Applies a pipeline to the raw teleop action, default is IdentityProcessor
             act_processed_teleop = teleop_action_processor((act, obs))
 
         elif policy is None and isinstance(teleop, list):
@@ -258,8 +264,9 @@ def record_loop(
             arm_action = {f"arm_{k}": v for k, v in arm_action.items()}
             keyboard_action = teleop_keyboard.get_action()
             base_action = robot._from_keyboard_to_base_action(keyboard_action)
-            act = {**arm_action, **base_action} if len(base_action) > 0 else arm_action
+            act = {**arm_action, **base_action} if base_action else arm_action
             act_processed_teleop = teleop_action_processor((act, obs))
+
         else:
             logging.info(
                 "No policy or teleoperator provided, skipping action generation."
@@ -268,7 +275,7 @@ def record_loop(
             )
             continue
 
-        # Applies a pipeline to the action, default is IdentityProcessor
+        # Apply the robot-side action pipeline (default identity) before sending.
         if policy is not None and act_processed_policy is not None:
             action_values = act_processed_policy
             robot_action_to_send = robot_action_processor((act_processed_policy, obs))
@@ -276,13 +283,10 @@ def record_loop(
             action_values = act_processed_teleop
             robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
 
-        # Send action to robot
-        # Action can eventually be clipped using `max_relative_target`,
-        # so action actually sent is saved in the dataset. action = postprocessor.process(action)
-        # TODO(steven, pepijn, adil): we should use a pipeline step to clip the action, so the sent action is the action that we input to the robot.
+        # TODO(steven, pepijn, adil): clip via a pipeline step so the dataset
+        # stores exactly what was sent to the robot.
         _sent_action = robot.send_action(robot_action_to_send)
 
-        # Write to dataset
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
@@ -294,9 +298,10 @@ def record_loop(
         dt_s = time.perf_counter() - start_loop_t
         if dt_s < 1 / fps:
             precise_sleep(1 / fps - dt_s)
-        elif dt_s > 2.5 / fps:
-            # Only log a warning if the loop takes longer than 1.5x the expected time
-            logging.warning(f"Loop took {dt_s} seconds, which is longer than the expected {1 / fps} seconds.")
+        elif dt_s > _LOOP_OVERRUN_WARN_RATIO / fps:
+            logging.warning(
+                f"Loop took {dt_s} seconds, which is longer than the expected {1 / fps} seconds."
+            )
 
         timestamp = time.perf_counter() - start_episode_t
 
@@ -311,14 +316,15 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
     robot = make_robot_from_config(cfg.robot)
     teleop = make_teleoperator_from_config(cfg.teleop) if cfg.teleop is not None else None
 
-    teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+    teleop_action_processor, robot_action_processor, robot_observation_processor = (
+        make_default_processors()
+    )
 
     dataset_features = combine_feature_dicts(
         aggregate_pipeline_dataset_features(
             pipeline=teleop_action_processor,
-            initial_features=create_initial_features(
-                action=robot.action_features
-            ),  # TODO(steven, pepijn): in future this should be come from teleop or policy
+            # TODO(steven, pepijn): this should come from teleop or policy in future.
+            initial_features=create_initial_features(action=robot.action_features),
             use_videos=cfg.dataset.video,
         ),
         aggregate_pipeline_dataset_features(
@@ -342,7 +348,6 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             )
         sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
     else:
-        # Create empty dataset or load existing saved episodes
         sanity_check_dataset_name(cfg.dataset.repo_id, cfg.policy)
         dataset = LeRobotDataset.create(
             cfg.dataset.repo_id,
@@ -356,10 +361,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             batch_encoding_size=cfg.dataset.video_encoding_batch_size,
         )
 
-    # Load pretrained policy
     policy = None if cfg.policy is None else make_policy(cfg.policy, ds_meta=dataset.meta)
-    preprocessor = None
-    postprocessor = None
+    preprocessor = postprocessor = None
     if cfg.policy is not None:
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,
@@ -398,10 +401,10 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 display_data=cfg.display_data,
             )
 
-            # Execute a few seconds without recording to give time to manually reset the environment
-            # Skip reset for the last episode to be recorded
+            # Between-episode reset window, skipped only for the very last episode.
+            is_last_episode = recorded_episodes >= cfg.dataset.num_episodes - 1
             if not events["stop_recording"] and (
-                (recorded_episodes < cfg.dataset.num_episodes - 1) or events["rerecord_episode"]
+                not is_last_episode or events["rerecord_episode"]
             ):
                 log_say("Reset the environment", cfg.play_sounds)
                 record_loop(
@@ -425,7 +428,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 continue
 
             if not events["stop_recording"]:
-                # If esc is pressed, dont save the episode
+                # ESC before save -> drop the in-progress episode.
                 dataset.save_episode()
                 recorded_episodes += 1
 
