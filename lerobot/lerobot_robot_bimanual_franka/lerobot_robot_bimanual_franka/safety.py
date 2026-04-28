@@ -45,7 +45,7 @@ WORKTABLE_HEIGHT = 0.12  # meters
 # Extra vertical reach below the Franka EE frame for the custom end-effector.
 # Set this to the added tool length, in meters. The same value is used for
 # every arm, assuming the bimanual Frankas have identical end-effectors.
-CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.18
+CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.2
 WORKTABLE_DISTANCE_MIN = 0.02  # meters; minimum closeness to the table; downward velocity is forced to zero at/past this distance
 # Maximum deceleration (m/s^2) we assume the arm can deliver. Used by the
 # kinematic envelope: smaller values are more conservative (larger braking
