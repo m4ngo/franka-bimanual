@@ -43,7 +43,11 @@ import numpy as np
 # scaled by the same ratio used to brake v_z, so braking the descent does
 # not expose any lateral motion that was incidentally coupled with the
 # downward joint command (see _apply_worktable_brake for the rationale).
-WORKTABLE_HEIGHT = 0.32  # meters
+WORKTABLE_HEIGHT = 0.12  # meters
+# Extra vertical reach below the Franka EE frame for the custom end-effector.
+# Set this to the added tool length, in meters. The same value is used for
+# every arm, assuming the bimanual Frankas have identical end-effectors.
+CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.2
 WORKTABLE_DISTANCE_THRESHOLD = 0.02  # meters; how close to the table can you get before the soft brake starts?
 WORKTABLE_DISTANCE_MIN = 0.02  # meters; minimum closeness to the table; downward velocity is forced to zero at/past this distance
 # Maximum deceleration (m/s^2) we assume the arm can deliver. Used by the
@@ -96,6 +100,14 @@ class ActionSafetyScreen:
     `screen_ee_actions` / `screen_joint_actions` so adding a new check is a
     one-line edit there.
     """
+
+    def __init__(
+        self,
+        end_effector_z_extension: float = CUSTOM_END_EFFECTOR_Z_EXTENSION,
+    ) -> None:
+        if end_effector_z_extension < 0.0:
+            raise ValueError("end_effector_z_extension must be non-negative.")
+        self.end_effector_z_extension = float(end_effector_z_extension)
 
     # ------------------------------------------------------------------
     # Public entry points
@@ -183,11 +195,12 @@ class ActionSafetyScreen:
             action = np.asarray(action, dtype=np.float64)
             _, dq, ee_translation, jacobian = kin_state[arm]
             ee_z = float(np.asarray(ee_translation)[2])
+            contact_z = self._worktable_contact_z(ee_z)
             jacobian = np.asarray(jacobian, dtype=np.float64)
             dq = np.asarray(dq, dtype=np.float64)
 
-            v_envelope = self._worktable_velocity_envelope(ee_z)
-            soft_factor = self._worktable_brake_factor(ee_z)
+            v_envelope = self._worktable_velocity_envelope(contact_z)
+            soft_factor = self._worktable_brake_factor(contact_z)
             v_actual_z = float(jacobian[2, :] @ dq)
             if is_ee:
                 v_commanded_z = float(action[2])
@@ -233,16 +246,20 @@ class ActionSafetyScreen:
             out[arm] = action
         return out
 
+    def _worktable_contact_z(self, ee_z: float) -> float:
+        """Lowest relevant tool height used by the worktable safety checks."""
+        return ee_z - self.end_effector_z_extension
+
     @staticmethod
-    def _worktable_brake_factor(ee_z: float) -> float:
-        """Soft-brake factor in [0, 1] based on EE height above the worktable.
+    def _worktable_brake_factor(contact_z: float) -> float:
+        """Soft-brake factor in [0, 1] based on tool height above the worktable.
 
         - >= WORKTABLE_DISTANCE_THRESHOLD above the table: 0 (no brake).
         - <= WORKTABLE_DISTANCE_MIN above the table (or below): 1 (downward
           velocity fully zeroed by this layer alone).
         - In between: linear ramp.
         """
-        dist = ee_z - WORKTABLE_HEIGHT
+        dist = contact_z - WORKTABLE_HEIGHT
         if dist >= WORKTABLE_DISTANCE_THRESHOLD:
             return 0.0
         if dist <= WORKTABLE_DISTANCE_MIN:
@@ -251,8 +268,8 @@ class ActionSafetyScreen:
         return (WORKTABLE_DISTANCE_THRESHOLD - dist) / span
 
     @staticmethod
-    def _worktable_velocity_envelope(ee_z: float) -> float:
-        """Maximum safe downward EE Z-speed (m/s) at the given EE height.
+    def _worktable_velocity_envelope(contact_z: float) -> float:
+        """Maximum safe downward EE Z-speed (m/s) at the given tool height.
 
         Derived from the kinematic stopping distance d_stop = v^2 / (2a):
         bounding the commanded downward speed by sqrt(2 * MAX_DECEL * (dist -
@@ -260,7 +277,7 @@ class ActionSafetyScreen:
         WORKTABLE_DISTANCE_MIN of the table, assuming WORKTABLE_MAX_DECEL is
         achievable. Returns 0 at or below DISTANCE_MIN.
         """
-        safe_dist = ee_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
+        safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
         if safe_dist <= 0.0:
             return 0.0
         return float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
