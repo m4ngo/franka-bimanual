@@ -20,9 +20,9 @@ from numpy.typing import NDArray
 # Position tracking / PD shaping happens in the parent (see BimanualFranka) so
 # this subprocess can stay a thin pass-through to franky.
 VELOCITY_COMMAND_DURATION_MS = 500
-MAX_VEL = 0.6 # m/s
-MAX_ACC = 0.3
-MAX_JER = 0.4
+VELOCITY = 1.0 # m/s
+ACCELERATION = 0.25
+JERK = 1.0
 TORQUE_THRESHOLD = 100.0 # Nm
 FORCE_THRESHOLD = 200.0 # N
 JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 250.0, 150.0]
@@ -98,9 +98,9 @@ class RobotProcess:
             robot = Robot(self.robot_ip)
             robot.recover_from_errors()
             robot.relative_dynamics_factor = RelativeDynamicsFactor(
-                velocity=MAX_VEL,
-                acceleration=MAX_ACC,
-                jerk=MAX_JER
+                velocity=VELOCITY,
+                acceleration=ACCELERATION,
+                jerk=JERK
             )
             # robot.joint_velocity_limit.set([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
             # robot.joint_acceleration_limit.set([15.0, 7.5, 10.0, 12.5, 15.0, 15.0, 15.0])

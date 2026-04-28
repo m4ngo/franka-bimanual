@@ -27,7 +27,7 @@ GRIPPER_MAX_MM = 110
 # Joint-velocity PD controller for tracking joint-position targets. Lives in
 # the parent process (this file) rather than franka_process so the safety
 # screen can inspect/modify the same velocities that get streamed to franky.
-JOINT_PD_KP = 2.6
+JOINT_PD_KP = 2.5
 JOINT_PD_KD = 0.1
 
 # Connection bring-up parameters.

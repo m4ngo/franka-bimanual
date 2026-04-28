@@ -20,19 +20,16 @@ from time import sleep, time
 
 
 class WSG:
-    BUFFER_SIZE = 4096
+    BUFFER_SIZE = 8
     DEFAULT_TIMEOUT_S = 10
 
     # Position poll / MOVE dispatch rate (~20 Hz).
     _POLL_INTERVAL_S = 0.05
 
-    # Proportional speed: speed_mm_s = Kp * |error_mm|, clamped to [MIN, MAX].
-    _MOVE_KP = 50.0          # (mm/s) per mm of error
-    _MOVE_SPEED_MIN = 10.0   # mm/s – avoid imperceptibly slow creep
-    _MOVE_SPEED_MAX = 200.0  # mm/s – hardware-safe ceiling
-    _MOVE_DEAD_ZONE_MM = 3.0 # errors smaller than this are not acted on
+    _MOVE_SPEED = 400.0  # mm/s – hardware-safe ceiling
+    _MOVE_DEAD_ZONE_MM = 8.0 # errors smaller than this are not acted on
 
-    _IO_LOOP_IDLE_S = 0.01
+    _IO_LOOP_IDLE_S = 0.05
     _BLOCKING_POLL_S = 0.005
     _RELEASE_MM = 10
 
@@ -118,17 +115,13 @@ class WSG:
                 if target is not None and pos is not None:
                     error = target - pos
                     if abs(error) > self._MOVE_DEAD_ZONE_MM:
-                        speed = min(
-                            self._MOVE_SPEED_MAX,
-                            max(self._MOVE_SPEED_MIN, self._MOVE_KP * abs(error)),
-                        )
                         try:
                             self.tcp_sock.send(
-                                f"MOVE({target},{speed:.1f})\n".encode()
+                                f"MOVE({target},{self._MOVE_SPEED:.1f})\n".encode()
                             )
                             if self.do_print:
                                 print(
-                                    f"{self.name}: [WSG] MOVE({target}, {speed:.1f})"
+                                    f"{self.name}: [WSG] MOVE({target}, {self._MOVE_SPEED:.1f})"
                                     f" err={error:+.1f} mm"
                                 )
                         except OSError as e:
@@ -233,7 +226,7 @@ class WSG:
 
         if blocking:
             return self._enqueue_cmd(
-                f"MOVE({position},{self._MOVE_SPEED_MAX:.1f})\n".encode(),
+                f"MOVE({position},{self._MOVE_SPEED:.1f})\n".encode(),
                 b"FIN MOVE",
             )
 
