@@ -17,6 +17,7 @@ Public API:
 import socket
 import threading
 from time import sleep, time
+import numpy as np
 
 
 class WSG:
@@ -28,6 +29,11 @@ class WSG:
 
     _MOVE_SPEED = 400.0  # mm/s – hardware-safe ceiling
     _MOVE_DEAD_ZONE_MM = 8.0 # errors smaller than this are not acted on
+    
+    # Schunk WSG default travel range, in millimeters. Commanded positions are
+    # clipped to this range before being forwarded to the gripper.
+    _GRIPPER_MIN_MM = 10
+    _GRIPPER_MAX_MM = 100
 
     _IO_LOOP_IDLE_S = 0.05
     _BLOCKING_POLL_S = 0.005
@@ -222,7 +228,7 @@ class WSG:
         * position 110 – fully open
         """
         with self._move_lock:
-            self._move_target = float(position)
+            self._move_target = np.clip(float(position), self._GRIPPER_MIN_MM, self._GRIPPER_MAX_MM)
 
         if blocking:
             return self._enqueue_cmd(

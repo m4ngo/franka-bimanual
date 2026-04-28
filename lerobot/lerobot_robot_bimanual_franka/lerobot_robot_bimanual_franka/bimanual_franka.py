@@ -19,10 +19,6 @@ from .wsg import WSG
 
 # 7 degrees of freedom per Franka arm.
 NUM_JOINTS = 7
-# Schunk WSG default travel range, in millimeters. Commanded positions are
-# clipped to this range before being forwarded to the gripper.
-GRIPPER_MIN_MM = 0
-GRIPPER_MAX_MM = 110
 
 # Joint-velocity PD controller for tracking joint-position targets. Lives in
 # the parent process (this file) rather than franka_process so the safety
@@ -181,8 +177,7 @@ class BimanualFranka(Robot):
         kinematic snapshot used by both PD and the screen.
         """
         for arm in self.active_arms:
-            pos = np.clip(action[f"{arm}_gripper"], GRIPPER_MIN_MM, GRIPPER_MAX_MM)
-            self.grippers[arm].move(pos, blocking=False)
+            self.grippers[arm].move(action[f"{arm}_gripper"], blocking=False)
 
         kin_state = self.robot_manager.current_kinematic_state_batch(
             list(self.active_arms)

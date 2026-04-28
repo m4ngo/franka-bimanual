@@ -31,7 +31,7 @@ from lerobot_teleoperator_gello import GelloConfig
 # Number of joints per Franka arm.
 NUM_JOINTS = 7
 # Fixed control loop rate (Hz).
-CONTROL_LOOP_HZ = 40
+CONTROL_LOOP_HZ = 20
 
 
 def _build_bimanual_action(
