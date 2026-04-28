@@ -25,7 +25,7 @@ ACCELERATION = 0.25
 JERK = 1.0
 TORQUE_THRESHOLD = 100.0 # Nm
 FORCE_THRESHOLD = 200.0 # N
-JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 250.0, 150.0]
+JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 
 # ---- Dimensions -------------------------------------------------------------
 NUM_JOINTS = 7
