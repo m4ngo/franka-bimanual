@@ -13,8 +13,8 @@ reason about and easy to extend with new checks.
 Two checks are implemented or stubbed:
 
 - Worktable brake: prevents the EE from impacting a horizontal worktable at
-  WORKTABLE_HEIGHT in the arm's base frame. Three layers stack to give a
-  smooth UX while still being safe under fast / momentum-laden commands.
+  WORKTABLE_HEIGHT in the arm's base frame. A stopping-distance envelope plus
+  overspeed override keep fast / momentum-laden commands safe.
 - Bimanual repel (TODO): pushes the arms apart when their EEs get too close.
 
 The kinematic snapshot is the tuple returned by
@@ -26,15 +26,13 @@ all read from the same robot.state and therefore mutually consistent.
 import numpy as np
 
 # --- Worktable safety -------------------------------------------------------
-# Three layers stack to brake the downward (toward-the-table) component of
+# Two layers stack to brake the downward (toward-the-table) component of
 # the commanded EE motion:
-#   1. Linear soft brake inside DISTANCE_THRESHOLD: smooth slowdown
-#      proportional to closeness, fully zeroed at DISTANCE_MIN.
-#   2. Kinematic stopping-distance envelope (always active): caps the
+#   1. Kinematic stopping-distance envelope (always active): caps the
 #      commanded downward speed at sqrt(2 * MAX_DECEL * (dist - MIN)) so
 #      the arm can always decelerate before reaching the table given the
 #      assumed max deceleration. This is what makes fast commands safe.
-#   3. Actual-velocity overspeed override: if the *measured* downward speed
+#   2. Actual-velocity overspeed override: if the *measured* downward speed
 #      exceeds the envelope (e.g. due to momentum from a prior fast command),
 #      the commanded EE downward velocity is forced to zero so the arm
 #      brakes maximally.
@@ -47,8 +45,7 @@ WORKTABLE_HEIGHT = 0.12  # meters
 # Extra vertical reach below the Franka EE frame for the custom end-effector.
 # Set this to the added tool length, in meters. The same value is used for
 # every arm, assuming the bimanual Frankas have identical end-effectors.
-CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.2
-WORKTABLE_DISTANCE_THRESHOLD = 0.02  # meters; how close to the table can you get before the soft brake starts?
+CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.18
 WORKTABLE_DISTANCE_MIN = 0.02  # meters; minimum closeness to the table; downward velocity is forced to zero at/past this distance
 # Maximum deceleration (m/s^2) we assume the arm can deliver. Used by the
 # kinematic envelope: smaller values are more conservative (larger braking
@@ -158,10 +155,9 @@ class ActionSafetyScreen:
     ) -> dict[str, np.ndarray]:
         """Brake motion that drives the EE toward the worktable.
 
-        Three layers compute a target downward EE Z-speed in the arm's base
+        Two layers compute a target downward EE Z-speed in the arm's base
         frame:
 
-            v_target_z = v_commanded_z * (1 - soft_factor)   # soft brake
             v_target_z = max(v_target_z, -v_envelope)        # envelope cap
             if -v_actual_z > v_envelope:                     # overspeed
                 v_target_z = max(v_target_z, 0.0)            # active brake
@@ -199,8 +195,15 @@ class ActionSafetyScreen:
             jacobian = np.asarray(jacobian, dtype=np.float64)
             dq = np.asarray(dq, dtype=np.float64)
 
-            v_envelope = self._worktable_velocity_envelope(contact_z)
-            soft_factor = self._worktable_brake_factor(contact_z)
+            # Kinematic stopping-distance envelope. This bounds downward
+            # speed by sqrt(2 * MAX_DECEL * (dist - MIN)), so the arm can
+            # decelerate before reaching WORKTABLE_DISTANCE_MIN.
+            safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
+            v_envelope = (
+                0.0
+                if safe_dist <= 0.0
+                else float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
+            )
             v_actual_z = float(jacobian[2, :] @ dq)
             if is_ee:
                 v_commanded_z = float(action[2])
@@ -217,13 +220,10 @@ class ActionSafetyScreen:
                 continue
 
             v_target_z = v_commanded_z
-            # Layer 1: soft brake on commanded downward motion.
-            if soft_factor > 0.0:
-                v_target_z = v_target_z * (1.0 - soft_factor)
-            # Layer 2: kinematic stopping-distance envelope.
+            # Layer 1: kinematic stopping-distance envelope.
             if v_target_z < -v_envelope:
                 v_target_z = -v_envelope
-            # Layer 3: overspeed override on measured velocity.
+            # Layer 2: overspeed override on measured velocity.
             if -v_actual_z > v_envelope:
                 v_target_z = max(v_target_z, 0.0)
 
@@ -249,38 +249,6 @@ class ActionSafetyScreen:
     def _worktable_contact_z(self, ee_z: float) -> float:
         """Lowest relevant tool height used by the worktable safety checks."""
         return ee_z - self.end_effector_z_extension
-
-    @staticmethod
-    def _worktable_brake_factor(contact_z: float) -> float:
-        """Soft-brake factor in [0, 1] based on tool height above the worktable.
-
-        - >= WORKTABLE_DISTANCE_THRESHOLD above the table: 0 (no brake).
-        - <= WORKTABLE_DISTANCE_MIN above the table (or below): 1 (downward
-          velocity fully zeroed by this layer alone).
-        - In between: linear ramp.
-        """
-        dist = contact_z - WORKTABLE_HEIGHT
-        if dist >= WORKTABLE_DISTANCE_THRESHOLD:
-            return 0.0
-        if dist <= WORKTABLE_DISTANCE_MIN:
-            return 1.0
-        span = WORKTABLE_DISTANCE_THRESHOLD - WORKTABLE_DISTANCE_MIN
-        return (WORKTABLE_DISTANCE_THRESHOLD - dist) / span
-
-    @staticmethod
-    def _worktable_velocity_envelope(contact_z: float) -> float:
-        """Maximum safe downward EE Z-speed (m/s) at the given tool height.
-
-        Derived from the kinematic stopping distance d_stop = v^2 / (2a):
-        bounding the commanded downward speed by sqrt(2 * MAX_DECEL * (dist -
-        MIN)) guarantees the arm can decelerate to zero before reaching
-        WORKTABLE_DISTANCE_MIN of the table, assuming WORKTABLE_MAX_DECEL is
-        achievable. Returns 0 at or below DISTANCE_MIN.
-        """
-        safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
-        if safe_dist <= 0.0:
-            return 0.0
-        return float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
 
     # ------------------------------------------------------------------
     # Bimanual repel (TODO)
