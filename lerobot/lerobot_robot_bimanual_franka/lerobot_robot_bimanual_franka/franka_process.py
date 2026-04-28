@@ -218,7 +218,7 @@ class MultiRobotWrapper:
         response_queue: Queue = Queue()
 
         worker = RobotProcess(server_ip, robot_ip, port, command_queue, response_queue)
-        process = Process(target=worker.run)
+        process = Process(target=worker.run, daemon=True)
         process.start()
 
         self.robots[name] = {"command_queue": command_queue, "response_queue": response_queue}
