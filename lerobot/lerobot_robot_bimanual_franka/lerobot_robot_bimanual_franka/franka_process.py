@@ -112,7 +112,6 @@ class RobotProcess:
             return
 
         while True:
-            print(robot.current_control_signal_type)
             try:
                 command, args, kwargs = self.command_queue.get()
 

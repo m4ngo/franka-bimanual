@@ -109,22 +109,26 @@ class BimanualFranka(Robot):
 
     def connect(self, calibrate: bool = True) -> None:
         """Start arm processes, verify they respond, then home the grippers."""
-        for arm in self.active_arms:
-            self.robot_manager.add_robot(
-                arm, self._server_ip(arm), self._robot_ip(arm), self._port(arm)
-            )
+        try:
+            for arm in self.active_arms:
+                self.robot_manager.add_robot(
+                    arm, self._server_ip(arm), self._robot_ip(arm), self._port(arm)
+                )
 
-        # Give each subprocess time to initialize its RPC connection.
-        time.sleep(_PROCESS_STARTUP_S)
-        for arm in self.active_arms:
-            self._probe_arm(arm)
+            # Give each subprocess time to initialize its RPC connection.
+            time.sleep(_PROCESS_STARTUP_S)
+            for arm in self.active_arms:
+                self._probe_arm(arm)
 
-        if not self.is_calibrated and calibrate:
-            self.calibrate()
+            if not self.is_calibrated and calibrate:
+                self.calibrate()
 
-        self.configure()
-        for arm in self.active_arms:
-            self.grippers[arm].home()
+            self.configure()
+            for arm in self.active_arms:
+                self.grippers[arm].home()
+        except Exception:
+            self.robot_manager.shutdown()
+            raise
 
     def _probe_arm(self, arm: str) -> None:
         """Confirm an arm responds to a joint-state query, retrying on failure."""
