@@ -108,7 +108,11 @@ class BimanualFranka(Robot):
         try:
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
-                    arm, self._server_ip(arm), self._robot_ip(arm), self._port(arm)
+                    arm,
+                    self._server_ip(arm),
+                    self._robot_ip(arm),
+                    self._port(arm),
+                    use_ee_delta=self.use_ee_delta,
                 )
 
             # Give each subprocess time to initialize its RPC connection.

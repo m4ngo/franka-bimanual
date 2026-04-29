@@ -37,11 +37,19 @@ SHUTDOWN_STOP_TIMEOUT_S = 2.0
 SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 TERMINATE_JOIN_TIMEOUT_S = 1.0
 
-# Robot errors that are recoverable via ``recover_from_errors``.
+# Robot errors that are recoverable via ``recover_from_errors``. The Reflex
+# entry catches libfranka's "command not possible in the current mode
+# ('Reflex')!" rejection, which the existing recover_from_errors path is
+# designed to clear. The InvalidMotionType entry covers the franky-side
+# "type of motion cannot change during runtime" exception, which is
+# resolved by recovering and letting the next motion command re-prime the
+# control mode.
 _RECOVERABLE_ERRORS = (
     "UDP receive: Timeout",
-    "communication_constrains_violation"
-    )
+    "communication_constrains_violation",
+    'current mode ("Reflex")',
+    "type of motion cannot change",
+)
 
 
 def _validate_vector(name: str, values, expected_len: int) -> list[float]:
@@ -68,12 +76,17 @@ class RobotProcess:
         port: int,
         command_queue: Queue,
         response_queue: Queue,
+        use_ee_delta: bool = False,
     ):
         self.server_ip = server_ip
         self.robot_ip = robot_ip
         self.port = port
         self.command_queue = command_queue
         self.response_queue = response_queue
+        # Determines which motion type is "primed" at startup so the
+        # controller is already in the expected control mode before the
+        # parent's first send_action.
+        self.use_ee_delta = use_ee_delta
 
     def run(self):
         """Main loop: initialise robot, then process commands until shutdown."""
@@ -105,8 +118,27 @@ class RobotProcess:
             # robot.joint_velocity_limit.set([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
             # robot.joint_acceleration_limit.set([15.0, 7.5, 10.0, 12.5, 15.0, 15.0, 15.0])
             # robot.joint_jerk_limit.set([7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0])
-            robot.set_collision_behavior(TORQUE_THRESHOLD, FORCE_THRESHOLD)  
+            robot.set_collision_behavior(TORQUE_THRESHOLD, FORCE_THRESHOLD)
             robot.set_joint_impedance(JOINT_STIFFNESS)
+
+            # Prime the control mode the parent will use
+            if self.use_ee_delta:
+                zero3 = np.zeros(3, dtype=np.float64)
+                prime_motion = CartesianVelocityMotion(
+                    Twist(cast(Any, zero3), cast(Any, zero3)),
+                    Duration(VELOCITY_COMMAND_DURATION_MS),
+                )
+            else:
+                zero7 = np.zeros(NUM_JOINTS, dtype=np.float64)
+                prime_motion = JointVelocityMotion(
+                    cast(Any, zero7), Duration(VELOCITY_COMMAND_DURATION_MS)
+                )
+
+            try:
+                robot.move(prime_motion, asynchronous=False)
+            except Exception:
+                robot.recover_from_errors()
+                robot.move(prime_motion, asynchronous=False)
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return
@@ -209,7 +241,14 @@ class MultiRobotWrapper:
         self.robots: dict[str, dict[str, Queue]] = {}
         self.processes: dict[str, Process] = {}
 
-    def add_robot(self, name: str, server_ip: str, robot_ip: str, port: int) -> None:
+    def add_robot(
+        self,
+        name: str,
+        server_ip: str,
+        robot_ip: str,
+        port: int,
+        use_ee_delta: bool = False,
+    ) -> None:
         """Spawn a subprocess for a new robot connection."""
         if name in self.processes and self.processes[name].is_alive():
             raise ValueError(f"Robot '{name}' is already connected")
@@ -217,7 +256,14 @@ class MultiRobotWrapper:
         command_queue: Queue = Queue()
         response_queue: Queue = Queue()
 
-        worker = RobotProcess(server_ip, robot_ip, port, command_queue, response_queue)
+        worker = RobotProcess(
+            server_ip,
+            robot_ip,
+            port,
+            command_queue,
+            response_queue,
+            use_ee_delta=use_ee_delta,
+        )
         process = Process(target=worker.run, daemon=True)
         process.start()
 

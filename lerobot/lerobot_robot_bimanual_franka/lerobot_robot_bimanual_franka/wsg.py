@@ -27,8 +27,8 @@ class WSG:
     # Position poll / MOVE dispatch rate (~20 Hz).
     _POLL_INTERVAL_S = 0.05
 
-    _MOVE_SPEED = 400.0  # mm/s – hardware-safe ceiling
-    _MOVE_DEAD_ZONE_MM = 8.0 # errors smaller than this are not acted on
+    _MOVE_SPEED = 420.0  # mm/s – hardware-safe ceiling
+    _MOVE_DEAD_ZONE_MM = 3.0 # errors smaller than this are not acted on
     
     # Schunk WSG default travel range, in millimeters. Commanded positions are
     # clipped to this range before being forwarded to the gripper.
