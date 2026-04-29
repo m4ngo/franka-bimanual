@@ -56,9 +56,6 @@ class BimanualFrankaConfig(RobotConfig):
     r_port: int
     use_ee_delta: bool
     active_arms: tuple[str, ...] = _VALID_ARMS
-    camera_width: int = 320
-    camera_height: int = 320
-    camera_fps: int | None = 20
     cameras: dict[str, ArvCameraConfig] = field(
         default_factory=lambda: {
             "cam_1": ArvCameraConfig(

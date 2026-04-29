@@ -107,8 +107,8 @@ class BimanualFranka(Robot):
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
         return {
             camera_name: (
-                self.config.camera_height,
-                self.config.camera_width,
+                self.cameras[camera_name].height,
+                self.cameras[camera_name].width,
                 IMAGE_CHANNELS,
             )
             for camera_name in self.cameras
