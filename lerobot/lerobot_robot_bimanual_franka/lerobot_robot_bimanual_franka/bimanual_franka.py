@@ -52,6 +52,10 @@ class BimanualFranka(Robot):
         self.config = config
         self.use_ee_delta = config.use_ee_delta
         self.active_arms = config.active_arms
+        # LeRobot's record pipeline expects every robot to expose a `cameras`
+        # container. This robot currently has no camera devices, so keep it
+        # empty to make headless recording paths work.
+        self.cameras: dict[str, object] = {}
 
         self.robot_manager = MultiRobotWrapper()
         self.grippers: dict[str, WSG] = {

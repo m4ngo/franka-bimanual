@@ -10,10 +10,10 @@ lerobot-record \
     --robot.r_port=18812 \
     --robot.use_ee_delta=false \
     --teleop.type=bimanual_gello \
-    --dataset.repo_id=test_user/test_dataset \  
-    --dataset.num_episodes=3 \  
-    --dataset.single_task="A test task" \  
-    --dataset.streaming_encoding=true \  
+    --dataset.repo_id=FlaccidMango19/test \
+    --dataset.num_episodes=3 \
+    --dataset.single_task="A test task" \
+    --dataset.streaming_encoding=true \
     --dataset.fps=20 \
     --display_data=true \
     --teleop.id=gello_teleop \
