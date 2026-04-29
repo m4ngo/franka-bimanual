@@ -1,7 +1,24 @@
+#!/usr/bin/env bash
+
 # Script for rolling out a trained policy.
 # $1 is repo id
 # $2 is number of episodes
 # $3 is policy repo id
+#
+# Display:
+# Run local Rerun viewer on the robot/workstation host.
+# Forward the viewer ports over SSH to view on your machine.
+
+if command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+  if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # Enable `conda activate` in non-interactive shells (SSH).
+    # shellcheck disable=SC1090
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+  fi
+  conda activate lerobot >/dev/null 2>&1 || true
+fi
+
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "Usage: $0 <repo_id> <policy_repo_id> <number_of_episodes>"
     exit 1
@@ -17,11 +34,12 @@ lerobot-record \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
     --robot.use_ee_delta=false \
-    --dataset.repo_id=$1 \
-    --dataset.num_episodes=$2 \
+    --dataset.repo_id="$1" \
+    --dataset.num_episodes="$2" \
     --dataset.single_task="Evaluating policy $3 on dataset $1" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
     --dataset.fps=20 \
     --display_data=true \
-    --policy.path=$3
+    --display_compressed_images=true \
+    --policy.path="$3"

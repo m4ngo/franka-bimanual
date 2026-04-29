@@ -1,7 +1,24 @@
+#!/usr/bin/env bash
+
 # Script for recording data for a given task.
 # $1 is repo id
 # $2 is number of episodes
 # $3 is task name
+#
+# Display:
+# Run local Rerun viewer on the robot/workstation host.
+# Forward the viewer ports over SSH to view on your machine.
+
+if command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+  if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # Enable `conda activate` in non-interactive shells (SSH).
+    # shellcheck disable=SC1090
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+  fi
+  conda activate lerobot >/dev/null 2>&1 || true
+fi
+
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
     echo "Usage: $0 <repo_id> <number_of_episodes> <task_name>"
     exit 1
@@ -18,13 +35,14 @@ lerobot-record \
     --robot.r_port=18812 \
     --robot.use_ee_delta=false \
     --teleop.type=bimanual_gello \
-    --dataset.repo_id=$1 \
-    --dataset.num_episodes=$2 \
-    --dataset.single_task=$3 \
+    --dataset.repo_id="$1" \
+    --dataset.num_episodes="$2" \
+    --dataset.single_task="$3" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
     --dataset.fps=20 \
     --display_data=true \
+    --display_compressed_images=true \
     --teleop.id=gello_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \
     --teleop.right_arm_config.port=/dev/ttyUSB0

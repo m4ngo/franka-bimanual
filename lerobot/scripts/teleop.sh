@@ -1,4 +1,16 @@
+#!/usr/bin/env bash
+
 # Script for teleoperating the robot.
+
+if command -v conda >/dev/null 2>&1; then
+  CONDA_BASE="$(conda info --base 2>/dev/null || true)"
+  if [ -n "$CONDA_BASE" ] && [ -f "$CONDA_BASE/etc/profile.d/conda.sh" ]; then
+    # shellcheck disable=SC1090
+    source "$CONDA_BASE/etc/profile.d/conda.sh"
+  fi
+  conda activate lerobot >/dev/null 2>&1 || true
+fi
+
 lerobot-teleoperate \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
