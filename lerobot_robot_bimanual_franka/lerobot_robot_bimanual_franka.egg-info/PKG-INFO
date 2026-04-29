@@ -5,5 +5,7 @@ Summary: Bimanual Franka TRI robot integration for LeRobot
 Requires-Python: >=3.10
 Description-Content-Type: text/markdown
 Requires-Dist: lerobot
+Requires-Dist: lerobot_camera_arv
+Requires-Dist: opencv-python-headless
 
 A python package for bimanual franka TRI setup. Made for LeRobot

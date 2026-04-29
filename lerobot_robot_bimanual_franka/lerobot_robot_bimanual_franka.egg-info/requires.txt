@@ -1,1 +1,3 @@
 lerobot
+lerobot_camera_arv
+opencv-python-headless
