@@ -65,7 +65,6 @@ class BimanualFrankaConfig(RobotConfig):
     camera_width: int = 320
     camera_height: int = 320
     camera_fps: int | None = 20
-    camera_cti_path: str = "/opt/spinnaker/lib/spinnaker-gentl/Spinnaker_GenTL.cti"
     cameras: tuple[BimanualFrankaCameraConfig, ...] = field(default_factory=lambda: _DEFAULT_CAMERAS)
 
     def __post_init__(self):

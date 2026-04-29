@@ -1,15 +1,17 @@
-"""Minimal GenTL camera wrapper for GigE workspace/gripper cameras."""
+"""Minimal Aravis camera wrapper for Ethernet GigE cameras."""
 
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
 
 import cv2
+import gi
 import numpy as np
-from harvesters.core import Harvester, ImageAcquirer
+
+gi.require_version("Aravis", "0.8")
+from gi.repository import Aravis
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +35,9 @@ _BAYER_TO_RGB: dict[str, int] = {
 class GigECameraConfig:
     name: str
     ip: str
-    serial_number: str
     width: int
     height: int
     fps: int | None
-    cti_path: str
 
 
 class GigECamera:
@@ -45,40 +45,39 @@ class GigECamera:
 
     def __init__(self, config: GigECameraConfig):
         self.config = config
-        self._harvester: Harvester | None = None
-        self._acquirer: ImageAcquirer | None = None
+        self._camera: Aravis.Camera | None = None
+        self._stream: Aravis.Stream | None = None
+        self._payload: int = 0
+        self._pixel_format: str = "Mono8"
         self._last_frame: np.ndarray | None = None
 
     @property
     def is_connected(self) -> bool:
-        return self._acquirer is not None
+        return self._camera is not None and self._stream is not None
 
     def connect(self) -> None:
         self.disconnect()
-        harvester = Harvester()
-        harvester.add_cti_file(self.config.cti_path)
-        harvester.update()
+        device = Aravis.open_device(self.config.ip)
+        camera = Aravis.Camera.new_with_device(device)
+        self._configure_camera(camera)
 
-        acquirer = harvester.create_image_acquirer(serial_number=self.config.serial_number)
-        remote_device = acquirer.remote_device
-        node_map = remote_device.node_map
+        stream = camera.create_stream(None, None)
+        payload = int(camera.get_payload())
+        for _ in range(20):
+            stream.push_buffer(Aravis.Buffer.new_allocate(payload))
 
-        self._configure_node(node_map, "Width", self.config.width)
-        self._configure_node(node_map, "Height", self.config.height)
-        if self.config.fps is not None:
-            self._configure_node(node_map, "AcquisitionFrameRateEnable", True)
-            self._configure_node(node_map, "AcquisitionFrameRate", float(self.config.fps))
+        camera.start_acquisition()
 
-        acquirer.start(run_as_thread=True)
-
-        self._harvester = harvester
-        self._acquirer = acquirer
+        self._camera = camera
+        self._stream = stream
+        self._payload = payload
+        self._pixel_format = self._safe_get_string(camera, "PixelFormat", "Mono8")
         self._last_frame = self.read()
         logger.info(
-            "Connected camera %s (%s @ %s)",
+            "Connected camera %s @ %s (%s)",
             self.config.name,
-            self.config.serial_number,
             self.config.ip,
+            self._pixel_format,
         )
 
     def read(self) -> np.ndarray:
@@ -88,23 +87,14 @@ class GigECamera:
         return self._fetch_frame(timeout_s=max_age_ms / 1000.0, allow_stale=True)
 
     def disconnect(self) -> None:
-        if self._acquirer is not None:
+        if self._camera is not None:
             try:
-                self._acquirer.stop()
+                self._camera.stop_acquisition()
             except Exception:
-                logger.debug("Failed stopping camera %s cleanly", self.config.name, exc_info=True)
-            try:
-                self._acquirer.destroy()
-            except Exception:
-                logger.debug("Failed destroying camera %s cleanly", self.config.name, exc_info=True)
-        if self._harvester is not None:
-            try:
-                self._harvester.reset()
-            except Exception:
-                logger.debug("Failed resetting harvester for %s", self.config.name, exc_info=True)
-
-        self._acquirer = None
-        self._harvester = None
+                logger.debug("Failed stopping camera %s", self.config.name, exc_info=True)
+        self._camera = None
+        self._stream = None
+        self._payload = 0
 
     def blank_frame(self) -> np.ndarray:
         if self._last_frame is not None:
@@ -112,17 +102,20 @@ class GigECamera:
         return np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
 
     def _fetch_frame(self, timeout_s: float, allow_stale: bool) -> np.ndarray:
-        if self._acquirer is None:
+        if self._stream is None:
             return self.blank_frame()
 
         deadline = time.monotonic() + max(timeout_s, 0.0)
         while True:
-            buffer = self._acquirer.try_fetch(timeout=0.0)
+            buffer = self._stream.try_pop_buffer()
             if buffer is not None:
-                with buffer:
-                    frame = self._buffer_to_rgb(buffer)
-                self._last_frame = frame
-                return frame.copy()
+                try:
+                    if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
+                        frame = self._buffer_to_rgb(buffer)
+                        self._last_frame = frame
+                        return frame.copy()
+                finally:
+                    self._stream.push_buffer(buffer)
 
             if allow_stale and self._last_frame is not None:
                 return self._last_frame.copy()
@@ -131,26 +124,20 @@ class GigECamera:
                 if self._last_frame is not None:
                     return self._last_frame.copy()
                 raise TimeoutError(
-                    f"Timed out reading camera {self.config.name} ({self.config.serial_number})."
+                    f"Timed out reading camera {self.config.name} ({self.config.ip})."
                 )
 
             time.sleep(0.005)
 
-    def _buffer_to_rgb(self, buffer: Any) -> np.ndarray:
-        component = buffer.payload.components[0]
-        height = int(component.height)
-        width = int(component.width)
-        channels = int(getattr(component, "num_components_per_pixel", 1))
-        data_format = str(getattr(component, "data_format", ""))
+    def _buffer_to_rgb(self, buffer: Aravis.Buffer) -> np.ndarray:
+        if self._camera is None:
+            return self.blank_frame()
 
-        frame = np.array(component.data, copy=True)
-        if channels > 1:
-            frame = frame.reshape(height, width, channels)
-        else:
-            frame = frame.reshape(height, width)
+        width = int(self._safe_get_int(self._camera, "Width", self.config.width))
+        height = int(self._safe_get_int(self._camera, "Height", self.config.height))
+        data = buffer.get_data()
+        frame = self._decode_frame(data, width, height, self._pixel_format)
 
-        frame = self._convert_to_uint8(frame)
-        frame = self._to_rgb(frame, data_format)
         if frame.shape[0] != self.config.height or frame.shape[1] != self.config.width:
             frame = cv2.resize(
                 frame,
@@ -159,43 +146,67 @@ class GigECamera:
             )
         return np.ascontiguousarray(frame)
 
-    def _to_rgb(self, frame: np.ndarray, data_format: str) -> np.ndarray:
-        if frame.ndim == 2:
-            conversion = _BAYER_TO_RGB.get(data_format)
-            if conversion is not None:
-                return cv2.cvtColor(frame, conversion)
-            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-
-        if frame.shape[2] == 1:
-            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
-
-        if frame.shape[2] >= 3:
-            return frame[:, :, :3]
-
-        raise ValueError(
-            f"Unsupported frame shape for camera {self.config.name}: {frame.shape}"
-        )
-
-    @staticmethod
-    def _convert_to_uint8(frame: np.ndarray) -> np.ndarray:
-        if frame.dtype == np.uint8:
-            return frame
-        if np.issubdtype(frame.dtype, np.integer):
-            max_value = max(int(np.iinfo(frame.dtype).max), 1)
-            return ((frame.astype(np.float32) / max_value) * 255.0).clip(0, 255).astype(np.uint8)
-        return np.clip(frame, 0, 255).astype(np.uint8)
-
-    @staticmethod
-    def _configure_node(node_map: Any, node_name: str, value: Any) -> None:
+    def _configure_camera(self, camera: Aravis.Camera) -> None:
         try:
-            node = getattr(node_map, node_name)
-        except AttributeError:
-            return
-
-        if not getattr(node, "is_writable", True):
-            return
-
-        try:
-            node.value = value
+            camera.gv_set_packet_size(1400)
         except Exception:
-            logger.debug("Skipping camera node %s=%s", node_name, value, exc_info=True)
+            logger.debug("Could not set packet size on %s", self.config.name, exc_info=True)
+
+        camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
+        self._safe_set_int(camera, "Width", self.config.width)
+        self._safe_set_int(camera, "Height", self.config.height)
+        if self.config.fps is not None:
+            self._safe_set_float(camera, "AcquisitionFrameRate", float(self.config.fps))
+
+    def _decode_frame(self, data: bytes, width: int, height: int, pixel_format: str) -> np.ndarray:
+        if pixel_format == "Mono16":
+            frame = np.frombuffer(data, dtype=np.uint16).reshape((height, width))
+            frame = (frame >> 8).astype(np.uint8)
+            return cv2.cvtColor(frame, cv2.COLOR_GRAY2RGB)
+
+        if pixel_format in _BAYER_TO_RGB:
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, _BAYER_TO_RGB[pixel_format])
+
+        if pixel_format == "RGB8":
+            frame = np.frombuffer(data, dtype=np.uint8).reshape((height, width, 3))
+            return frame
+
+        if pixel_format == "Mono8":
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+
+        # Fallback: best effort as mono8 to keep observation keys stable.
+        try:
+            mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
+            return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
+        except Exception as exc:
+            raise ValueError(f"Unsupported pixel format {pixel_format} on {self.config.name}") from exc
+
+    @staticmethod
+    def _safe_set_int(camera: Aravis.Camera, key: str, value: int) -> None:
+        try:
+            camera.set_integer(key, int(value))
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
+
+    @staticmethod
+    def _safe_set_float(camera: Aravis.Camera, key: str, value: float) -> None:
+        try:
+            camera.set_float(key, float(value))
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
+
+    @staticmethod
+    def _safe_get_int(camera: Aravis.Camera, key: str, default: int) -> int:
+        try:
+            return int(camera.get_integer(key))
+        except Exception:
+            return default
+
+    @staticmethod
+    def _safe_get_string(camera: Aravis.Camera, key: str, default: str) -> str:
+        try:
+            return str(camera.get_string(key))
+        except Exception:
+            return default

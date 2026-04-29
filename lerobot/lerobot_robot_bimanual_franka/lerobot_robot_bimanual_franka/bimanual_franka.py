@@ -95,11 +95,9 @@ class BimanualFranka(Robot):
             GigECameraConfig(
                 name=camera.name,
                 ip=camera.ip,
-                serial_number=camera.serial_number,
                 width=self.config.camera_width,
                 height=self.config.camera_height,
                 fps=self.config.camera_fps,
-                cti_path=self.config.camera_cti_path,
             )
         )
 
