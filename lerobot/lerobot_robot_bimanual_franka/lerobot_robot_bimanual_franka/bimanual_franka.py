@@ -5,20 +5,24 @@ LeRobot Robot interface. Each arm runs in its own subprocess via
 MultiRobotWrapper; grippers communicate over TCP through WSG.
 """
 
+import logging
 import time
+from functools import cached_property
 
 import numpy as np
 
 from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
-from .bimanual_franka_config import BimanualFrankaConfig
+from .bimanual_franka_config import BimanualFrankaConfig, BimanualFrankaCameraConfig
 from .franka_process import KinematicSnapshot, MultiRobotWrapper
+from .gige_camera import GigECamera, GigECameraConfig
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 
 # 7 degrees of freedom per Franka arm.
 NUM_JOINTS = 7
+IMAGE_CHANNELS = 3
 
 # Joint-velocity PD controller for tracking joint-position targets. Lives in
 # the parent process (this file) rather than franka_process so the safety
@@ -42,6 +46,8 @@ _CONNECT_RETRIES = 3
 _CONNECT_TIMEOUT_S = 10.0
 _RETRY_SLEEP_S = 1.0
 
+logger = logging.getLogger(__name__)
+
 
 class BimanualFranka(Robot):
     config_class = BimanualFrankaConfig
@@ -52,10 +58,9 @@ class BimanualFranka(Robot):
         self.config = config
         self.use_ee_delta = config.use_ee_delta
         self.active_arms = config.active_arms
-        # LeRobot's record pipeline expects every robot to expose a `cameras`
-        # container. This robot currently has no camera devices, so keep it
-        # empty to make headless recording paths work.
-        self.cameras: dict[str, object] = {}
+        self.cameras: dict[str, GigECamera] = {
+            camera.name: self._make_camera(camera) for camera in self.config.cameras
+        }
 
         self.robot_manager = MultiRobotWrapper()
         self.grippers: dict[str, WSG] = {
@@ -85,9 +90,36 @@ class BimanualFranka(Robot):
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
+    def _make_camera(self, camera: BimanualFrankaCameraConfig) -> GigECamera:
+        return GigECamera(
+            GigECameraConfig(
+                name=camera.name,
+                ip=camera.ip,
+                serial_number=camera.serial_number,
+                width=self.config.camera_width,
+                height=self.config.camera_height,
+                fps=self.config.camera_fps,
+                cti_path=self.config.camera_cti_path,
+            )
+        )
+
+    @cached_property
+    def _camera_features(self) -> dict[str, tuple[int, int, int]]:
+        return {
+            camera_name: (
+                self.config.camera_height,
+                self.config.camera_width,
+                IMAGE_CHANNELS,
+            )
+            for camera_name in self.cameras
+        }
+
     @property
     def observation_features(self) -> dict[str, type]:
-        return self._arm_features(JOINT_FEATURE_KEYS)
+        return {
+            **self._arm_features(JOINT_FEATURE_KEYS),
+            **self._camera_features,
+        }
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -122,9 +154,17 @@ class BimanualFranka(Robot):
             self.configure()
             for arm in self.active_arms:
                 self.grippers[arm].home()
+            self._connect_cameras()
         except Exception:
             self.robot_manager.shutdown()
             raise
+
+    def _connect_cameras(self) -> None:
+        for camera_name, camera in self.cameras.items():
+            try:
+                camera.connect()
+            except Exception as exc:  # noqa: BLE001 - cameras should not block control
+                logger.warning("Camera %s failed to connect: %s", camera_name, exc)
 
     def _probe_arm(self, arm: str) -> None:
         """Confirm an arm responds to a kinematic-state query, retrying on failure."""
@@ -144,6 +184,8 @@ class BimanualFranka(Robot):
         )
 
     def disconnect(self) -> None:
+        for camera in self.cameras.values():
+            camera.disconnect()
         self.robot_manager.shutdown()
         for gripper in self.grippers.values():
             gripper.close()
@@ -188,6 +230,13 @@ class BimanualFranka(Robot):
             for i in range(NUM_JOINTS):
                 obs[f"{arm}_joint_{i + 1}"] = float(q[i])
             obs[f"{arm}_gripper"] = self.grippers[arm].position
+
+        for camera_name, camera in self.cameras.items():
+            try:
+                obs[camera_name] = camera.read_latest()
+            except Exception as exc:  # noqa: BLE001 - preserve control-path behavior
+                logger.warning("Camera %s read failed: %s", camera_name, exc)
+                obs[camera_name] = camera.blank_frame()
         return obs
 
     def send_action(self, action: RobotAction) -> RobotAction:
