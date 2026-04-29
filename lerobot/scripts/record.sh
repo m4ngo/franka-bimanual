@@ -1,3 +1,10 @@
+# $1 is repo id
+# $2 is number of episodes
+# $3 is task name
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
+    echo "Usage: $0 <repo_id> <number_of_episodes> <task_name>"
+    exit 1
+fi
 lerobot-record \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
@@ -10,9 +17,9 @@ lerobot-record \
     --robot.r_port=18812 \
     --robot.use_ee_delta=false \
     --teleop.type=bimanual_gello \
-    --dataset.repo_id=FlaccidMango19/test \
-    --dataset.num_episodes=3 \
-    --dataset.single_task="A test task" \
+    --dataset.repo_id=$1 \
+    --dataset.num_episodes=$2 \
+    --dataset.single_task=$3 \
     --dataset.streaming_encoding=true \
     --dataset.fps=20 \
     --display_data=true \
