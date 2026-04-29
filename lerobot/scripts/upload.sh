@@ -13,4 +13,8 @@ if command -v conda >/dev/null 2>&1; then
   conda activate lerobot >/dev/null 2>&1 || true
 fi
 
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: $0 <repo_id> <path/to/data>"
+    exit 1
+fi
 hf upload "$1" "$2" . --repo-type dataset
