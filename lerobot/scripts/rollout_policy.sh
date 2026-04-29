@@ -17,7 +17,6 @@ lerobot-record \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
     --robot.use_ee_delta=false \
-    --teleop.type=bimanual_gello \
     --dataset.repo_id=$1 \
     --dataset.num_episodes=$2 \
     --dataset.single_task="Evaluating policy $3 on dataset $1" \
