@@ -14,8 +14,8 @@ lerobot-record \
     --dataset.num_episodes=3 \  
     --dataset.single_task="A test task" \  
     --dataset.streaming_encoding=true \  
+    --dataset.fps=20 \
     --display_data=true \
     --teleop.id=gello_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \
-    --teleop.right_arm_config.port=/dev/ttyUSB0 \
-    --fps=20
+    --teleop.right_arm_config.port=/dev/ttyUSB0
