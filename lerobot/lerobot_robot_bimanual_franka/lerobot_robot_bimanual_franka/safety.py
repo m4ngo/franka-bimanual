@@ -77,6 +77,16 @@ BIMANUAL_REPEL_FORCE = 1.0
 # Applied AFTER all per-arm checks so they can never push past it.
 JOINT_VELOCITY_MAX = 2.0  # rad/s
 
+# --- EE-twist ceiling -------------------------------------------------------
+# Hardware-safe ceilings on the linear (m/s) and angular (rad/s) components
+# of an EE-twist command. Linear and angular are clamped independently
+# because they have different units. Conservative defaults sit well below
+# libfranka's maxima (1.7 m/s linear, 2.5 rad/s angular) and below the
+# acceleration the streamed CartesianVelocityMotion can reach without
+# tripping a discontinuity-induced Reflex.
+EE_LINEAR_VELOCITY_MAX = 0.30  # m/s
+EE_ANGULAR_VELOCITY_MAX = 1.20  # rad/s
+
 
 # Type alias for the kinematic snapshot returned by
 # MultiRobotWrapper.current_kinematic_state(_batch). Documented here so
@@ -143,6 +153,27 @@ class ActionSafetyScreen:
         if norm > JOINT_VELOCITY_MAX:
             return velocity * (JOINT_VELOCITY_MAX / norm)
         return velocity
+
+    @staticmethod
+    def clamp_ee_twist_magnitude(twist: np.ndarray) -> np.ndarray:
+        """Scale a 6-DoF EE twist [vx, vy, vz, wx, wy, wz] down to safe norms.
+
+        Linear and angular halves are clamped independently because they
+        have different units. Applied as the final stage of the EE pipeline,
+        after every other screen, so no upstream check can push the command
+        past the hardware-safe ceiling.
+        """
+        twist = np.asarray(twist, dtype=np.float64).copy()
+        linear, angular = twist[:3], twist[3:]
+        lin_norm = float(np.linalg.norm(linear))
+        if lin_norm > EE_LINEAR_VELOCITY_MAX:
+            linear *= EE_LINEAR_VELOCITY_MAX / lin_norm
+        ang_norm = float(np.linalg.norm(angular))
+        if ang_norm > EE_ANGULAR_VELOCITY_MAX:
+            angular *= EE_ANGULAR_VELOCITY_MAX / ang_norm
+        twist[:3] = linear
+        twist[3:] = angular
+        return twist
 
     # ------------------------------------------------------------------
     # Worktable brake

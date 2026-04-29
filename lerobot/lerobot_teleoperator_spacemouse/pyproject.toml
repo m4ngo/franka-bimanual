@@ -1,0 +1,20 @@
+[project]
+name = "lerobot_teleoperator_spacemouse"
+version = "0.1.0"
+description = "A LeRobot plugin for the 3Dconnexion SpaceMouse: produces EE-delta twists and uses the two device buttons as gripper open/close commands."
+requires-python = ">=3.11"
+
+dependencies = [
+    "lerobot",
+    "pyspacemouse>=2.0",
+]
+
+[tool.setuptools]
+packages = [
+    "lerobot_teleoperator_spacemouse",
+    "lerobot_teleoperator_spacemouse.lerobot_teleoperator_spacemouse",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"

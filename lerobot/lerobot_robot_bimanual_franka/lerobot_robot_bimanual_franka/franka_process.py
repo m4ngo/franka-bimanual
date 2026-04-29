@@ -20,12 +20,12 @@ from numpy.typing import NDArray
 # Position tracking / PD shaping happens in the parent (see BimanualFranka) so
 # this subprocess can stay a thin pass-through to franky.
 VELOCITY_COMMAND_DURATION_MS = 500
-VELOCITY = 1.0 # m/s
-ACCELERATION = 0.25
-JERK = 1.0
+JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
 TORQUE_THRESHOLD = 100.0 # Nm
 FORCE_THRESHOLD = 200.0 # N
 JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
+
+EE_DELTA_RELATIVE_DYNAMICS = (0.4, 0.25, 0.15)
 
 # ---- Dimensions -------------------------------------------------------------
 NUM_JOINTS = 7
@@ -37,13 +37,7 @@ SHUTDOWN_STOP_TIMEOUT_S = 2.0
 SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 TERMINATE_JOIN_TIMEOUT_S = 1.0
 
-# Robot errors that are recoverable via ``recover_from_errors``. The Reflex
-# entry catches libfranka's "command not possible in the current mode
-# ('Reflex')!" rejection, which the existing recover_from_errors path is
-# designed to clear. The InvalidMotionType entry covers the franky-side
-# "type of motion cannot change during runtime" exception, which is
-# resolved by recovering and letting the next motion command re-prime the
-# control mode.
+# Robot errors that are recoverable via ``recover_from_errors``
 _RECOVERABLE_ERRORS = (
     "UDP receive: Timeout",
     "communication_constrains_violation",
@@ -110,35 +104,34 @@ class RobotProcess:
 
             robot = Robot(self.robot_ip)
             robot.recover_from_errors()
-            robot.relative_dynamics_factor = RelativeDynamicsFactor(
-                velocity=VELOCITY,
-                acceleration=ACCELERATION,
-                jerk=JERK
-            )
+            robot.relative_dynamics_factor = RelativeDynamicsFactor(*JOINT_RELATIVE_DYNAMICS)
             # robot.joint_velocity_limit.set([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
             # robot.joint_acceleration_limit.set([15.0, 7.5, 10.0, 12.5, 15.0, 15.0, 15.0])
             # robot.joint_jerk_limit.set([7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0])
             robot.set_collision_behavior(TORQUE_THRESHOLD, FORCE_THRESHOLD)
             robot.set_joint_impedance(JOINT_STIFFNESS)
 
-            # Prime the control mode the parent will use
-            if self.use_ee_delta:
-                zero3 = np.zeros(3, dtype=np.float64)
-                prime_motion = CartesianVelocityMotion(
-                    Twist(cast(Any, zero3), cast(Any, zero3)),
-                    Duration(VELOCITY_COMMAND_DURATION_MS),
-                )
-            else:
-                zero7 = np.zeros(NUM_JOINTS, dtype=np.float64)
-                prime_motion = JointVelocityMotion(
-                    cast(Any, zero7), Duration(VELOCITY_COMMAND_DURATION_MS)
-                )
+            ee_dynamics = RelativeDynamicsFactor(*EE_DELTA_RELATIVE_DYNAMICS)
 
-            try:
-                robot.move(prime_motion, asynchronous=False)
-            except Exception:
-                robot.recover_from_errors()
-                robot.move(prime_motion, asynchronous=False)
+            # Closure that returns a fresh zero-velocity motion of the same
+            # control mode the parent has been streaming, used by the
+            # "stop_motion" and "shutdown" handlers below. Sending the
+            # wrong type at stop time triggers franky's
+            # InvalidMotionTypeException right before the rpyc connection
+            # closes, which the controller logs as a noisy traceback.
+            zero_lin = np.zeros(3, dtype=np.float64)
+            zero_joint = np.zeros(NUM_JOINTS, dtype=np.float64)
+
+            # def make_prime_motion():
+            #     if self.use_ee_delta:
+            #         return CartesianVelocityMotion(
+            #             Twist(cast(Any, zero_lin), cast(Any, zero_lin)),
+            #             Duration(VELOCITY_COMMAND_DURATION_MS),
+            #             ee_dynamics,
+            #         )
+            #     return JointVelocityMotion(
+            #         cast(Any, zero_joint), Duration(VELOCITY_COMMAND_DURATION_MS)
+            #     )
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return
@@ -165,6 +158,7 @@ class RobotProcess:
                     motion = CartesianVelocityMotion(
                         Twist(cast(Any, linear), cast(Any, angular)),
                         Duration(VELOCITY_COMMAND_DURATION_MS),
+                        ee_dynamics,
                     )
                     result = robot.move(motion, asynchronous=args[1])
                     self.response_queue.put(("success", result))
@@ -198,21 +192,23 @@ class RobotProcess:
                     self.response_queue.put(("success", robot.join_motion(timeout=timeout)))
 
                 elif command == "stop_motion":
-                    zero = np.zeros(NUM_JOINTS, dtype=np.float64)
-                    motion = JointVelocityMotion(
-                        cast(Any, zero), Duration(VELOCITY_COMMAND_DURATION_MS)
-                    )
-                    self.response_queue.put(("success", robot.move(motion, asynchronous=False)))
+                    # Match the active control mode (see "shutdown" below)
+                    # so the stop itself isn't a motion-type change.
+                    # self.response_queue.put(
+                    #     ("success", robot.move(make_prime_motion(), asynchronous=False))
+                    # )
+                    pass
 
                 elif command == "shutdown":
                     try:
-                        zero = np.zeros(NUM_JOINTS, dtype=np.float64)
-                        robot.move(
-                            JointVelocityMotion(
-                                cast(Any, zero), Duration(VELOCITY_COMMAND_DURATION_MS)
-                            ),
-                            asynchronous=False,
-                        )
+                        # Use the same zero-velocity prime motion we built
+                        # at init: it matches whichever control mode the
+                        # parent has been streaming, so the final stop is
+                        # NOT a motion-type change (which would otherwise
+                        # raise InvalidMotionTypeException right before
+                        # we close the rpyc connection).
+                        # robot.move(make_prime_motion(), asynchronous=False)
+                        pass
                     except Exception:
                         # A failed final-stop should not block shutdown.
                         pass

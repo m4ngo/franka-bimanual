@@ -196,6 +196,10 @@ class BimanualFranka(Robot):
                 for arm in self.active_arms
             }
             ee_by_arm = self.safety.screen_ee_actions(ee_by_arm, kin_state)
+            ee_by_arm = {
+                arm: self.safety.clamp_ee_twist_magnitude(twist)
+                for arm, twist in ee_by_arm.items()
+            }
             self.robot_manager.move_ee_delta_batch(
                 {arm: twist.tolist() for arm, twist in ee_by_arm.items()},
                 asynchronous=True,
