@@ -71,12 +71,12 @@ def _make_robot_config() -> BimanualFrankaConfig:
 
 def _make_teleop_configs(args: argparse.Namespace) -> tuple[GelloConfig, GelloConfig]:
     left = GelloConfig(
-        port=os.getenv("GELLO_LEFT_PORT", args.portl),
-        id=os.getenv("GELLO_LEFT_ID", "gello_teleop_left"),
+        port=args.portl,
+        id="gello_teleop_left",
     )
     right = GelloConfig(
-        port=os.getenv("GELLO_RIGHT_PORT", args.portr),
-        id=os.getenv("GELLO_RIGHT_ID", "gello_teleop_right"),
+        port=args.portr,
+        id="gello_teleop_right",
     )
     return left, right
 
