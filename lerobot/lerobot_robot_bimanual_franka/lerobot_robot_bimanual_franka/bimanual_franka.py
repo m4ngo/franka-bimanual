@@ -14,9 +14,10 @@ import numpy as np
 from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
-from .bimanual_franka_config import BimanualFrankaConfig, BimanualFrankaCameraConfig
+from lerobot_camera_arv import ArvCamera, ArvCameraConfig  # type: ignore
+
+from .bimanual_franka_config import BimanualFrankaConfig
 from .franka_process import KinematicSnapshot, MultiRobotWrapper
-from .gige_camera import GigECamera, GigECameraConfig
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 
@@ -58,8 +59,9 @@ class BimanualFranka(Robot):
         self.config = config
         self.use_ee_delta = config.use_ee_delta
         self.active_arms = config.active_arms
-        self.cameras: dict[str, GigECamera] = {
-            camera.name: self._make_camera(camera) for camera in self.config.cameras
+        self.cameras: dict[str, ArvCamera] = {
+            camera_name: self._make_camera(camera_config)
+            for camera_name, camera_config in self.config.cameras.items()
         }
 
         self.robot_manager = MultiRobotWrapper()
@@ -90,14 +92,14 @@ class BimanualFranka(Robot):
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
-    def _make_camera(self, camera: BimanualFrankaCameraConfig) -> GigECamera:
-        return GigECamera(
-            GigECameraConfig(
+    def _make_camera(self, camera: ArvCameraConfig) -> ArvCamera:
+        return ArvCamera(
+            ArvCameraConfig(
                 name=camera.name,
                 ip=camera.ip,
-                width=self.config.camera_width,
-                height=self.config.camera_height,
-                fps=self.config.camera_fps,
+                width=camera.width,
+                height=camera.height,
+                fps=camera.fps,
             )
         )
 
@@ -113,7 +115,7 @@ class BimanualFranka(Robot):
         }
 
     @property
-    def observation_features(self) -> dict[str, type]:
+    def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
         return {
             **self._arm_features(JOINT_FEATURE_KEYS),
             **self._camera_features,
@@ -231,7 +233,7 @@ class BimanualFranka(Robot):
 
         for camera_name, camera in self.cameras.items():
             try:
-                obs[camera_name] = camera.read_latest()
+                obs[camera_name] = camera.async_read()
             except Exception as exc:  # noqa: BLE001 - preserve control-path behavior
                 logger.warning("Camera %s read failed: %s", camera_name, exc)
                 obs[camera_name] = camera.blank_frame()

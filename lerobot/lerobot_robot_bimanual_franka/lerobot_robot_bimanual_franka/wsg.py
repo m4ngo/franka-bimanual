@@ -60,9 +60,9 @@ class WSG:
     # Rate caps.  ``_MIN_MOVE_INTERVAL_S`` keeps overlapping motion plans
     # from piling up at the gripper, ``_TARGET_CHANGE_THRESH_MM`` absorbs
     # noisy teleop input without an actual dead-zone.
-    _MIN_MOVE_INTERVAL_S = 0.020       # ~50 Hz max MOVE rate
-    _TARGET_CHANGE_THRESH_MM = 0.3
-    _POS_POLL_INTERVAL_S = 0.040       # ~25 Hz POS? poll
+    _MIN_MOVE_INTERVAL_S = 0.050       # ~20 Hz max MOVE rate
+    _TARGET_CHANGE_THRESH_MM = 1.0
+    _POS_POLL_INTERVAL_S = 0.050       # ~20 Hz POS? poll
     _SOCK_RECV_TIMEOUT_S = 0.5
     _RECV_BUF_SIZE = 4096
     _RELEASE_PULL_BACK_MM = 10.0
@@ -331,6 +331,7 @@ class WSG:
 
     @classmethod
     def _move_cmd(cls, target_mm: float) -> bytes:
+        print("moeving to", target_mm)
         return f"MOVE({target_mm:.2f},{cls.MOVE_SPEED_MM_S:.1f})\n".encode()
 
     def _send_raw(self, data: bytes) -> bool:

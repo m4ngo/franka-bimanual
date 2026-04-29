@@ -4,14 +4,20 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
+from typing import Any
 
 import cv2
 import gi
 import numpy as np
+from numpy.typing import NDArray
 
 gi.require_version("Aravis", "0.8")
-from gi.repository import Aravis
+from gi.repository import Aravis  # type: ignore[attr-defined]
+
+from lerobot.cameras.camera import Camera
+from lerobot.cameras.configs import CameraConfig  # noqa: F401 - re-exported for callers
+
+from .config_arv import ArvCameraConfig
 
 logger = logging.getLogger(__name__)
 
@@ -31,33 +37,32 @@ _BAYER_TO_RGB: dict[str, int] = {
 }
 
 
-@dataclass(frozen=True)
-class GigECameraConfig:
-    name: str
-    ip: str
-    width: int
-    height: int
-    fps: int | None
+class ArvCamera(Camera):
+    def __init__(self, config: ArvCameraConfig):
+        super().__init__(config)
+        self._config = config
+        self._name = config.name
+        self._ip = config.ip
+        self._pixel_format = config.pixel_format
+        self._width = int(config.width) if config.width is not None else 0
+        self._height = int(config.height) if config.height is not None else 0
 
-
-class GigECamera:
-    """Best-effort camera reader that never interferes with arm control."""
-
-    def __init__(self, config: GigECameraConfig):
-        self.config = config
         self._camera: Aravis.Camera | None = None
         self._stream: Aravis.Stream | None = None
         self._payload: int = 0
-        self._pixel_format: str = "Mono8"
         self._last_frame: np.ndarray | None = None
 
     @property
     def is_connected(self) -> bool:
         return self._camera is not None and self._stream is not None
 
-    def connect(self) -> None:
+    @staticmethod
+    def find_cameras() -> list[dict[str, Any]]:
+        raise NotImplementedError("Don't use find cameras here")
+
+    def connect(self, warmup: bool = True) -> None:
         self.disconnect()
-        device = Aravis.open_device(self.config.ip)
+        device = Aravis.open_device(self._ip)
         camera = Aravis.Camera.new_with_device(device)
         self._configure_camera(camera)
 
@@ -75,23 +80,23 @@ class GigECamera:
         self._last_frame = self.read()
         logger.info(
             "Connected camera %s @ %s (%s)",
-            self.config.name,
-            self.config.ip,
+            self._name,
+            self._ip,
             self._pixel_format,
         )
 
-    def read(self) -> np.ndarray:
+    def read(self) -> NDArray[Any]:
         return self._fetch_frame(timeout_s=1.0, allow_stale=False)
 
-    def read_latest(self, max_age_ms: int = 500) -> np.ndarray:
-        return self._fetch_frame(timeout_s=max_age_ms / 1000.0, allow_stale=True)
+    def async_read(self, timeout_ms: float = 500) -> NDArray[Any]:
+        return self._fetch_frame(timeout_s=timeout_ms / 1000.0, allow_stale=True)
 
     def disconnect(self) -> None:
         if self._camera is not None:
             try:
                 self._camera.stop_acquisition()
             except Exception:
-                logger.debug("Failed stopping camera %s", self.config.name, exc_info=True)
+                logger.debug("Failed stopping camera %s %s", self._name, self._ip, exc_info=True)
         self._camera = None
         self._stream = None
         self._payload = 0
@@ -99,7 +104,7 @@ class GigECamera:
     def blank_frame(self) -> np.ndarray:
         if self._last_frame is not None:
             return self._last_frame.copy()
-        return np.zeros((self.config.height, self.config.width, 3), dtype=np.uint8)
+        return np.zeros((self._height, self._width, 3), dtype=np.uint8)
 
     def _fetch_frame(self, timeout_s: float, allow_stale: bool) -> np.ndarray:
         if self._stream is None:
@@ -124,7 +129,7 @@ class GigECamera:
                 if self._last_frame is not None:
                     return self._last_frame.copy()
                 raise TimeoutError(
-                    f"Timed out reading camera {self.config.name} ({self.config.ip})."
+                    f"Timed out reading camera {self._name} ({self._config.ip})."
                 )
 
             time.sleep(0.005)
@@ -133,15 +138,15 @@ class GigECamera:
         if self._camera is None:
             return self.blank_frame()
 
-        width = int(self._safe_get_int(self._camera, "Width", self.config.width))
-        height = int(self._safe_get_int(self._camera, "Height", self.config.height))
+        width = int(self._safe_get_int(self._camera, "Width", self._width))
+        height = int(self._safe_get_int(self._camera, "Height", self._height))
         data = buffer.get_data()
         frame = self._decode_frame(data, width, height, self._pixel_format)
 
-        if frame.shape[0] != self.config.height or frame.shape[1] != self.config.width:
+        if frame.shape[0] != self._height or frame.shape[1] != self._width:
             frame = cv2.resize(
                 frame,
-                (self.config.width, self.config.height),
+                (self._width, self._height),
                 interpolation=cv2.INTER_AREA,
             )
         return np.ascontiguousarray(frame)
@@ -150,13 +155,13 @@ class GigECamera:
         try:
             camera.gv_set_packet_size(1400)
         except Exception:
-            logger.debug("Could not set packet size on %s", self.config.name, exc_info=True)
+            logger.debug("Could not set packet size on %s %s", self._name, self._ip, exc_info=True)
 
         camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
-        self._safe_set_int(camera, "Width", self.config.width)
-        self._safe_set_int(camera, "Height", self.config.height)
-        if self.config.fps is not None:
-            self._safe_set_float(camera, "AcquisitionFrameRate", float(self.config.fps))
+        self._safe_set_int(camera, "Width", self._width)
+        self._safe_set_int(camera, "Height", self._height)
+        if self._config.fps is not None:
+            self._safe_set_float(camera, "AcquisitionFrameRate", float(self._config.fps))
 
     def _decode_frame(self, data: bytes, width: int, height: int, pixel_format: str) -> np.ndarray:
         if pixel_format == "Mono16":
@@ -181,7 +186,7 @@ class GigECamera:
             mono = np.frombuffer(data, dtype=np.uint8).reshape((height, width))
             return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
         except Exception as exc:
-            raise ValueError(f"Unsupported pixel format {pixel_format} on {self.config.name}") from exc
+            raise ValueError(f"Unsupported pixel format {pixel_format} on {self._name}") from exc
 
     @staticmethod
     def _safe_set_int(camera: Aravis.Camera, key: str, value: int) -> None:
