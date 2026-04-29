@@ -1,0 +1,21 @@
+lerobot-record \
+    --robot.type=bimanual_franka \
+    --robot.l_server_ip=192.168.3.11 \
+    --robot.l_robot_ip=192.168.200.2 \
+    --robot.l_gripper_ip=192.168.2.21 \
+    --robot.l_port=18813 \
+    --robot.r_server_ip=192.168.3.10 \
+    --robot.r_robot_ip=192.168.201.10 \
+    --robot.r_gripper_ip=192.168.2.20 \
+    --robot.r_port=18812 \
+    --robot.use_ee_delta=false \
+    --teleop.type=bimanual_gello \
+    --dataset.repo_id=test_user/test_dataset \  
+    --dataset.num_episodes=3 \  
+    --dataset.single_task="A test task" \  
+    --dataset.streaming_encoding=true \  
+    --display_data=true \
+    --teleop.id=gello_teleop \
+    --teleop.left_arm_config.port=/dev/ttyUSB1 \
+    --teleop.right_arm_config.port=/dev/ttyUSB0 \
+    --fps=20

@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: lerobot_robot_bimanual_franka
+Version: 0.1.0
+Summary: Bimanual Franka TRI robot integration for LeRobot
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: lerobot
+
+A python package for bimanual franka TRI setup. Made for LeRobot

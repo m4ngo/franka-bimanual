@@ -31,6 +31,17 @@ EE_DELTA_RELATIVE_DYNAMICS = (0.4, 0.25, 0.15)
 NUM_JOINTS = 7
 EE_DELTA_DIMS = 6  # linear(3) + angular(3)
 
+# Kinematic snapshot returned by `current_kinematic_state(_batch)`. All four
+# arrays come from the same `robot.state` snapshot so they are mutually
+# consistent for one parent-side control tick.
+#   q              : (7,)   joint positions     (rad)
+#   dq             : (7,)   joint velocities    (rad/s)
+#   ee_translation : (3,)   EE position in base (m)
+#   jacobian       : (6, 7) base-frame Jacobian; rows [0:3] linear, [3:6] angular
+KinematicSnapshot = tuple[
+    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+]
+
 # ---- Timeouts ---------------------------------------------------------------
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
 SHUTDOWN_STOP_TIMEOUT_S = 2.0
@@ -122,16 +133,16 @@ class RobotProcess:
             zero_lin = np.zeros(3, dtype=np.float64)
             zero_joint = np.zeros(NUM_JOINTS, dtype=np.float64)
 
-            # def make_prime_motion():
-            #     if self.use_ee_delta:
-            #         return CartesianVelocityMotion(
-            #             Twist(cast(Any, zero_lin), cast(Any, zero_lin)),
-            #             Duration(VELOCITY_COMMAND_DURATION_MS),
-            #             ee_dynamics,
-            #         )
-            #     return JointVelocityMotion(
-            #         cast(Any, zero_joint), Duration(VELOCITY_COMMAND_DURATION_MS)
-            #     )
+            def make_prime_motion():
+                if self.use_ee_delta:
+                    return CartesianVelocityMotion(
+                        Twist(cast(Any, zero_lin), cast(Any, zero_lin)),
+                        Duration(VELOCITY_COMMAND_DURATION_MS),
+                        ee_dynamics,
+                    )
+                return JointVelocityMotion(
+                    cast(Any, zero_joint), Duration(VELOCITY_COMMAND_DURATION_MS)
+                )
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return
@@ -163,12 +174,6 @@ class RobotProcess:
                     result = robot.move(motion, asynchronous=args[1])
                     self.response_queue.put(("success", result))
 
-                elif command == "get_state":
-                    self.response_queue.put(("success", robot.get_last_callback_data()))
-
-                elif command == "current_joint_positions":
-                    self.response_queue.put(("success", robot.current_joint_positions))
-
                 elif command == "current_kinematic_state":
                     # All kinematic state needed for one parent-side control
                     # tick (PD + safety overlays), captured from the same
@@ -187,16 +192,12 @@ class RobotProcess:
                         ("success", (q, dq, ee_translation, jacobian))
                     )
 
-                elif command == "join_motion":
-                    timeout = args[0] if args else None
-                    self.response_queue.put(("success", robot.join_motion(timeout=timeout)))
-
                 elif command == "stop_motion":
                     # Match the active control mode (see "shutdown" below)
                     # so the stop itself isn't a motion-type change.
-                    # self.response_queue.put(
-                    #     ("success", robot.move(make_prime_motion(), asynchronous=False))
-                    # )
+                    self.response_queue.put(
+                        ("success", robot.move(make_prime_motion(), asynchronous=False))
+                    )
                     pass
 
                 elif command == "shutdown":
@@ -207,7 +208,7 @@ class RobotProcess:
                         # NOT a motion-type change (which would otherwise
                         # raise InvalidMotionTypeException right before
                         # we close the rpyc connection).
-                        # robot.move(make_prime_motion(), asynchronous=False)
+                        robot.move(make_prime_motion(), asynchronous=False)
                         pass
                     except Exception:
                         # A failed final-stop should not block shutdown.
@@ -327,24 +328,6 @@ class MultiRobotWrapper:
 
     # --- Motion commands -----------------------------------------------------
 
-    def move_joint_velocity(
-        self, robot_name: str, velocity: list, asynchronous: bool = False
-    ):
-        """Stream a 7-DoF joint velocity (rad/s) to a single arm.
-
-        The subprocess forwards the velocity to franky as-is; PD shaping and
-        safety clamping live in the parent process.
-        """
-        velocity = _validate_vector("move_joint_velocity", velocity, NUM_JOINTS)
-        return self._request(
-            robot_name, "move_joint_velocity", [velocity, asynchronous], {}
-        )
-
-    def move_ee_delta(self, robot_name: str, position: list, asynchronous: bool = False):
-        """Command an end-effector twist (linear + angular) for a single arm."""
-        position = _validate_vector("move_ee_delta position", position, EE_DELTA_DIMS)
-        return self._request(robot_name, "move_ee_delta", [position, asynchronous], {})
-
     def move_joint_velocity_batch(
         self, velocities_by_robot: dict[str, list], asynchronous: bool = False
     ) -> dict[str, Any]:
@@ -375,9 +358,6 @@ class MultiRobotWrapper:
         ]
         return self._request_many(requests)
 
-    def stop_motion(self, robot_name: str, timeout_s: float = SHUTDOWN_STOP_TIMEOUT_S):
-        return self._request(robot_name, "stop_motion", [], {}, timeout_s=timeout_s)
-
     def stop_all_motion(self, timeout_s: float = SHUTDOWN_STOP_TIMEOUT_S) -> dict[str, Any]:
         """Issue stop_motion to every live arm."""
         requests = [
@@ -389,28 +369,10 @@ class MultiRobotWrapper:
 
     # --- State queries -------------------------------------------------------
 
-    def get_robot_state(self, robot_name: str):
-        return self._request(robot_name, "get_state", [], {})
-
-    def current_joint_positions(
-        self, robot_name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
-    ):
-        return self._request(robot_name, "current_joint_positions", [], {}, timeout_s=timeout_s)
-
     def current_kinematic_state(
         self, robot_name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
-    ) -> tuple[
-        NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
-    ]:
-        """Return (q, dq, ee_translation, jacobian) for one arm.
-
-        - q, dq: 7-vector joint positions and velocities (rad, rad/s).
-        - ee_translation: 3-vector EE position in the arm's base frame (m).
-        - jacobian: 6x7 base-frame Jacobian; rows [0:3] linear, [3:6] angular.
-
-        All four arrays are read from the same robot.state snapshot so they
-        are mutually consistent for one parent-side control tick.
-        """
+    ) -> KinematicSnapshot:
+        """Return (q, dq, ee_translation, jacobian) for one arm."""
         return self._request(
             robot_name, "current_kinematic_state", [], {}, timeout_s=timeout_s
         )
@@ -419,21 +381,10 @@ class MultiRobotWrapper:
         self,
         robot_names: list[str],
         timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
-    ) -> dict[
-        str,
-        tuple[
-            NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
-        ],
-    ]:
+    ) -> dict[str, KinematicSnapshot]:
         """Query (q, dq, ee_translation, jacobian) for several arms in parallel."""
         requests = [(name, "current_kinematic_state", [], {}) for name in robot_names]
         return self._request_many(requests, timeout_s=timeout_s)
-
-    def join_motion(self, robot_name: str, timeout: float = 0.0):
-        # Grant extra budget over the in-robot timeout to allow round-trip.
-        return self._request(
-            robot_name, "join_motion", [timeout], {}, timeout_s=max(DEFAULT_REQUEST_TIMEOUT_S, timeout + 1.0)
-        )
 
     # --- Lifecycle -----------------------------------------------------------
 

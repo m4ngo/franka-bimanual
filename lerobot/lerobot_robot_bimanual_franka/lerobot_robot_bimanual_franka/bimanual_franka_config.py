@@ -8,7 +8,7 @@ from lerobot.robots import RobotConfig
 _VALID_ARMS: tuple[str, ...] = ("l", "r")
 
 
-@RobotConfig.register_subclass("my_cool_robot")
+@RobotConfig.register_subclass("bimanual_franka")
 @dataclass
 class BimanualFrankaConfig(RobotConfig):
     l_server_ip: str

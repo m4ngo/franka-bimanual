@@ -1,0 +1,13 @@
+README.md
+pyproject.toml
+lerobot_robot_bimanual_franka/__init__.py
+lerobot_robot_bimanual_franka/bimanual_franka.py
+lerobot_robot_bimanual_franka/bimanual_franka_config.py
+lerobot_robot_bimanual_franka/franka_process.py
+lerobot_robot_bimanual_franka/safety.py
+lerobot_robot_bimanual_franka/wsg.py
+lerobot_robot_bimanual_franka.egg-info/PKG-INFO
+lerobot_robot_bimanual_franka.egg-info/SOURCES.txt
+lerobot_robot_bimanual_franka.egg-info/dependency_links.txt
+lerobot_robot_bimanual_franka.egg-info/requires.txt
+lerobot_robot_bimanual_franka.egg-info/top_level.txt

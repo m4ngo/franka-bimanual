@@ -1,0 +1,2 @@
+lerobot
+dynamixel-sdk>=3.8

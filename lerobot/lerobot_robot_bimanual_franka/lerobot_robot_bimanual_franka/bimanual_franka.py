@@ -13,7 +13,7 @@ from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
 from .bimanual_franka_config import BimanualFrankaConfig
-from .franka_process import MultiRobotWrapper
+from .franka_process import KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 
@@ -26,6 +26,16 @@ NUM_JOINTS = 7
 JOINT_PD_KP = 2.5
 JOINT_PD_KD = 0.1
 
+# Per-arm action/observation feature key suffixes.
+JOINT_FEATURE_KEYS: tuple[str, ...] = (
+    *(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)),
+    "gripper",
+)
+EE_FEATURE_KEYS: tuple[str, ...] = (
+    "x", "y", "z", "roll", "pitch", "yaw", "gripper",
+)
+EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "roll", "pitch", "yaw")
+
 # Connection bring-up parameters.
 _PROCESS_STARTUP_S = 1.0
 _CONNECT_RETRIES = 3
@@ -35,7 +45,7 @@ _RETRY_SLEEP_S = 1.0
 
 class BimanualFranka(Robot):
     config_class = BimanualFrankaConfig
-    name = "my_cool_robot"
+    name = "bimanual_franka"
 
     def __init__(self, config: BimanualFrankaConfig):
         super().__init__(config)
@@ -50,6 +60,12 @@ class BimanualFranka(Robot):
         }
         self.safety = ActionSafetyScreen()
 
+        # Cache populated by `get_observation` and consumed by the very next
+        # `send_action` to avoid issuing a redundant `current_kinematic_state`
+        # IPC every loop. Cleared after a single use so a stand-alone
+        # `send_action` still fetches a fresh snapshot.
+        self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
+
     def _gripper_ip(self, arm: str) -> str:
         return getattr(self.config, f"{arm}_gripper_ip")
 
@@ -62,42 +78,18 @@ class BimanualFranka(Robot):
     def _port(self, arm: str) -> int:
         return getattr(self.config, f"{arm}_port")
 
-    @property
-    def _motors_ft(self) -> dict[str, type]:
-        """Action feature schema: end-effector deltas or joint angles."""
-        if self.use_ee_delta:
-            axes = ("x", "y", "z", "roll", "pitch", "yaw")
-            return {
-                f"{arm}_{key}": float
-                for arm in self.active_arms
-                for key in (*axes, "gripper")
-            }
-        return self._motors_ft_joints
+    def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
+        return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
     @property
-    def _motors_ft_joints(self) -> dict[str, type]:
-        """Per-joint action/observation feature schema."""
-        return {
-            f"{arm}_{key}": float
-            for arm in self.active_arms
-            for key in (
-                *(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)),
-                "gripper",
-            )
-        }
+    def observation_features(self) -> dict[str, type]:
+        return self._arm_features(JOINT_FEATURE_KEYS)
 
     @property
-    def _cameras_ft(self) -> dict[str, tuple]:
-        # Camera support is intentionally disabled; reserve the hook for later.
-        return {}
-
-    @property
-    def observation_features(self) -> dict:
-        return {**self._motors_ft_joints, **self._cameras_ft}
-
-    @property
-    def action_features(self) -> dict:
-        return self._motors_ft
+    def action_features(self) -> dict[str, type]:
+        return self._arm_features(
+            EE_FEATURE_KEYS if self.use_ee_delta else JOINT_FEATURE_KEYS
+        )
 
     @property
     def is_connected(self) -> bool:
@@ -115,7 +107,7 @@ class BimanualFranka(Robot):
                     use_ee_delta=self.use_ee_delta,
                 )
 
-            # Give each subprocess time to initialize its RPC connection.
+            # Give each subprocess time to initialise its RPC connection.
             time.sleep(_PROCESS_STARTUP_S)
             for arm in self.active_arms:
                 self._probe_arm(arm)
@@ -131,11 +123,13 @@ class BimanualFranka(Robot):
             raise
 
     def _probe_arm(self, arm: str) -> None:
-        """Confirm an arm responds to a joint-state query, retrying on failure."""
+        """Confirm an arm responds to a kinematic-state query, retrying on failure."""
         last_error: Exception | None = None
         for _ in range(_CONNECT_RETRIES):
             try:
-                self.robot_manager.current_joint_positions(arm, timeout_s=_CONNECT_TIMEOUT_S)
+                self.robot_manager.current_kinematic_state(
+                    arm, timeout_s=_CONNECT_TIMEOUT_S
+                )
                 return
             except Exception as e:
                 last_error = e
@@ -160,74 +154,89 @@ class BimanualFranka(Robot):
     def configure(self) -> None:
         pass
 
+    # ------------------------------------------------------------------
+    # Hot path: observation + action
+    # ------------------------------------------------------------------
+
+    def _fetch_kin_state(self) -> dict[str, KinematicSnapshot]:
+        """One parallel IPC round-trip to grab (q, dq, ee, J) for every arm."""
+        return self.robot_manager.current_kinematic_state_batch(
+            list(self.active_arms)
+        )
+
+    def _consume_kin_state(self) -> dict[str, KinematicSnapshot]:
+        """Return the cached snapshot if fresh, otherwise fetch one."""
+        kin_state = self._cached_kin_state
+        self._cached_kin_state = None
+        return kin_state if kin_state is not None else self._fetch_kin_state()
+
     def get_observation(self) -> RobotObservation:
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
+        kin_state = self._fetch_kin_state()
+        # Stash for send_action. send_action invalidates after consuming.
+        self._cached_kin_state = kin_state
+
         obs: RobotObservation = {}
         for arm in self.active_arms:
-            joints: np.ndarray = self.robot_manager.current_joint_positions(arm)
-            for i, value in enumerate(joints, start=1):
-                obs[f"{arm}_joint_{i}"] = value
+            q = kin_state[arm][0]
+            for i in range(NUM_JOINTS):
+                obs[f"{arm}_joint_{i + 1}"] = float(q[i])
             obs[f"{arm}_gripper"] = self.grippers[arm].position
         return obs
 
     def send_action(self, action: RobotAction) -> RobotAction:
-        """Forward gripper + arm commands. Gripper send is non-blocking.
+        """Forward gripper + arm commands.
 
-        For arm motion the parent owns PD shaping (joint mode) and the
-        safety screen, so both observe the same velocities that get
-        streamed to franky. One IPC round-trip per arm fetches the
-        kinematic snapshot used by both PD and the screen.
+        One IPC round-trip fetches the kinematic snapshot used by both the PD
+        controller and the safety screen (or reuses the snapshot stashed by
+        the immediately preceding `get_observation`). A second parallel IPC
+        ships the velocity command to both arm subprocesses. Gripper sends
+        are non-blocking and run in parallel with the arm IPC.
         """
         for arm in self.active_arms:
             self.grippers[arm].move(action[f"{arm}_gripper"], blocking=False)
 
-        kin_state = self.robot_manager.current_kinematic_state_batch(
-            list(self.active_arms)
-        )
+        kin_state = self._consume_kin_state()
 
         if self.use_ee_delta:
-            ee_by_arm = {
-                arm: np.array(
-                    [action[f"{arm}_{axis}"] for axis in ("x", "y", "z", "roll", "pitch", "yaw")],
+            twists = {
+                arm: np.fromiter(
+                    (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
                     dtype=np.float64,
+                    count=len(EE_AXIS_KEYS),
                 )
                 for arm in self.active_arms
             }
-            ee_by_arm = self.safety.screen_ee_actions(ee_by_arm, kin_state)
-            ee_by_arm = {
-                arm: self.safety.clamp_ee_twist_magnitude(twist)
-                for arm, twist in ee_by_arm.items()
-            }
+            twists = self.safety.shape_ee(twists, kin_state)
             self.robot_manager.move_ee_delta_batch(
-                {arm: twist.tolist() for arm, twist in ee_by_arm.items()},
+                {arm: twist.tolist() for arm, twist in twists.items()},
                 asynchronous=True,
             )
             return action
 
-        # Joint mode: PD turns the position target into a velocity, the
-        # safety screen shapes that velocity, and the magnitude clamp is
-        # the final hardware-safe ceiling.
-        joint_velocities_by_arm: dict[str, np.ndarray] = {}
-        for arm in self.active_arms:
-            target = np.asarray(
-                [action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)],
-                dtype=np.float64,
-            )
-            q, dq, _, _ = kin_state[arm]
-            joint_velocities_by_arm[arm] = JOINT_PD_KP * (target - q) - JOINT_PD_KD * dq
-
-        joint_velocities_by_arm = self.safety.screen_joint_actions(
-            joint_velocities_by_arm, kin_state
-        )
-        joint_velocities_by_arm = {
-            arm: self.safety.clamp_joint_velocity_magnitude(vel)
-            for arm, vel in joint_velocities_by_arm.items()
+        # Joint mode: PD turns each position target into a velocity, then the
+        # safety screen + magnitude clamp shape it before it goes out.
+        velocities = {
+            arm: self._joint_pd(action, arm, kin_state[arm])
+            for arm in self.active_arms
         }
-
+        velocities = self.safety.shape_joint(velocities, kin_state)
         self.robot_manager.move_joint_velocity_batch(
-            {arm: vel.tolist() for arm, vel in joint_velocities_by_arm.items()},
+            {arm: vel.tolist() for arm, vel in velocities.items()},
             asynchronous=True,
         )
         return action
+
+    @staticmethod
+    def _joint_pd(
+        action: RobotAction, arm: str, snapshot: KinematicSnapshot
+    ) -> np.ndarray:
+        target = np.fromiter(
+            (action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)),
+            dtype=np.float64,
+            count=NUM_JOINTS,
+        )
+        q, dq, _, _ = snapshot
+        return JOINT_PD_KP * (target - q) - JOINT_PD_KD * dq

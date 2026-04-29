@@ -1,7 +1,15 @@
-"""Configuration dataclass for the GELLO teleoperator plugin.
+"""Configuration dataclasses for the GELLO teleoperator plugin.
 
-Defines serial port settings, calibration home pose, per-joint signs, and
-optional smoothing/async parameters used by :class:`Gello`.
+Defines two pieces:
+
+* :class:`GelloLeaderFields` — a plain dataclass holding the per-arm GELLO
+  hardware/calibration parameters. This is the type used for
+  ``BimanualGelloConfig.left_arm_config`` / ``right_arm_config`` so that
+  draccus does not treat it as a polymorphic ``TeleoperatorConfig`` choice
+  (which would otherwise recurse infinitely through the choice registry).
+* :class:`GelloConfig` — the registered ``"gello"`` teleoperator choice. It
+  composes the leader fields with the standard ``id`` / ``calibration_dir``
+  metadata from :class:`TeleoperatorConfig`.
 """
 
 from dataclasses import dataclass, field
@@ -9,9 +17,16 @@ from dataclasses import dataclass, field
 from lerobot.teleoperators.config import TeleoperatorConfig
 
 
-@TeleoperatorConfig.register_subclass("gello")
 @dataclass
-class GelloConfig(TeleoperatorConfig):
+class GelloLeaderFields:
+    """Hardware + calibration parameters for one GELLO leader arm.
+
+    This is intentionally a plain dataclass (not a :class:`TeleoperatorConfig`
+    subclass) so it can be embedded in higher-level configs (such as
+    :class:`BimanualGelloConfig`) without being treated as a polymorphic
+    choice by draccus.
+    """
+
     # Serial port that the Dynamixel bus is attached to.
     port: str = "/dev/ttyUSB0"
     baudrate: int = 57_600
@@ -31,3 +46,9 @@ class GelloConfig(TeleoperatorConfig):
     smoothing: float = 0.99
     # If True, read motor states in a background thread to hide USB latency.
     use_async: bool = True
+
+
+@TeleoperatorConfig.register_subclass("gello")
+@dataclass
+class GelloConfig(TeleoperatorConfig, GelloLeaderFields):
+    """Standalone GELLO leader, exposed as the ``"gello"`` teleoperator type."""

@@ -9,12 +9,9 @@ dependencies = [
     "dynamixel-sdk>=3.8",
 ]
 
-[tool.setuptools]
-packages = [
-    "lerobot_teleoperator_gello",
-    "lerobot_teleoperator_gello.lerobot_teleoperator_gello",
-]
-
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["lerobot_teleoperator_gello", "lerobot_teleoperator_gello.*"]

@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: lerobot_teleoperator_gello
+Version: 0.1.0
+Summary: A lerobot plugin for the franka gello (by Phillip Wu) teleop device from Aaron Tsai, forked from the implementation by (https://github.com/F-Fer/lerobot_ur5e_gello.git).
+Requires-Python: >=3.11
+Requires-Dist: lerobot
+Requires-Dist: dynamixel-sdk>=3.8

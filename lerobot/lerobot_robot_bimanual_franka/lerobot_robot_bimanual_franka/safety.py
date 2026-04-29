@@ -25,6 +25,8 @@ all read from the same robot.state and therefore mutually consistent.
 
 import numpy as np
 
+from .franka_process import KinematicSnapshot
+
 # --- Worktable safety -------------------------------------------------------
 # Two layers stack to brake the downward (toward-the-table) component of
 # the commanded EE motion:
@@ -88,15 +90,31 @@ EE_LINEAR_VELOCITY_MAX = 0.30  # m/s
 EE_ANGULAR_VELOCITY_MAX = 1.20  # rad/s
 
 
-# Type alias for the kinematic snapshot returned by
-# MultiRobotWrapper.current_kinematic_state(_batch). Documented here so
-# callers don't have to spell the tuple out everywhere.
-# Layout: (q, dq, ee_translation, jacobian)
-#   q              : (7,)   joint positions     (rad)
-#   dq             : (7,)   joint velocities    (rad/s)
-#   ee_translation : (3,)   EE position in base (m)
-#   jacobian       : (6, 7) base-frame Jacobian
-KinematicSnapshot = tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+def _clamp_joint_velocity(velocity: np.ndarray) -> np.ndarray:
+    """Scale a 7-DoF velocity vector down to JOINT_VELOCITY_MAX in L2 norm."""
+    norm = float(np.linalg.norm(velocity))
+    if norm > JOINT_VELOCITY_MAX:
+        return velocity * (JOINT_VELOCITY_MAX / norm)
+    return velocity
+
+
+def _clamp_ee_twist(twist: np.ndarray) -> np.ndarray:
+    """Scale a 6-DoF EE twist [vx, vy, vz, wx, wy, wz] down to safe norms.
+
+    Linear and angular halves are clamped independently because they have
+    different units.
+    """
+    twist = np.asarray(twist, dtype=np.float64).copy()
+    linear, angular = twist[:3], twist[3:]
+    lin_norm = float(np.linalg.norm(linear))
+    if lin_norm > EE_LINEAR_VELOCITY_MAX:
+        linear *= EE_LINEAR_VELOCITY_MAX / lin_norm
+    ang_norm = float(np.linalg.norm(angular))
+    if ang_norm > EE_ANGULAR_VELOCITY_MAX:
+        angular *= EE_ANGULAR_VELOCITY_MAX / ang_norm
+    twist[:3] = linear
+    twist[3:] = angular
+    return twist
 
 
 class ActionSafetyScreen:
@@ -104,8 +122,9 @@ class ActionSafetyScreen:
 
     All checks are pure functions of (action, kinematic_state) and return a
     new action of the same shape. Composition is a left-to-right pipe inside
-    `screen_ee_actions` / `screen_joint_actions` so adding a new check is a
-    one-line edit there.
+    `shape_ee` / `shape_joint`, which apply each screen in turn and finish
+    with the hardware-safe magnitude clamp; adding a new check is a one-line
+    edit there.
     """
 
     def __init__(
@@ -119,61 +138,30 @@ class ActionSafetyScreen:
     # ------------------------------------------------------------------
     # Public entry points
     # ------------------------------------------------------------------
-    def screen_ee_actions(
+    def shape_ee(
         self,
         ee_by_arm: dict[str, np.ndarray],
         kin_state: dict[str, KinematicSnapshot],
     ) -> dict[str, np.ndarray]:
-        """Apply worktable / bimanual safety to EE-twist actions."""
+        """Apply screens then the magnitude clamp to EE-twist actions."""
         ee_by_arm = self._apply_worktable_brake(ee_by_arm, kin_state, is_ee=True)
         # ee_by_arm = self._apply_bimanual_repel(ee_by_arm, kin_state, is_ee=True)  # TODO
-        return ee_by_arm
+        return {arm: _clamp_ee_twist(twist) for arm, twist in ee_by_arm.items()}
 
-    def screen_joint_actions(
+    def shape_joint(
         self,
         joint_velocities_by_arm: dict[str, np.ndarray],
         kin_state: dict[str, KinematicSnapshot],
     ) -> dict[str, np.ndarray]:
-        """Apply worktable / bimanual safety to joint-velocity actions."""
+        """Apply screens then the magnitude clamp to joint-velocity actions."""
         joint_velocities_by_arm = self._apply_worktable_brake(
             joint_velocities_by_arm, kin_state, is_ee=False
         )
         # joint_velocities_by_arm = self._apply_bimanual_repel(joint_velocities_by_arm, kin_state, is_ee=False)  # TODO
-        return joint_velocities_by_arm
-
-    @staticmethod
-    def clamp_joint_velocity_magnitude(velocity: np.ndarray) -> np.ndarray:
-        """Scale a 7-DoF velocity vector down to JOINT_VELOCITY_MAX in L2 norm.
-
-        Applied as the final stage of the joint pipeline, after every other
-        screen, so no upstream check can push the command past the hardware-
-        safe ceiling.
-        """
-        norm = float(np.linalg.norm(velocity))
-        if norm > JOINT_VELOCITY_MAX:
-            return velocity * (JOINT_VELOCITY_MAX / norm)
-        return velocity
-
-    @staticmethod
-    def clamp_ee_twist_magnitude(twist: np.ndarray) -> np.ndarray:
-        """Scale a 6-DoF EE twist [vx, vy, vz, wx, wy, wz] down to safe norms.
-
-        Linear and angular halves are clamped independently because they
-        have different units. Applied as the final stage of the EE pipeline,
-        after every other screen, so no upstream check can push the command
-        past the hardware-safe ceiling.
-        """
-        twist = np.asarray(twist, dtype=np.float64).copy()
-        linear, angular = twist[:3], twist[3:]
-        lin_norm = float(np.linalg.norm(linear))
-        if lin_norm > EE_LINEAR_VELOCITY_MAX:
-            linear *= EE_LINEAR_VELOCITY_MAX / lin_norm
-        ang_norm = float(np.linalg.norm(angular))
-        if ang_norm > EE_ANGULAR_VELOCITY_MAX:
-            angular *= EE_ANGULAR_VELOCITY_MAX / ang_norm
-        twist[:3] = linear
-        twist[3:] = angular
-        return twist
+        return {
+            arm: _clamp_joint_velocity(vel)
+            for arm, vel in joint_velocities_by_arm.items()
+        }
 
     # ------------------------------------------------------------------
     # Worktable brake
