@@ -1,3 +1,4 @@
+# Script for teleoperating the robot.
 lerobot-teleoperate \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \

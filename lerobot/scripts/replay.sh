@@ -1,3 +1,4 @@
+# Script for replaying a recorded dataset.
 # $1 is repo id
 # $2 is episode number
 if [ -z "$1" ] || [ -z "$2" ]; then

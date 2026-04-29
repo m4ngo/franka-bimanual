@@ -1,3 +1,4 @@
+# Script for recording data for a given task.
 # $1 is repo id
 # $2 is number of episodes
 # $3 is task name
@@ -21,6 +22,7 @@ lerobot-record \
     --dataset.num_episodes=$2 \
     --dataset.single_task=$3 \
     --dataset.streaming_encoding=true \
+    --dataset.vcodec=auto \
     --dataset.fps=20 \
     --display_data=true \
     --teleop.id=gello_teleop \
