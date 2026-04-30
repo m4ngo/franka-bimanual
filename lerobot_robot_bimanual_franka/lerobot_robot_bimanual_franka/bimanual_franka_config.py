@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from lerobot.robots import RobotConfig
 from lerobot.cameras import CameraConfig
 from lerobot_camera_arv import ArvCameraConfig  # type: ignore
+from lerobot_camera_framos import FramosCameraConfig  # type: ignore
 
 # Arm identifier -> side. Ordered tuple preserves CLI / config ordering.
 _VALID_ARMS: tuple[str, ...] = ("l", "r")
@@ -56,7 +57,7 @@ class BimanualFrankaConfig(RobotConfig):
     r_port: int
     use_ee_delta: bool
     active_arms: tuple[str, ...] = _VALID_ARMS
-    cameras: dict[str, ArvCameraConfig] = field(
+    cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_1": ArvCameraConfig(
                 name="gripper_bfs_23595723",
@@ -65,9 +66,10 @@ class BimanualFrankaConfig(RobotConfig):
                 width=240,
                 height=150,
             ),
-            "cam_2": ArvCameraConfig(
+            "cam_2": FramosCameraConfig(
                 name="workspace_framos_d71",
                 ip="192.168.0.116",
+                serial_number="6CD146030D71",
                 fps=20,
                 width=240,
                 height=135,
@@ -93,9 +95,10 @@ class BimanualFrankaConfig(RobotConfig):
                 width=240,
                 height=150,
             ),
-            "cam_6": ArvCameraConfig(
+            "cam_6": FramosCameraConfig(
                 name="workspace_framos_d63",
                 ip="192.168.1.102",
+                serial_number="6CD146030D63",
                 fps=20,
                 width=240,
                 height=135,

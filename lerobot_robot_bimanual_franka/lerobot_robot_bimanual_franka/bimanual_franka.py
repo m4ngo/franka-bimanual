@@ -11,10 +11,13 @@ from functools import cached_property
 
 import numpy as np
 
+from lerobot.cameras.camera import Camera
+from lerobot.cameras.configs import CameraConfig
 from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
 from lerobot_camera_arv import ArvCamera, ArvCameraConfig  # type: ignore
+from lerobot_camera_framos import FramosCamera, FramosCameraConfig  # type: ignore
 
 from .bimanual_franka_config import BimanualFrankaConfig
 from .franka_process import KinematicSnapshot, MultiRobotWrapper
@@ -59,7 +62,7 @@ class BimanualFranka(Robot):
         self.config = config
         self.use_ee_delta = config.use_ee_delta
         self.active_arms = config.active_arms
-        self.cameras: dict[str, ArvCamera] = {
+        self.cameras: dict[str, Camera] = {
             camera_name: self._make_camera(camera_config)
             for camera_name, camera_config in self.config.cameras.items()
         }
@@ -92,16 +95,21 @@ class BimanualFranka(Robot):
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
-    def _make_camera(self, camera: ArvCameraConfig) -> ArvCamera:
-        return ArvCamera(
-            ArvCameraConfig(
-                name=camera.name,
-                ip=camera.ip,
-                width=camera.width,
-                height=camera.height,
-                fps=camera.fps,
+    def _make_camera(self, camera: CameraConfig) -> Camera:
+        if isinstance(camera, FramosCameraConfig):
+            return FramosCamera(camera)
+        if isinstance(camera, ArvCameraConfig):
+            return ArvCamera(
+                ArvCameraConfig(
+                    name=camera.name,
+                    ip=camera.ip,
+                    width=camera.width,
+                    height=camera.height,
+                    fps=camera.fps,
+                    pixel_format=camera.pixel_format
+                )
             )
-        )
+        raise TypeError(f"Unsupported camera config type: {type(camera).__name__}")
 
     @cached_property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:

@@ -1,0 +1,8 @@
+pyproject.toml
+lerobot_camera_framos/__init__.py
+lerobot_camera_framos/config_framos.py
+lerobot_camera_framos/framos.py
+lerobot_camera_framos.egg-info/PKG-INFO
+lerobot_camera_framos.egg-info/SOURCES.txt
+lerobot_camera_framos.egg-info/dependency_links.txt
+lerobot_camera_framos.egg-info/top_level.txt
