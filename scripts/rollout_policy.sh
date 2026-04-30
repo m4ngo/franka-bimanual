@@ -19,8 +19,8 @@ if command -v conda >/dev/null 2>&1; then
   conda activate lerobot >/dev/null 2>&1 || true
 fi
 
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ]; then
-    echo "Usage: $0 <repo_id> <policy_repo_id> <number_of_episodes>"
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
+    echo "Usage: $0 <repo_id> <number_of_episodes> <policy_repo_id> <output_dir>"
     exit 1
 fi
 lerobot-record \
@@ -36,6 +36,7 @@ lerobot-record \
     --robot.use_ee_delta=false \
     --dataset.repo_id="$1" \
     --dataset.num_episodes="$2" \
+    --dataset.root="$4" \
     --dataset.single_task="Evaluating policy $3 on dataset $1" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \

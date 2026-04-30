@@ -27,7 +27,7 @@ _BAYER_TO_RGB: dict[str, int] = {
     # "BayerBG8": cv2.COLOR_BAYER_BG2RGB,
     # "BayerGB8": cv2.COLOR_BAYER_GB2RGB,
     # "BayerGR8": cv2.COLOR_BAYER_GR2RGB,
-    "BayerRG8": cv2.COLOR_BayerBG2BGR,
+    "BayerRG8": cv2.COLOR_BAYER_BG2RGB,
     # "BayerBG10": cv2.COLOR_BAYER_BG2RGB,
     # "BayerGB10": cv2.COLOR_BAYER_GB2RGB,
     # "BayerGR10": cv2.COLOR_BAYER_GR2RGB,
