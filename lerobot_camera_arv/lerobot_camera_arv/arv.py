@@ -21,6 +21,8 @@ from .config_arv import ArvCameraConfig
 
 logger = logging.getLogger(__name__)
 
+DOWNSCALE_FACTOR = 8
+
 _BAYER_TO_RGB: dict[str, int] = {
     "BayerBG8": cv2.COLOR_BAYER_BG2RGB,
     "BayerGB8": cv2.COLOR_BAYER_GB2RGB,
@@ -51,6 +53,9 @@ class ArvCamera(Camera):
         self._stream: Aravis.Stream | None = None
         self._payload: int = 0
         self._last_frame: np.ndarray | None = None
+
+        self._sensor_width: int = self._width * DOWNSCALE_FACTOR
+        self._sensor_height: int = self._height * DOWNSCALE_FACTOR
 
     @property
     def is_connected(self) -> bool:
@@ -137,18 +142,20 @@ class ArvCamera(Camera):
     def _buffer_to_rgb(self, buffer: Aravis.Buffer) -> np.ndarray:
         if self._camera is None:
             return self.blank_frame()
-
-        width = int(self._safe_get_int(self._camera, "Width", self._width))
-        height = int(self._safe_get_int(self._camera, "Height", self._height))
+        # Use the camera's actual sensor dimensions when decoding the
+        # incoming buffer so we keep the full frame (no camera-side crop).
+        width = int(self._safe_get_int(self._camera, "Width", self._sensor_width))
+        height = int(self._safe_get_int(self._camera, "Height", self._sensor_height))
         data = buffer.get_data()
         frame = self._decode_frame(data, width, height, self._pixel_format)
 
-        if frame.shape[0] != self._height or frame.shape[1] != self._width:
-            frame = cv2.resize(
-                frame,
-                (self._width, self._height),
-                interpolation=cv2.INTER_AREA,
-            )
+        # If the requested output size differs from the sensor size, downsample
+        # in software (preserve the full frame then resize). This avoids camera
+        # ROI/cropping behavior on the device.
+        if (self._height and self._width) and (
+            frame.shape[0] != self._height or frame.shape[1] != self._width
+        ):
+            frame = cv2.resize(frame, (self._width, self._height), interpolation=cv2.INTER_AREA)
         return np.ascontiguousarray(frame)
 
     def _configure_camera(self, camera: Aravis.Camera) -> None:
@@ -158,8 +165,8 @@ class ArvCamera(Camera):
             logger.debug("Could not set packet size on %s %s", self._name, self._ip, exc_info=True)
 
         camera.set_acquisition_mode(Aravis.AcquisitionMode.CONTINUOUS)
-        self._safe_set_int(camera, "Width", self._width)
-        self._safe_set_int(camera, "Height", self._height)
+        self._safe_set_int(camera, "Width", self._sensor_width)
+        self._safe_set_int(camera, "Height", self._sensor_height)
         if self._config.fps is not None:
             self._safe_set_float(camera, "AcquisitionFrameRate", float(self._config.fps))
 

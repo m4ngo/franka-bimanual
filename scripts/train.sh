@@ -22,7 +22,7 @@ fi
 lerobot-train \  
   --dataset.repo_id="$1" \  
   --policy.type=act \  
-  --output_dir="outputs/train/act_$1" \  
+  --output_dir="~/franka_data/policy/train/act_$1" \  
   --job_name="act_$1" \  
   --policy.device=cuda \  
   --wandb.enable=true \  

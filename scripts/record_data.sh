@@ -24,6 +24,7 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
     exit 1
 fi
 lerobot-record \
+    --resume=true \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
     --robot.l_robot_ip=192.168.200.2 \

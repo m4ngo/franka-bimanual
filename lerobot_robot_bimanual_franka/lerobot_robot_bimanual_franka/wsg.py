@@ -61,7 +61,7 @@ class WSG:
     # from piling up at the gripper, ``_TARGET_CHANGE_THRESH_MM`` absorbs
     # noisy teleop input without an actual dead-zone.
     _MIN_MOVE_INTERVAL_S = 0.050       # ~20 Hz max MOVE rate
-    _TARGET_CHANGE_THRESH_MM = 1.0
+    _TARGET_CHANGE_THRESH_MM = 0.5
     _POS_POLL_INTERVAL_S = 0.050       # ~20 Hz POS? poll
     _SOCK_RECV_TIMEOUT_S = 0.5
     _RECV_BUF_SIZE = 4096
@@ -291,7 +291,7 @@ class WSG:
                         target_dirty
                         and (now - self._last_move_send_t) >= self._MIN_MOVE_INTERVAL_S
                     ):
-                        target = self._target_mm  # type: ignore[assignment]
+                        target = self._target_mm
                         self._last_sent_target_mm = target
                         self._last_move_send_t = now
                         cmd_to_send = self._move_cmd(target)
