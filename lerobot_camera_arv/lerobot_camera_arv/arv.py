@@ -24,18 +24,7 @@ logger = logging.getLogger(__name__)
 DOWNSCALE_FACTOR = 8
 
 _BAYER_TO_RGB: dict[str, int] = {
-    "BayerBG8": cv2.COLOR_BAYER_BG2RGB,
-    "BayerGB8": cv2.COLOR_BAYER_GB2RGB,
-    "BayerGR8": cv2.COLOR_BAYER_GR2RGB,
-    "BayerRG8": cv2.COLOR_BAYER_RG2RGB,
-    "BayerBG10": cv2.COLOR_BAYER_BG2RGB,
-    "BayerGB10": cv2.COLOR_BAYER_GB2RGB,
-    "BayerGR10": cv2.COLOR_BAYER_GR2RGB,
-    "BayerRG10": cv2.COLOR_BAYER_RG2RGB,
-    "BayerBG12": cv2.COLOR_BAYER_BG2RGB,
-    "BayerGB12": cv2.COLOR_BAYER_GB2RGB,
-    "BayerGR12": cv2.COLOR_BAYER_GR2RGB,
-    "BayerRG12": cv2.COLOR_BAYER_RG2RGB,
+    "BayerBG8": cv2.COLOR_BayerBG2BGR
 }
 
 
