@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 DOWNSCALE_FACTOR = 8
 
-BUFFER_RING_SIZE = 8
+BUFFER_RING_SIZE = 4
 
 
 def _payload_bytes(width: int, height: int, pixel_format: str) -> int:
