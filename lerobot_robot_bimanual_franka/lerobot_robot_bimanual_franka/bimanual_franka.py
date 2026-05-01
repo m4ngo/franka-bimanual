@@ -16,8 +16,8 @@ from lerobot.cameras.configs import CameraConfig
 from lerobot.robots import Robot
 from lerobot.types import RobotAction, RobotObservation
 
-from lerobot_camera_arv import ArvCamera, ArvCameraConfig  # type: ignore
-from lerobot_camera_framos import FramosCamera, FramosCameraConfig  # type: ignore
+from lerobot_camera_arv import ArvCamera, ArvCameraConfig
+from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
 from .bimanual_franka_config import BimanualFrankaConfig
 from .franka_process import KinematicSnapshot, MultiRobotWrapper

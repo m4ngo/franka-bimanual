@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: lerobot_teleoperator_spacemouse
+Version: 0.1.0
+Summary: A LeRobot plugin for the 3Dconnexion SpaceMouse: produces EE-delta twists and uses the two device buttons as gripper open/close commands.
+Requires-Python: >=3.11
+Requires-Dist: lerobot
+Requires-Dist: pyspacemouse>=2.0

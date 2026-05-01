@@ -1,0 +1,2 @@
+lerobot
+pyspacemouse>=2.0
