@@ -15,7 +15,7 @@ class FramosCameraConfig(CameraConfig):
     depth_width: int = 1280
     depth_height: int = 720
     align_to: str = "color"
-    color_format: str = "bgr8"
+    color_format: str = "rgb8"
     depth_format: str = "z16"
     #: librealsense only accepts discrete FPS (typically 6/15/30/60/90 on D415e).
     #: If unset, FPS is snapped from `CameraConfig.fps` automatically in `FramosCamera`.

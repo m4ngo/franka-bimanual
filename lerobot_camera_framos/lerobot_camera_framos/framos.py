@@ -269,6 +269,9 @@ class FramosCamera(Camera):
                     interpolation=cv2.INTER_AREA,
                 )
             arr = np.ascontiguousarray(arr)
+            # Match lerobot_camera_arv (Bayer→RGB): tensors are RGB channel order for LeRobot/stack.
+            if arr.ndim == 3 and arr.shape[2] == 3 and self._config.color_format.lower() == "bgr8":
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
             self._last_color = arr
             return arr.copy()
 

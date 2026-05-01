@@ -59,7 +59,7 @@ def main() -> int:
         sn = dev.get_info(rs.camera_info.serial_number)
         cfg = rs.config()
         cfg.enable_device(sn)
-        cfg.enable_stream(rs.stream.color, COLOR_W, COLOR_H, rs.format.bgr8, FPS)
+        cfg.enable_stream(rs.stream.color, COLOR_W, COLOR_H, rs.format.rgb8, FPS)
         cfg.enable_stream(rs.stream.depth, DEPTH_W, DEPTH_H, rs.format.z16, FPS)
 
         pipeline = rs.pipeline()
@@ -93,7 +93,8 @@ def main() -> int:
 
             color_path = os.path.join(OUTDIR, f"FRAMOS_{sn}_color.png")
             depth_path = os.path.join(OUTDIR, f"FRAMOS_{sn}_depth.png")
-            cv2.imwrite(color_path, color_np)
+            # Frames are RGB in memory (`rgb8`); OpenCV PNG expects BGR.
+            cv2.imwrite(color_path, cv2.cvtColor(color_np, cv2.COLOR_RGB2BGR))
             cv2.imwrite(depth_path, depth_vis)
             valid = (depth_np > 0).sum()
             print(
