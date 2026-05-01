@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 
 DOWNSCALE_FACTOR = 8
 
-BUFFER_RING_SIZE = 48
+BUFFER_RING_SIZE = 8
 
 
 def _payload_bytes(width: int, height: int, pixel_format: str) -> int:
@@ -74,6 +74,10 @@ class ArvCamera(Camera):
         self._stream: Aravis.Stream | None = None
         self._payload: int = 0
         self._last_frame: np.ndarray | None = None
+
+        # Rolling FPS diagnostics — logs measured rate every 100 frames.
+        self._fps_times: list[float] = []
+        self._fps_log_interval: int = 100
 
         self._sensor_width: int = self._width * DOWNSCALE_FACTOR
         self._sensor_height: int = self._height * DOWNSCALE_FACTOR
@@ -133,43 +137,65 @@ class ArvCamera(Camera):
         return np.zeros((self._height, self._width, 3), dtype=np.uint8)
 
     def _fetch_frame(self, timeout_s: float, allow_stale: bool) -> np.ndarray:
+        """Fetch the most-recent frame, mirroring FramosCamera._fetch_color().
+
+        Aravis buffers form a FIFO: without draining, the consumer always reads
+        the *oldest* queued frame, which can lag seconds behind reality when the
+        ring fills up.  After blocking until at least one frame arrives we drain
+        every additional ready buffer (recycling them back to the camera) so the
+        frame we decode is always the freshest — exactly what the RealSense
+        pipeline.wait_for_frames() does internally for the FRAMOS cameras.
+        """
         if self._stream is None:
             return self.blank_frame()
 
-        deadline = time.monotonic() + max(timeout_s, 0.0)
-        while True:
-            buffer = self._stream.try_pop_buffer()
-            if buffer is not None:
-                try:
-                    if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
-                        try:
-                            frame = self._buffer_to_rgb(buffer)
-                        except ValueError as exc:
-                            # Truncated / padded GigE payload: skip this buffer and grab
-                            # the next (common when many cameras saturate the NIC).
-                            logger.debug(
-                                "Dropped frame %s @ %s: %s",
-                                self._name,
-                                self._ip,
-                                exc,
-                            )
-                            continue
-                        self._last_frame = frame
-                        return frame.copy()
-                finally:
-                    self._stream.push_buffer(buffer)
+        # Block until the first frame is ready (or timeout elapses).
+        timeout_us = max(1, int(timeout_s * 1_000_000))
+        buffer = self._stream.timeout_pop_buffer(timeout_us)
 
-            if allow_stale and self._last_frame is not None:
+        if buffer is None:
+            if self._last_frame is not None:
                 return self._last_frame.copy()
+            if allow_stale:
+                return self.blank_frame()
+            raise TimeoutError(
+                f"Timed out reading camera {self._name} ({self._config.ip})."
+            )
 
-            if time.monotonic() >= deadline:
-                if self._last_frame is not None:
-                    return self._last_frame.copy()
-                raise TimeoutError(
-                    f"Timed out reading camera {self._name} ({self._config.ip})."
-                )
+        # Drain any frames that queued up while we were busy elsewhere so we
+        # always deliver the freshest image, not one from seconds ago.
+        dropped = 0
+        while True:
+            newer = self._stream.try_pop_buffer()
+            if newer is None:
+                break
+            self._stream.push_buffer(buffer)  # recycle the older frame
+            buffer = newer
+            dropped += 1
+        if dropped:
+            logger.debug("%s: drained %d stale frame(s) to stay current", self._name, dropped)
 
-            time.sleep(0.005)
+        try:
+            if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
+                try:
+                    frame = self._buffer_to_rgb(buffer)
+                except ValueError as exc:
+                    # Truncated / padded GigE payload — fall back to last known.
+                    logger.debug("Dropped frame %s @ %s: %s", self._name, self._ip, exc)
+                else:
+                    self._last_frame = frame
+                    self._record_fps()
+                    return frame.copy()
+        finally:
+            self._stream.push_buffer(buffer)
+
+        if self._last_frame is not None:
+            return self._last_frame.copy()
+        if allow_stale:
+            return self.blank_frame()
+        raise TimeoutError(
+            f"Camera {self._name} ({self._config.ip}): frame had non-SUCCESS status."
+        )
 
     def _buffer_to_rgb(self, buffer: Aravis.Buffer) -> np.ndarray:
         if self._camera is None:
@@ -215,6 +241,9 @@ class ArvCamera(Camera):
         self._safe_set_int(camera, "Width", self._sensor_width)
         self._safe_set_int(camera, "Height", self._sensor_height)
         if self._config.fps is not None:
+            # Some GigE cameras gate the FPS register behind a separate enable
+            # boolean; set it first so the rate write actually takes effect.
+            self._safe_set_bool(camera, "AcquisitionFrameRateEnable", True)
             self._safe_set_float(camera, "AcquisitionFrameRate", float(self._config.fps))
 
     def _decode_frame(self, data: bytes, width: int, height: int, pixel_format: str) -> np.ndarray:
@@ -241,6 +270,30 @@ class ArvCamera(Camera):
             return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
         except Exception as exc:
             raise ValueError(f"Unsupported pixel format {pixel_format} on {self._name}") from exc
+
+    def _record_fps(self) -> None:
+        """Track inter-frame timestamps and log measured FPS periodically."""
+        now = time.monotonic()
+        self._fps_times.append(now)
+        if len(self._fps_times) >= self._fps_log_interval:
+            elapsed = self._fps_times[-1] - self._fps_times[0]
+            if elapsed > 0:
+                measured = (len(self._fps_times) - 1) / elapsed
+                logger.debug(
+                    "ARV %s @ %s: measured %.2f fps over last %d frames",
+                    self._name,
+                    self._ip,
+                    measured,
+                    len(self._fps_times) - 1,
+                )
+            self._fps_times = self._fps_times[-10:]  # keep a short tail for continuity
+
+    @staticmethod
+    def _safe_set_bool(camera: Aravis.Camera, key: str, value: bool) -> None:
+        try:
+            camera.set_boolean(key, value)
+        except Exception:
+            logger.debug("Could not set %s=%s", key, value, exc_info=True)
 
     @staticmethod
     def _safe_set_int(camera: Aravis.Camera, key: str, value: int) -> None:
