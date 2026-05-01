@@ -23,6 +23,27 @@ logger = logging.getLogger(__name__)
 
 DOWNSCALE_FACTOR = 8
 
+BUFFER_RING_SIZE = 48
+
+
+def _payload_bytes(width: int, height: int, pixel_format: str) -> int:
+    """Minimal raw image size in bytes (no GigE Vision chunk/metadata)."""
+
+    def _dims() -> int:
+        return int(width) * int(height)
+
+    pf = pixel_format
+    if pf == "Mono16":
+        return _dims() * 2
+    if pf.endswith("Packed") and pf != "Mono16":
+        return -1
+    if pf.startswith("Mono") or pf.startswith("Bayer"):
+        return _dims()
+    if pf == "RGB8":
+        return _dims() * 3
+    return -1
+
+
 _BAYER_TO_RGB: dict[str, int] = {
     # "BayerBG8": cv2.COLOR_BAYER_BG2RGB,
     # "BayerGB8": cv2.COLOR_BAYER_GB2RGB,
@@ -73,7 +94,7 @@ class ArvCamera(Camera):
 
         stream = camera.create_stream(None, None)
         payload = int(camera.get_payload())
-        for _ in range(20):
+        for _ in range(BUFFER_RING_SIZE):
             stream.push_buffer(Aravis.Buffer.new_allocate(payload))
 
         camera.start_acquisition()
@@ -121,7 +142,18 @@ class ArvCamera(Camera):
             if buffer is not None:
                 try:
                     if buffer.get_status() == Aravis.BufferStatus.SUCCESS:
-                        frame = self._buffer_to_rgb(buffer)
+                        try:
+                            frame = self._buffer_to_rgb(buffer)
+                        except ValueError as exc:
+                            # Truncated / padded GigE payload: skip this buffer and grab
+                            # the next (common when many cameras saturate the NIC).
+                            logger.debug(
+                                "Dropped frame %s @ %s: %s",
+                                self._name,
+                                self._ip,
+                                exc,
+                            )
+                            continue
                         self._last_frame = frame
                         return frame.copy()
                 finally:
@@ -147,6 +179,21 @@ class ArvCamera(Camera):
         width = int(self._safe_get_int(self._camera, "Width", self._sensor_width))
         height = int(self._safe_get_int(self._camera, "Height", self._sensor_height))
         data = buffer.get_data()
+        nbytes = len(data)
+        raw_expect = _payload_bytes(width, height, self._pixel_format)
+        if raw_expect > 0 and nbytes != raw_expect:
+            if nbytes < raw_expect:
+                raise ValueError(
+                    f"incomplete GigE payload: {nbytes} < {raw_expect} bytes "
+                    f"for {width}x{height} {self._pixel_format}"
+                )
+            data = bytes(data[:raw_expect])
+        elif self._payload and nbytes != self._payload and raw_expect < 0:
+            if nbytes < self._payload:
+                raise ValueError(
+                    f"short buffer ({nbytes} < payload {self._payload}): {width}x{height} {self._pixel_format}"
+                )
+
         frame = self._decode_frame(data, width, height, self._pixel_format)
 
         # If the requested output size differs from the sensor size, downsample

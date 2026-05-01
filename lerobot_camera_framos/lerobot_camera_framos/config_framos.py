@@ -17,4 +17,7 @@ class FramosCameraConfig(CameraConfig):
     align_to: str = "color"
     color_format: str = "bgr8"
     depth_format: str = "z16"
+    #: librealsense only accepts discrete FPS (typically 6/15/30/60/90 on D415e).
+    #: If unset, FPS is snapped from `CameraConfig.fps` automatically in `FramosCamera`.
+    streaming_fps: int | None = None
     options: dict[str, float] = field(default_factory=dict)

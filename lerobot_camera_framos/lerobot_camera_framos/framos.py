@@ -39,6 +39,18 @@ _STREAM_LOOKUP: dict[str, int] = {
     "infrared": rs.stream.infrared,
 }
 
+# D415 / D415e RGB + depth video modes only expose these frame rates (not e.g. 20).
+_SUPPORTED_STREAM_FPS: tuple[int, ...] = (6, 15, 30, 60, 90)
+
+
+def _snap_stream_fps(requested: int | None) -> int:
+    if requested is None:
+        return 30
+    req = int(max(1, min(requested, 90)))
+    if req in _SUPPORTED_STREAM_FPS:
+        return req
+    return min(_SUPPORTED_STREAM_FPS, key=lambda f: abs(f - req))
+
 
 class FramosCamera(Camera):
     def __init__(self, config: FramosCameraConfig):
@@ -90,7 +102,20 @@ class FramosCamera(Camera):
         if self._serial:
             cfg.enable_device(self._serial)
 
-        fps = int(self._config.fps) if self._config.fps is not None else 30
+        policy_fps = self._config.fps
+        if self._config.streaming_fps is not None:
+            stream_fps = _snap_stream_fps(self._config.streaming_fps)
+        else:
+            stream_fps = _snap_stream_fps(
+                int(policy_fps) if policy_fps is not None else None
+            )
+        if policy_fps is not None and stream_fps != int(policy_fps):
+            logger.warning(
+                "FRAMOS %s: pipeline FPS %d is not supported by the device; using %d",
+                self._name,
+                int(policy_fps),
+                stream_fps,
+            )
 
         if self._config.enable_depth:
             cfg.enable_stream(
@@ -98,7 +123,7 @@ class FramosCamera(Camera):
                 int(self._config.depth_width),
                 int(self._config.depth_height),
                 _FORMAT_LOOKUP.get(self._config.depth_format.lower(), rs.format.z16),
-                fps,
+                stream_fps,
             )
         if self._config.enable_color:
             cfg.enable_stream(
@@ -106,11 +131,24 @@ class FramosCamera(Camera):
                 int(self._config.color_width),
                 int(self._config.color_height),
                 _FORMAT_LOOKUP.get(self._config.color_format.lower(), rs.format.bgr8),
-                fps,
+                stream_fps,
             )
 
         pipeline = rs.pipeline()
-        profile = pipeline.start(cfg)
+        try:
+            profile = pipeline.start(cfg)
+        except Exception as exc:
+            try:
+                pipeline.stop()
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"FRAMOS {self._name}: pipeline.start failed: {exc}. "
+                "Check stream resolution/format/FPS against rs-enumerate-devices / "
+                "sensor.get_stream_profiles(); LeRobot `fps` is often 20 but RealSense "
+                "requires 6/15/30/60/90 — set `streaming_fps` on FramosCameraConfig if needed."
+            ) from exc
+
         self._pipeline = pipeline
         self._profile = profile
 

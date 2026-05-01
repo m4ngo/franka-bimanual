@@ -45,8 +45,8 @@ class GelloLeaderFields:
     # values closer to 0 smooth jitter but add latency.
     smoothing: float = 0.99
     # If True, read motor states in a background thread to hide USB latency.
-    use_async: bool = True,  
-    calibration_dir: Path = Path("~/franka_ws/config/gello")  # Override default
+    use_async: bool = True
+    # calibration_dir: Path = Path("~/franka_ws/config/gello")  # Override default
 
 
 @TeleoperatorConfig.register_subclass("gello")

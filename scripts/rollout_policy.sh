@@ -4,6 +4,7 @@
 # $1 is repo id
 # $2 is number of episodes
 # $3 is policy repo id
+# $4 is output directory
 #
 # Display:
 # Run local Rerun viewer on the robot/workstation host.
