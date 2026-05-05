@@ -19,12 +19,12 @@ if command -v conda >/dev/null 2>&1; then
   conda activate lerobot >/dev/null 2>&1 || true
 fi
 
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
-    echo "Usage: $0 <repo_id> <number_of_episodes> <task_name> <output_dir>"
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
+    echo "Usage: $0 <repo_id> <number_of_episodes> <task_name> <output_dir> <resume>"
     exit 1
 fi
 lerobot-record \
-    --resume=true\
+    --resume=$5\
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
     --robot.l_robot_ip=192.168.200.2 \

@@ -5,6 +5,7 @@
 # $2 is policy repo id
 # $3 is batch size
 # $4 is steps
+# $5 policy type
 
 if command -v conda >/dev/null 2>&1; then
   CONDA_BASE="$(conda info --base 2>/dev/null || true)"
@@ -15,15 +16,15 @@ if command -v conda >/dev/null 2>&1; then
   conda activate lerobot >/dev/null 2>&1 || true
 fi
 
-if [ -z "$1" ] || [ -z "$2" ]; then
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
     echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps>"
     exit 1
 fi
 lerobot-train \
   --dataset.repo_id="$1" \
-  --policy.type=act \
-  --output_dir="~/franka_data/policy/train/act_$1" \
-  --job_name="act_$1" \
+  --policy.type=$5 \
+  --output_dir="../franka_data/policy/train/$5_$1" \
+  --job_name="$5_$1" \
   --policy.device=cuda \
   --wandb.enable=true \
   --policy.repo_id="$2" \

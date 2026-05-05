@@ -10,40 +10,6 @@ from lerobot_camera_framos import FramosCameraConfig  # type: ignore
 # Arm identifier -> side. Ordered tuple preserves CLI / config ordering.
 _VALID_ARMS: tuple[str, ...] = ("l", "r")
 
-# _DEFAULT_CAMERAS: tuple[BimanualFrankaCameraConfig, ...] = (
-#     BimanualFrankaCameraConfig(
-#         name="gripper_bfs_23595723",
-#         ip="192.168.0.142",
-#         serial_number="BFS_23595723",
-#     ),
-#     BimanualFrankaCameraConfig(
-#         name="workspace_framos_d71",
-#         ip="192.168.0.116",
-#         serial_number="FRAMOS_D71",
-#     ),
-#     BimanualFrankaCameraConfig(
-#         name="gripper_bfs_23595719",
-#         ip="192.168.1.138",
-#         serial_number="BFS_23595719",
-#     ),
-#     BimanualFrankaCameraConfig(
-#         name="gripper_bfs_23595720",
-#         ip="192.168.1.139",
-#         serial_number="BFS_23595720",
-#     ),
-#     BimanualFrankaCameraConfig(
-#         name="gripper_bfs_23595724",
-#         ip="192.168.1.143",
-#         serial_number="BFS_23595724",
-#     ),
-#     BimanualFrankaCameraConfig(
-#         name="workspace_framos_d63",
-#         ip="192.168.1.102",
-#         serial_number="FRAMOS_D63",
-#     ),
-# )
-
-
 @RobotConfig.register_subclass("bimanual_franka")
 @dataclass
 class BimanualFrankaConfig(RobotConfig):
@@ -63,45 +29,45 @@ class BimanualFrankaConfig(RobotConfig):
                 name="gripper_bfs_23595723",
                 ip="192.168.0.142",
                 fps=15,
-                width=240,
-                height=150,
+                width=224,
+                height=224,
             ),
             "cam_2": FramosCameraConfig(
                 name="workspace_framos_d71",
                 ip="192.168.0.116",
                 serial_number="6CD146030D71",
                 fps=15,
-                width=240,
-                height=135,
+                width=224,
+                height=224,
             ),
             "cam_3": ArvCameraConfig(
                 name="gripper_bfs_23595719",
                 ip="192.168.1.138",
                 fps=15,
-                width=240,
-                height=150,
+                width=224,
+                height=224,
             ),
             "cam_4": ArvCameraConfig(
                 name="gripper_bfs_23595720",
                 ip="192.168.1.139",
                 fps=15,
-                width=240,
-                height=150,
+                width=224,
+                height=224,
             ),
             "cam_5": ArvCameraConfig(
                 name="gripper_bfs_23595724",
                 ip="192.168.1.143",
                 fps=15,
-                width=240,
-                height=150,
+                width=224,
+                height=224,
             ),
             "cam_6": FramosCameraConfig(
                 name="workspace_framos_d63",
                 ip="192.168.1.102",
                 serial_number="6CD146030D63",
                 fps=15,
-                width=240,
-                height=135,
+                width=224,
+                height=224,
             ),
         }
     )
