@@ -1,15 +1,10 @@
-"""Configuration dataclass for the bimanual GELLO teleoperator plugin.
+"""Configuration for the bimanual GELLO teleoperator.
 
-Pairs two :class:`GelloLeaderFields` instances (one per arm) so that
-``lerobot-teleoperate`` and ``lerobot-record`` can drive a bimanual Franka
-with two GELLO leaders through the standard
-``--teleop.type=bimanual_gello`` CLI surface.
+Uses GelloLeaderFields (plain dataclass) rather than GelloConfig (TeleoperatorConfig subclass)
+to avoid draccus recursing through the choice registry when building the CLI parser.
 
-Note: the per-arm field type is :class:`GelloLeaderFields` (a plain dataclass)
-rather than :class:`GelloConfig` (a ``TeleoperatorConfig`` choice). Embedding
-a choice-registry type here would cause draccus to recurse through every
-registered teleop type — including this one — and infinite-loop while
-building the CLI parser.
+Per-arm calibration files are derived from the bimanual id:
+  ``{id}_left.json`` and ``{id}_right.json``
 """
 
 from dataclasses import dataclass, field
@@ -22,14 +17,7 @@ from .config_gello import GelloLeaderFields
 @TeleoperatorConfig.register_subclass("bimanual_gello")
 @dataclass
 class BimanualGelloConfig(TeleoperatorConfig):
-    """Pair of GELLO leaders driving a bimanual follower (left + right arm).
-
-    The bimanual ``id`` is appended with ``_left`` / ``_right`` to produce the
-    per-arm calibration identifiers used by each underlying :class:`Gello`.
-    For example, ``--teleop.id=gello_teleop`` resolves to calibration files
-    ``gello_teleop_left.json`` and ``gello_teleop_right.json`` under
-    ``$HF_LEROBOT_HOME/calibration/teleoperators/gello/``.
-    """
+    """Pair of GELLO leaders driving a bimanual follower (left + right arm)."""
 
     left_arm_config: GelloLeaderFields = field(default_factory=GelloLeaderFields)
     right_arm_config: GelloLeaderFields = field(default_factory=GelloLeaderFields)

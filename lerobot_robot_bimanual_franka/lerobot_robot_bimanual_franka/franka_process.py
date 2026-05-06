@@ -1,9 +1,7 @@
-"""Subprocess-based Franka robot driver used by the bimanual plugin.
+"""Subprocess-based Franka robot driver for the bimanual plugin.
 
-Each Franka arm runs in its own process (RobotProcess) and communicates with
-the parent via two multiprocessing queues. MultiRobotWrapper is the
-parent-side facade that dispatches commands to the right subprocess and
-gathers their responses.
+Each arm runs in its own RobotProcess. MultiRobotWrapper is the parent-side
+facade that dispatches commands and collects responses.
 """
 
 import logging
@@ -18,49 +16,32 @@ from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-# ---- Control parameters -----------------------------------------------------
-# Duration attached to each streamed velocity command (ms). The control loop in
-# the parent process must re-issue commands faster than this or the arm stalls.
-# Position tracking / PD shaping happens in the parent (see BimanualFranka) so
-# this subprocess can stay a thin pass-through to franky.
+# Duration (ms) attached to each streamed velocity command. Parent must re-issue faster than this.
 VELOCITY_COMMAND_DURATION_MS = 500
 
-# Jacobian cache: recompute only when any joint moves more than this many
-# radians (L-inf norm) from the last cached configuration. During slow /
-# idle motion the cache persists for many cycles; at JOINT_VELOCITY_MAX
-# (2 rad/s) and 20 Hz the worst-case staleness is one cycle (0.10 rad).
-# Safety analysis: ||ΔJ_row2|| ≈ 0.10 × 0.1 → v_z error ≈ 0.02 m/s,
-# well inside the 3 cm WORKTABLE_DISTANCE_MIN safety buffer.
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad; L-inf norm
+# Recompute Jacobian only when joints move more than this (L-inf, rad) from the cached config.
+_JACOBIAN_CACHE_Q_THRESHOLD = 0.50
+
 JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-TORQUE_THRESHOLD = 100.0 # Nm
-FORCE_THRESHOLD = 200.0 # N
+TORQUE_THRESHOLD = 100.0  # Nm
+FORCE_THRESHOLD = 200.0   # N
 JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 
 EE_DELTA_RELATIVE_DYNAMICS = (0.4, 0.25, 0.15)
 
-# ---- Dimensions -------------------------------------------------------------
 NUM_JOINTS = 7
 EE_DELTA_DIMS = 6  # linear(3) + angular(3)
 
-# Kinematic snapshot returned by `current_kinematic_state(_batch)`. All four
-# arrays come from the same `robot.state` snapshot so they are mutually
-# consistent for one parent-side control tick.
-#   q              : (7,)   joint positions     (rad)
-#   dq             : (7,)   joint velocities    (rad/s)
-#   ee_translation : (3,)   EE position in base (m)
-#   jacobian       : (6, 7) base-frame Jacobian; rows [0:3] linear, [3:6] angular
+# (q, dq, ee_translation, jacobian) snapshot from one robot.state read.
 KinematicSnapshot = tuple[
     NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
 ]
 
-# ---- Timeouts ---------------------------------------------------------------
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
 SHUTDOWN_STOP_TIMEOUT_S = 2.0
 SHUTDOWN_JOIN_TIMEOUT_S = 5.0
 TERMINATE_JOIN_TIMEOUT_S = 1.0
 
-# Robot errors that are recoverable via ``recover_from_errors``
 _RECOVERABLE_ERRORS = (
     "UDP receive: Timeout",
     "communication_constrains_violation",
@@ -70,11 +51,8 @@ _RECOVERABLE_ERRORS = (
 
 
 def _validate_vector(name: str, values, expected_len: int) -> list[float]:
-    """Validate that *values* is a numeric sequence of the requested length."""
     if not isinstance(values, (list, tuple)):
-        raise ValueError(
-            f"{name} must be a list/tuple of length {expected_len}, got {type(values).__name__}"
-        )
+        raise ValueError(f"{name} must be a list/tuple of length {expected_len}, got {type(values).__name__}")
     if len(values) != expected_len:
         raise ValueError(f"{name} must have length {expected_len}, got {len(values)}")
     try:
@@ -100,19 +78,13 @@ class RobotProcess:
         self.port = port
         self.command_queue = command_queue
         self.response_queue = response_queue
-        # Determines which motion type is "primed" at startup so the
-        # controller is already in the expected control mode before the
-        # parent's first send_action.
         self.use_ee_delta = use_ee_delta
 
     def run(self):
-        """Main loop: initialise robot, then process commands until shutdown."""
         try:
-            # The parent handles Ctrl+C and issues explicit shutdown commands.
             signal.signal(signal.SIGINT, signal.SIG_IGN)
 
             from net_franky import setup_net_franky
-
             setup_net_franky(self.server_ip, self.port)
 
             from net_franky.franky import (
@@ -122,32 +94,24 @@ class RobotProcess:
                 JointVelocityMotion,
                 Robot,
                 Twist,
-                RelativeDynamicsFactor
+                RelativeDynamicsFactor,
             )
 
             robot = Robot(self.robot_ip)
             robot.recover_from_errors()
             robot.relative_dynamics_factor = RelativeDynamicsFactor(*JOINT_RELATIVE_DYNAMICS)
-            # robot.joint_velocity_limit.set([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61])
-            # robot.joint_acceleration_limit.set([15.0, 7.5, 10.0, 12.5, 15.0, 15.0, 15.0])
-            # robot.joint_jerk_limit.set([7500.0, 3750.0, 5000.0, 6250.0, 7500.0, 10000.0, 10000.0])
             robot.set_collision_behavior(TORQUE_THRESHOLD, FORCE_THRESHOLD)
             robot.set_joint_impedance(JOINT_STIFFNESS)
 
             ee_dynamics = RelativeDynamicsFactor(*EE_DELTA_RELATIVE_DYNAMICS)
-
-            # Closure that returns a fresh zero-velocity motion of the same
-            # control mode the parent has been streaming, used by the
-            # "stop_motion" and "shutdown" handlers below. Sending the
-            # wrong type at stop time triggers franky's
-            # InvalidMotionTypeException right before the rpyc connection
-            # closes, which the controller logs as a noisy traceback.
             zero_lin = np.zeros(3, dtype=np.float64)
             zero_joint = np.zeros(NUM_JOINTS, dtype=np.float64)
 
-            # Jacobian cache (see _JACOBIAN_CACHE_Q_THRESHOLD).
             _cached_jacobian: NDArray[np.float64] | None = None
             _cached_jacobian_q: NDArray[np.float64] | None = None
+            # get_last_callback_data() raises AttributeError before any motion starts (state is None).
+            # Only use the fast callback path after the robot has received at least one move command.
+            _motion_started = False
 
             def make_prime_motion():
                 if self.use_ee_delta:
@@ -156,9 +120,8 @@ class RobotProcess:
                         Duration(VELOCITY_COMMAND_DURATION_MS),
                         ee_dynamics,
                     )
-                return JointVelocityMotion(
-                    cast(Any, zero_joint), Duration(VELOCITY_COMMAND_DURATION_MS)
-                )
+                return JointVelocityMotion(cast(Any, zero_joint), Duration(VELOCITY_COMMAND_DURATION_MS))
+
         except Exception as e:
             self.response_queue.put(("error", f"Failed to initialize robot: {e}"))
             return
@@ -172,10 +135,9 @@ class RobotProcess:
                         _validate_vector("move_joint_velocity", args[0], NUM_JOINTS),
                         dtype=np.float64,
                     )
-                    motion = JointVelocityMotion(
-                        cast(Any, velocity), Duration(VELOCITY_COMMAND_DURATION_MS)
-                    )
+                    motion = JointVelocityMotion(cast(Any, velocity), Duration(VELOCITY_COMMAND_DURATION_MS))
                     result = robot.move(motion, asynchronous=args[1])
+                    _motion_started = True
                     self.response_queue.put(("success", result))
 
                 elif command == "move_ee_delta":
@@ -188,67 +150,47 @@ class RobotProcess:
                         ee_dynamics,
                     )
                     result = robot.move(motion, asynchronous=args[1])
+                    _motion_started = True
                     self.response_queue.put(("success", result))
 
                 elif command == "current_kinematic_state":
-                    # Prefer locally-buffered callback state (updated at 1 kHz
-                    # during active motion, no network round-trip) over
-                    # robot.state (RPC). Falls back before the first motion or
-                    # on any exception from get_last_callback_data().
+                    # Prefer callback-buffered state (1 kHz, no RPC) over robot.state,
+                    # but only after motion has started — before that the callback state is None.
                     _cb_state = None
-                    try:
-                        _cb_state, _, _, _, _ = robot.get_last_callback_data()
-                    except Exception:
-                        pass
+                    if _motion_started:
+                        try:
+                            _cb_state, _, _, _, _ = robot.get_last_callback_data()
+                        except Exception:
+                            pass
                     state = _cb_state if _cb_state is not None else robot.state
 
-                    q  = np.asarray(state.q,  dtype=np.float64)
+                    q = np.asarray(state.q, dtype=np.float64)
                     dq = np.asarray(state.dq, dtype=np.float64)
-                    ee_translation = np.asarray(
-                        state.O_T_EE.translation, dtype=np.float64
-                    ).flatten()
+                    ee_translation = np.asarray(state.O_T_EE.translation, dtype=np.float64).flatten()
 
-                    # Recompute the Jacobian only when joints have moved beyond
-                    # _JACOBIAN_CACHE_Q_THRESHOLD from the last cached config.
-                    # At low / moderate speeds this avoids a per-cycle RPC.
                     if (
                         _cached_jacobian is None
-                        or float(np.max(np.abs(q - _cached_jacobian_q)))
-                        > _JACOBIAN_CACHE_Q_THRESHOLD
+                        or float(np.max(np.abs(q - _cached_jacobian_q))) > _JACOBIAN_CACHE_Q_THRESHOLD
                     ):
                         try:
-                            _raw_j = robot.model.zero_jacobian(
-                                Frame.EndEffector, state
-                            )
+                            _raw_j = robot.model.zero_jacobian(Frame.EndEffector, state)
                         except Exception:
-                            # net_franky may reject a locally-derived state;
-                            # fall back to an RPC-backed state for this call.
-                            _raw_j = robot.model.zero_jacobian(
-                                Frame.EndEffector, robot.state
-                            )
+                            _raw_j = robot.model.zero_jacobian(Frame.EndEffector, robot.state)
                         _cached_jacobian = np.asarray(_raw_j, dtype=np.float64)
                         _cached_jacobian_q = q.copy()
 
-                    self.response_queue.put(
-                        ("success", (q, dq, ee_translation, _cached_jacobian))
-                    )
+                    self.response_queue.put(("success", (q, dq, ee_translation, _cached_jacobian)))
 
                 elif command == "move_joint_velocity_async":
-                    # Dispatch in a daemon thread so this command loop is not
-                    # blocked for the full RPyC round-trip of robot.move().
-                    # The next current_kinematic_state command is therefore
-                    # processed immediately without queuing behind the move.
                     _vel = np.asarray(args[0], dtype=np.float64)
-                    _motion = JointVelocityMotion(
-                        cast(Any, _vel), Duration(VELOCITY_COMMAND_DURATION_MS)
-                    )
+                    _motion = JointVelocityMotion(cast(Any, _vel), Duration(VELOCITY_COMMAND_DURATION_MS))
+                    _motion_started = True
 
                     def _run_jv(_m=_motion):
                         try:
                             robot.move(_m, asynchronous=True)
                         except Exception as _e:
-                            _et = str(_e)
-                            if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                            if any(tok in str(_e) for tok in _RECOVERABLE_ERRORS):
                                 try:
                                     robot.recover_from_errors()
                                 except Exception:
@@ -258,7 +200,6 @@ class RobotProcess:
                     threading.Thread(target=_run_jv, daemon=True).start()
 
                 elif command == "move_ee_delta_async":
-                    # Same rationale: dispatch in a daemon thread.
                     _d = args[0]
                     _motion = CartesianVelocityMotion(
                         Twist(
@@ -268,13 +209,13 @@ class RobotProcess:
                         Duration(VELOCITY_COMMAND_DURATION_MS),
                         ee_dynamics,
                     )
+                    _motion_started = True
 
                     def _run_ee(_m=_motion):
                         try:
                             robot.move(_m, asynchronous=True)
                         except Exception as _e:
-                            _et = str(_e)
-                            if any(tok in _et for tok in _RECOVERABLE_ERRORS):
+                            if any(tok in str(_e) for tok in _RECOVERABLE_ERRORS):
                                 try:
                                     robot.recover_from_errors()
                                 except Exception:
@@ -284,25 +225,14 @@ class RobotProcess:
                     threading.Thread(target=_run_ee, daemon=True).start()
 
                 elif command == "stop_motion":
-                    # Match the active control mode (see "shutdown" below)
-                    # so the stop itself isn't a motion-type change.
                     self.response_queue.put(
                         ("success", robot.move(make_prime_motion(), asynchronous=False))
                     )
-                    pass
 
                 elif command == "shutdown":
                     try:
-                        # Use the same zero-velocity prime motion we built
-                        # at init: it matches whichever control mode the
-                        # parent has been streaming, so the final stop is
-                        # NOT a motion-type change (which would otherwise
-                        # raise InvalidMotionTypeException right before
-                        # we close the rpyc connection).
                         robot.move(make_prime_motion(), asynchronous=False)
-                        pass
                     except Exception:
-                        # A failed final-stop should not block shutdown.
                         pass
                     break
 
@@ -311,12 +241,10 @@ class RobotProcess:
 
             except Exception as e:
                 error_text = str(e)
-                # Attempt in-process recovery for known transient faults.
                 if any(token in error_text for token in _RECOVERABLE_ERRORS):
                     try:
                         robot.recover_from_errors()
                     except Exception:
-                        # Keep surfacing the original exception even if recovery fails.
                         pass
                 self.response_queue.put(("error", error_text))
 
@@ -325,7 +253,6 @@ class MultiRobotWrapper:
     """Parent-side manager that dispatches commands to per-arm subprocesses."""
 
     def __init__(self):
-        # robot_name -> {"command_queue": Queue, "response_queue": Queue}
         self.robots: dict[str, dict[str, Queue]] = {}
         self.processes: dict[str, Process] = {}
 
@@ -337,21 +264,12 @@ class MultiRobotWrapper:
         port: int,
         use_ee_delta: bool = False,
     ) -> None:
-        """Spawn a subprocess for a new robot connection."""
         if name in self.processes and self.processes[name].is_alive():
             raise ValueError(f"Robot '{name}' is already connected")
 
         command_queue: Queue = Queue()
         response_queue: Queue = Queue()
-
-        worker = RobotProcess(
-            server_ip,
-            robot_ip,
-            port,
-            command_queue,
-            response_queue,
-            use_ee_delta=use_ee_delta,
-        )
+        worker = RobotProcess(server_ip, robot_ip, port, command_queue, response_queue, use_ee_delta)
         process = Process(target=worker.run, daemon=True)
         process.start()
 
@@ -360,26 +278,20 @@ class MultiRobotWrapper:
 
     @property
     def num_processes(self) -> int:
-        """Count of subprocesses that are currently alive."""
         return sum(1 for p in self.processes.values() if p.is_alive())
-
-    # --- Request plumbing ----------------------------------------------------
 
     def _enqueue(self, robot_name: str, command: str, args: list, kwargs: dict) -> None:
         if robot_name not in self.robots:
             raise KeyError(f"Robot '{robot_name}' is not registered")
-
         process = self.processes.get(robot_name)
         if process is None or not process.is_alive():
             raise RuntimeError(f"Robot process '{robot_name}' is not alive")
-
         self.robots[robot_name]["command_queue"].put((command, args, kwargs))
 
     def _collect(self, robot_name: str, command: str, timeout_s: float):
         process = self.processes.get(robot_name)
         if process is None:
             raise RuntimeError(f"Robot process '{robot_name}' is not available")
-
         try:
             status, result = self.robots[robot_name]["response_queue"].get(timeout=timeout_s)
         except Empty as e:
@@ -387,29 +299,15 @@ class MultiRobotWrapper:
                 f"Timed out waiting for '{command}' response from robot '{robot_name}'. "
                 f"Process alive: {process.is_alive()}."
             ) from e
-
         if status == "error":
             raise Exception(result)
         return result
 
-    def _request(
-        self,
-        robot_name: str,
-        command: str,
-        args: list,
-        kwargs: dict,
-        timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
-    ):
+    def _request(self, robot_name: str, command: str, args: list, kwargs: dict, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S):
         self._enqueue(robot_name, command, args, kwargs)
         return self._collect(robot_name, command, timeout_s)
 
-    def _request_many(
-        self,
-        requests: list[tuple[str, str, list, dict]],
-        timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
-    ) -> dict[str, Any]:
-        # Enqueue every command first so subprocesses run in parallel, then
-        # harvest the responses.
+    def _request_many(self, requests: list[tuple[str, str, list, dict]], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> dict[str, Any]:
         for robot_name, command, args, kwargs in requests:
             self._enqueue(robot_name, command, args, kwargs)
         return {
@@ -417,68 +315,31 @@ class MultiRobotWrapper:
             for robot_name, command, _, _ in requests
         }
 
-    # --- Motion commands -----------------------------------------------------
-
-    def move_joint_velocity_batch(
-        self, velocities_by_robot: dict[str, list], asynchronous: bool = False
-    ) -> dict[str, Any]:
-        """Send joint velocities (rad/s) to several arms in parallel.
-
-        When *asynchronous* is True the parent enqueues the command and
-        returns immediately without waiting for a subprocess acknowledgement
-        (fire-and-forget). Errors are logged by the child and surfaced on
-        the next kinematic-state request if the robot enters an error state.
-        """
+    def move_joint_velocity_batch(self, velocities_by_robot: dict[str, list], asynchronous: bool = False) -> dict[str, Any]:
+        """Send joint velocities (rad/s) to several arms in parallel."""
         if asynchronous:
             for name, vel in velocities_by_robot.items():
-                self._enqueue(
-                    name,
-                    "move_joint_velocity_async",
-                    [_validate_vector("move_joint_velocity", vel, NUM_JOINTS)],
-                    {},
-                )
+                self._enqueue(name, "move_joint_velocity_async", [_validate_vector("move_joint_velocity", vel, NUM_JOINTS)], {})
             return {}
         requests = [
-            (
-                name,
-                "move_joint_velocity",
-                [_validate_vector("move_joint_velocity", vel, NUM_JOINTS), False],
-                {},
-            )
+            (name, "move_joint_velocity", [_validate_vector("move_joint_velocity", vel, NUM_JOINTS), False], {})
             for name, vel in velocities_by_robot.items()
         ]
         return self._request_many(requests)
 
-    def move_ee_delta_batch(
-        self, positions_by_robot: dict[str, list], asynchronous: bool = False
-    ) -> dict[str, Any]:
-        """Send EE twists to several arms in parallel.
-
-        When *asynchronous* is True the parent enqueues and returns without
-        waiting (fire-and-forget, same rationale as move_joint_velocity_batch).
-        """
+    def move_ee_delta_batch(self, positions_by_robot: dict[str, list], asynchronous: bool = False) -> dict[str, Any]:
+        """Send EE twists to several arms in parallel."""
         if asynchronous:
             for name, pos in positions_by_robot.items():
-                self._enqueue(
-                    name,
-                    "move_ee_delta_async",
-                    [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS)],
-                    {},
-                )
+                self._enqueue(name, "move_ee_delta_async", [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS)], {})
             return {}
         requests = [
-            (
-                name,
-                "move_ee_delta",
-                [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS), False],
-                {},
-            )
+            (name, "move_ee_delta", [_validate_vector("move_ee_delta position", pos, EE_DELTA_DIMS), False], {})
             for name, pos in positions_by_robot.items()
         ]
         return self._request_many(requests)
 
     def stop_all_motion(self, timeout_s: float = SHUTDOWN_STOP_TIMEOUT_S) -> dict[str, Any]:
-        """Issue stop_motion to every live arm."""
         requests = [
             (name, "stop_motion", [], {})
             for name, process in self.processes.items()
@@ -486,33 +347,17 @@ class MultiRobotWrapper:
         ]
         return self._request_many(requests, timeout_s=timeout_s) if requests else {}
 
-    # --- State queries -------------------------------------------------------
+    def current_kinematic_state(self, robot_name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> KinematicSnapshot:
+        return self._request(robot_name, "current_kinematic_state", [], {}, timeout_s=timeout_s)
 
-    def current_kinematic_state(
-        self, robot_name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
-    ) -> KinematicSnapshot:
-        """Return (q, dq, ee_translation, jacobian) for one arm."""
-        return self._request(
-            robot_name, "current_kinematic_state", [], {}, timeout_s=timeout_s
-        )
-
-    def current_kinematic_state_batch(
-        self,
-        robot_names: list[str],
-        timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S,
-    ) -> dict[str, KinematicSnapshot]:
-        """Query (q, dq, ee_translation, jacobian) for several arms in parallel."""
+    def current_kinematic_state_batch(self, robot_names: list[str], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> dict[str, KinematicSnapshot]:
         requests = [(name, "current_kinematic_state", [], {}) for name in robot_names]
         return self._request_many(requests, timeout_s=timeout_s)
 
-    # --- Lifecycle -----------------------------------------------------------
-
     def shutdown(self) -> None:
-        """Stop motion, signal shutdown, then join (and terminate) workers."""
         try:
             self.stop_all_motion(timeout_s=SHUTDOWN_STOP_TIMEOUT_S)
         except Exception:
-            # Continue shutdown even if stopping one robot fails.
             pass
 
         for queues in self.robots.values():

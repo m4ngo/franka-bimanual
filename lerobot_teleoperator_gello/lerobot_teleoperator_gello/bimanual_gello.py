@@ -1,24 +1,7 @@
-"""Bimanual GELLO teleoperator: two single-arm :class:`Gello` leaders fused.
+"""Bimanual GELLO teleoperator: two single-arm Gello leaders fused into one.
 
-Mirrors the built-in ``bi_so_leader`` design (see
-``lerobot.teleoperators.bi_so_leader``) so the bimanual rig can be driven via
-the standard ``lerobot-teleoperate`` / ``lerobot-record`` entry points:
-
-```
-lerobot-teleoperate \\
-    --robot.type=bimanual_franka \\
-    ...bimanual robot args... \\
-    --teleop.type=bimanual_gello \\
-    --teleop.id=gello_teleop \\
-    --teleop.left_arm_config.port=/dev/ttyUSB0 \\
-    --teleop.right_arm_config.port=/dev/ttyUSB1
-```
-
-Per-arm calibration files default to ``{teleop.id}_left.json`` and
-``{teleop.id}_right.json`` (same convention as ``bi_so_leader``). Action keys
-are emitted with ``l_`` / ``r_`` prefixes (e.g. ``l_joint_1`` … ``r_gripper``)
-to match the schema consumed by
-:class:`lerobot_robot_bimanual_franka.BimanualFranka`.
+Action keys are emitted with ``l_`` / ``r_`` prefixes to match the schema
+expected by BimanualFranka (e.g. ``l_joint_1`` … ``r_gripper``).
 """
 
 from __future__ import annotations
@@ -36,20 +19,16 @@ from .gello import Gello
 logger = logging.getLogger(__name__)
 
 
-def _to_gello_config(
-    parent: BimanualGelloConfig, side: str, child: GelloLeaderFields
-) -> GelloConfig:
-    """Promote per-arm fields to a full :class:`GelloConfig` for one sub-leader."""
-    child_id = f"{parent.id}_{side}" if parent.id else None
+def _to_gello_config(parent: BimanualGelloConfig, side: str, child: GelloLeaderFields) -> GelloConfig:
     return GelloConfig(
-        id=child_id,
+        id=f"{parent.id}_{side}" if parent.id else None,
         calibration_dir=parent.calibration_dir,
         **asdict(child),
     )
 
 
 class BimanualGello(Teleoperator):
-    """Pair of :class:`Gello` leaders presented as a single bimanual teleop."""
+    """Pair of Gello leaders presented as a single bimanual teleoperator."""
 
     config_class = BimanualGelloConfig
     name = "bimanual_gello"
@@ -59,10 +38,6 @@ class BimanualGello(Teleoperator):
         self.config = config
         self.left_arm = Gello(_to_gello_config(config, "left", config.left_arm_config))
         self.right_arm = Gello(_to_gello_config(config, "right", config.right_arm_config))
-
-    # ------------------------------------------------------------------
-    # Teleoperator interface
-    # ------------------------------------------------------------------
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -91,11 +66,10 @@ class BimanualGello(Teleoperator):
         try:
             self.right_arm.connect(calibrate=calibrate)
         except Exception:
-            # Roll back the left arm so the dynamixel buses do not stay half-open.
             try:
                 self.left_arm.disconnect()
             except Exception:
-                logger.exception("Failed to disconnect left GELLO during bring-up rollback")
+                logger.exception("Failed to disconnect left GELLO during rollback")
             raise
 
     def calibrate(self) -> None:
@@ -122,18 +96,16 @@ class BimanualGello(Teleoperator):
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # No force feedback on GELLO yet (matches Gello.send_feedback).
         raise NotImplementedError
 
     def disconnect(self) -> None:
-        # Tolerate partial connection state so we never leak a half-open bus.
         errors: list[tuple[str, BaseException]] = []
         for label, arm in (("left", self.left_arm), ("right", self.right_arm)):
             if not arm.is_connected:
                 continue
             try:
                 arm.disconnect()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append((label, exc))
 
         if errors:

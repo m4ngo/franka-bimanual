@@ -42,8 +42,8 @@ lerobot-record \
     --dataset.root="$4" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
-    --dataset.fps=20 \
-    --display_data=true \
+    --dataset.fps=10 \
+    --display_data=false \
     --display_compressed_images=true \
     --teleop.id=gello_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \

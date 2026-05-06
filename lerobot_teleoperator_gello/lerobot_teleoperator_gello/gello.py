@@ -1,9 +1,9 @@
-"""GELLO teleoperator interface using Dynamixel motors.
+"""GELLO teleoperator using Dynamixel motors.
 
-Implements the LeRobot Teleoperator interface for the GELLO FR3 leader device
-(Philipp Wu et al., https://wuphilipp.github.io/gello_site/). Reads joint
-positions from Dynamixel servos, applies a per-joint calibration, and exposes
-normalized joint + gripper commands for the follower robot.
+Reads joint positions from Dynamixel servos, applies per-joint calibration,
+and exposes normalized joint positions and gripper commands for the follower robot.
+
+Joints are normalized by 2π (radians → unitless). Gripper is [0, 1] where 1=open.
 """
 
 import json
@@ -25,23 +25,16 @@ from .config_gello import GelloConfig
 
 logger = logging.getLogger(__name__)
 
-# Dynamixel encoder resolution: counts per 2*pi rad.
-_DYNAMIXEL_COUNTS = 4096
-# Gripper command range exposed to the follower robot, in millimeters.
-_GRIPPER_MAX_MM = 110.0
-# Fallback sleep after a read error before retrying the bus.
-_READ_LOOP_BACKOFF_S = 0.05
-# Grace period for the read thread to exit on disconnect.
-_READ_THREAD_JOIN_S = 2.0
+_DYNAMIXEL_COUNTS = 4096         # encoder counts per full revolution
+_READ_LOOP_BACKOFF_S = 0.05      # sleep after a read error before retrying
+_READ_THREAD_JOIN_S = 2.0        # grace period for read thread exit on disconnect
 
 
 @dataclass
 class GelloCalibration:
-    # Map from motor name to the encoder offset (in counts) at the home pose.
-    joint_offsets: dict[str, int]
-    # Motor counts at the open and fully-closed gripper positions.
-    gripper_open_position: int
-    gripper_closed_position: int
+    joint_offsets: dict[str, int]      # encoder count at home pose per motor
+    gripper_open_position: int         # encoder count at fully-open gripper
+    gripper_closed_position: int       # encoder count at fully-closed gripper
 
 
 class Gello(Teleoperator):
@@ -50,29 +43,16 @@ class Gello(Teleoperator):
     config_class = GelloConfig
     name = "gello"
 
-    # Radians per encoder count.
     RAD_PER_COUNT = 2 * np.pi / (_DYNAMIXEL_COUNTS - 1)
 
-    JOINT_NAMES = [
-        "joint_1",
-        "joint_2",
-        "joint_3",
-        "joint_4",
-        "joint_5",
-        "joint_6",
-        "joint_7",
-        "gripper",
-    ]
+    JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper"]
 
     def __init__(self, config: GelloConfig):
         super().__init__(config)
         self.config = config
 
         expected = len(self.JOINT_NAMES)
-        if (
-            len(config.calibration_position) != expected
-            or len(config.joint_signs) != expected
-        ):
+        if len(config.calibration_position) != expected or len(config.joint_signs) != expected:
             raise ValueError(
                 "GelloConfig joint calibration must define one value per joint for the FR3 leader."
             )
@@ -86,15 +66,10 @@ class Gello(Teleoperator):
             },
         )
 
-        # Async read loop state.
         self.thread: Thread | None = None
         self.stop_event: Event | None = None
         self.lock: Lock = Lock()
         self.latest_action: dict[str, float] | None = None
-
-    # ------------------------------------------------------------------
-    # Teleoperator interface
-    # ------------------------------------------------------------------
 
     @property
     def action_features(self) -> dict[str, type]:
@@ -116,8 +91,6 @@ class Gello(Teleoperator):
         if self.is_connected:
             raise DeviceAlreadyConnectedError(f"{self} already connected")
 
-        # Handshake is done manually after baudrate is set so the initial
-        # connect does not assume a specific baudrate.
         self.bus.connect(handshake=False)
         self.bus.set_baudrate(self.config.baudrate)
         self.bus._handshake()
@@ -125,47 +98,37 @@ class Gello(Teleoperator):
 
         self._load_calibration()
         if not self.is_calibrated and calibrate:
-            logger.info(
-                "Mismatch between calibration values in the motor and the calibration file "
-                "or no calibration file found"
-            )
+            logger.info("No calibration found or mismatch; running calibration.")
             self.calibrate()
 
         self.configure()
 
         if self.config.use_async:
             if self.is_calibrated:
-                # Seed latest_action before starting the read thread.
                 raw = self.bus.sync_read("Present_Position", normalize=False)
                 self.latest_action = self._process_action(raw)
                 self._start_read_thread()
             else:
-                logger.info(
-                    "%s connected without calibration; async action stream will start after calibration.",
-                    self,
-                )
+                logger.info("%s connected without calibration; async stream starts after calibration.", self)
 
         logger.info(f"{self} connected.")
 
     def disconnect(self) -> None:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
-
         if self.config.use_async:
             self._stop_read_thread()
-
         self.bus.disconnect()
         logger.info(f"{self} disconnected.")
 
     def calibrate(self) -> None:
-        # Stop the async read loop so the bus isn't in use during calibration.
         if self.config.use_async:
             self._stop_read_thread()
 
         self.bus.disable_torque()
         if self._calibration:
             user_input = input(
-                "Press ENTER to use existing calibration, or type 'c' and press ENTER to run new calibration: "
+                "Press ENTER to use existing calibration, or type 'c' and ENTER to recalibrate: "
             )
             if user_input.strip().lower() != "c":
                 logger.info("Using existing calibration")
@@ -192,13 +155,7 @@ class Gello(Teleoperator):
         self.bus.configure_motors()
         for motor in self.bus.motors:
             if motor != "gripper":
-                # Extended position mode allows multi-turn motion so small
-                # assembly errors don't leave a joint jammed at 0 or 4095.
                 self.bus.write("Operating_Mode", motor, OperatingMode.EXTENDED_POSITION.value)
-
-        # Current-based position control on the gripper lets the operator
-        # press through the command to open it manually without overloading
-        # the servo, then have it snap back when released.
         self.bus.write("Operating_Mode", "gripper", OperatingMode.CURRENT_POSITION.value)
 
     def setup_motors(self) -> None:
@@ -215,11 +172,7 @@ class Gello(Teleoperator):
         if self.config.use_async:
             with self.lock:
                 if self.latest_action is None:
-                    # No async read yet; fall back to a synchronous one.
-                    logger.warning(
-                        f"{self} async read loop has not updated latest_action yet. "
-                        "Performing synchronous read."
-                    )
+                    logger.warning("%s async read has not updated yet; performing synchronous read.", self)
                     raw = self.bus.sync_read("Present_Position", normalize=False)
                     self.latest_action = self._process_action(raw)
                 return self.latest_action.copy()
@@ -228,64 +181,56 @@ class Gello(Teleoperator):
         return self._process_action(raw)
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO(rcadene, aliberts): Implement force feedback.
         raise NotImplementedError
 
-    # ------------------------------------------------------------------
-    # Internals
-    # ------------------------------------------------------------------
-
     def _process_action(self, raw_action: Mapping[str, Any]) -> dict[str, float]:
-        """Convert raw motor counts to robot-facing joint angles + gripper mm."""
-        calibration = self._calibration
-        if calibration is None:
+        """Convert raw motor counts to normalized joint positions and gripper.
+
+        Joints: (sign * (count - offset) * RAD_PER_COUNT + ref_rad) / (2π) → unitless
+        Gripper: 1 - normalized_count → [0, 1] where 1=open, 0=closed
+        """
+        if self._calibration is None:
             raise RuntimeError(f"{self} is not calibrated.")
+        calibration = self._calibration
 
         result: dict[str, float] = {}
-        # The "gripper" joint is computed here for uniform error semantics
-        # (missing offsets raise consistently), then overwritten below.
         for idx, motor in enumerate(self.JOINT_NAMES):
-            offset = calibration.joint_offsets[motor]
-            sign = self.config.joint_signs[idx]
-            ref_rad = self.config.calibration_position[idx]
+            if motor == "gripper":
+                continue
             result[motor] = (
-                sign * (float(raw_action[motor]) - offset) * self.RAD_PER_COUNT + ref_rad
-            )
+                self.config.joint_signs[idx]
+                * (float(raw_action[motor]) - calibration.joint_offsets[motor])
+                * self.RAD_PER_COUNT
+                + self.config.calibration_position[idx]
+            ) / (2 * np.pi)
 
-        # Map gripper counts -> [0, _GRIPPER_MAX_MM] with open at _GRIPPER_MAX_MM.
         gripper_range = calibration.gripper_closed_position - calibration.gripper_open_position
-        normalized = (float(raw_action["gripper"]) - calibration.gripper_open_position) / gripper_range
-        result["gripper"] = (1.0 - normalized) * _GRIPPER_MAX_MM
+        result["gripper"] = 1.0 - (float(raw_action["gripper"]) - calibration.gripper_open_position) / gripper_range
         return result
 
     def _read_loop(self) -> None:
         if self.stop_event is None:
-            raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
+            raise RuntimeError(f"{self}: stop_event not initialized before read loop.")
 
         alpha = self.config.smoothing
         while not self.stop_event.is_set():
             try:
                 raw = self.bus.sync_read("Present_Position", normalize=False)
                 new_action = self._process_action(raw)
-
                 with self.lock:
                     if self.latest_action is None:
                         self.latest_action = new_action
                     else:
-                        # Exponential moving average per joint.
                         for k, v in new_action.items():
                             self.latest_action[k] = alpha * v + (1 - alpha) * self.latest_action[k]
-
             except Exception:
                 time.sleep(_READ_LOOP_BACKOFF_S)
 
     def _start_read_thread(self) -> None:
-        # Ensure any previous thread is fully stopped before starting a new one.
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=0.1)
         if self.stop_event is not None:
             self.stop_event.set()
-
         self.stop_event = Event()
         self.thread = Thread(target=self._read_loop, name=f"{self}_read_loop", daemon=True)
         self.thread.start()
@@ -293,10 +238,8 @@ class Gello(Teleoperator):
     def _stop_read_thread(self) -> None:
         if self.stop_event is not None:
             self.stop_event.set()
-
         if self.thread is not None and self.thread.is_alive():
             self.thread.join(timeout=_READ_THREAD_JOIN_S)
-
         self.thread = None
         self.stop_event = None
 

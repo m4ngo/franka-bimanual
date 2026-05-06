@@ -26,4 +26,4 @@ lerobot-teleoperate \
     --teleop.id=gello_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \
     --teleop.right_arm_config.port=/dev/ttyUSB0 \
-    --fps=15
+    --fps=10

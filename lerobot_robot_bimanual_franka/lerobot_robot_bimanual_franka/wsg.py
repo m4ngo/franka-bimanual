@@ -52,6 +52,7 @@ class _Waiter:
 
 class WSG:
     # Motion / range tuning.
+    GRIPPER_TRUE_MAX_MM = 110.0
     MOVE_SPEED_MM_S = 420.0
     GRIPPER_MIN_MM = 10.0
     GRIPPER_MAX_MM = 100.0

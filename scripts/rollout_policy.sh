@@ -41,7 +41,7 @@ lerobot-record \
     --dataset.single_task="Evaluating policy $3 on dataset $1" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
-    --dataset.fps=20 \
+    --dataset.fps=10 \
     --display_data=true \
     --display_compressed_images=true \
     --policy.path="$3"
