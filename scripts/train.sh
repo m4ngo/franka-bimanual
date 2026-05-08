@@ -8,7 +8,7 @@
 # $5 policy type
 
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
-    echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps>"
+    echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps> <policy_type>"
     exit 1
 fi
 lerobot-train \
