@@ -61,7 +61,7 @@ Important folders on the workstation
 	- `~/franka_ws/scripts` contains the scripts used to roll out polices, record, teleop, etc.
 
 ## Quick start with scripts
-Before running any scripts, ensure you have the right conda environment activated: `conda activate lerobot`
+Before running any scripts, ensure you have the right environment activated: `source ~/.venv/bin/activate`
 
 Teleop
 - Before even running teleop, if its the first time running teleop after turning on the robots, calibrate the GELLOs
