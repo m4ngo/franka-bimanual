@@ -33,7 +33,7 @@ class SpaceMouseConfig(TeleoperatorConfig):
     # Gripper travel limits forwarded as the action's "gripper" value (mm).
     # The right button drives the target to gripper_max_mm (open); the left
     # button drives it to gripper_min_mm (close).
-    gripper_min_mm: float = 10.0
+    gripper_min_mm: float = 20.0
     gripper_max_mm: float = 100.0
     # Gripper target on connect, before any button press.
     initial_gripper_mm: float = 100.0

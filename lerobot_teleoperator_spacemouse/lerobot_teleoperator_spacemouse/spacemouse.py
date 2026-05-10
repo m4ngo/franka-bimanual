@@ -13,6 +13,7 @@ Thin wrapper around `pyspacemouse` that exposes the device as a LeRobot
 import logging
 
 import pyspacemouse
+import numpy as np
 
 from lerobot.teleoperators import Teleoperator
 from lerobot.utils.errors import DeviceAlreadyConnectedError, DeviceNotConnectedError
@@ -36,7 +37,7 @@ class SpaceMouse(Teleoperator):
 
     # Order matches the EE-delta convention used by the bimanual Franka
     # (linear xyz, angular roll/pitch/yaw).
-    AXIS_NAMES = ("x", "y", "z", "roll", "pitch", "yaw")
+    AXIS_NAMES = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
     def __init__(self, config: SpaceMouseConfig):
         super().__init__(config)
@@ -50,6 +51,9 @@ class SpaceMouse(Teleoperator):
 
         self._device: pyspacemouse.SpaceMouseDevice | None = None
         self._gripper_target_mm: float = float(config.initial_gripper_mm)
+
+        self.cur_pos: np.ndarray = np.asarray([0.5, 0.0, 0.5], dtype=np.float64)
+        self.cur_rot: np.ndarray = np.asarray([0.94045083, -0.32899504, 0.08059487, -0.02861769], dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Teleoperator interface

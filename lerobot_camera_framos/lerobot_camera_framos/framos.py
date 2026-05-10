@@ -93,7 +93,7 @@ class FramosCamera(Camera):
             out.append(entry)
         return out
 
-    def connect(self, warmup: bool = True) -> None:
+    def connect(self, warmup: bool = False) -> None:
         self.disconnect()
 
         cfg = rs.config()
@@ -161,14 +161,14 @@ class FramosCamera(Camera):
         device = profile.get_device()
         self._apply_options(device)
 
-        if warmup:
-            # FRAMOS D415e color sensor needs a few frames before AE settles.
-            for _ in range(10):
-                try:
-                    self._pipeline.wait_for_frames(timeout_ms=500)
-                except Exception:
-                    pass
-            self._last_color = self.read()
+        # if warmup:
+        #     # FRAMOS D415e color sensor needs a few frames before AE settles.
+        #     for _ in range(10):
+        #         try:
+        #             self._pipeline.wait_for_frames(timeout_ms=500)
+        #         except Exception:
+        #             pass
+        #     self._last_color = self.read()
 
         logger.info(
             "Connected FRAMOS camera %s (sn=%s ip=%s)",

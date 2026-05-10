@@ -18,6 +18,6 @@ lerobot-replay \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
-    --robot.use_ee_delta=false \
+    --robot.use_ee_pos=false \
     --dataset.repo_id="$1" \
     --dataset.episode="$2"

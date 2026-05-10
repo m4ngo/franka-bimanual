@@ -169,12 +169,15 @@ class RobotProcess:
                             pass
                     state = _cb_state if _cb_state is not None else robot.state
 
-                    q = np.asarray(state.q, dtype=np.float64)
-                    dq = np.asarray(state.dq, dtype=np.float64)
-                    ee_pos = np.asarray(state.O_T_EE.translation, dtype=np.float64).flatten()
-                    ee_rot = np.asarray(state.O_T_EE.quaternion, dtype=np.float64).flatten()
-                    ee_vel = np.concatenate([state.O_dP_EE_c.linear, state.O_dP_EE_c.angular])
-
+                    # Convert proxied/remote state fields to plain numeric arrays
+                    q = np.array([float(x) for x in state.q], dtype=np.float64)
+                    dq = np.array([float(x) for x in state.dq], dtype=np.float64)
+                    ee_pos = np.array([float(x) for x in state.O_T_EE.translation], dtype=np.float64).flatten()
+                    ee_rot = np.array([float(x) for x in state.O_T_EE.quaternion], dtype=np.float64).flatten()
+                    ee_vel = np.array(
+                        [float(x) for x in list(state.O_dP_EE_c.linear) + list(state.O_dP_EE_c.angular)],
+                        dtype=np.float64,
+                    )
                     if (
                         _cached_jacobian is None
                         or _cached_jacobian_q is None

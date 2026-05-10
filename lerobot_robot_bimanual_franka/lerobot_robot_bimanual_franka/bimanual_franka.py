@@ -110,6 +110,9 @@ class BimanualFranka(Robot):
 
     def connect(self, calibrate: bool = True) -> None:
         try:
+            if calibrate:
+                self.calibrate()
+            self.configure()
             self._connect_cameras()
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
@@ -260,6 +263,7 @@ class BimanualFranka(Robot):
 
         pos_error = target[:3] - np.asarray(pos, dtype=np.float64)
 
+        # normalize quats
         target_q = np.asarray(target[3:], dtype=np.float64)
         target_q /= max(float(np.linalg.norm(target_q)), 1e-12)
         curr_q = np.asarray(rot, dtype=np.float64)
