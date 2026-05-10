@@ -138,9 +138,10 @@ class SpaceMouse(Teleoperator):
             "x": state.y * t_scale * tx,
             "y": state.x * t_scale * ty,
             "z": state.z * t_scale * tz,
-            "roll": state.roll * r_scale * rx,
-            "pitch": state.pitch * r_scale * ry,
-            "yaw": state.yaw * r_scale * rz,
+            "qx": state.roll * r_scale * rx,
+            "qy": state.pitch * r_scale * ry,
+            "qz": state.yaw * r_scale * rz,
+            "qw": state.yaw * r_scale * rz,
             "gripper": self._gripper_target_mm,
         }
 

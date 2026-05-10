@@ -202,7 +202,7 @@ class Gello(Teleoperator):
                 * (float(raw_action[motor]) - calibration.joint_offsets[motor])
                 * self.RAD_PER_COUNT
                 + self.config.calibration_position[idx]
-            ) / (2 * np.pi)
+            )
 
         gripper_range = calibration.gripper_closed_position - calibration.gripper_open_position
         result["gripper"] = 1.0 - (float(raw_action["gripper"]) - calibration.gripper_open_position) / gripper_range

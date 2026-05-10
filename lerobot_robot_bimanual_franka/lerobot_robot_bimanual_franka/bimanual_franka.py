@@ -28,9 +28,12 @@ _CAMERA_READ_TIMEOUT_MS: float = 5.0
 JOINT_PD_KP = 2.0
 JOINT_PD_KD = 0.1
 
+EE_PD_KP = 2.0
+EE_PD_KD = 0.1
+
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
-EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "roll", "pitch", "yaw", "gripper")
-EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "roll", "pitch", "yaw")
+EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
+EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
 _PROCESS_STARTUP_S = 1.0
 _CONNECT_RETRIES = 3
@@ -47,7 +50,7 @@ class BimanualFranka(Robot):
     def __init__(self, config: BimanualFrankaConfig):
         super().__init__(config)
         self.config = config
-        self.use_ee_delta = config.use_ee_delta
+        self.use_ee_pos = config.use_ee_pos
         self.active_arms = config.active_arms
         self.cameras: dict[str, Camera] = {
             name: self._make_camera(cfg) for name, cfg in config.cameras.items()
@@ -86,10 +89,12 @@ class BimanualFranka(Robot):
 
     @cached_property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
-        return {
-            name: (cam.height, cam.width, IMAGE_CHANNELS)
-            for name, cam in self.cameras.items()
-        }
+        features: dict[str, tuple[int, int, int]] = {}
+        for name, cam in self.cameras.items():
+            if cam.height is None or cam.width is None:
+                raise RuntimeError(f"Camera '{name}' does not report height/width")
+            features[name] = (int(cam.height), int(cam.width), IMAGE_CHANNELS)
+        return features
 
     @property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
@@ -97,7 +102,7 @@ class BimanualFranka(Robot):
 
     @property
     def action_features(self) -> dict[str, type]:
-        return self._arm_features(EE_FEATURE_KEYS if self.use_ee_delta else JOINT_FEATURE_KEYS)
+        return self._arm_features(EE_FEATURE_KEYS if self.use_ee_pos else JOINT_FEATURE_KEYS)
 
     @property
     def is_connected(self) -> bool:
@@ -105,23 +110,20 @@ class BimanualFranka(Robot):
 
     def connect(self, calibrate: bool = True) -> None:
         try:
+            self._connect_cameras()
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
                     arm,
                     self._server_ip(arm),
                     self._robot_ip(arm),
                     self._port(arm),
-                    use_ee_delta=self.use_ee_delta,
+                    use_ee_delta=self.use_ee_pos,
                 )
             time.sleep(_PROCESS_STARTUP_S)
             for arm in self.active_arms:
                 self._probe_arm(arm)
-            if not self.is_calibrated and calibrate:
-                self.calibrate()
-            self.configure()
             for arm in self.active_arms:
                 self.grippers[arm].home()
-            self._connect_cameras()
         except Exception:
             self.robot_manager.shutdown()
             raise
@@ -182,7 +184,7 @@ class BimanualFranka(Robot):
         for arm in self.active_arms:
             q = kin_state[arm][0]
             for i in range(NUM_JOINTS):
-                obs[f"{arm}_joint_{i + 1}"] = float(q[i]) / (2 * np.pi)
+                obs[f"{arm}_joint_{i + 1}"] = float(q[i])
             pos = self.grippers[arm].position
             obs[f"{arm}_gripper"] = (0 if pos is None else pos) / WSG.GRIPPER_TRUE_MAX_MM
 
@@ -191,7 +193,12 @@ class BimanualFranka(Robot):
                 obs[name] = fut.result()
             except Exception as exc:
                 logger.warning("Camera %s read failed: %s", name, exc)
-                obs[name] = self.cameras[name].blank_frame()
+                blank_frame_fn = getattr(self.cameras[name], "blank_frame", None)
+                if callable(blank_frame_fn):
+                    obs[name] = blank_frame_fn()
+                else:
+                    h, w, c = self._camera_features[name]
+                    obs[name] = np.zeros((h, w, c), dtype=np.uint8)
 
         return obs
 
@@ -210,13 +217,9 @@ class BimanualFranka(Robot):
         for arm in self.active_arms:
             self.grippers[arm].move(action[f"{arm}_gripper"] * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
 
-        if self.use_ee_delta:
+        if self.use_ee_pos:
             twists = {
-                arm: np.fromiter(
-                    (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
-                    dtype=np.float64,
-                    count=len(EE_AXIS_KEYS),
-                )
+                arm: self._ee_pd(action, arm, kin_state[arm])
                 for arm in self.active_arms
             }
             twists = self.safety.shape_ee(twists, kin_state)
@@ -241,7 +244,51 @@ class BimanualFranka(Robot):
     def _joint_pd(action: RobotAction, arm: str, snapshot: KinematicSnapshot) -> np.ndarray:
         # Action joints are normalized by 2π; convert back to radians for PD tracking.
         target = np.array(
-            [action[f"{arm}_joint_{i}"] * 2 * np.pi for i in range(1, NUM_JOINTS + 1)]
+            [action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)]
         )
-        q, dq, _, _ = snapshot
+        q, dq, _, _, _, _ = snapshot
         return JOINT_PD_KP * (target - q) - JOINT_PD_KD * dq
+
+    @staticmethod
+    def _ee_pd(action: RobotAction, arm: str, snapshot: KinematicSnapshot) -> np.ndarray:
+        target = np.fromiter(
+                (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
+                dtype=np.float64,
+                count=len(EE_AXIS_KEYS),
+            )
+        _, _, _, pos, rot, twist = snapshot
+
+        pos_error = target[:3] - np.asarray(pos, dtype=np.float64)
+
+        target_q = np.asarray(target[3:], dtype=np.float64)
+        target_q /= max(float(np.linalg.norm(target_q)), 1e-12)
+        curr_q = np.asarray(rot, dtype=np.float64)
+        curr_q /= max(float(np.linalg.norm(curr_q)), 1e-12)
+
+        curr_conj = np.array([-curr_q[0], -curr_q[1], -curr_q[2], curr_q[3]], dtype=np.float64)
+        x1, y1, z1, w1 = target_q
+        x2, y2, z2, w2 = curr_conj
+        q_err = np.array( # horrific quaternion error calc
+            [
+                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            ],
+            dtype=np.float64,
+        )
+        q_err /= max(float(np.linalg.norm(q_err)), 1e-12)
+        if q_err[3] < 0.0:
+            q_err = -q_err
+
+        v = q_err[:3]
+        w = float(np.clip(q_err[3], -1.0, 1.0))
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            rot_error = 2.0 * v
+        else:
+            angle = 2.0 * np.arctan2(v_norm, w)
+            rot_error = (v / v_norm) * angle
+
+        error = np.concatenate((pos_error, rot_error))
+        return EE_PD_KP * error - EE_PD_KD * np.asarray(twist, dtype=np.float64)

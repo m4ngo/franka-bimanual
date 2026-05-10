@@ -19,7 +19,7 @@ class BimanualFrankaConfig(RobotConfig):
     r_robot_ip: str
     r_gripper_ip: str
     r_port: int
-    use_ee_delta: bool
+    use_ee_pos: bool
     active_arms: tuple[str, ...] = _VALID_ARMS
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {

@@ -82,7 +82,7 @@ class ActionSafetyScreen:
         out: dict[str, np.ndarray] = {}
         for arm, action in action_by_arm.items():
             action = np.asarray(action, dtype=np.float64)
-            _, dq, ee_translation, jacobian = kin_state[arm]
+            _, dq, jacobian, ee_translation, _, _ = kin_state[arm]
             contact_z = float(np.asarray(ee_translation)[2]) - self.end_effector_z_extension
             jacobian = np.asarray(jacobian, dtype=np.float64)
             dq = np.asarray(dq, dtype=np.float64)

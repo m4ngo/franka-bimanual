@@ -17,7 +17,7 @@ from numpy.typing import NDArray
 logger = logging.getLogger(__name__)
 
 # Duration (ms) attached to each streamed velocity command. Parent must re-issue faster than this.
-VELOCITY_COMMAND_DURATION_MS = 500
+VELOCITY_COMMAND_DURATION_MS = 250
 
 # Recompute Jacobian only when joints move more than this (L-inf, rad) from the cached config.
 _JACOBIAN_CACHE_Q_THRESHOLD = 0.50
@@ -32,9 +32,14 @@ EE_DELTA_RELATIVE_DYNAMICS = (0.4, 0.25, 0.15)
 NUM_JOINTS = 7
 EE_DELTA_DIMS = 6  # linear(3) + angular(3)
 
-# (q, dq, ee_translation, jacobian) snapshot from one robot.state read.
+# (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist) snapshot from one robot.state read.
 KinematicSnapshot = tuple[
-    NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], NDArray[np.float64]
+    NDArray[np.float64], # joint pos
+    NDArray[np.float64], # joint velocities
+    NDArray[np.float64], # jacobian
+    NDArray[np.float64], # ee pos
+    NDArray[np.float64], # ee rot
+    NDArray[np.float64], # ee twist (velocity)
 ]
 
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
@@ -166,10 +171,13 @@ class RobotProcess:
 
                     q = np.asarray(state.q, dtype=np.float64)
                     dq = np.asarray(state.dq, dtype=np.float64)
-                    ee_translation = np.asarray(state.O_T_EE.translation, dtype=np.float64).flatten()
+                    ee_pos = np.asarray(state.O_T_EE.translation, dtype=np.float64).flatten()
+                    ee_rot = np.asarray(state.O_T_EE.quaternion, dtype=np.float64).flatten()
+                    ee_vel = np.concatenate([state.O_dP_EE_c.linear, state.O_dP_EE_c.angular])
 
                     if (
                         _cached_jacobian is None
+                        or _cached_jacobian_q is None
                         or float(np.max(np.abs(q - _cached_jacobian_q))) > _JACOBIAN_CACHE_Q_THRESHOLD
                     ):
                         try:
@@ -179,7 +187,7 @@ class RobotProcess:
                         _cached_jacobian = np.asarray(_raw_j, dtype=np.float64)
                         _cached_jacobian_q = q.copy()
 
-                    self.response_queue.put(("success", (q, dq, ee_translation, _cached_jacobian)))
+                    self.response_queue.put(("success", (q, dq, _cached_jacobian, ee_pos, ee_rot, ee_vel)))
 
                 elif command == "move_joint_velocity_async":
                     _vel = np.asarray(args[0], dtype=np.float64)
