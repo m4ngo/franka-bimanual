@@ -11,6 +11,7 @@ from typing import Any
 
 import numpy as np
 import rpyc
+import rpyc.utils.classic as rpyc_classic
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
@@ -128,10 +129,14 @@ class RobotDriver:
         return not self._conn.closed
 
     def get_kinematic_state(self) -> KinematicSnapshot:
-        q_l, dq_l, p_l, r_l, v_l = self._rpc_state(self.robot)
+        # rpyc-classic returns container results as netrefs; obtain() pickles
+        # them across in one round-trip so numpy can build local arrays without
+        # probing the remote object for __array__ (which would raise on the
+        # server and spam AttributeError into its debug log).
+        q_l, dq_l, p_l, r_l, v_l = rpyc_classic.obtain(self._rpc_state(self.robot))
         q = np.array(q_l)
         if self._jac is None or float(np.max(np.abs(q - self._jac_q))) > _JACOBIAN_CACHE_Q_THRESHOLD:
-            self._jac = np.array(self._rpc_jacobian(self.robot)).reshape(6, 7)
+            self._jac = np.array(rpyc_classic.obtain(self._rpc_jacobian(self.robot))).reshape(6, 7)
             self._jac_q = q.copy()
         return q, np.array(dq_l), self._jac, np.array(p_l), np.array(r_l), np.array(v_l)
 
