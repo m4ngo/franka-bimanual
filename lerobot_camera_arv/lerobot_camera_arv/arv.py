@@ -165,13 +165,21 @@ class ArvCamera(Camera):
         # Drain any frames that queued up while we were busy elsewhere so we
         # always deliver the freshest image, not one from seconds ago.
         dropped = 0
-        while True:
+        max_drain = 65536
+        while dropped < max_drain:
             newer = self._stream.try_pop_buffer()
             if newer is None:
                 break
             self._stream.push_buffer(buffer)  # recycle the older frame
             buffer = newer
             dropped += 1
+        if dropped >= max_drain:
+            logger.warning(
+                "%s @ %s: drained %d buffers (hit cap); possible driver issue",
+                self._name,
+                self._ip,
+                max_drain,
+            )
         if dropped:
             logger.debug("%s: drained %d stale frame(s) to stay current", self._name, dropped)
 

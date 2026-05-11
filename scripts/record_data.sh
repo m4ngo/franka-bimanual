@@ -9,6 +9,9 @@
 # Run local Rerun viewer on the robot/workstation host.
 # Forward the viewer ports over SSH to view on your machine.
 
+# If recording hangs after "Recording episode 0", try:
+#   --dataset.vcodec=libsvtav1   (avoid six parallel NVENC sessions)
+#   --dataset.streaming_encoding=false
 if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
     echo "Usage: $0 <repo_id> <number_of_episodes> <task_name> <output_dir> <resume>"
     exit 1

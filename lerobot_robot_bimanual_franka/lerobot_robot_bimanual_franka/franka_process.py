@@ -11,7 +11,6 @@ from typing import Any
 
 import numpy as np
 import rpyc
-import rpyc.utils.classic as rpyc_classic
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
@@ -42,8 +41,10 @@ KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
 
 
 # All motion construction lives here so each loop op is one RPyC round-trip.
-# brine encodes only native float; numpy scalars become netrefs (50+ extra
-# round-trips on access) — float() everywhere is mandatory.
+# brine encodes immutable types only — tuples of native floats are brineable,
+# but lists are NOT (they cross the wire as netrefs, costing one round-trip
+# per element access and spamming AttributeError into the server log when
+# numpy probes them for __array__). Always exchange data as tuples.
 # CBRobot.get_last_callback_data leaks state_mutex on AttributeError, so we
 # read cb_robot.state directly under a `with` block and recover any mutex left
 # locked by a previously crashed session.
@@ -76,16 +77,16 @@ def get_state(robot):
         s = _cbm.state
     s = s.robot_state if s is not None else robot.state
     return (
-        [float(x) for x in s.q],
-        [float(x) for x in s.dq],
-        [float(x) for x in s.O_T_EE.translation],
-        [float(x) for x in s.O_T_EE.quaternion],
-        [float(x) for x in s.O_dP_EE_c.linear] + [float(x) for x in s.O_dP_EE_c.angular],
+        tuple(float(x) for x in s.q),
+        tuple(float(x) for x in s.dq),
+        tuple(float(x) for x in s.O_T_EE.translation),
+        tuple(float(x) for x in s.O_T_EE.quaternion),
+        tuple(float(x) for x in s.O_dP_EE_c.linear) + tuple(float(x) for x in s.O_dP_EE_c.angular),
     )
 
 def get_jacobian(robot):
     j = _np.asarray(robot.model.zero_jacobian(_fr.Frame.EndEffector, robot.state))
-    return [float(x) for x in j.flat]
+    return tuple(float(x) for x in j.flat)
 
 def send_jv(robot, vel):
     robot.move(_fr.JointVelocityMotion(_np.asarray(vel, dtype=_np.float64), _DUR), asynchronous=True)
@@ -129,20 +130,17 @@ class RobotDriver:
         return not self._conn.closed
 
     def get_kinematic_state(self) -> KinematicSnapshot:
-        # rpyc-classic returns container results as netrefs; obtain() pickles
-        # them across in one round-trip so numpy can build local arrays without
-        # probing the remote object for __array__ (which would raise on the
-        # server and spam AttributeError into its debug log).
-        q_l, dq_l, p_l, r_l, v_l = rpyc_classic.obtain(self._rpc_state(self.robot))
+        q_l, dq_l, p_l, r_l, v_l = self._rpc_state(self.robot)
         q = np.array(q_l)
         if self._jac is None or float(np.max(np.abs(q - self._jac_q))) > _JACOBIAN_CACHE_Q_THRESHOLD:
-            self._jac = np.array(rpyc_classic.obtain(self._rpc_jacobian(self.robot))).reshape(6, 7)
+            self._jac = np.array(self._rpc_jacobian(self.robot)).reshape(6, 7)
             self._jac_q = q.copy()
         return q, np.array(dq_l), self._jac, np.array(p_l), np.array(r_l), np.array(v_l)
 
     def send_velocity(self, vel: list[float]) -> None:
+        # tuple() so brine encodes by value (lists go over as netrefs).
         try:
-            self._rpc_send(self.robot, vel)
+            self._rpc_send(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
                 try:
