@@ -1,4 +1,5 @@
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 
@@ -170,6 +171,68 @@ class BimanualFranka(Robot):
             )
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action
+
+    def home(
+        self,
+        home_q_left: np.ndarray | None,
+        home_q_right: np.ndarray | None,
+        gripper_norm: float = 1.0,
+        max_time_s: float = 5.0,
+        tol_rad: float = 0.05,
+        fps: int = 30,
+    ) -> bool:
+        """Drive both arms to a joint-space home pose via the joint-velocity PD.
+
+        Bypasses `use_ee_pos` so this works regardless of the configured action
+        mode. Runs a closed-loop PD at `fps` Hz until each active arm's max
+        joint error is below `tol_rad`, or `max_time_s` elapses. Gripper
+        command is fire-and-forget.
+
+        Returns True on convergence, False on timeout.
+        """
+        if not self.is_connected:
+            raise ConnectionError(f"{self} is not connected.")
+
+        candidates = {"l": home_q_left, "r": home_q_right}
+        targets = {
+            arm: np.asarray(q, dtype=np.float64)
+            for arm, q in candidates.items()
+            if q is not None and arm in self.active_arms
+        }
+        if not targets:
+            return True
+
+        for arm in targets:
+            self.grippers[arm].move(gripper_norm * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
+
+        period_s = 1.0 / fps
+        deadline = time.perf_counter() + max_time_s
+        names = list(targets)
+        while True:
+            tick_start = time.perf_counter()
+            kin = self.robot_manager.current_kinematic_state_batch(names)
+
+            cmds_raw = {
+                arm: JOINT_PD_KP * (targets[arm] - kin[arm][0]) - JOINT_PD_KD * kin[arm][1]
+                for arm in names
+            }
+            cmds = self.safety.shape_joint(cmds_raw, kin)
+            self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
+
+            max_err = max(
+                float(np.max(np.abs(targets[arm] - kin[arm][0]))) for arm in names
+            )
+            if max_err < tol_rad:
+                self._cached_kin_state = None
+                return True
+            if tick_start >= deadline:
+                self._cached_kin_state = None
+                logger.warning("home(): timeout after %.2fs, max joint error %.4f rad", max_time_s, max_err)
+                return False
+
+            elapsed = time.perf_counter() - tick_start
+            if elapsed < period_s:
+                time.sleep(period_s - elapsed)
 
     @staticmethod
     def _joint_pd(action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:

@@ -64,10 +64,8 @@ Important folders on the workstation
 Before running any scripts, ensure you have the right environment activated: `source ~/.venv/bin/activate`
 
 Teleop
-- Before even running teleop, if its the first time running teleop after turning on the robots, you may need to calibrate the GELLOs
-	- Sometimes the calibration is saved, but if the GELLOs got turned off last time or disconnected, they may become uncalibrated
-	- Calibration can be done using the script in /scripts/old/calibrate_gello_teleop.py
-    - The GELLOs home position looks like this: *(missing image, please upload)*
+- Before even running teleop, if its the first time running teleop after turning on the robots, calibrate the GELLOs
+	- *not filled in yet*
 - Ensure setup is ready. MAKE SURE THE GELLOs AREN'T COLLIDING. It can be helpful to prop them on a box in their 'default position' to ensure nothing goes wrong when teleop starts
 - Run `./~/franka_ws/scripts/teleop.sh`
 - Teleop should start automatically, control using the GELLOs
