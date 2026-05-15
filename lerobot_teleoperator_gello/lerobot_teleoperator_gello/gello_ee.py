@@ -26,16 +26,16 @@ class GelloEE(Gello):
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {axis: float for axis in self.AXIS_NAMES} | {"gripper": float}
+        return self._maybe_prefix({axis: float for axis in self.AXIS_NAMES} | {"gripper": float})
 
     def get_action(self) -> dict[str, float]:
         if not self.is_connected:
             raise DeviceNotConnectedError(f"{self} is not connected.")
 
-        joint_action = super().get_action()
+        joint_action = self._get_raw_action()  # unprefixed; we apply prefix once at the bottom
         q = np.array([joint_action[f"joint_{i}"] for i in range(1, 8)])
         pos, quat_xyzw = franka_fk(q)
-        return {
+        return self._maybe_prefix({
             "x":      float(pos[0]),
             "y":      float(pos[1]),
             "z":      float(pos[2]),
@@ -44,4 +44,4 @@ class GelloEE(Gello):
             "qz":     float(quat_xyzw[2]),
             "qw":     float(quat_xyzw[3]),
             "gripper": joint_action["gripper"],
-        }
+        })

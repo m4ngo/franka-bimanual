@@ -16,3 +16,6 @@ from .config_gello import GelloLeaderFields
 @dataclass
 class GelloEEConfig(TeleoperatorConfig, GelloLeaderFields):
     """Standalone GELLO EE leader, registered as ``"gello_ee"``."""
+
+    # See GelloConfig.side — same semantics, for single-arm EE teleop.
+    side: str | None = None

@@ -70,10 +70,13 @@ class Gello(Teleoperator):
         self.stop_event: Event | None = None
         self.lock: Lock = Lock()
         self.latest_action: dict[str, float] | None = None
+    def _maybe_prefix(self, d: dict[str, Any]) -> dict[str, Any]:
+        side = getattr(self.config, "side", None)
+        return d if side is None else {f"{side}_{k}": v for k, v in d.items()}
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {motor: float for motor in self.bus.motors}
+        return self._maybe_prefix({motor: float for motor in self.bus.motors})
 
     @property
     def feedback_features(self) -> dict[str, type]:
@@ -165,10 +168,12 @@ class Gello(Teleoperator):
             self.bus.setup_motor(motor)
             print(f"'{motor}' motor id set to {self.bus.motors[motor].id}")
 
-    def get_action(self) -> dict[str, float]:
-        if not self.is_connected:
-            raise DeviceNotConnectedError(f"{self} is not connected.")
+    def _get_raw_action(self) -> dict[str, float]:
+        """Return the unprefixed action dict (joint_1..joint_7, gripper).
 
+        Subclasses (e.g. GelloEE) consume this directly so the side-prefix
+        is applied at exactly one layer — at the top of the public get_action.
+        """
         if self.config.use_async:
             with self.lock:
                 if self.latest_action is None:
@@ -179,6 +184,11 @@ class Gello(Teleoperator):
 
         raw = self.bus.sync_read("Present_Position", normalize=False)
         return self._process_action(raw)
+
+    def get_action(self) -> dict[str, float]:
+        if not self.is_connected:
+            raise DeviceNotConnectedError(f"{self} is not connected.")
+        return self._maybe_prefix(self._get_raw_action())
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         raise NotImplementedError

@@ -27,3 +27,9 @@ class GelloLeaderFields:
 @dataclass
 class GelloConfig(TeleoperatorConfig, GelloLeaderFields):
     """Standalone GELLO leader, registered as the ``"gello"`` teleoperator type."""
+
+    # When set ("l" or "r"), Gello.get_action and Gello.action_features emit
+    # keys prefixed with f"{side}_". Used for single-arm operation against a
+    # bimanual follower (BimanualFranka with active_arms=(side,)).
+    # Kept off GelloLeaderFields so BimanualGello's children always see None.
+    side: str | None = None

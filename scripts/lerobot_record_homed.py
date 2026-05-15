@@ -1,0 +1,299 @@
+"""Homed bimanual-Franka recording/rollout orchestrator.
+
+Wraps lerobot's `record_loop` with a `BimanualFranka.home(...)` call inserted
+at the start of every episode, so each episode begins from a fixed joint-
+space home pose with grippers open. Supports both teleop recording
+(`--policy` unset) and policy rollout (`--policy <hf_repo>`).
+
+Rig IPs/ports are hardcoded to match the existing shell wrappers — this is
+not a general-purpose tool, it's the workstation's specific recipe.
+
+Usage examples are in `scripts/record_data_homed.sh` and
+`scripts/rollout_policy_homed.sh`.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+
+POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
+
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.feature_utils import combine_feature_dicts
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.pipeline_features import (
+    aggregate_pipeline_dataset_features,
+    create_initial_features,
+)
+from lerobot.datasets.video_utils import VideoEncodingManager
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.processor import make_default_processors
+from lerobot.robots import make_robot_from_config
+from lerobot.scripts.lerobot_record import record_loop
+from lerobot.teleoperators import make_teleoperator_from_config
+from lerobot.utils.control_utils import (
+    init_keyboard_listener,
+    sanity_check_dataset_name,
+    sanity_check_dataset_robot_compatibility,
+)
+from lerobot.utils.utils import init_logging, log_say
+
+# Importing the plugin packages triggers their @register_subclass decorators,
+# so make_robot_from_config / make_teleoperator_from_config can resolve
+# bimanual_franka / bimanual_gello{,_ee} by name.
+from lerobot_robot_bimanual_franka import BimanualFranka, BimanualFrankaConfig
+from lerobot_teleoperator_gello import (
+    BimanualGelloConfig,
+    BimanualGelloEEConfig,
+    GelloLeaderFields,
+)
+
+logger = logging.getLogger(__name__)
+
+# Rig defaults — match the existing shell scripts.
+_L_SERVER_IP, _L_ROBOT_IP, _L_GRIPPER_IP, _L_PORT = "192.168.3.11", "192.168.200.2", "192.168.2.21", 18813
+_R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.2.20", 18812
+_L_GELLO_PORT, _R_GELLO_PORT = "/dev/ttyUSB1", "/dev/ttyUSB0"
+
+
+def _str2bool(v: str) -> bool:
+    return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
+
+
+def _build_robot(use_ee_pos: bool) -> BimanualFranka:
+    cfg = BimanualFrankaConfig(
+        l_server_ip=_L_SERVER_IP, l_robot_ip=_L_ROBOT_IP,
+        l_gripper_ip=_L_GRIPPER_IP, l_port=_L_PORT,
+        r_server_ip=_R_SERVER_IP, r_robot_ip=_R_ROBOT_IP,
+        r_gripper_ip=_R_GRIPPER_IP, r_port=_R_PORT,
+        use_ee_pos=use_ee_pos,
+    )
+    return make_robot_from_config(cfg)
+
+
+def _build_teleop(mode: str, teleop_id: str):
+    if mode == "gello":
+        cfg = BimanualGelloConfig(
+            id=teleop_id,
+            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT),
+            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT),
+        )
+    elif mode == "gello_ee":
+        cfg = BimanualGelloEEConfig(
+            id=teleop_id,
+            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT),
+            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT),
+        )
+    else:
+        raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello' or 'gello_ee'.")
+    return make_teleoperator_from_config(cfg)
+
+
+def _build_dataset(args, robot, teleop_proc, robot_obs_proc) -> LeRobotDataset:
+    dataset_features = combine_feature_dicts(
+        aggregate_pipeline_dataset_features(
+            pipeline=teleop_proc,
+            initial_features=create_initial_features(action=robot.action_features),
+            use_videos=True,
+        ),
+        aggregate_pipeline_dataset_features(
+            pipeline=robot_obs_proc,
+            initial_features=create_initial_features(observation=robot.observation_features),
+            use_videos=True,
+        ),
+    )
+
+    n_cams = len(getattr(robot, "cameras", {}))
+    common = dict(
+        batch_encoding_size=1,
+        vcodec="auto",
+        streaming_encoding=True,
+        encoder_queue_maxsize=8,
+        encoder_threads=2,
+    )
+
+    if args.resume:
+        dataset = LeRobotDataset.resume(
+            args.repo_id,
+            root=args.output_dir,
+            image_writer_processes=0 if n_cams == 0 else 0,
+            image_writer_threads=4 * n_cams if n_cams > 0 else 0,
+            **common,
+        )
+        sanity_check_dataset_robot_compatibility(dataset, robot, args.fps, dataset_features)
+    else:
+        # Mimics lerobot's name guard — when --policy is set, repo_id must start with "eval_".
+        sanity_check_dataset_name(args.repo_id, args._policy_cfg)
+        dataset = LeRobotDataset.create(
+            args.repo_id,
+            args.fps,
+            root=args.output_dir,
+            robot_type=robot.name,
+            features=dataset_features,
+            use_videos=True,
+            image_writer_processes=0,
+            image_writer_threads=4 * n_cams,
+            **common,
+        )
+    return dataset
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--repo-id", required=True)
+    p.add_argument("--output-dir", required=True)
+    p.add_argument("--num-episodes", type=int, required=True)
+    p.add_argument("--task", required=True, help="single_task description")
+    p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
+    p.add_argument("--use-ee-pos", type=_str2bool, required=True)
+    p.add_argument("--teleop-mode", default="gello_ee", choices=("gello", "gello_ee"),
+                   help="Teleop type (ignored when --policy is set)")
+    p.add_argument("--teleop-id", default="homed_teleop")
+    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--episode-time-s", type=float, default=60.0)
+    p.add_argument("--reset-time-s", type=float, default=5.0,
+                   help="Time between episodes for the operator to reset the scene by hand")
+    p.add_argument("--resume", type=_str2bool, default=False)
+    p.add_argument("--push-to-hub", type=_str2bool, default=True)
+    p.add_argument("--play-sounds", type=_str2bool, default=False)
+
+    p.add_argument("--home-pose-name", default=None,
+                   help=f"Name of a saved pose in {POSES_DIR} (overrides --home-q-* and --home-gripper)")
+    p.add_argument("--home-q-left", nargs=7, type=float,
+                   default=[0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0])
+    p.add_argument("--home-q-right", nargs=7, type=float,
+                   default=[0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0])
+    p.add_argument("--home-gripper", type=float, default=1.0,
+                   help="Normalized gripper at home (0=closed, 1=open)")
+    p.add_argument("--home-max-time-s", type=float, default=5.0)
+    p.add_argument("--home-tol-rad", type=float, default=0.05)
+
+    args = p.parse_args()
+    init_logging()
+
+    # If --policy is set, load its config so sanity_check_dataset_name can see it.
+    args._policy_cfg = None
+    if args.policy:
+        args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
+        args._policy_cfg.pretrained_path = args.policy
+
+    robot = _build_robot(use_ee_pos=args.use_ee_pos)
+    teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
+
+    teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
+
+    dataset = _build_dataset(args, robot, teleop_proc, robot_obs_proc)
+
+    policy = preprocessor = postprocessor = None
+    if args._policy_cfg is not None:
+        policy = make_policy(args._policy_cfg, ds_meta=dataset.meta)
+        preprocessor, postprocessor = make_pre_post_processors(
+            policy_cfg=args._policy_cfg,
+            pretrained_path=args.policy,
+            dataset_stats=dataset.meta.stats,
+            preprocessor_overrides={
+                "device_processor": {"device": args._policy_cfg.device},
+            },
+        )
+
+    if args.home_pose_name:
+        pose_path = POSES_DIR / f"{args.home_pose_name}.json"
+        pose = json.loads(pose_path.read_text())
+        home_q_l = np.asarray(pose["l_q"], dtype=np.float64)
+        home_q_r = np.asarray(pose["r_q"], dtype=np.float64)
+        args.home_gripper = float(pose.get("gripper", args.home_gripper))
+        logger.info("Loaded home pose %r from %s", args.home_pose_name, pose_path)
+    else:
+        home_q_l = np.asarray(args.home_q_left, dtype=np.float64)
+        home_q_r = np.asarray(args.home_q_right, dtype=np.float64)
+
+    robot.connect()
+    if teleop is not None:
+        teleop.connect()
+
+    listener, events = init_keyboard_listener()
+
+    try:
+        with VideoEncodingManager(dataset):
+            recorded = 0
+            while recorded < args.num_episodes and not events["stop_recording"]:
+                log_say(f"Homing arms before episode {dataset.num_episodes}", args.play_sounds)
+                ok = robot.home(
+                    home_q_left=home_q_l,
+                    home_q_right=home_q_r,
+                    gripper_norm=args.home_gripper,
+                    max_time_s=args.home_max_time_s,
+                    tol_rad=args.home_tol_rad,
+                    fps=args.fps,
+                )
+                if not ok:
+                    logger.warning("Homing did not converge before episode %d; proceeding anyway",
+                                   dataset.num_episodes)
+
+                log_say(f"Recording episode {dataset.num_episodes}", args.play_sounds)
+                record_loop(
+                    robot=robot,
+                    events=events,
+                    fps=args.fps,
+                    teleop_action_processor=teleop_proc,
+                    robot_action_processor=robot_action_proc,
+                    robot_observation_processor=robot_obs_proc,
+                    teleop=teleop,
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    postprocessor=postprocessor,
+                    dataset=dataset,
+                    control_time_s=args.episode_time_s,
+                    single_task=args.task,
+                )
+
+                if not events["stop_recording"] and (
+                    (recorded < args.num_episodes - 1) or events["rerecord_episode"]
+                ):
+                    log_say("Reset the environment", args.play_sounds)
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=args.fps,
+                        teleop_action_processor=teleop_proc,
+                        robot_action_processor=robot_action_proc,
+                        robot_observation_processor=robot_obs_proc,
+                        teleop=teleop,
+                        control_time_s=args.reset_time_s,
+                        single_task=args.task,
+                    )
+
+                if events["rerecord_episode"]:
+                    log_say("Re-record episode", args.play_sounds)
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    dataset.clear_episode_buffer()
+                    continue
+
+                dataset.save_episode()
+                recorded += 1
+    finally:
+        log_say("Stop recording", args.play_sounds, blocking=True)
+        if dataset is not None:
+            dataset.finalize()
+            if args.push_to_hub:
+                try:
+                    dataset.push_to_hub()
+                except Exception:
+                    logger.exception("push_to_hub failed; dataset is still on disk at %s",
+                                     Path(args.output_dir).resolve())
+        if robot.is_connected:
+            robot.disconnect()
+        if teleop is not None and teleop.is_connected:
+            teleop.disconnect()
+        if listener is not None:
+            listener.stop()
+
+
+if __name__ == "__main__":
+    main()
