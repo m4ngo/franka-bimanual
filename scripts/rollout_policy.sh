@@ -14,9 +14,10 @@ if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ]; then
     echo "Usage: $0 <repo_id> <number_of_episodes> <policy_repo_id> <output_dir>"
     exit 1
 fi
-lerobot-rollout \
-    --strategy.type=sentry \
+lerobot-record \
     --policy.path="$3" \
+    --policy.noise_scheduler_type="DDIM" \
+    --policy.num_inference_steps=10 \
     --robot.type=bimanual_franka \
     --robot.l_server_ip=192.168.3.11 \
     --robot.l_robot_ip=192.168.200.2 \
@@ -26,7 +27,7 @@ lerobot-rollout \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
-    --robot.use_ee_pos=false \
+    --robot.use_ee_pos=true \
     --dataset.repo_id="$1" \
     --dataset.num_episodes="$2" \
     --dataset.root="$4" \
@@ -34,4 +35,4 @@ lerobot-rollout \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
     --dataset.fps=30 \
-    --display_data=false
+    --display_data=true

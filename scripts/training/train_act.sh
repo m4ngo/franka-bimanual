@@ -16,9 +16,12 @@ lerobot-train \
   --dataset.repo_id="$1" \
   --policy.type=$5 \
   --output_dir="../franka_data/policy/train/$5_$1" \
+  --policy.chunk_size=100 \
   --job_name="$5_$1" \
   --policy.device=cuda \
   --wandb.enable=true \
   --policy.repo_id="$2" \
   --batch_size="$3" \
-  --steps="$4"
+  --steps="$4" \
+  --eval_freq=5000 \
+  --num_workers=4

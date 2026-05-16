@@ -1,9 +1,12 @@
 """Homed bimanual-Franka recording/rollout orchestrator.
 
 Wraps lerobot's `record_loop` with a `BimanualFranka.home(...)` call inserted
-at the start of every episode, so each episode begins from a fixed joint-
-space home pose with grippers open. Supports both teleop recording
-(`--policy` unset) and policy rollout (`--policy <hf_repo>`).
+at the start of every episode, so each episode begins from a fixed home pose
+with grippers open. Joint targets in `home_poses/*.json` are driven in joint
+velocity mode by default; when `--use-ee-pos true`, homing uses Cartesian
+velocity toward the FK of those joints (same controller mode as EE teleop).
+Supports both teleop recording (`--policy` unset) and policy rollout
+(`--policy <hf_repo>`).
 
 Rig IPs/ports are hardcoded to match the existing shell wrappers — this is
 not a general-purpose tool, it's the workstation's specific recipe.
@@ -156,7 +159,7 @@ def main() -> None:
     p.add_argument("--teleop-id", default="homed_teleop")
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--episode-time-s", type=float, default=60.0)
-    p.add_argument("--reset-time-s", type=float, default=5.0,
+    p.add_argument("--reset-time-s", type=float, default=3.0,
                    help="Time between episodes for the operator to reset the scene by hand")
     p.add_argument("--resume", type=_str2bool, default=False)
     p.add_argument("--push-to-hub", type=_str2bool, default=True)
@@ -170,8 +173,15 @@ def main() -> None:
                    default=[0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0])
     p.add_argument("--home-gripper", type=float, default=1.0,
                    help="Normalized gripper at home (0=closed, 1=open)")
-    p.add_argument("--home-max-time-s", type=float, default=5.0)
-    p.add_argument("--home-tol-rad", type=float, default=0.05)
+    p.add_argument("--home-max-time-s", type=float, default=3.0)
+    p.add_argument("--home-tol-rad", type=float, default=0.05,
+                   help="Joint homing: max per-joint error (rad). EE homing: default rot tolerance if --home-tol-rot-rad unset.")
+    p.add_argument("--home-fps", type=int, default=None,
+                   help="Homing control rate (Hz). Default: max(--fps, 60) in EE mode, else --fps.")
+    p.add_argument("--home-tol-m", type=float, default=0.03,
+                   help="EE homing only: max position error (m) per arm")
+    p.add_argument("--home-tol-rot-rad", type=float, default=None,
+                   help="EE homing only: max axis-angle error (rad); defaults to --home-tol-rad")
 
     args = p.parse_args()
     init_logging()
@@ -223,14 +233,17 @@ def main() -> None:
             recorded = 0
             while recorded < args.num_episodes and not events["stop_recording"]:
                 log_say(f"Homing arms before episode {dataset.num_episodes}", args.play_sounds)
-                ok = robot.home(
-                    home_q_left=home_q_l,
-                    home_q_right=home_q_r,
+                home_kw: dict = dict(
                     gripper_norm=args.home_gripper,
                     max_time_s=args.home_max_time_s,
                     tol_rad=args.home_tol_rad,
                     fps=args.fps,
+                    home_fps=args.home_fps,
                 )
+                if args.use_ee_pos:
+                    home_kw["tol_pos_m"] = args.home_tol_m
+                    home_kw["tol_rot_rad"] = args.home_tol_rot_rad
+                ok = robot.home(home_q_left=home_q_l, home_q_right=home_q_r, **home_kw)
                 if not ok:
                     logger.warning("Homing did not converge before episode %d; proceeding anyway",
                                    dataset.num_episodes)

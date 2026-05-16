@@ -14,6 +14,7 @@ dependencies = [
     "lerobot_camera_framos",
     "net_franky",
     "opencv-python-headless",
+    "scipy",
 ]
 
 [tool.setuptools.packages.find]

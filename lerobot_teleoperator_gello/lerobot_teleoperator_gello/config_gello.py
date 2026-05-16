@@ -21,6 +21,7 @@ class GelloLeaderFields:
     gripper_travel_counts: int = 575  # closed-to-open travel in encoder counts
     smoothing: float = 0.99           # EMA alpha; 1.0 = no smoothing, 0.0 = max smoothing
     use_async: bool = True            # read motor states in a background thread
+    use_noise: bool = True
 
 
 @TeleoperatorConfig.register_subclass("gello")

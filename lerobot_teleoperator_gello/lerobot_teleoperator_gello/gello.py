@@ -44,6 +44,7 @@ class Gello(Teleoperator):
     name = "gello"
 
     RAD_PER_COUNT = 2 * np.pi / (_DYNAMIXEL_COUNTS - 1)
+    NOISE_SCALE = 0.02
 
     JOINT_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "joint_7", "gripper"]
 
@@ -70,6 +71,8 @@ class Gello(Teleoperator):
         self.stop_event: Event | None = None
         self.lock: Lock = Lock()
         self.latest_action: dict[str, float] | None = None
+        self.use_noise = config.use_noise
+
     def _maybe_prefix(self, d: dict[str, Any]) -> dict[str, Any]:
         side = getattr(self.config, "side", None)
         return d if side is None else {f"{side}_{k}": v for k, v in d.items()}
@@ -212,6 +215,7 @@ class Gello(Teleoperator):
                 * (float(raw_action[motor]) - calibration.joint_offsets[motor])
                 * self.RAD_PER_COUNT
                 + self.config.calibration_position[idx]
+                + (np.random.normal(0.0, self.NOISE_SCALE) if self.use_noise else 0.0)
             )
 
         gripper_range = calibration.gripper_closed_position - calibration.gripper_open_position

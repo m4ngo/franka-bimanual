@@ -15,7 +15,7 @@ from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-VELOCITY_COMMAND_DURATION_MS = 250
+VELOCITY_COMMAND_DURATION_MS = 100
 NUM_JOINTS = 7
 EE_DELTA_DIMS = 6
 
@@ -121,7 +121,8 @@ class RobotDriver:
         ns = self._conn.namespace
         self._rpc_state = ns["get_state"]
         self._rpc_jacobian = ns["get_jacobian"]
-        self._rpc_send = ns["send_ee"] if use_ee_delta else ns["send_jv"]
+        self._rpc_send_jv = ns["send_jv"]
+        self._rpc_send_ee = ns["send_ee"]
         self._rpc_stop = ns["stop"]
         self.robot = ns["init_robot"](robot_ip)
 
@@ -137,10 +138,25 @@ class RobotDriver:
             self._jac_q = q.copy()
         return q, np.array(dq_l), self._jac, np.array(p_l), np.array(r_l), np.array(v_l)
 
-    def send_velocity(self, vel: list[float]) -> None:
+    def send_joint_velocity(self, vel: list[float]) -> None:
+        """Joint-space velocity RPC (joint-mode teleop and `home()` when not in EE mode)."""
         # tuple() so brine encodes by value (lists go over as netrefs).
         try:
-            self._rpc_send(self.robot, tuple(vel))
+            self._rpc_send_jv(self.robot, tuple(vel))
+        except Exception as e:
+            if any(t in str(e) for t in _RECOVERABLE_ERRORS):
+                try:
+                    self.robot.recover_from_errors()
+                except Exception:
+                    pass
+            logger.warning("send_joint_velocity: %s", e)
+
+    def send_velocity(self, vel: list[float]) -> None:
+        """Cartesian twist when `use_ee_delta`, else joint velocity (normal teleop)."""
+        # tuple() so brine encodes by value (lists go over as netrefs).
+        rpc = self._rpc_send_ee if self.use_ee_delta else self._rpc_send_jv
+        try:
+            rpc(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
                 try:
@@ -190,7 +206,7 @@ class MultiRobotWrapper:
         return self._gather(lambda n: self.drivers[n].get_kinematic_state(), names, timeout_s)
 
     def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True) -> None:
-        self._gather(lambda n: self.drivers[n].send_velocity(vels[n]), list(vels))
+        self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n]), list(vels))
 
     def move_ee_delta_batch(self, twists: dict[str, list], asynchronous: bool = True) -> None:
         self._gather(lambda n: self.drivers[n].send_velocity(twists[n]), list(twists))

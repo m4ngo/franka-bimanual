@@ -14,6 +14,7 @@ from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
 from .bimanual_franka_config import BimanualFrankaConfig
+from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
@@ -158,7 +159,7 @@ class BimanualFranka(Robot):
         self._cached_kin_state = None
 
         for arm in self.active_arms:
-            self.grippers[arm].move(action[f"{arm}_gripper"] * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
+            self.grippers[arm].move(np.clip(action[f"{arm}_gripper"], 0.0, 1.0) * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
 
         if self.use_ee_pos:
             cmds = self.safety.shape_ee(
@@ -169,6 +170,7 @@ class BimanualFranka(Robot):
             cmds = self.safety.shape_joint(
                 {arm: self._joint_pd(action, arm, kin[arm]) for arm in self.active_arms}, kin
             )
+
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action
 
@@ -180,48 +182,97 @@ class BimanualFranka(Robot):
         max_time_s: float = 5.0,
         tol_rad: float = 0.05,
         fps: int = 30,
+        *,
+        home_fps: int | None = None,
+        tol_pos_m: float = 0.025,
+        tol_rot_rad: float | None = None,
     ) -> bool:
-        """Drive both arms to a joint-space home pose via the joint-velocity PD.
+        """Drive both arms to a saved home configuration.
 
-        Bypasses `use_ee_pos` so this works regardless of the configured action
-        mode. Runs a closed-loop PD at `fps` Hz until each active arm's max
-        joint error is below `tol_rad`, or `max_time_s` elapses. Gripper
-        command is fire-and-forget.
+        Joint targets (`home_q_*`) are always interpreted as the desired
+        `q`; when `use_ee_pos` is True, FK turns them into EE setpoints and
+        homing runs the same Cartesian-velocity PD as teleop (no joint-velocity
+        commands in that session).
 
-        Returns True on convergence, False on timeout.
+        Control rate: ``home_fps`` if set; else EE homing uses ``max(fps, 60)``
+        and joint homing uses ``fps``.
         """
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
         candidates = {"l": home_q_left, "r": home_q_right}
-        targets = {
+        targets_q = {
             arm: np.asarray(q, dtype=np.float64)
             for arm, q in candidates.items()
             if q is not None and arm in self.active_arms
         }
-        if not targets:
+        if not targets_q:
             return True
 
-        for arm in targets:
+        for arm in targets_q:
             self.grippers[arm].move(gripper_norm * WSG.GRIPPER_TRUE_MAX_MM, blocking=False)
 
-        period_s = 1.0 / fps
+        rate_hz = float(
+            home_fps
+            if home_fps is not None
+            else (max(fps, 60) if self.use_ee_pos else fps)
+        )
+        period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s
-        names = list(targets)
+        names = list(targets_q)
+        rot_tol = float(tol_rot_rad if tol_rot_rad is not None else tol_rad)
+
+        if self.use_ee_pos:
+            targets_ee: dict[str, np.ndarray] = {}
+            for arm, q in targets_q.items():
+                p, qu = franka_fk(q)
+                qu = np.asarray(qu, dtype=np.float64)
+                qu /= max(float(np.linalg.norm(qu)), 1e-12)
+                targets_ee[arm] = np.concatenate((p, qu))
+            while True:
+                tick_start = time.perf_counter()
+                kin = self.robot_manager.current_kinematic_state_batch(names)
+
+                cmds_raw = {arm: self._ee_velocity_toward_pose(targets_ee[arm], kin[arm]) for arm in names}
+                cmds = self.safety.shape_ee(cmds_raw, kin)
+                self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
+
+                max_pos = 0.0
+                max_rot = 0.0
+                for arm in names:
+                    pe, re = self._ee_pose_errors(targets_ee[arm], kin[arm])
+                    max_pos = max(max_pos, float(np.linalg.norm(pe)))
+                    max_rot = max(max_rot, float(np.linalg.norm(re)))
+
+                if max_pos < tol_pos_m and max_rot < rot_tol:
+                    self._cached_kin_state = None
+                    return True
+                if tick_start >= deadline:
+                    self._cached_kin_state = None
+                    logger.warning(
+                        "home(): EE timeout after %.2fs (pos err %.4f m, rot err %.4f rad)",
+                        max_time_s,
+                        max_pos,
+                        max_rot,
+                    )
+                    return False
+
+                elapsed = time.perf_counter() - tick_start
+                if elapsed < period_s:
+                    time.sleep(period_s - elapsed)
+
         while True:
             tick_start = time.perf_counter()
             kin = self.robot_manager.current_kinematic_state_batch(names)
 
             cmds_raw = {
-                arm: JOINT_PD_KP * (targets[arm] - kin[arm][0]) - JOINT_PD_KD * kin[arm][1]
+                arm: JOINT_PD_KP * (targets_q[arm] - kin[arm][0]) - JOINT_PD_KD * kin[arm][1]
                 for arm in names
             }
             cmds = self.safety.shape_joint(cmds_raw, kin)
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
 
-            max_err = max(
-                float(np.max(np.abs(targets[arm] - kin[arm][0]))) for arm in names
-            )
+            max_err = max(float(np.max(np.abs(targets_q[arm] - kin[arm][0]))) for arm in names)
             if max_err < tol_rad:
                 self._cached_kin_state = None
                 return True
@@ -235,22 +286,9 @@ class BimanualFranka(Robot):
                 time.sleep(period_s - elapsed)
 
     @staticmethod
-    def _joint_pd(action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:
-        target = np.fromiter(
-            (action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)),
-            dtype=np.float64, count=NUM_JOINTS,
-        )
-        q, dq = snap[0], snap[1]
-        return JOINT_PD_KP * (target - q) - JOINT_PD_KD * dq
-
-    @staticmethod
-    def _ee_pd(action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:
-        target = np.fromiter(
-            (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
-            dtype=np.float64, count=len(EE_AXIS_KEYS),
-        )
-        _, _, _, pos, rot, twist = snap
-
+    def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:
+        """Position error (m) and axis-angle orientation error (rad) vs ``target`` (7: x,y,z,qx,qy,qz,qw)."""
+        _, _, _, pos, rot, _ = snap
         pos_error = target[:3] - np.asarray(pos, dtype=np.float64)
 
         target_q = target[3:].copy()
@@ -277,4 +315,27 @@ class BimanualFranka(Robot):
         else:
             rot_error = (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(q_err[3], -1.0, 1.0))))
 
+        return pos_error, rot_error
+
+    @staticmethod
+    def _ee_velocity_toward_pose(target: np.ndarray, snap: KinematicSnapshot) -> np.ndarray:
+        pos_error, rot_error = BimanualFranka._ee_pose_errors(target, snap)
+        _, _, _, _, _, twist = snap
         return EE_PD_KP * np.concatenate((pos_error, rot_error)) - EE_PD_KD * np.asarray(twist, dtype=np.float64)
+
+    @staticmethod
+    def _joint_pd(action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:
+        target = np.fromiter(
+            (action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)),
+            dtype=np.float64, count=NUM_JOINTS,
+        )
+        q, dq = snap[0], snap[1]
+        return JOINT_PD_KP * (target - q) - JOINT_PD_KD * dq
+
+    @staticmethod
+    def _ee_pd(action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:
+        target = np.fromiter(
+            (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
+            dtype=np.float64, count=len(EE_AXIS_KEYS),
+        )
+        return BimanualFranka._ee_velocity_toward_pose(target, snap)
