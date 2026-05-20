@@ -248,6 +248,10 @@ class FramosCamera(Camera):
                 return self._blank_color()
 
             if depth and self._config.enable_depth:
+                # pc = rs.pointcloud()
+                # points = pc.calculate(depth)
+                # vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
+                # print(len(vertices))
                 self._last_depth = np.asanyarray(depth.get_data())
 
             if not color:
