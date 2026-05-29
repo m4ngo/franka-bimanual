@@ -131,7 +131,7 @@ class WSG:
         with self._state_lock:
             return self._gripper_state
 
-    def move(self, position_mm: float, blocking: bool = False) -> bool:
+    def move(self, position_mm: float, speed: float = 1.0, blocking: bool = False) -> bool:
         """Stream a new target position (mm).
 
         Non-blocking by default: the latest target is published to the

@@ -31,6 +31,11 @@ class BimanualFrankaConfig(RobotConfig):
             "cam_6": FramosCameraConfig(name="workspace_framos_d63", ip="192.168.1.102", serial_number="6CD146030D63", fps=30, width=224, height=224),
         }
     )
+    depth: bool = True
+    depth_cam: str = "cam_2_scene"
+    world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.245)
+    world_in_robot_quat_wxyz: tuple[float, float, float, float] = (0.996, -0.07, 0.043, -0.023)
+    depth_crop_radius_m: float = 0.4
 
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):
@@ -45,6 +50,6 @@ class BimanualFrankaConfig(RobotConfig):
 
         self.active_arms = tuple(dict.fromkeys(self.active_arms))
 
-        camera_names = [camera.name for camera in self.cameras.values()]
+        camera_names = [str(getattr(camera, "name", "")) for camera in self.cameras.values()]
         if len(camera_names) != len(set(camera_names)):
             raise ValueError("Camera names must be unique.")

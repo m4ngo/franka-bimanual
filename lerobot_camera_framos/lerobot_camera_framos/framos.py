@@ -66,6 +66,12 @@ class FramosCamera(Camera):
         self._aligner: rs.align | None = None
         self._last_color: np.ndarray | None = None
         self._last_depth: np.ndarray | None = None
+        self._vertices: np.ndarray | None = None
+        self._depth_scale: float = 0.001
+
+        self._intrinsics = np.asarray(config.intrinsic_matrix, dtype=np.float64)
+        self._r_world_from_cam = np.asarray(config.r_cam_in_world, dtype=np.float64)
+        self._t_world_from_cam = np.asarray(config.t_cam_in_world, dtype=np.float64)
 
         self._output_width = int(config.width) if config.width is not None else int(config.color_width)
         self._output_height = int(config.height) if config.height is not None else int(config.color_height)
@@ -160,6 +166,10 @@ class FramosCamera(Camera):
             self._aligner = None
 
         device = profile.get_device()
+        try:
+            self._depth_scale = float(device.first_depth_sensor().get_depth_scale())
+        except Exception:
+            self._depth_scale = 0.001
         self._apply_options(device)
 
         # if warmup:
@@ -218,6 +228,38 @@ class FramosCamera(Camera):
         self._profile = None
         self._aligner = None
 
+    def get_depth(self) -> list[tuple[float, float, float]]:
+        depth_image = self._last_depth
+        if depth_image is None:
+            return []
+
+        depth_m = np.asarray(depth_image, dtype=np.float32) * self._depth_scale
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
+        if not np.any(valid):
+            return []
+
+        yy, xx = np.nonzero(valid)
+        if yy.size >= 2048:
+            idx = np.linspace(0, yy.size - 1, 2048, dtype=np.int64)
+            yy = yy[idx]
+            xx = xx[idx]
+        else:
+            reps = (2048 + yy.size - 1) // yy.size
+            yy = np.tile(yy, reps)[:2048]
+            xx = np.tile(xx, reps)[:2048]
+
+        z = depth_m[yy, xx]
+        fx = float(self._intrinsics[0, 0])
+        fy = float(self._intrinsics[1, 1])
+        cx = float(self._intrinsics[0, 2])
+        cy = float(self._intrinsics[1, 2])
+
+        x = (xx.astype(np.float32) - cx) * z / fx
+        y = (yy.astype(np.float32) - cy) * z / fy
+        cam_points = np.stack((x, y, z), axis=1).astype(np.float64, copy=False)
+        world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+        return [(float(p[0]), float(p[1]), float(p[2])) for p in world_points]
+
     def _fetch_color(self, timeout_ms: float, allow_stale: bool) -> np.ndarray:
         if self._pipeline is None:
             return self._blank_color()
@@ -249,14 +291,6 @@ class FramosCamera(Camera):
                 return self._blank_color()
 
             if depth and self._config.enable_depth:
-                # pc = rs.pointcloud()
-                # points = pc.calculate(depth)
-                # vertices = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
-                # print(len(vertices))
-                # pcd = o3d.geometry.PointCloud()
-                # pcd.points = o3d.utility.Vector3dVector(vertices)
-
-                # o3d.visualization.draw_geometries([pcd])
                 self._last_depth = np.asanyarray(depth.get_data())
 
             if not color:

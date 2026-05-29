@@ -2,6 +2,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
+from typing import cast
 
 import numpy as np
 
@@ -23,6 +24,7 @@ from .wsg import WSG
 IMAGE_CHANNELS = 3
 _CAMERA_READ_TIMEOUT_MS: float = 5.0
 _CONNECT_TIMEOUT_S = 10.0
+_DEPTH_POINT_COUNT = 2048
 
 JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
 EE_PD_KP, EE_PD_KD = 2.0, 0.1
@@ -32,6 +34,8 @@ EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "grip
 EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
 _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraConfig: ArvCamera}
+
+_DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +64,18 @@ class BimanualFranka(Robot):
         self.safety = ActionSafetyScreen()
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
-        self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras), 1))
+        self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
+        self._use_depth = bool(getattr(config, "depth", False))
+        self._depth_cam = str(getattr(config, "depth_cam", ""))
+        self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
+
+        world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))
+        world_in_robot_translation = getattr(config, "world_in_robot_translation_m", (0.0, 0.0, 0.0))
+        r_w_in_r = self._quat_wxyz_to_rot(world_in_robot_quat)
+        t_w_in_r = np.asarray(world_in_robot_translation, dtype=np.float64)
+        # Invert world-in-robot pose to map robot-frame EE positions into world frame.
+        self._r_robot_in_world = r_w_in_r.T
+        self._t_robot_in_world = -self._r_robot_in_world @ t_w_in_r
 
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
         gripper_ip = getattr(self.config, f"{arm}_gripper_ip")
@@ -77,6 +92,20 @@ class BimanualFranka(Robot):
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
+    def _depth_features(self) -> dict[str, type]:
+        return {
+            f"depth_{point_index:04d}_{axis}": float
+            for point_index in range(_DEPTH_POINT_COUNT)
+            for axis in _DEPTH_POINT_AXES
+        }
+
+    def _depth_feature_names(self) -> list[str]:
+        return [
+            f"depth_{point_index:04d}_{axis}"
+            for point_index in range(_DEPTH_POINT_COUNT)
+            for axis in _DEPTH_POINT_AXES
+        ]
+
     @cached_property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
         out: dict[str, tuple[int, int, int]] = {}
@@ -85,9 +114,11 @@ class BimanualFranka(Robot):
                 raise RuntimeError(f"Camera '{n}' does not report height/width")
             out[n] = (int(cam.height), int(cam.width), IMAGE_CHANNELS)
         return out
-
+    
     @property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
+        if self._use_depth:
+            return {**self._arm_features(JOINT_FEATURE_KEYS), **self._camera_features, **self._depth_features()}
         return {**self._arm_features(JOINT_FEATURE_KEYS), **self._camera_features}
 
     @property
@@ -166,7 +197,70 @@ class BimanualFranka(Robot):
                 logger.warning("Camera %s read failed: %s", n, e)
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
+        
+        if self._use_depth:
+            depth_cam = self.cameras.get(self._depth_cam)
+            if depth_cam is None:
+                raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
+            get_depth = getattr(depth_cam, "get_depth")
+            verts = self._camera_pool.submit(get_depth).result()
+            ee_world = self._ee_world_center(kin)
+            depth_points = self._sample_depth_points(verts, ee_world)
+            flat_depth = depth_points.reshape(-1)
+            for name, value in zip(self._depth_feature_names(), flat_depth, strict=True):
+                obs[name] = float(value)
         return obs
+
+    def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
+        ee_world_points: list[np.ndarray] = []
+        for arm in self.active_arms:
+            pos_robot = np.asarray(kin[arm][3], dtype=np.float64)
+            ee_world_points.append(self._r_robot_in_world @ pos_robot + self._t_robot_in_world)
+        if not ee_world_points:
+            return np.zeros(3, dtype=np.float64)
+        return np.mean(np.vstack(ee_world_points), axis=0)
+
+    def _sample_depth_points(self, verts: list[tuple[float, float, float]], center: np.ndarray) -> np.ndarray:
+        points = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+        if points.size == 0:
+            return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
+
+        points = points[np.isfinite(points).all(axis=1)]
+        if points.shape[0] == 0:
+            return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
+
+        deltas = points - center.reshape(1, 3)
+        dist2 = np.einsum("ij,ij->i", deltas, deltas)
+        mask = dist2 <= (self._depth_crop_radius_m ** 2)
+        cropped = points[mask]
+
+        if cropped.shape[0] == 0:
+            sampled = np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float64)
+        elif cropped.shape[0] >= _DEPTH_POINT_COUNT:
+            idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
+            sampled = cropped[idx]
+        else:
+            reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
+            sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
+
+        out = np.asarray(sampled, dtype=np.float32)
+        return out
+
+    @staticmethod
+    def _quat_wxyz_to_rot(q: tuple[float, float, float, float]) -> np.ndarray:
+        w, x, y, z = q
+        n = float(np.sqrt(w * w + x * x + y * y + z * z))
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float64)
+        w, x, y, z = w / n, x / n, y / n, z / n
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
 
     def send_action(self, action: RobotAction) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
@@ -306,6 +400,7 @@ class BimanualFranka(Robot):
     def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:
         """Position error (m) and axis-angle orientation error (rad) vs ``target`` (7: x,y,z,qx,qy,qz,qw)."""
         _, _, _, pos, rot, _ = snap
+        # print(pos, rot)
         pos_error = target[:3] - np.asarray(pos, dtype=np.float64)
 
         target_q = target[3:].copy()

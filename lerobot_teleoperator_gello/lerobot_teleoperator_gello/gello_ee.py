@@ -43,5 +43,5 @@ class GelloEE(Gello):
             "qy":     float(quat_xyzw[1]),
             "qz":     float(quat_xyzw[2]),
             "qw":     float(quat_xyzw[3]),
-            "gripper": joint_action["gripper"],
+            "gripper": joint_action["gripper"]
         })

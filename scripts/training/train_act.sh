@@ -17,6 +17,7 @@ lerobot-train \
   --policy.type=$5 \
   --output_dir="../franka_data/policy/train/$5_$1" \
   --policy.chunk_size=100 \
+  --policy.n_action_steps=5 \
   --job_name="$5_$1" \
   --policy.device=cuda \
   --wandb.enable=true \

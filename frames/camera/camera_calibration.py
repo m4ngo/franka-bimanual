@@ -9,7 +9,9 @@ criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 # prepare object points, like (0,0,0), (1,0,0), (2,0,0) ....,(6,5,0)
 square_size = 0.02 # meters
 objp = np.zeros((8*13,3), np.float32)
-objp[:,:2] = np.mgrid[0:8,0:13].T.reshape(-1,2) * square_size
+objp[:,:2] = np.mgrid[0:8,0:13].T.reshape(-1,2)
+objp[:,0] = 7 - objp[:,0]
+objp[:,:2] *= square_size
 
 # Arrays to store object points and image points from all the images.
 # objpoints = [(0.01, 0.0), (0.09, -0.14), (-0.09, -0.14)] # 3d point in real world space
@@ -50,9 +52,14 @@ print("Distortion coefficients:\n", dist)
 
 for i, (rvec, tvec) in enumerate(zip(rvecs, tvecs)):
     R, _ = cv.Rodrigues(rvec)
+    R_cam_in_board = R.T
+    t_cam_in_board = -R.T @ tvec
     print(f"Extrinsics for image {i}:")
     print("R:\n", R)
     print("t:\n", tvec)
+    print("Camera pose in chessboard/world coords:")
+    print("R_cam_in_board:\n", R_cam_in_board)
+    print("t_cam_in_board:\n", t_cam_in_board)
     
 mean_error = 0
 for i in range(len(objpoints)):
