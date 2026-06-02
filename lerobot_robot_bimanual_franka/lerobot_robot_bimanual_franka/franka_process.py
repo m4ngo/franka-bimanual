@@ -24,7 +24,7 @@ RPYC_TIMEOUT_S = 10
 
 _JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
 _JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (0.4, 0.25, 0.15)
+_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.3, 1.0)
 _TORQUE_THRESHOLD = 100.0  # Nm
 _FORCE_THRESHOLD = 200.0   # N
 _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
@@ -64,10 +64,13 @@ _EE_DYN = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
 _ZERO3 = _np.zeros(3)
 _ZERO_J = _np.zeros({NUM_JOINTS})
 
-def init_robot(ip):
+def init_robot(ip, ee):
     r = _cbm.CBRobot(ip)
     r.recover_from_errors()
-    r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_JOINT_RELATIVE_DYNAMICS!r})
+    if ee:
+        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
+    else:
+        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_JOINT_RELATIVE_DYNAMICS!r})
     r.set_collision_behavior({_TORQUE_THRESHOLD}, {_FORCE_THRESHOLD})
     r.set_joint_impedance({_JOINT_STIFFNESS!r})
     return r
@@ -124,7 +127,7 @@ class RobotDriver:
         self._rpc_send_jv = ns["send_jv"]
         self._rpc_send_ee = ns["send_ee"]
         self._rpc_stop = ns["stop"]
-        self.robot = ns["init_robot"](robot_ip)
+        self.robot = ns["init_robot"](robot_ip, use_ee_delta)
 
     @property
     def is_alive(self) -> bool:

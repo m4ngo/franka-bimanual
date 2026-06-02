@@ -26,7 +26,7 @@ from lerobot_robot_bimanual_franka import BimanualFrankaConfig
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
 
 _WORLD_IN_ROBOT_TRANSLATION_M = np.array((0.669, 0.003, 0.120), dtype=np.float64)
-_WORLD_IN_ROBOT_QUAT_WXYZ = np.array((0.926393, 0.0, 0.0, -0.376557), dtype=np.float64)
+_WORLD_IN_ROBOT_QUAT_WXYZ = np.array((-0.376557, 0.0, 0.0, 0.926393), dtype=np.float64)
 _WORLD_FROM_ROBOT_ROT = Rotation.from_quat(
     (_WORLD_IN_ROBOT_QUAT_WXYZ[1], _WORLD_IN_ROBOT_QUAT_WXYZ[2], _WORLD_IN_ROBOT_QUAT_WXYZ[3], _WORLD_IN_ROBOT_QUAT_WXYZ[0])
 ).inv()

@@ -34,7 +34,7 @@ class BimanualFrankaConfig(RobotConfig):
     depth: bool = True
     depth_cam: str = "cam_2_scene"
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = (0.926393, 0.0, 0.0, -0.376557)
+    world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)
     depth_crop_radius_m: float = 0.4
 
     def __post_init__(self):

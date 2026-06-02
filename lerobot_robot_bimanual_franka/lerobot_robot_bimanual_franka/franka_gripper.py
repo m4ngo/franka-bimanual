@@ -8,6 +8,7 @@ transport with arm motion. A single background worker keeps `grasp()` and
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import time
 import threading
 
 import rpyc
@@ -18,6 +19,8 @@ RPYC_TIMEOUT_S = 10
 class FrankaGripper:
     GRIPPER_TRUE_MAX_MM = 80.0
     _MOVE_SPEED_M_S = 1.0
+    _INTERPOLATE_SPEED = 110
+    _START_OFFSET_S = 0.6
     # _ASYNC_MOVE_SPEED_M_S = 0.20
     # Keep every meaningful width update so the latest command reaches the gripper.
     # _TARGET_CHANGE_THRESH_MM = 0.8
@@ -27,7 +30,6 @@ class FrankaGripper:
         self.name = name
         self.do_print = do_print
         self._position_mm = self.GRIPPER_TRUE_MAX_MM
-        self._last_sent_position_mm: float | None = None
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix=f"{name}gripper")
 
         self._conn = rpyc.classic.connect(server_ip, port)
@@ -62,6 +64,7 @@ def close_gripper(controller):
         self._rpc_grasp = ns["grasp_gripper"]
         self._rpc_open = ns["open_gripper"]
         self._is_open = True
+        self._position_ts: float | None = None
 
     @staticmethod
     def _clamp_mm(position_mm: float) -> float:
@@ -69,7 +72,12 @@ def close_gripper(controller):
 
     @property
     def position(self) -> float | None:
-        return self._position_mm
+        if self._position_ts is None:
+            return self._position_mm
+        elapsed = (time.monotonic() - (self._position_ts + self._START_OFFSET_S))
+        if elapsed < 0:
+            return self._position_mm
+        return self._clamp_mm(self._position_mm + (-1 if self._position_mm == self.GRIPPER_TRUE_MAX_MM else 1) * elapsed * self._INTERPOLATE_SPEED)
 
     @property
     def gripper_state(self) -> int | None:
@@ -78,16 +86,22 @@ def close_gripper(controller):
     def move(self, position_mm: float, speed: float = _MOVE_SPEED_M_S, blocking: bool = False) -> bool:
         if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open:
             self._is_open = False
+            self._position_mm = self.GRIPPER_TRUE_MAX_MM
+            self._position_ts = time.monotonic()
+            # store time
             self.grasp(0.0, speed, self._DEFAULT_FORCE)
         elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open:
             self._is_open = True
+            self._position_mm = 0
+            self._position_ts = time.monotonic()
+            # store time
             self.open(speed)
         return True
 
     def home(self) -> bool:
         result = bool(self._rpc_home(self._controller))
         self._position_mm = self.GRIPPER_TRUE_MAX_MM
-        self._last_sent_position_mm = self.GRIPPER_TRUE_MAX_MM
+        self._position_ts = None
         return result
 
     def home_async(self) -> threading.Thread:
