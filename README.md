@@ -67,7 +67,7 @@ Teleop
 - Before even running teleop, if its the first time running teleop after turning on the robots, you may need to calibrate the GELLOs
 	- Sometimes the calibration is saved, but if the GELLOs got turned off last time or disconnected, they may become uncalibrated
 	- Calibration can be done using the script in /scripts/old/calibrate_gello_teleop.py
-    - The GELLOs home position looks like this: <img width="4032" height="3024" alt="IMG_7486" src="https://github.com/user-attachments/assets/156e1dd7-5d33-4302-948f-51686f9cdebe" />
+    - The GELLOs home position looks like this: (note that the joints are all straight except the 90 degree angle in the elbow and the gripper is fully open) <img width="1344" height="1008" alt="IMG_7486" src="https://github.com/user-attachments/assets/156e1dd7-5d33-4302-948f-51686f9cdebe" />
 
 - Ensure setup is ready. MAKE SURE THE GELLOs AREN'T COLLIDING. It can be helpful to prop them on a box in their 'default position' to ensure nothing goes wrong when teleop starts
 - Run `./~/franka_ws/scripts/teleop.sh`
