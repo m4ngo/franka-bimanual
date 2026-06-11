@@ -114,13 +114,14 @@ def process_chunk(chunk: np.ndarray, current_ee_pose: np.ndarray) -> np.ndarray:
         step = chunk[i]
         next_pos = step[:3]
         next_quat = step[3:7]
+        gripper = (step[7] - 0.5) * 2.0
 
         delta_pos = (next_pos - prev_pos) / _POS_SCALE
         delta_rot = (
             Rotation.from_quat(next_quat) * Rotation.from_quat(prev_quat).inv()
         ).as_rotvec() / _ROT_SCALE
 
-        result[i] = np.array([*delta_pos, *delta_rot, step[7], step[8], step[9]], dtype=np.float32)
+        result[i] = np.array([*delta_pos, *delta_rot, gripper, step[8], step[9]], dtype=np.float32)
 
         prev_pos = next_pos
         prev_quat = next_quat
@@ -187,7 +188,7 @@ class ResidualPolicy:
         """Args:
             obs: dict with keys:
                 "action_chunk" (5, 9)  — normalised delta chunk from base policy
-                "proprio"      (9,)    — current EE pose + left_gripper (-1.0, 0.0) + right_gripper (0.0, 1.0)
+                "proprio"      (9,)    — current EE pose + right_gripper (0.0, 1.0) + left_gripper (-1.0, 0.0)
                 "point_cloud"  (2048, 3)
                 "gains"        (2,)    — [prev_kp, prev_kd]
 
