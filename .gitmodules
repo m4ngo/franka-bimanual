@@ -1,0 +1,3 @@
+[submodule "multi-fast"]
+	path = multi-fast
+	url = https://github.com/ecai-uw/multi-fast

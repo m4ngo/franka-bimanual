@@ -187,7 +187,7 @@ class ResidualPolicy:
         """Args:
             obs: dict with keys:
                 "action_chunk" (5, 9)  — normalised delta chunk from base policy
-                "proprio"      (8,)    — current EE pose + gripper
+                "proprio"      (9,)    — current EE pose + left_gripper (-1.0, 0.0) + right_gripper (0.0, 1.0)
                 "point_cloud"  (2048, 3)
                 "gains"        (2,)    — [prev_kp, prev_kd]
 
@@ -195,9 +195,9 @@ class ResidualPolicy:
             (8,) — [dx, dy, dz, rx, ry, rz, kp, kd], all normalised.
         """
         res = np.zeros(8, dtype=np.float32)
-        res[2] = 0.0
-        res[6] = 0.3
-        res[7] = 1.0
+        res[2] = -1.0
+        res[6] = 0.5
+        res[7] = 0.0
         return res
 
 
