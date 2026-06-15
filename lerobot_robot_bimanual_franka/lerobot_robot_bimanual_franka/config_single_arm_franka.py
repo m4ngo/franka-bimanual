@@ -15,7 +15,7 @@ class SingleArmFrankaConfig(RobotConfig):
     r_port: int
     use_ee_pos: bool
     active_arms: tuple[str, ...] = ("r",)
-    depth: bool = False
+    depth: bool = True
     depth_cam: str = "cam_2_scene"
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
     world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)
