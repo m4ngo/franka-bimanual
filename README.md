@@ -16,11 +16,11 @@ NUC (left arm controller)
 
 right franka
 - controller IP at 192.168.201.10
-- gripper IP at 192.168.2.20
+- SCHUNK gripper IP at 192.168.2.20
 
 left franka
 - controller IP at 192.168.200.2
-- gripper IP at 192.168.2.21
+- SCHUNK gripper IP at 192.168.2.21
 
 camera IPs
 - "192.168.0.142": "BFS_23595723"

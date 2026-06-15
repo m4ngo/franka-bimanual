@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 
 import env_wrapper
+from viz import EpisodeRecorder, save_episode_html
 from env_wrapper import (
     _ACTION_KEYS,
     _CHUNK_EXEC,
@@ -149,6 +150,7 @@ def _run_episode(
     episode_time_s: "float | None",
     fps: float = 20.0,
     task: str = "",
+    recorder: "EpisodeRecorder | None" = None,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -160,6 +162,8 @@ def _run_episode(
         episode_time_s: stop after this many seconds when recording; None runs forever.
         fps: target control frequency; each step sleeps for the remainder of 1/fps.
         task: task description string included in every recorded frame.
+        recorder: optional EpisodeRecorder; when provided, per-step state is
+            appended so save_episode_html can be called after the episode.
     """
     base_policy.reset()
 
@@ -221,6 +225,18 @@ def _run_episode(
             controller.cache_delta(dpos, drot)
             action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
             controller.send_action(action)
+
+            if recorder is not None:
+                q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
+                recorder.record(
+                    q=q,
+                    actual_ee_pos=ee_pose[:3],
+                    base_desired_pos=base_chunk[chunk_used, :3],
+                    total_desired_pos=base_chunk[chunk_used, :3] + dpos,
+                    kp=kp,
+                    kd=kd,
+                    gripper=action["r_gripper"],
+                )
 
             if dataset is not None:
                 frame: dict = {
@@ -296,6 +312,10 @@ def main() -> None:
                         help="Push dataset to HuggingFace Hub after recording")
     parser.add_argument("--resume", type=_str2bool, default=False,
                         help="Resume an existing dataset instead of creating a new one")
+    parser.add_argument("--viz-dir", default=None,
+                        help="Directory to write per-episode Plotly HTML visualizations")
+    parser.add_argument("--viz-stride", type=int, default=1,
+                        help="Animate every Nth step in the visualization (default 1)")
 
     args = parser.parse_args()
 
@@ -346,9 +366,22 @@ def main() -> None:
         print("homing...")
         if not controller.home(**home_kwargs):
             logger.warning("homing did not converge; proceeding anyway")
+        recorder = EpisodeRecorder() if args.viz_dir else None
         try:
-            _run_episode(controller, base_policy, residual, dataset=None, episode_time_s=None, fps=args.fps)
+            _run_episode(
+                controller, base_policy, residual,
+                dataset=None, episode_time_s=None,
+                fps=args.fps, recorder=recorder,
+            )
         finally:
+            if recorder is not None and len(recorder) > 0:
+                viz_path = os.path.join(args.viz_dir, "episode.html")
+                print(f"saving visualization to {viz_path}...")
+                save_episode_html(
+                    recorder, viz_path,
+                    title="residual episode (free run)",
+                    frame_stride=args.viz_stride,
+                )
             controller.disconnect()
         return
 
@@ -368,13 +401,27 @@ def main() -> None:
 
                 print(f"recording episode {dataset.num_episodes} / {args.num_episodes} "
                       f"({args.episode_time_s:.0f}s)...")
-                _run_episode(
-                    controller, base_policy, residual,
-                    dataset=dataset,
-                    episode_time_s=args.episode_time_s,
-                    fps=args.fps,
-                    task=args.task,
-                )
+                recorder = EpisodeRecorder() if args.viz_dir else None
+                try:
+                    _run_episode(
+                        controller, base_policy, residual,
+                        dataset=dataset,
+                        episode_time_s=args.episode_time_s,
+                        fps=args.fps,
+                        task=args.task,
+                        recorder=recorder,
+                    )
+                finally:
+                    if recorder is not None and len(recorder) > 0:
+                        viz_path = os.path.join(
+                            args.viz_dir, f"episode_{ep_idx:03d}.html"
+                        )
+                        print(f"saving visualization to {viz_path}...")
+                        save_episode_html(
+                            recorder, viz_path,
+                            title=f"episode {ep_idx} — {args.task}",
+                            frame_stride=args.viz_stride,
+                        )
                 dataset.save_episode()
                 print(f"episode {dataset.num_episodes - 1} saved")
 
