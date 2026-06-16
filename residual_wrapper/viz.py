@@ -144,6 +144,7 @@ def save_episode_html(
     path: str,
     title: str = "Residual episode",
     frame_stride: int = 1,
+    fps: float = 20.0,
 ) -> None:
     """Write a self-contained animated Plotly HTML from recorded episode data.
 
@@ -170,12 +171,15 @@ def save_episode_html(
         title:        Figure title.
         frame_stride: Emit every Nth step in the animation (default 1 = all steps).
                       Use 2–4 to reduce file size for long episodes.
+        fps:          Playback speed in frames per second (default 20).
     """
     T_full = len(recorder)
     if T_full == 0:
         return
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
 
     # --- apply stride --------------------------------------------------------
     indices = list(range(0, T_full, max(1, frame_stride)))
@@ -334,7 +338,7 @@ def save_episode_html(
                     label="Play",
                     method="animate",
                     args=[None, dict(
-                        frame=dict(duration=80, redraw=True),
+                        frame=dict(duration=frame_duration_ms, redraw=True),
                         fromcurrent=True,
                         transition=dict(duration=0),
                     )],

@@ -151,8 +151,17 @@ def visualize(repo_id: str, episode_index: int, compress: bool, spawn: bool) -> 
     # stored it under observation.images.* (it is not a real RGB video).
     cam_keys = [k for k in dataset.meta.camera_keys if k != depth_feat_key]
     cam_names = _camera_names()
-    action_names = list(dataset.meta.names["action"])
-    state_names = list(dataset.meta.names["observation.state"])
+    def _flatten_names(names) -> list[str]:
+        flat: list[str] = []
+        for item in names:
+            if isinstance(item, str):
+                flat.append(item)
+            else:
+                flat.extend(item)
+        return flat
+
+    action_names = _flatten_names(dataset.meta.names["action"])
+    state_names = _flatten_names(dataset.meta.names["observation.state"])
     arm_prefixes = _arm_prefixes(action_names)
     mode = _action_mode(action_names)
     # New format: dedicated depth_points feature.  Legacy: depth_* scalars in state.

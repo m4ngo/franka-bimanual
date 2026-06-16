@@ -381,6 +381,7 @@ def main() -> None:
                     recorder, viz_path,
                     title="residual episode (free run)",
                     frame_stride=args.viz_stride,
+                    fps=args.fps,
                 )
             controller.disconnect()
         return
@@ -421,6 +422,7 @@ def main() -> None:
                             recorder, viz_path,
                             title=f"episode {ep_idx} — {args.task}",
                             frame_stride=args.viz_stride,
+                            fps=args.fps,
                         )
                 dataset.save_episode()
                 print(f"episode {dataset.num_episodes - 1} saved")
