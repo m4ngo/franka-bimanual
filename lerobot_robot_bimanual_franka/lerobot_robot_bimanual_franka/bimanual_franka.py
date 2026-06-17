@@ -255,7 +255,7 @@ class BimanualFranka(Robot):
             dtype=np.float64,
         )
 
-    def send_action(self, action: RobotAction) -> RobotAction:
+    def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
         kp = np.clip(action["kp"], -1.0, 1.0)
@@ -271,7 +271,7 @@ class BimanualFranka(Robot):
 
         if self.use_ee_pos:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot) for arm in self.active_arms}, kin
+                {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action) for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
         else:
@@ -431,8 +431,11 @@ class BimanualFranka(Robot):
         return pos_error, rot_error
 
     @staticmethod
-    def _ee_velocity_toward_pose(kp_gain: float, kd_gain: float, target: np.ndarray, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
+    def _ee_velocity_toward_pose(kp_gain: float, kd_gain: float, target: np.ndarray, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None, ignore_action: bool = False) -> np.ndarray:
         pos_error, rot_error = BimanualFranka._ee_pose_errors(target, snap)
+        if ignore_action:
+            pos_error -= pos_error
+            rot_error -= rot_error
         if dpos is not None:
             pos_error += dpos
         if drot is not None:
@@ -450,9 +453,9 @@ class BimanualFranka(Robot):
         return (JOINT_PD_KP * kp_gain) * (target - q) - (JOINT_PD_KD * kd_gain) * dq
 
     @staticmethod
-    def _ee_pd(kp_gain: float, kd_gain: float, action: RobotAction, arm: str, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
+    def _ee_pd(kp_gain: float, kd_gain: float, action: RobotAction, arm: str, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None, ignore_action: bool = False) -> np.ndarray:
         target = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
             dtype=np.float64, count=len(EE_AXIS_KEYS),
         )
-        return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot)
+        return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot, ignore_action)
