@@ -22,9 +22,12 @@ class SpaceMouseLeaderFields:
 
     # Position increment (metres) per control tick at full axis deflection.
     # pyspacemouse normalises axis values to [-1, 1].
-    translation_scale: float = 0.035
+    translation_scale: float = 0.02
     # Rotation increment (radians) per control tick at full axis deflection.
-    rotation_scale: float = 0.1
+    rotation_scale: float = 0.05
+
+    prefix: str = ""
+    use_delta: bool = False
 
     # Initial EE Cartesian position [x, y, z] in metres. Override with
     # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.

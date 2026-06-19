@@ -14,6 +14,7 @@ class SingleArmFrankaConfig(RobotConfig):
     r_gripper_ip: str
     r_port: int
     use_ee_pos: bool
+    use_delta: bool = False
     active_arms: tuple[str, ...] = ("r",)
     depth: bool = True
     depth_cam: str = "cam_2_scene"

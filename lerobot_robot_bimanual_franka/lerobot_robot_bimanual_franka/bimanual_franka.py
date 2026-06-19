@@ -58,6 +58,7 @@ class BimanualFranka(Robot):
         super().__init__(config)
         self.config = config
         self.use_ee_pos = config.use_ee_pos
+        self.use_delta = config.use_delta
         self.active_arms = config.active_arms
         self.cameras: dict[str, Camera] = {n: _make_camera(c) for n, c in config.cameras.items()}
         self.robot_manager = MultiRobotWrapper()
@@ -118,7 +119,7 @@ class BimanualFranka(Robot):
 
     @property
     def action_features(self) -> dict[str, type]:
-        d = self._arm_features(EE_FEATURE_KEYS if self.use_ee_pos else JOINT_FEATURE_KEYS)
+        d = self._arm_features(EE_FEATURE_KEYS if (self.use_ee_pos or self.use_delta) else JOINT_FEATURE_KEYS)
         d["kp"] = float
         d["kd"] = float
         return d
@@ -150,7 +151,7 @@ class BimanualFranka(Robot):
                     getattr(self.config, f"{arm}_server_ip"),
                     getattr(self.config, f"{arm}_robot_ip"),
                     getattr(self.config, f"{arm}_port"),
-                    use_ee_delta=self.use_ee_pos,
+                    use_ee_delta=self.use_ee_pos or self.use_delta,
                 )
                 self.robot_manager.current_kinematic_state(arm, timeout_s=_CONNECT_TIMEOUT_S)
             for arm in self.active_arms:
@@ -269,7 +270,12 @@ class BimanualFranka(Robot):
                 blocking=False,
             )
 
-        if self.use_ee_pos:
+        if self.use_delta:
+            cmds = self.safety.shape_ee(
+                {arm: self._ee_delta(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot) for arm in self.active_arms}, kin
+            )
+            self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
+        elif self.use_ee_pos:
             cmds = self.safety.shape_ee(
                 {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action) for arm in self.active_arms}, kin
             )
@@ -278,7 +284,6 @@ class BimanualFranka(Robot):
             cmds = self.safety.shape_joint(
                 {arm: self._joint_pd(kp_gain, kd_gain, action, arm, kin[arm]) for arm in self.active_arms}, kin
             )
-
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action
 
@@ -459,3 +464,35 @@ class BimanualFranka(Robot):
             dtype=np.float64, count=len(EE_AXIS_KEYS),
         )
         return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot, ignore_action)
+
+    @staticmethod
+    def _ee_delta(kp_gain: float, kd_gain: float, action: RobotAction, arm: str, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
+        """Apply EE deltas from action directly as a velocity command.
+
+        The action values for position axes (x, y, z) are position deltas in metres.
+        The action values for rotation axes (qx, qy, qz, qw) encode a delta rotation as
+        a unit quaternion (xyzw), which is converted to an axis-angle vector here.
+        Cached deltas (dpos, drot) are addded on top of the action deltas.
+        No goal-pose PD error is computed.
+        """
+        action_dpos = np.fromiter(
+            (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
+            dtype=np.float64, count=3,
+        )
+        dq = np.fromiter(
+            (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
+            dtype=np.float64, count=4,
+        )
+        # Convert delta quaternion (xyzw) to axis-angle rotation error.
+        v = dq[:3]
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            action_drot = 2.0 * v
+        else:
+            action_drot = (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
+
+        total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64))
+        total_drot = action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))
+
+        _, _, _, _, _, twist = snap
+        return (EE_PD_KP * kp_gain) * np.concatenate((total_dpos, total_drot)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)

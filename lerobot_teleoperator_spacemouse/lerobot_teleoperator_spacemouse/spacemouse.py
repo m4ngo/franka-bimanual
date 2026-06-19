@@ -62,6 +62,9 @@ class SpaceMouse(Teleoperator):
         self.cur_pos: np.ndarray = np.asarray(config.initial_pos, dtype=np.float64)
         self.cur_rot: Rotation = Rotation.from_quat(config.initial_rot)  # stored as xyzw
 
+        self._prefix = config.prefix
+        self._use_delta = config.use_delta
+
     # ------------------------------------------------------------------
     # Public helpers
     # ------------------------------------------------------------------
@@ -86,7 +89,7 @@ class SpaceMouse(Teleoperator):
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {axis: float for axis in self.AXIS_NAMES} | {"gripper": float}
+        return {(self._prefix + axis): float for axis in self.AXIS_NAMES} | {f"{self._prefix}gripper": float, "kp": float, "kd": float}
 
     @property
     def feedback_features(self) -> dict[str, type]:
@@ -164,12 +167,13 @@ class SpaceMouse(Teleoperator):
         tx, ty, tz = self.config.translation_signs
         rx, ry, rz = self.config.rotation_signs
 
-        # Integrate position: spacemouse x/y are swapped relative to robot frame.
-        self.cur_pos = self.cur_pos + np.array([
+        delta_pos = np.array([
             state.y * t_scale * tx,
             state.x * t_scale * ty,
             state.z * t_scale * tz,
         ], dtype=np.float64)
+        # Integrate position: spacemouse x/y are swapped relative to robot frame.
+        self.cur_pos = self.cur_pos + delta_pos
 
         # Integrate orientation: compose a small-angle rotation onto cur_rot.
         # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
@@ -178,18 +182,36 @@ class SpaceMouse(Teleoperator):
             state.pitch * r_scale * ry,
             state.yaw   * r_scale * rz,
         ])
+        dx, dy, dz, dw = delta_rot.as_quat()
+
         self.cur_rot = delta_rot * self.cur_rot
 
-        qx, qy, qz, qw = self.cur_rot.as_quat()  # scipy returns xyzw
+        qx, qy, qz, qw = self.cur_rot.as_quat()  # scipy returns xyzw)
+
+        if self._use_delta:
+            return {
+                f"{self._prefix}x":  float(delta_pos[0]),
+                f"{self._prefix}y":  float(delta_pos[1]),
+                f"{self._prefix}z":  float(delta_pos[2]),
+                f"{self._prefix}qx": float(dx),
+                f"{self._prefix}qy": float(dy),
+                f"{self._prefix}qz": float(dz),
+                f"{self._prefix}qw": float(dw),
+                f"{self._prefix}gripper": self._gripper_target_mm,
+                "kp": 0.0,
+                "kd": 0.0
+            }
         return {
-            "x":  float(self.cur_pos[0]),
-            "y":  float(self.cur_pos[1]),
-            "z":  float(self.cur_pos[2]),
-            "qx": float(qx),
-            "qy": float(qy),
-            "qz": float(qz),
-            "qw": float(qw),
-            "gripper": self._gripper_target_mm
+            f"{self._prefix}x":  float(self.cur_pos[0]),
+            f"{self._prefix}y":  float(self.cur_pos[1]),
+            f"{self._prefix}z":  float(self.cur_pos[2]),
+            f"{self._prefix}qx": float(qx),
+            f"{self._prefix}qy": float(qy),
+            f"{self._prefix}qz": float(qz),
+            f"{self._prefix}qw": float(qw),
+            f"{self._prefix}gripper": self._gripper_target_mm,
+            "kp": 0.0,
+            "kd": 0.0
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

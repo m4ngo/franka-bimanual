@@ -26,8 +26,13 @@ import os
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.spatial.transform import Rotation
 
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
+
+# Default world→robot transform (matches BimanualFrankaConfig defaults).
+_DEFAULT_WORLD_IN_ROBOT_T = (0.669, 0.003, 0.120)
+_DEFAULT_WORLD_IN_ROBOT_Q_WXYZ = (-0.376557, 0.0, 0.0, 0.926393)
 
 
 # ---------------------------------------------------------------------------
@@ -42,13 +47,14 @@ class EpisodeRecorder:
     """
 
     def __init__(self) -> None:
-        self.joint_angles: list[np.ndarray] = []      # (7,) per step
-        self.actual_ee_pos: list[np.ndarray] = []     # (3,) actual EE via FK
-        self.base_desired_pos: list[np.ndarray] = []  # (3,) base-policy absolute target
-        self.total_desired_pos: list[np.ndarray] = [] # (3,) base + residual delta target
+        self.joint_angles: list[np.ndarray] = []       # (7,) per step
+        self.actual_ee_pos: list[np.ndarray] = []      # (3,) actual EE via FK
+        self.base_desired_pos: list[np.ndarray] = []   # (3,) base-policy absolute target
+        self.total_desired_pos: list[np.ndarray] = []  # (3,) base + residual delta target
         self.kp: list[float] = []
         self.kd: list[float] = []
         self.gripper: list[float] = []
+        self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
 
     def record(
         self,
@@ -59,6 +65,7 @@ class EpisodeRecorder:
         kp: float,
         kd: float,
         gripper: float,
+        point_cloud: np.ndarray | None = None,
     ) -> None:
         """Record one control step.
 
@@ -70,6 +77,7 @@ class EpisodeRecorder:
             kp:                Proportional gain (normalised, range [-1, 1]).
             kd:                Derivative gain   (normalised, range [-1, 1]).
             gripper:           Commanded gripper normalised to [0, 1].
+            point_cloud:       (N, 3) point cloud in world space, or None.
         """
         self.joint_angles.append(np.asarray(q, dtype=np.float64).copy())
         self.actual_ee_pos.append(np.asarray(actual_ee_pos[:3], dtype=np.float32).copy())
@@ -78,6 +86,9 @@ class EpisodeRecorder:
         self.kp.append(float(kp))
         self.kd.append(float(kd))
         self.gripper.append(float(gripper))
+        self.point_clouds.append(
+            np.asarray(point_cloud, dtype=np.float32).copy() if point_cloud is not None else None
+        )
 
     def __len__(self) -> int:
         return len(self.joint_angles)
@@ -135,6 +146,41 @@ def _metric_trace(
     )
 
 
+def _build_world_to_robot(
+    translation: tuple[float, float, float],
+    quat_wxyz: tuple[float, float, float, float],
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return (R, t) for p_robot = R @ p_world + t.
+
+    Args:
+        translation:  (tx, ty, tz) in metres.
+        quat_wxyz:    Unit quaternion (w, x, y, z).
+    """
+    w, x, y, z = quat_wxyz
+    R = Rotation.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
+    t = np.array(translation, dtype=np.float64)
+    return R, t
+
+
+def _apply_world_to_robot(
+    pts: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Apply rigid transform: p_robot = R @ p_world + t.  pts: (N, 3)."""
+    return (R @ pts.T).T + t
+
+
+def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
+    """Scatter3d for a single point cloud frame."""
+    return go.Scatter3d(
+        x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+        mode="markers",
+        marker=dict(size=2, color="pink", opacity=0.45),
+        name="point cloud",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -145,11 +191,15 @@ def save_episode_html(
     title: str = "Residual episode",
     frame_stride: int = 1,
     fps: float = 20.0,
+    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
+    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    pcd_max_pts: int = 3000,
 ) -> None:
     """Write a self-contained animated Plotly HTML from recorded episode data.
 
     Layout:
-        Left 65 %  — animated 3D arm skeleton + four EE trajectory trails:
+        Left 65 %  — animated 3D arm skeleton + EE trajectory trails +
+                       point cloud (when available).
                        actual (thin gray), total desired (solid blue),
                        base desired (dashed orange).
         Right 35 % — stacked time-series: kp (row 1), kd (row 2), gripper (row 3).
@@ -160,18 +210,28 @@ def save_episode_html(
         2  total desired   — base + residual delta target
         3  base desired    — base-policy-only absolute target
         4  kp metric
-        5  kd metric
-        6  gripper metric
-        7  kp zero-line    (static, not animated)
-        8  kd zero-line    (static, not animated)
+        5  kp_true metric
+        6  kd metric
+        7  kd_true metric  (not animated via frames)
+        8  gripper metric  (not animated via frames)
+        9  point cloud     — only present when recorder.point_clouds contains data
+        (static zero-lines appended last, not in any frame update)
 
     Args:
-        recorder:     Populated EpisodeRecorder.
-        path:         Output .html path; parent directories are created.
-        title:        Figure title.
-        frame_stride: Emit every Nth step in the animation (default 1 = all steps).
-                      Use 2–4 to reduce file size for long episodes.
-        fps:          Playback speed in frames per second (default 20).
+        recorder:                  Populated EpisodeRecorder.
+        path:                      Output .html path; parent directories are created.
+        title:                     Figure title.
+        frame_stride:              Emit every Nth step (default 1 = all).
+                                   Use 2–4 to reduce file size for long episodes.
+        fps:                       Playback speed in frames per second (default 20).
+        world_in_robot_translation: (tx, ty, tz) metres — translation part of the
+                                   world→robot rigid transform.  Defaults to
+                                   BimanualFrankaConfig values.
+        world_in_robot_quat_wxyz:  (w, x, y, z) unit quaternion — rotation part of
+                                   the world→robot rigid transform.  Defaults to
+                                   BimanualFrankaConfig values.
+        pcd_max_pts:               Max points to render per frame (uniformly
+                                   subsampled).  Reduces HTML size for dense clouds.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -194,12 +254,31 @@ def save_episode_html(
     grip_arr         = np.array([recorder.gripper[i] for i in indices])
     ts               = np.array(indices, dtype=np.float32)
 
+    # --- point clouds: transform world→robot and subsample -------------------
+    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
+    raw_pcds = [recorder.point_clouds[i] for i in indices]  # (T,) list of (N,3) or None
+    has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
+
+    pcd_robot: list[np.ndarray] = []
+    if has_pcd:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        for pts in raw_pcds:
+            if pts is None or len(pts) == 0:
+                pcd_robot.append(empty)
+                continue
+            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
+            if len(transformed) > pcd_max_pts:
+                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
+                transformed = transformed[idx]
+            pcd_robot.append(transformed)
+
     # --- forward kinematics --------------------------------------------------
     skeletons = [_skeleton_pts(q) for q in joint_angles]  # T × (9, 3)
 
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
+    pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
     all_xyz = np.concatenate(
-        [actual_pos, total_des_pos, base_des_pos] + skeletons,
+        [actual_pos, total_des_pos, base_des_pos] + skeletons + pcd_for_bbox,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -253,23 +332,42 @@ def save_episode_html(
         _trail_trace(base_des_pos[:1], color="darkorange", name="base desired", dash="dash"),
         row=1, col=1,
     )
-    # Trace 4: kp
-    fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp"), row=1, col=2)
-    # Trace 5: kd
-    fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd"), row=2, col=2)
-    # Trace 6: gripper
+    # Traces 4-5: kp_gain (solid) and kp_true (dotted)
+    fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
+                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
+                  row=1, col=2)
+    # Traces 6-7: kd_gain (solid) and kd_true (dotted)
+    fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
+                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
+                  row=2, col=2)
+    # Trace 8: gripper
     fig.add_trace(
         _metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"),
         row=3, col=2,
     )
+    # Trace 9 (optional): point cloud at step 0 in robot space
+    if has_pcd:
+        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
 
     # --- animation frames ----------------------------------------------------
+    # Traces 0-8 are always animated; trace 9 (point cloud) is added when present.
+    # Index mapping:
+    #   0 skeleton  1 actual  2 total  3 base  4 kp_gain  5 kp_true
+    #   6 kd_gain   7 kd_true 8 gripper  [9 point cloud]
+    animated_traces = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    if has_pcd:
+        animated_traces.append(9)
+
     frames = []
     for t in range(T):
         skel  = skeletons[t]
         ap    = actual_pos[:t + 1]
         tp    = total_des_pos[:t + 1]
         bp    = base_des_pos[:t + 1]
+        kp_t  = kp_arr[:t + 1]
+        kd_t  = kd_arr[:t + 1]
         frame_data = [
             # 0: skeleton
             go.Scatter3d(
@@ -299,18 +397,34 @@ def save_episode_html(
                 line=dict(color="darkorange", width=5, dash="dash"),
                 marker=dict(size=3, color="darkorange"),
             ),
-            # 4: kp 0..t
-            go.Scatter(x=ts[:t + 1], y=kp_arr[:t + 1], mode="lines",
+            # 4: kp_gain 0..t
+            go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
                        line=dict(color="crimson", width=2)),
-            # 5: kd 0..t
-            go.Scatter(x=ts[:t + 1], y=kd_arr[:t + 1], mode="lines",
+            # 5: kp_true 0..t
+            go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
+                       line=dict(color="crimson", width=2, dash="dot")),
+            # 6: kd_gain 0..t
+            go.Scatter(x=ts[:t + 1], y=kd_t, mode="lines",
                        line=dict(color="seagreen", width=2)),
-            # 6: gripper 0..t
+            # 7: kd_true 0..t
+            go.Scatter(x=ts[:t + 1], y=10**(kd_t * 2 * np.sqrt(kp_t)), mode="lines",
+                       line=dict(color="seagreen", width=2, dash="dot")),
+            # 8: gripper 0..t
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
         ]
+        if has_pcd:
+            pts = pcd_robot[t]
+            if len(pts) == 0:
+                pts = np.zeros((1, 3), dtype=np.float32)
+            # 9: point cloud at step t
+            frame_data.append(go.Scatter3d(
+                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                mode="markers",
+                marker=dict(size=2, color="rgba(60, 200, 120, 0.45)", opacity=0.45),
+            ))
         frames.append(
-            go.Frame(data=frame_data, traces=[0, 1, 2, 3, 4, 5, 6], name=str(t))
+            go.Frame(data=frame_data, traces=animated_traces, name=str(t))
         )
     fig.frames = frames
 
@@ -371,9 +485,11 @@ def save_episode_html(
     )
 
     # Fixed axis ranges for metric subplots.
+    # kp/kd panels show both the normalised gain [-1,1] and the true value (10^gain),
+    # so use autorange for those two; gripper is always [0,1].
     x_end = float(ts[-1]) + 1
-    fig.update_yaxes(range=[-1.15, 1.15], title_text="kp",      row=1, col=2)
-    fig.update_yaxes(range=[-1.15, 1.15], title_text="kd",      row=2, col=2)
+    fig.update_yaxes(title_text="kp",      row=1, col=2)
+    fig.update_yaxes(title_text="kd",      row=2, col=2)
     fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
@@ -381,6 +497,264 @@ def save_episode_html(
 
     # Zero-reference lines for kp and kd (static — appended after the 7 animated
     # traces so go.Frame updates don't touch them).
+    _zero_line = dict(color="black", width=1, dash="dot")
+    fig.add_trace(
+        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
+                   line=_zero_line, showlegend=False, hoverinfo="skip"),
+        row=1, col=2,
+    )
+    fig.add_trace(
+        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
+                   line=_zero_line, showlegend=False, hoverinfo="skip"),
+        row=2, col=2,
+    )
+
+    fig.write_html(path, include_plotlyjs="cdn")
+
+
+def save_rollout_html(
+    recorder: EpisodeRecorder,
+    path: str,
+    title: str = "Base policy rollout",
+    frame_stride: int = 1,
+    fps: float = 20.0,
+    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
+    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    pcd_max_pts: int = 3000,
+) -> None:
+    """Write a self-contained animated Plotly HTML for a base-policy-only rollout.
+
+    Simpler than save_episode_html: shows only the actual EE trail and the
+    "commanded" trail (recorder.base_desired_pos, i.e. actual_pos + base_delta),
+    with the same kp/kd/gripper time-series panels.  Use this when there is no
+    residual policy and the two-trail layout of save_episode_html would just show
+    two identical overlapping lines.
+
+    Layout:
+        Left 65 %  — animated 3D arm skeleton + EE trails + optional point cloud.
+                       actual  (thin gray), commanded (solid royalblue).
+        Right 35 % — stacked time-series: kp (row 1), kd (row 2), gripper (row 3).
+
+    Args:
+        recorder:                  Populated EpisodeRecorder.
+        path:                      Output .html path; parent directories are created.
+        title:                     Figure title.
+        frame_stride:              Emit every Nth step (default 1 = all).
+        fps:                       Playback speed in frames per second.
+        world_in_robot_translation: (tx, ty, tz) metres — world→robot transform.
+        world_in_robot_quat_wxyz:  (w, x, y, z) — rotation part of world→robot.
+        pcd_max_pts:               Max points to render per frame.
+    """
+    T_full = len(recorder)
+    if T_full == 0:
+        return
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+
+    frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
+
+    indices = list(range(0, T_full, max(1, frame_stride)))
+    T = len(indices)
+
+    joint_angles   = [recorder.joint_angles[i]     for i in indices]
+    actual_pos     = np.array([recorder.actual_ee_pos[i]    for i in indices])  # (T, 3)
+    commanded_pos  = np.array([recorder.base_desired_pos[i] for i in indices])  # (T, 3)
+    kp_arr         = np.array([recorder.kp[i]      for i in indices])
+    kd_arr         = np.array([recorder.kd[i]      for i in indices])
+    grip_arr       = np.array([recorder.gripper[i] for i in indices])
+    ts             = np.array(indices, dtype=np.float32)
+
+    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
+    raw_pcds = [recorder.point_clouds[i] for i in indices]
+    has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
+
+    pcd_robot: list[np.ndarray] = []
+    if has_pcd:
+        empty = np.zeros((0, 3), dtype=np.float32)
+        for pts in raw_pcds:
+            if pts is None or len(pts) == 0:
+                pcd_robot.append(empty)
+                continue
+            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
+            if len(transformed) > pcd_max_pts:
+                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
+                transformed = transformed[idx]
+            pcd_robot.append(transformed)
+
+    skeletons = [_skeleton_pts(q) for q in joint_angles]
+
+    pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
+    all_xyz = np.concatenate([actual_pos, commanded_pos] + skeletons + pcd_for_bbox, axis=0)
+    mn, mx = all_xyz.min(0), all_xyz.max(0)
+    pad = float((mx - mn).max()) * 0.05
+    x_range = [float(mn[0] - pad), float(mx[0] + pad)]
+    y_range = [float(mn[1] - pad), float(mx[1] + pad)]
+    z_range = [float(mn[2] - pad), float(mx[2] + pad)]
+    extents = np.array(
+        [x_range[1] - x_range[0], y_range[1] - y_range[0], z_range[1] - z_range[0]],
+        dtype=np.float32,
+    )
+    ext_max = float(extents.max())
+    aspectratio = dict(
+        x=float(extents[0] / ext_max),
+        y=float(extents[1] / ext_max),
+        z=float(extents[2] / ext_max),
+    )
+
+    fig = make_subplots(
+        rows=3, cols=2,
+        specs=[
+            [{"type": "scene", "rowspan": 3}, {"type": "xy"}],
+            [None,                             {"type": "xy"}],
+            [None,                             {"type": "xy"}],
+        ],
+        column_widths=[0.65, 0.35],
+        row_heights=[0.33, 0.33, 0.34],
+        horizontal_spacing=0.04,
+        vertical_spacing=0.06,
+    )
+
+    # Trace 0: skeleton
+    fig.add_trace(_skeleton_trace(skeletons[0]), row=1, col=1)
+    # Trace 1: actual EE trail
+    fig.add_trace(
+        _trail_trace(actual_pos[:1], color="slategray", name="actual EE", width=3, marker_size=2),
+        row=1, col=1,
+    )
+    # Trace 2: commanded trail (actual + base delta)
+    fig.add_trace(
+        _trail_trace(commanded_pos[:1], color="royalblue", name="commanded"),
+        row=1, col=1,
+    )
+    # Traces 3-4: kp
+    fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
+                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
+                  row=1, col=2)
+    # Traces 5-6: kd
+    fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
+                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
+                  row=2, col=2)
+    # Trace 7: gripper
+    fig.add_trace(_metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"), row=3, col=2)
+    # Trace 8 (optional): point cloud
+    if has_pcd:
+        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+
+    animated_traces = [0, 1, 2, 3, 4, 5, 6, 7]
+    if has_pcd:
+        animated_traces.append(8)
+
+    frames = []
+    for t in range(T):
+        skel = skeletons[t]
+        ap   = actual_pos[:t + 1]
+        cp   = commanded_pos[:t + 1]
+        kp_t = kp_arr[:t + 1]
+        kd_t = kd_arr[:t + 1]
+        frame_data = [
+            go.Scatter3d(
+                x=skel[:, 0], y=skel[:, 1], z=skel[:, 2],
+                mode="lines+markers",
+                line=dict(color="dimgray", width=6),
+                marker=dict(size=5, color="dimgray"),
+            ),
+            go.Scatter3d(
+                x=ap[:, 0], y=ap[:, 1], z=ap[:, 2],
+                mode="lines+markers",
+                line=dict(color="slategray", width=3),
+                marker=dict(size=2, color="slategray"),
+            ),
+            go.Scatter3d(
+                x=cp[:, 0], y=cp[:, 1], z=cp[:, 2],
+                mode="lines+markers",
+                line=dict(color="royalblue", width=5),
+                marker=dict(size=3, color="royalblue"),
+            ),
+            go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
+                       line=dict(color="crimson", width=2)),
+            go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
+                       line=dict(color="crimson", width=2, dash="dot")),
+            go.Scatter(x=ts[:t + 1], y=kd_t, mode="lines",
+                       line=dict(color="seagreen", width=2)),
+            go.Scatter(x=ts[:t + 1], y=10**(kd_t * 2 * np.sqrt(kp_t)), mode="lines",
+                       line=dict(color="seagreen", width=2, dash="dot")),
+            go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
+                       line=dict(color="darkorchid", width=2)),
+        ]
+        if has_pcd:
+            pts = pcd_robot[t]
+            if len(pts) == 0:
+                pts = np.zeros((1, 3), dtype=np.float32)
+            frame_data.append(go.Scatter3d(
+                x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+                mode="markers",
+                marker=dict(size=2, color="rgba(60, 200, 120, 0.45)", opacity=0.45),
+            ))
+        frames.append(go.Frame(data=frame_data, traces=animated_traces, name=str(t)))
+    fig.frames = frames
+
+    fig.update_layout(
+        title=dict(text=title, x=0.5, xanchor="center"),
+        showlegend=True,
+        legend=dict(x=0.0, y=1.0, bgcolor="rgba(255,255,255,0.7)"),
+        margin=dict(l=0, r=10, t=50, b=60),
+        scene=dict(
+            xaxis=dict(range=x_range, autorange=False, title="x (m)"),
+            yaxis=dict(range=y_range, autorange=False, title="y (m)"),
+            zaxis=dict(range=z_range, autorange=False, title="z (m)"),
+            aspectmode="manual",
+            aspectratio=aspectratio,
+        ),
+        updatemenus=[dict(
+            type="buttons",
+            showactive=False,
+            x=0.0, y=0.0, xanchor="left", yanchor="top",
+            buttons=[
+                dict(
+                    label="Play",
+                    method="animate",
+                    args=[None, dict(
+                        frame=dict(duration=frame_duration_ms, redraw=True),
+                        fromcurrent=True,
+                        transition=dict(duration=0),
+                    )],
+                ),
+                dict(
+                    label="Pause",
+                    method="animate",
+                    args=[[None], dict(
+                        frame=dict(duration=0, redraw=False),
+                        mode="immediate",
+                    )],
+                ),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="step: "),
+            pad=dict(t=40),
+            steps=[dict(
+                method="animate",
+                args=[[str(t)], dict(
+                    mode="immediate",
+                    frame=dict(duration=0, redraw=True),
+                    transition=dict(duration=0),
+                )],
+                label=str(indices[t]),
+            ) for t in range(T)],
+        )],
+    )
+
+    x_end = float(ts[-1]) + 1
+    fig.update_yaxes(title_text="kp",      row=1, col=2)
+    fig.update_yaxes(title_text="kd",      row=2, col=2)
+    fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
+    fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
+    fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=3, col=2)
+
     _zero_line = dict(color="black", width=1, dash="dot")
     fig.add_trace(
         go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",

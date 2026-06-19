@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 
 import env_wrapper
-from viz import EpisodeRecorder, save_episode_html
+from viz import EpisodeRecorder, save_episode_html, save_rollout_html
 from env_wrapper import (
     _ACTION_KEYS,
     _CHUNK_EXEC,
@@ -172,6 +172,7 @@ def _run_episode(
     chunk_used = _CHUNK_EXEC   # triggers immediate inference on first step
     prev_kp = 0.0
     prev_kd = 0.0
+    last_point_cloud: np.ndarray | None = None
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -200,8 +201,9 @@ def _run_episode(
                 chunk_used = 0
 
                 if residual is not None:
-                    point_cloud = extract_point_cloud(obs)
-                    processed_chunk = process_chunk(base_chunk, ee_pose)
+                    last_point_cloud = extract_point_cloud(obs)
+                    point_cloud = last_point_cloud
+                    processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
                         "proprio": split_gripper(ee_pose),
@@ -228,14 +230,19 @@ def _run_episode(
 
             if recorder is not None:
                 q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
+                # In delta mode, base_chunk[:3] is a position delta, not an absolute
+                # target.  Add it to the current EE position so both trail fields stay
+                # in world-space metres for meaningful 3D visualization.
+                base_desired_pos = ee_pose[:3] + base_chunk[chunk_used, :3]
                 recorder.record(
                     q=q,
                     actual_ee_pos=ee_pose[:3],
-                    base_desired_pos=base_chunk[chunk_used, :3],
-                    total_desired_pos=base_chunk[chunk_used, :3] + dpos,
+                    base_desired_pos=base_desired_pos,
+                    total_desired_pos=base_desired_pos + dpos,
                     kp=kp,
                     kd=kd,
                     gripper=action["r_gripper"],
+                    point_cloud=last_point_cloud,
                 )
 
             if dataset is not None:
@@ -265,6 +272,23 @@ def _run_episode(
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _save_viz(
+    recorder: EpisodeRecorder,
+    path: str,
+    residual: "ResidualPolicy | None",
+    title: str,
+    frame_stride: int,
+    fps: float,
+) -> None:
+    """Dispatch to save_rollout_html (base only) or save_episode_html (residual)."""
+    if residual is None:
+        save_rollout_html(recorder, path, title=f"base policy — {title}",
+                          frame_stride=frame_stride, fps=fps)
+    else:
+        save_episode_html(recorder, path, title=f"residual — {title}",
+                          frame_stride=frame_stride, fps=fps)
+
 
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
@@ -363,28 +387,23 @@ def main() -> None:
     dataset: LeRobotDataset | None = None
 
     if not recording:
-        print("homing...")
-        if not controller.home(**home_kwargs):
-            logger.warning("homing did not converge; proceeding anyway")
-        recorder = EpisodeRecorder() if args.viz_dir else None
-        try:
-            _run_episode(
-                controller, base_policy, residual,
-                dataset=None, episode_time_s=None,
-                fps=args.fps, recorder=recorder,
-            )
-        finally:
-            if recorder is not None and len(recorder) > 0:
-                viz_path = os.path.join(args.viz_dir, "episode.html")
-                print(f"saving visualization to {viz_path}...")
-                save_episode_html(
-                    recorder, viz_path,
-                    title="residual episode (free run)",
-                    frame_stride=args.viz_stride,
-                    fps=args.fps,
+            print("homing...")
+            if not controller.home(**home_kwargs):
+                logger.warning("homing did not converge; proceeding anyway")
+            recorder = EpisodeRecorder() if args.viz_dir else None
+            try:
+                _run_episode(
+                    controller, base_policy, residual,
+                    dataset=None, episode_time_s=None,
+                    fps=args.fps, recorder=recorder,
                 )
-            controller.disconnect()
-        return
+            finally:
+                if recorder is not None and len(recorder) > 0:
+                    viz_path = os.path.join(args.viz_dir, "episode.html")
+                    print(f"saving visualization to {viz_path}...")
+                    _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps)
+                controller.disconnect()
+            return
 
     # Multi-episode recording mode.
     dataset = _build_dataset(args, controller)
@@ -418,12 +437,7 @@ def main() -> None:
                             args.viz_dir, f"episode_{ep_idx:03d}.html"
                         )
                         print(f"saving visualization to {viz_path}...")
-                        save_episode_html(
-                            recorder, viz_path,
-                            title=f"episode {ep_idx} — {args.task}",
-                            frame_stride=args.viz_stride,
-                            fps=args.fps,
-                        )
+                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps)
                 dataset.save_episode()
                 print(f"episode {dataset.num_episodes - 1} saved")
 

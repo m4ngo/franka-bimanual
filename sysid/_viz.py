@@ -22,7 +22,7 @@ _spec.loader.exec_module(_fk_mod)
 franka_fk_chain = _fk_mod.franka_fk_chain
 
 # Offset subtracted from world-frame eef_pos to recover robot base frame.
-_WORLD_FRAME_OFFSET = np.array([-0.56, 0.0, 0.912])
+WORLD_FRAME_OFFSET = np.array([-0.56, 0.0, 0.912])
 
 
 def save_comparison_html(
@@ -38,20 +38,21 @@ def save_comparison_html(
     Layout
     ------
     Left (65 %)  : animated arm skeleton + trails:
-                     reference EE path (static, dashed orange — full trajectory)
+                     reference EE path (growing, dashed orange — current step)
                      replayed EE path (growing, solid blue — current step)
     Right (35 %) : three stacked time-series panels (static full data + moving cursor):
                      row 1  per-axis position error (x/y/z)
                      row 2  L2 position error norm
                      row 3  per-joint qpos (ref dashed, replayed solid; 7 joints each)
     """
-    ref_pos = ref["eef_pos"] - _WORLD_FRAME_OFFSET      # (T_ref, 3) — robot frame
+    ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET      # (T_ref, 3) — robot frame
     rep_pos = recorded["eef_pos"]                       # (T_rep, 3)
     T_rep = len(rep_pos)
+    T_ref = len(ref_pos)
     ts_full = np.arange(T_rep, dtype=np.float32) / fps
 
     # Position error
-    T_min = min(len(ref_pos), T_rep)
+    T_min = min(T_ref, T_rep)
     pos_err      = rep_pos[:T_min] - ref_pos[:T_min]   # (T_min, 3)
     pos_err_norm = np.linalg.norm(pos_err, axis=1)     # (T_min,)
     mean_err = float(pos_err_norm.mean())
@@ -60,25 +61,34 @@ def save_comparison_html(
     ref_qpos = ref.get("qpos")       # (T_ref, 7) or None
     rep_qpos = recorded.get("qpos")  # (T_rep, 7)
 
-    # Animation indices
+    # Animation indices — driven by the replayed trajectory length
     indices  = list(range(0, T_rep, max(1, frame_stride)))
     T        = len(indices)
     ts_anim  = np.array(indices, dtype=np.float32) / fps
     frame_ms = int(round(1000.0 / max(fps, 1.0)))
 
-    # Down-sampled replayed data for animated trails (already robot frame)
-    rep_pos_s = rep_pos[indices]                       # (T, 3)
+    # Down-sampled data for animated trails
+    rep_pos_s = rep_pos[indices]                        # (T, 3)
     rep_q_s   = [recorded["qpos"][i] for i in indices] if rep_qpos is not None else None
 
+    # Reference trail: clamp each animation index to T_ref so the reference
+    # trail grows in sync but never overshoots its own length.
+    ref_indices_s = [min(i, T_ref - 1) for i in indices]
+    ref_pos_s     = ref_pos[ref_indices_s]              # (T, 3) — may plateau at end
+    ref_q_s       = ([ref_qpos[min(i, T_ref - 1)] for i in indices]
+                     if ref_qpos is not None else None)
+
     # Pre-compute arm skeletons in robot frame
-    if rep_q_s is not None:
-        skeletons = []
-        for q in rep_q_s:
-            chain = franka_fk_chain(q)                         # (8,4,4) robot frame
-            pts_r = np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # (9,3) robot frame
-            skeletons.append(pts_r)
-    else:
-        skeletons = None
+    def _build_skeletons(q_list):
+        skels = []
+        for q in q_list:
+            chain = franka_fk_chain(q)                          # (8,4,4) robot frame
+            pts_r = np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # (9,3)
+            skels.append(pts_r)
+        return skels
+
+    rep_skeletons = _build_skeletons(rep_q_s) if rep_q_s is not None else None
+    ref_skeletons = _build_skeletons(ref_q_s) if ref_q_s is not None else None
 
     # -----------------------------------------------------------------------
     fig = make_subplots(
@@ -97,11 +107,22 @@ def save_comparison_html(
     # -----------------------------------------------------------------------
     # Static traces (never updated by frames)
     # -----------------------------------------------------------------------
+    # Ghost trails: full paths shown at low opacity for spatial context
     fig.add_trace(go.Scatter3d(
         x=ref_pos[:, 0], y=ref_pos[:, 1], z=ref_pos[:, 2],
         mode="lines",
-        line=dict(color="darkorange", width=3, dash="dash"),
-        name="reference EE",
+        line=dict(color="darkorange", width=2),
+        opacity=0.15,
+        name="reference EE (full)",
+        showlegend=True,
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter3d(
+        x=rep_pos[:, 0], y=rep_pos[:, 1], z=rep_pos[:, 2],
+        mode="lines",
+        line=dict(color="royalblue", width=2),
+        opacity=0.15,
+        name="replayed EE (full)",
+        showlegend=True,
     ), row=1, col=1)
 
     joint_colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf"]
@@ -163,15 +184,36 @@ def save_comparison_html(
         fig.add_trace(trace, row=row, col=col)
         anim_idxs.append(len(fig.data) - 1)
 
-    skel0 = skeletons[0] if skeletons else np.zeros((2, 3))
+    # --- Reference skeleton (animated) ---
+    ref_skel0 = ref_skeletons[0] if ref_skeletons else np.zeros((2, 3))
     _add_anim(go.Scatter3d(
-        x=skel0[:, 0], y=skel0[:, 1], z=skel0[:, 2],
+        x=ref_skel0[:, 0], y=ref_skel0[:, 1], z=ref_skel0[:, 2],
+        mode="lines+markers",
+        line=dict(color="darkorange", width=4),
+        marker=dict(size=4, color="darkorange"),
+        name="ref skeleton",
+    ), 1, 1)
+
+    # --- Replayed skeleton (animated) ---
+    rep_skel0 = rep_skeletons[0] if rep_skeletons else np.zeros((2, 3))
+    _add_anim(go.Scatter3d(
+        x=rep_skel0[:, 0], y=rep_skel0[:, 1], z=rep_skel0[:, 2],
         mode="lines+markers",
         line=dict(color="dimgray", width=6),
         marker=dict(size=5, color="dimgray"),
-        name="skeleton",
+        name="rep skeleton",
     ), 1, 1)
 
+    # --- Reference EE growing trail (animated) ---
+    _add_anim(go.Scatter3d(
+        x=ref_pos_s[:1, 0], y=ref_pos_s[:1, 1], z=ref_pos_s[:1, 2],
+        mode="lines+markers",
+        line=dict(color="darkorange", width=4, dash="dash"),
+        marker=dict(size=3, color="darkorange"),
+        name="reference EE",
+    ), 1, 1)
+
+    # --- Replayed EE growing trail (animated) ---
     _add_anim(go.Scatter3d(
         x=rep_pos_s[:1, 0], y=rep_pos_s[:1, 1], z=rep_pos_s[:1, 2],
         mode="lines+markers",
@@ -208,17 +250,37 @@ def save_comparison_html(
     for fi, t_val in enumerate(ts_anim):
         fd: list = []
 
-        skel = skeletons[fi] if skeletons else np.zeros((2, 3))
+        # Reference skeleton
+        ref_skel = ref_skeletons[fi] if ref_skeletons else np.zeros((2, 3))
         fd.append(go.Scatter3d(
-            x=skel[:, 0], y=skel[:, 1], z=skel[:, 2],
+            x=ref_skel[:, 0], y=ref_skel[:, 1], z=ref_skel[:, 2],
+            mode="lines+markers",
+            line=dict(color="darkorange", width=4),
+            marker=dict(size=4, color="darkorange"),
+        ))
+
+        # Replayed skeleton
+        rep_skel = rep_skeletons[fi] if rep_skeletons else np.zeros((2, 3))
+        fd.append(go.Scatter3d(
+            x=rep_skel[:, 0], y=rep_skel[:, 1], z=rep_skel[:, 2],
             mode="lines+markers",
             line=dict(color="dimgray", width=6),
             marker=dict(size=5, color="dimgray"),
         ))
 
-        rp = rep_pos_s[:fi + 1]
+        # Reference EE growing trail
+        rp_ref = ref_pos_s[:fi + 1]
         fd.append(go.Scatter3d(
-            x=rp[:, 0], y=rp[:, 1], z=rp[:, 2],
+            x=rp_ref[:, 0], y=rp_ref[:, 1], z=rp_ref[:, 2],
+            mode="lines+markers",
+            line=dict(color="darkorange", width=4, dash="dash"),
+            marker=dict(size=3, color="darkorange"),
+        ))
+
+        # Replayed EE growing trail
+        rp_rep = rep_pos_s[:fi + 1]
+        fd.append(go.Scatter3d(
+            x=rp_rep[:, 0], y=rp_rep[:, 1], z=rp_rep[:, 2],
             mode="lines+markers",
             line=dict(color="royalblue", width=4),
             marker=dict(size=3, color="royalblue"),
@@ -235,7 +297,12 @@ def save_comparison_html(
     # -----------------------------------------------------------------------
     # 3D scene bounds
     # -----------------------------------------------------------------------
-    all_xyz = np.concatenate([ref_pos, rep_pos] + (skeletons or []), axis=0)
+    all_xyz = np.concatenate(
+        [ref_pos, rep_pos]
+        + (ref_skeletons or [])
+        + (rep_skeletons or []),
+        axis=0,
+    )
     mn, mx  = all_xyz.min(0), all_xyz.max(0)
     pad     = float(max((mx - mn).max() * 0.05, 0.01))
     extents = mx - mn

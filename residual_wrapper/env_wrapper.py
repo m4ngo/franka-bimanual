@@ -58,37 +58,29 @@ def strip_depth(obs: dict) -> dict:
 # Chunk processing
 # ---------------------------------------------------------------------------
 
-def process_chunk(chunk: np.ndarray, current_ee: np.ndarray) -> np.ndarray:
-    """Convert the first _RESIDUAL_HORIZON steps of a base-policy chunk to normalised deltas.
+def process_chunk(chunk: np.ndarray) -> np.ndarray:
+    """Normalise the first _RESIDUAL_HORIZON steps of a delta-action base-policy chunk.
+
+    The base policy outputs per-step EE deltas directly, so no consecutive-pose
+    differencing is needed.  Each step's position delta is divided by _POS_SCALE and
+    each rotation delta quaternion (xyzw) is converted to a rotvec and divided by
+    _ROT_SCALE to produce the normalised representation the residual policy expects.
 
     Args:
-        chunk: (T, 10) array — [r_x, r_y, r_z, r_qx, r_qy, r_qz, r_qw, r_gripper, kp, kd].
-              T must be >= _RESIDUAL_HORIZON.
-        current_ee: (8,) — [x, y, z, qx, qy, qz, qw, gripper] current robot state.
+        chunk: (T, 10) array — [dx, dy, dz, dqx, dqy, dqz, dqw, gripper, kp, kd].
+               T must be >= _RESIDUAL_HORIZON.  Position deltas in metres; rotation
+               delta encoded as a unit quaternion (xyzw).
 
     Returns:
         (_RESIDUAL_HORIZON, 9) — [dx, dy, dz, rx, ry, rz, gripper, kp, kd] normalised.
     """
     result = np.zeros((_RESIDUAL_HORIZON, 9), dtype=np.float32)
-    prev_pos = current_ee[:3]
-    prev_quat = current_ee[3:7]
-
     for i in range(_RESIDUAL_HORIZON):
         step = chunk[i]
-        next_pos = step[:3]
-        next_quat = step[3:7]
+        delta_pos = step[:3] / _POS_SCALE
+        delta_rot = Rotation.from_quat(step[3:7]).as_rotvec() / _ROT_SCALE
         gripper = (step[7] - 0.5) * 2.0
-
-        delta_pos = (next_pos - prev_pos) / _POS_SCALE
-        delta_rot = (
-            Rotation.from_quat(next_quat) * Rotation.from_quat(prev_quat).inv()
-        ).as_rotvec() / _ROT_SCALE
-
         result[i] = np.array([*delta_pos, *delta_rot, gripper, step[8], step[9]], dtype=np.float32)
-
-        prev_pos = next_pos
-        prev_quat = next_quat
-
     return result
 
 
@@ -110,7 +102,8 @@ def start_controller() -> SingleArmFranka:
         r_robot_ip="192.168.201.10",
         r_gripper_ip="192.168.201.10",
         r_port=18812,
-        use_ee_pos=True,
+        use_ee_pos=False,
+        use_delta=True,
     )
     robot = SingleArmFranka(config)
     robot.connect()

@@ -3,17 +3,20 @@ Policy wrappers for the base (LeRobot ACT/diffusion) and residual policies.
 
 Action spaces
 -------------
-Base policy output  : [r_x, r_y, r_z, r_qx, r_qy, r_qz, r_qw, r_gripper, kp, kd]
-                      Absolute EE pose (m, xyzw quat) in robot frame, plus gains.
+Base policy output  : [dx, dy, dz, dqx, dqy, dqz, dqw, gripper, kp, kd]
+                      Per-step EE delta in robot frame.  Position columns (0–2) are
+                      metres; rotation columns (3–6) encode the delta as a unit
+                      quaternion (xyzw).  These are passed directly to the robot in
+                      use_delta=True mode — no goal-pose PD error is computed.
 
-Residual input chunk: (10, 9) per-step deltas derived from the base chunk.
+Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
                       [dx, dy, dz, rx, ry, rz, gripper, kp, kd]
                       Position deltas normalised to [-1, 1] where ±1 = ±0.05 m.
-                      Rotation deltas (axis-angle) normalised where ±1 = ±0.5 rad.
-                      First step delta is relative to the current EE pose; subsequent
-                      steps are relative to the previous chunk action.
+                      Rotation deltas (axis-angle rotvec) normalised where ±1 = ±0.5 rad.
+                      Derived by converting each base-chunk step's delta quat to a rotvec
+                      and dividing by the respective scales.
 
-Residual output     : (5, 9) chunk — [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
+Residual output     : (_CHUNK_EXEC, 9) chunk — [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
                       per step (normalised, same scales as input).  Gains are at
                       indices 0–1, positional/rotational deltas at 2–7, gripper at 8.
 """

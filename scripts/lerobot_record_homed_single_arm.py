@@ -13,6 +13,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
+import select
+import sys
+import termios
+import threading
+import tty
 from pathlib import Path
 import time
 
@@ -43,25 +49,85 @@ from lerobot.utils.utils import init_logging, log_say
 # Importing the plugin packages triggers their @register_subclass decorators.
 from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
 from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig
+from lerobot_teleoperator_spacemouse import SpaceMouseConfig
 
 logger = logging.getLogger(__name__)
 
 
+class _StdinKeyboardThread:
+    """Raw-stdin keyboard reader that updates a LeRobot events dict.
+
+    pynput (used by init_keyboard_listener) requires an X11/Wayland display and
+    silently fails over SSH without X11 forwarding.  This thread reads escape
+    sequences directly from stdin so that right-arrow, left-arrow, and Escape
+    work in any terminal, including SSH sessions.
+
+    Start it just before record_loop and stop it immediately after so that the
+    raw-mode terminal setting does not interfere with input() calls between episodes.
+    """
+
+    def __init__(self, events: dict) -> None:
+        self._events = events
+        self._stop_evt = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        self._stop_evt.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="stdin-kb")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_evt.set()
+        if self._thread is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+
+    def _run(self) -> None:
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            while not self._stop_evt.is_set():
+                ready, _, _ = select.select([sys.stdin], [], [], 0.05)
+                if not ready:
+                    continue
+                time.sleep(0.02)  # let multi-byte sequences fully arrive
+                data = os.read(fd, 16)
+                if b"\x03" in data:                                          # Ctrl-C
+                    self._events["stop_recording"] = True
+                    self._events["exit_early"] = True
+                elif data.startswith(b"\x1b[C") or data.startswith(b"\x1bOC"):  # right arrow
+                    print("\r\nRight arrow: ending episode early...", flush=True)
+                    self._events["exit_early"] = True
+                elif data.startswith(b"\x1b[D") or data.startswith(b"\x1bOD"):  # left arrow
+                    print("\r\nLeft arrow: ending episode and re-recording...", flush=True)
+                    self._events["rerecord_episode"] = True
+                    self._events["exit_early"] = True
+                elif data == b"\x1b":                                        # Escape
+                    print("\r\nEscape: stopping recording...", flush=True)
+                    self._events["stop_recording"] = True
+                    self._events["exit_early"] = True
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+
+
 _R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.201.10", 18812
 _R_GELLO_PORT = "/dev/ttyUSB0"
+_R_SPACEMOUSE_PATH = "/dev/hidraw3"
 
 
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(use_ee_pos: bool) -> SingleArmFranka:
+def _build_robot(use_ee_pos: bool, use_delta: bool = False) -> SingleArmFranka:
     cfg = SingleArmFrankaConfig(
         r_server_ip=_R_SERVER_IP,
         r_robot_ip=_R_ROBOT_IP,
         r_gripper_ip=_R_GRIPPER_IP,
         r_port=_R_PORT,
         use_ee_pos=use_ee_pos,
+        use_delta=use_delta,
     )
     return make_robot_from_config(cfg)
 
@@ -71,8 +137,17 @@ def _build_teleop(mode: str, teleop_id: str):
         cfg = GelloConfig(id=teleop_id, side="r", port=_R_GELLO_PORT)
     elif mode == "gello_ee":
         cfg = GelloEEConfig(id=teleop_id, side="r", port=_R_GELLO_PORT)
+    elif mode == "spacemouse":
+        cfg = SpaceMouseConfig(
+            id=teleop_id,
+            hidraw_path=_R_SPACEMOUSE_PATH,
+            prefix="r_",
+            use_delta=True,
+            translation_scale=0.1,
+            rotation_scale=0.2,
+        )
     else:
-        raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello' or 'gello_ee'.")
+        raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
     return make_teleoperator_from_config(cfg)
 
 
@@ -132,10 +207,12 @@ def main() -> None:
     p.add_argument("--task", required=True, help="single_task description")
     p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
     p.add_argument("--use-ee-pos", type=_str2bool, required=True)
+    p.add_argument("--use-delta", type=_str2bool, default=False,
+                   help="Use EE-delta control mode (use_ee_pos must be false)")
     p.add_argument(
         "--teleop-mode",
         default="gello_ee",
-        choices=("gello", "gello_ee"),
+        choices=("gello", "gello_ee", "spacemouse"),
         help="Teleop type (ignored when --policy is set)",
     )
     p.add_argument("--teleop-id", default="homed_single_arm_teleop")
@@ -192,7 +269,7 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(use_ee_pos=args.use_ee_pos)
+    robot = _build_robot(use_ee_pos=args.use_ee_pos, use_delta=args.use_delta)
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -223,6 +300,7 @@ def main() -> None:
         teleop.connect()
 
     listener, events = init_keyboard_listener()
+    stdin_kb = _StdinKeyboardThread(events)
 
     try:
         with VideoEncodingManager(dataset):
@@ -244,38 +322,47 @@ def main() -> None:
                     logger.warning("Homing did not converge before episode %d; proceeding anyway", dataset.num_episodes)
 
                 log_say(f"Recording episode {dataset.num_episodes}", args.play_sounds)
-                record_loop(
-                    robot=robot,
-                    events=events,
-                    fps=args.fps,
-                    teleop_action_processor=teleop_proc,
-                    robot_action_processor=robot_action_proc,
-                    robot_observation_processor=robot_obs_proc,
-                    teleop=teleop,
-                    policy=policy,
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    dataset=dataset,
-                    control_time_s=args.episode_time_s,
-                    single_task=args.task,
-                )
+                events["exit_early"] = False
+                stdin_kb.start()
+                try:
+                    record_loop(
+                        robot=robot,
+                        events=events,
+                        fps=args.fps,
+                        teleop_action_processor=teleop_proc,
+                        robot_action_processor=robot_action_proc,
+                        robot_observation_processor=robot_obs_proc,
+                        teleop=teleop,
+                        policy=policy,
+                        preprocessor=preprocessor,
+                        postprocessor=postprocessor,
+                        dataset=dataset,
+                        control_time_s=args.episode_time_s,
+                        single_task=args.task,
+                    )
+                finally:
+                    stdin_kb.stop()
 
                 if not events["stop_recording"] and (
                     (recorded < args.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", args.play_sounds)
                     if args.policy is not None:
-                        record_loop(
-                            robot=robot,
-                            events=events,
-                            fps=args.fps,
-                            teleop_action_processor=teleop_proc,
-                            robot_action_processor=robot_action_proc,
-                            robot_observation_processor=robot_obs_proc,
-                            teleop=teleop,
-                            control_time_s=args.reset_time_s,
-                            single_task=args.task,
-                        )
+                        stdin_kb.start()
+                        try:
+                            record_loop(
+                                robot=robot,
+                                events=events,
+                                fps=args.fps,
+                                teleop_action_processor=teleop_proc,
+                                robot_action_processor=robot_action_proc,
+                                robot_observation_processor=robot_obs_proc,
+                                teleop=teleop,
+                                control_time_s=args.reset_time_s,
+                                single_task=args.task,
+                            )
+                        finally:
+                            stdin_kb.stop()
                     else:
                         input("Press Enter when ready to start the next episode...")
 

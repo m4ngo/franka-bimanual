@@ -59,22 +59,29 @@ _DEFAULT_KD = 0.0
 # Trajectory parsing
 # ---------------------------------------------------------------------------
 
-def parse_traj(filename: str) -> dict[str, np.ndarray]:
+def parse_num_traj(filename: str) -> int:
+    with h5py.File(filename, "r") as f:
+        group_key = list(f.keys())[0]
+        group = f[group_key]
+        return len(group.keys())
+
+def parse_traj(filename: str, index: int) -> tuple[str, dict[str, np.ndarray]]:
     """Load the first episode from a sysid HDF5 file.
 
     Expected structure: f[group_key][episode_key][field] → (T, D) dataset.
     All datasets are copied into numpy arrays so the file can be closed.
     """
     traj: dict[str, np.ndarray] = {}
+    key = ""
     with h5py.File(filename, "r") as f:
         group_key = list(f.keys())[0]
         group = f[group_key]
-        episode_key = list(group.keys())[2]
-        print(episode_key)
+        episode_key = list(group.keys())[index]
+        key = episode_key
         episode = group[episode_key]
         for field in episode:
             traj[field] = episode[field][:]
-    return traj
+    return (key, traj)
 
 
 # ---------------------------------------------------------------------------
@@ -209,10 +216,6 @@ def main() -> None:
         description="Replay a reference trajectory on the Franka and record the kinematic response."
     )
     parser.add_argument("traj_file", help="Input HDF5 trajectory file to replay")
-    parser.add_argument(
-        "--output", default=str(_HERE / "data_replayed.hdf5"),
-        help="Output HDF5 file for the recorded response",
-    )
     parser.add_argument("--fps", type=float, default=20.0, help="Control rate in Hz")
     parser.add_argument(
         "--kp", type=float, default=_DEFAULT_KP,
@@ -226,9 +229,9 @@ def main() -> None:
                         help="Gripper openness [0, 1] held constant during replay")
     parser.add_argument("--home-max-time-s", type=float, default=5.0,
                         help="Maximum seconds allowed for the homing move")
-    parser.add_argument("--home-tol-rad", type=float, default=0.05,
+    parser.add_argument("--home-tol-rad", type=float, default=0.005,
                         help="Joint-angle convergence tolerance (rad) for homing")
-    parser.add_argument("--home-tol-m", type=float, default=0.025,
+    parser.add_argument("--home-tol-m", type=float, default=0.005,
                         help="EE position convergence tolerance (m) for homing")
     parser.add_argument("--viz-out", default=None,
                         help="Path for the comparison HTML; defaults to <output>.html")
@@ -239,64 +242,66 @@ def main() -> None:
     logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
     logger.setLevel(logging.DEBUG)
 
-    # Load reference trajectory
-    logger.info("loading trajectory from %s", args.traj_file)
-    traj = parse_traj(args.traj_file)
-    n_steps = len(traj["eef_pos"])
-    logger.info("trajectory: %d steps, keys: %s", n_steps, sorted(traj.keys()))
-
     # Connect robot
     logger.info("connecting to robot...")
     controller = start_controller()
     logger.info("robot connected")
 
-    # Home to first trajectory position (uses qpos from trajectory if available)
-    if "qpos" in traj:
-        home_q = traj["qpos"][0].astype(np.float64)
-        logger.info("homing to first trajectory qpos: %s", np.round(home_q, 3))
-    else:
-        logger.warning("trajectory has no 'qpos'; skipping pose-specific homing")
-        home_q = None
-
-    if home_q is not None:
-        converged = controller.home(
-            home_q_left=None,
-            home_q_right=home_q,
-            gripper_norm=args.gripper_norm,
-            max_time_s=args.home_max_time_s,
-            tol_rad=args.home_tol_rad,
-            tol_pos_m=args.home_tol_m,
-        )
-        if not converged:
-            logger.warning("homing did not converge; proceeding anyway")
-
-    # Replay and record
-    logger.info(
-        "replaying %d steps at %.1f Hz (kp=%.2f → gain=%.2f) — press right-arrow to stop early",
-        n_steps, args.fps, args.kp, 10.0 ** args.kp,
-    )
     try:
-        recorded = _run_episode(
-            controller=controller,
-            traj=traj,
-            fps=args.fps,
-            kp=args.kp,
-            kd=args.kd,
-            gripper_norm=args.gripper_norm,
-        )
+        for i in range(0, parse_num_traj(args.traj_file)):
+            # Load reference trajectory
+            logger.info("loading trajectory from %s", args.traj_file)
+            name, traj = parse_traj(args.traj_file, i)
+            output = "record_" + name
+            n_steps = len(traj["eef_pos"])
+            logger.info(f"recording trajectory: {name} with {n_steps} steps, keys: {sorted(traj.keys())}")
+
+            # Home to first trajectory position (uses qpos from trajectory if available)
+            if "qpos" in traj:
+                home_q = traj["qpos"][0].astype(np.float64)
+                logger.info("homing to first trajectory qpos: %s", np.round(home_q, 3))
+            else:
+                logger.warning("trajectory has no 'qpos'; skipping pose-specific homing")
+                home_q = None
+
+            if home_q is not None:
+                converged = controller.home(
+                    home_q_left=None,
+                    home_q_right=home_q,
+                    gripper_norm=args.gripper_norm,
+                    max_time_s=args.home_max_time_s,
+                    tol_rad=args.home_tol_rad,
+                    tol_pos_m=args.home_tol_m,
+                )
+                if not converged:
+                    logger.warning("homing did not converge; proceeding anyway")
+
+            # Replay and record
+            logger.info(
+                "replaying %d steps at %.1f Hz (kp=%.2f → gain=%.2f) — press right-arrow to stop early",
+                n_steps, args.fps, args.kp, 10.0 ** args.kp,
+            )
+            recorded = _run_episode(
+                controller=controller,
+                traj=traj,
+                fps=args.fps,
+                kp=args.kp,
+                kd=args.kd,
+                gripper_norm=args.gripper_norm,
+            )
+
+            if not recorded:
+                logger.warning("no steps recorded; exiting")
+                return
+
+            # Save HDF5
+            save_sysid_hdf5(recorded, f"sysid/outputs/{i}_" + output + ".hdf5")
+
+            # Visualization
+            viz_out = args.viz_out or str(Path(f"sysid/outputs/{i}_" + output).with_suffix(".html"))
+            save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
     finally:
         controller.disconnect()
-
-    if not recorded:
-        logger.warning("no steps recorded; exiting")
-        return
-
-    # Save HDF5
-    save_sysid_hdf5(recorded, args.output)
-
-    # Visualization
-    viz_out = args.viz_out or str(Path(args.output).with_suffix(".html"))
-    save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
 
 
 if __name__ == "__main__":
