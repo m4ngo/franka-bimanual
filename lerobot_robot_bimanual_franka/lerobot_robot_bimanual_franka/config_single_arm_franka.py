@@ -5,6 +5,8 @@ from lerobot.robots import RobotConfig
 from lerobot_camera_arv import ArvCameraConfig  # type: ignore
 from lerobot_camera_framos import FramosCameraConfig  # type: ignore
 
+from .bimanual_franka_config import ControlMode
+
 
 @RobotConfig.register_subclass("single_arm_franka")
 @dataclass
@@ -13,8 +15,7 @@ class SingleArmFrankaConfig(RobotConfig):
     r_robot_ip: str
     r_gripper_ip: str
     r_port: int
-    use_ee_pos: bool
-    use_delta: bool = False
+    control_mode: ControlMode
     active_arms: tuple[str, ...] = ("r",)
     depth: bool = True
     depth_cam: str = "cam_2_scene"

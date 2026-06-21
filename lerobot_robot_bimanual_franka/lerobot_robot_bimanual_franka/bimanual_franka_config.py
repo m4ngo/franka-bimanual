@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import Enum
 
 from lerobot.robots import RobotConfig
 from lerobot.cameras import CameraConfig
@@ -6,6 +7,12 @@ from lerobot_camera_arv import ArvCameraConfig  # type: ignore
 from lerobot_camera_framos import FramosCameraConfig  # type: ignore
 
 _VALID_ARMS: tuple[str, ...] = ("l", "r")
+
+
+class ControlMode(str, Enum):
+    JOINT_POS = "JOINT_POS"  # joint position setpoints → joint velocity PD
+    EE_POS    = "EE_POS"     # absolute EE pose setpoints → Cartesian velocity PD
+    EE_DELTA  = "EE_DELTA"   # EE delta commands applied directly as Cartesian velocity
 
 
 @RobotConfig.register_subclass("bimanual_franka")
@@ -19,8 +26,7 @@ class BimanualFrankaConfig(RobotConfig):
     r_robot_ip: str
     r_gripper_ip: str
     r_port: int
-    use_ee_pos: bool
-    use_delta: bool = False
+    control_mode: ControlMode
     active_arms: tuple[str, ...] = _VALID_ARMS
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {

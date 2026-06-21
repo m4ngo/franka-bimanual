@@ -14,7 +14,7 @@ from lerobot.types import RobotAction, RobotObservation
 from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
-from .bimanual_franka_config import BimanualFrankaConfig
+from .bimanual_franka_config import BimanualFrankaConfig, ControlMode
 from .franka_gripper import FrankaGripper
 from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
@@ -57,8 +57,7 @@ class BimanualFranka(Robot):
     def __init__(self, config: BimanualFrankaConfig):
         super().__init__(config)
         self.config = config
-        self.use_ee_pos = config.use_ee_pos
-        self.use_delta = config.use_delta
+        self.control_mode = config.control_mode
         self.active_arms = config.active_arms
         self.cameras: dict[str, Camera] = {n: _make_camera(c) for n, c in config.cameras.items()}
         self.robot_manager = MultiRobotWrapper()
@@ -80,7 +79,7 @@ class BimanualFranka(Robot):
         # Invert world-in-robot pose to map robot-frame EE positions into world frame.
         self._r_robot_in_world = r_w_in_r.T
         self._t_robot_in_world = -self._r_robot_in_world @ t_w_in_r
-        # delta bypasses
+        # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
 
@@ -119,7 +118,8 @@ class BimanualFranka(Robot):
 
     @property
     def action_features(self) -> dict[str, type]:
-        d = self._arm_features(EE_FEATURE_KEYS if (self.use_ee_pos or self.use_delta) else JOINT_FEATURE_KEYS)
+        keys = JOINT_FEATURE_KEYS if self.control_mode == ControlMode.JOINT_POS else EE_FEATURE_KEYS
+        d = self._arm_features(keys)
         d["kp"] = float
         d["kd"] = float
         return d
@@ -139,6 +139,7 @@ class BimanualFranka(Robot):
         pass
 
     def connect(self, calibrate: bool = True) -> None:
+        use_ee = self.control_mode != ControlMode.JOINT_POS
         try:
             for n, cam in self.cameras.items():
                 try:
@@ -151,7 +152,7 @@ class BimanualFranka(Robot):
                     getattr(self.config, f"{arm}_server_ip"),
                     getattr(self.config, f"{arm}_robot_ip"),
                     getattr(self.config, f"{arm}_port"),
-                    use_ee_delta=self.use_ee_pos or self.use_delta,
+                    use_ee_delta=use_ee,
                 )
                 self.robot_manager.current_kinematic_state(arm, timeout_s=_CONNECT_TIMEOUT_S)
             for arm in self.active_arms:
@@ -196,13 +197,12 @@ class BimanualFranka(Robot):
                 logger.warning("Camera %s read failed: %s", n, e)
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
-        
+
         if self._use_depth:
             depth_cam = self.cameras.get(self._depth_cam)
             if depth_cam is None:
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
-            get_depth = getattr(depth_cam, "get_depth")
-            verts = self._camera_pool.submit(get_depth).result()
+            verts = self._camera_pool.submit(getattr(depth_cam, "get_depth")).result()
             ee_world = self._ee_world_center(kin)
             flat = self._sample_depth_points(verts, ee_world).reshape(-1)
             for i, v in enumerate(flat):
@@ -225,8 +225,7 @@ class BimanualFranka(Robot):
 
         deltas = points - center.reshape(1, 3)
         dist2 = np.einsum("ij,ij->i", deltas, deltas)
-        mask = dist2 <= (self._depth_crop_radius_m ** 2)
-        cropped = points[mask]
+        cropped = points[dist2 <= (self._depth_crop_radius_m ** 2)]
 
         if cropped.shape[0] == 0:
             sampled = np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float64)
@@ -237,8 +236,7 @@ class BimanualFranka(Robot):
             reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
             sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
 
-        out = np.asarray(sampled, dtype=np.float32)
-        return out
+        return np.asarray(sampled, dtype=np.float32)
 
     @staticmethod
     def _quat_wxyz_to_rot(q: tuple[float, float, float, float]) -> np.ndarray:
@@ -259,10 +257,8 @@ class BimanualFranka(Robot):
     def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
-        kp = np.clip(action["kp"], -1.0, 1.0)
-        kd = np.clip(action["kd"], -1.0, 1.0)
-        kp_gain = _KP_GAIN_BASE**kp
-        kd_gain = _KD_GAIN_BASE**(kd * 2 * np.sqrt(kp))
+        kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
+        kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(kp_gain))
 
         for arm in self.active_arms:
             self.grippers[arm].move(
@@ -270,14 +266,16 @@ class BimanualFranka(Robot):
                 blocking=False,
             )
 
-        if self.use_delta:
+        if self.control_mode == ControlMode.EE_DELTA:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_delta(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot) for arm in self.active_arms}, kin
+                {arm: self._ee_delta(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
+                 for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
-        elif self.use_ee_pos:
+        elif self.control_mode == ControlMode.EE_POS:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action) for arm in self.active_arms}, kin
+                {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
+                 for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
         else:
@@ -302,13 +300,12 @@ class BimanualFranka(Robot):
     ) -> bool:
         """Drive both arms to a saved home configuration.
 
-        Joint targets (`home_q_*`) are always interpreted as the desired
-        `q`; when `use_ee_pos` is True, FK turns them into EE setpoints and
-        homing runs the same Cartesian-velocity PD as teleop (no joint-velocity
-        commands in that session).
+        Joint targets (``home_q_*``) are always interpreted as the desired ``q``.
+        In EE_POS and EE_DELTA modes, FK converts them to EE setpoints and homing
+        runs Cartesian-velocity PD. In JOINT_POS mode, joint-velocity PD is used.
 
-        Control rate: ``home_fps`` if set; else EE homing uses ``max(fps, 60)``
-        and joint homing uses ``fps``.
+        Control rate: ``home_fps`` if set; else EE modes use ``max(fps, 60)``, joint
+        mode uses ``fps``.
         """
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
@@ -321,21 +318,18 @@ class BimanualFranka(Robot):
         }
         if not targets_q:
             return True
-            
+
         for arm in targets_q:
             self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
-        rate_hz = float(
-            home_fps
-            if home_fps is not None
-            else (max(fps, 60) if self.use_ee_pos else fps)
-        )
+        use_ee_homing = self.control_mode != ControlMode.JOINT_POS
+        rate_hz = float(home_fps if home_fps is not None else (max(fps, 60) if use_ee_homing else fps))
         period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s
         names = list(targets_q)
         rot_tol = float(tol_rot_rad if tol_rot_rad is not None else tol_rad)
 
-        if self.use_ee_pos:
+        if use_ee_homing:
             targets_ee: dict[str, np.ndarray] = {}
             for arm, q in targets_q.items():
                 p, qu = franka_fk(q)
@@ -350,12 +344,9 @@ class BimanualFranka(Robot):
                 cmds = self.safety.shape_ee(cmds_raw, kin)
                 self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
 
-                max_pos = 0.0
-                max_rot = 0.0
-                for arm in names:
-                    pe, re = self._ee_pose_errors(targets_ee[arm], kin[arm])
-                    max_pos = max(max_pos, float(np.linalg.norm(pe)))
-                    max_rot = max(max_rot, float(np.linalg.norm(re)))
+                errs = [self._ee_pose_errors(targets_ee[arm], kin[arm]) for arm in names]
+                max_pos = max(float(np.linalg.norm(pe)) for pe, _ in errs)
+                max_rot = max(float(np.linalg.norm(re)) for _, re in errs)
 
                 if max_pos < tol_pos_m and max_rot < rot_tol:
                     self._cached_kin_state = None
@@ -364,9 +355,7 @@ class BimanualFranka(Robot):
                     self._cached_kin_state = None
                     logger.warning(
                         "home(): EE timeout after %.2fs (pos err %.4f m, rot err %.4f rad)",
-                        max_time_s,
-                        max_pos,
-                        max_rot,
+                        max_time_s, max_pos, max_rot,
                     )
                     return False
 
@@ -406,7 +395,6 @@ class BimanualFranka(Robot):
     def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:
         """Position error (m) and axis-angle orientation error (rad) vs ``target`` (7: x,y,z,qx,qy,qz,qw)."""
         _, _, _, pos, rot, _ = snap
-        # print(pos, rot)
         pos_error = target[:3] - np.asarray(pos, dtype=np.float64)
 
         target_q = target[3:].copy()
@@ -428,19 +416,24 @@ class BimanualFranka(Robot):
 
         v = q_err[:3]
         v_norm = float(np.linalg.norm(v))
-        if v_norm < 1e-9:
-            rot_error = 2.0 * v
-        else:
-            rot_error = (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(q_err[3], -1.0, 1.0))))
+        rot_error = 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(q_err[3], -1.0, 1.0))))
 
         return pos_error, rot_error
 
     @staticmethod
-    def _ee_velocity_toward_pose(kp_gain: float, kd_gain: float, target: np.ndarray, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None, ignore_action: bool = False) -> np.ndarray:
+    def _ee_velocity_toward_pose(
+        kp_gain: float,
+        kd_gain: float,
+        target: np.ndarray,
+        snap: KinematicSnapshot,
+        dpos: np.ndarray | None = None,
+        drot: np.ndarray | None = None,
+        ignore_action: bool = False,
+    ) -> np.ndarray:
         pos_error, rot_error = BimanualFranka._ee_pose_errors(target, snap)
         if ignore_action:
-            pos_error -= pos_error
-            rot_error -= rot_error
+            pos_error = np.zeros_like(pos_error)
+            rot_error = np.zeros_like(rot_error)
         if dpos is not None:
             pos_error += dpos
         if drot is not None:
@@ -458,7 +451,16 @@ class BimanualFranka(Robot):
         return (JOINT_PD_KP * kp_gain) * (target - q) - (JOINT_PD_KD * kd_gain) * dq
 
     @staticmethod
-    def _ee_pd(kp_gain: float, kd_gain: float, action: RobotAction, arm: str, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None, ignore_action: bool = False) -> np.ndarray:
+    def _ee_pd(
+        kp_gain: float,
+        kd_gain: float,
+        action: RobotAction,
+        arm: str,
+        snap: KinematicSnapshot,
+        dpos: np.ndarray | None = None,
+        drot: np.ndarray | None = None,
+        ignore_action: bool = False,
+    ) -> np.ndarray:
         target = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
             dtype=np.float64, count=len(EE_AXIS_KEYS),
@@ -466,14 +468,20 @@ class BimanualFranka(Robot):
         return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot, ignore_action)
 
     @staticmethod
-    def _ee_delta(kp_gain: float, kd_gain: float, action: RobotAction, arm: str, snap: KinematicSnapshot, dpos: np.ndarray | None = None, drot: np.ndarray | None = None) -> np.ndarray:
+    def _ee_delta(
+        kp_gain: float,
+        kd_gain: float,
+        action: RobotAction,
+        arm: str,
+        snap: KinematicSnapshot,
+        dpos: np.ndarray | None = None,
+        drot: np.ndarray | None = None
+    ) -> np.ndarray:
         """Apply EE deltas from action directly as a velocity command.
 
-        The action values for position axes (x, y, z) are position deltas in metres.
-        The action values for rotation axes (qx, qy, qz, qw) encode a delta rotation as
-        a unit quaternion (xyzw), which is converted to an axis-angle vector here.
-        Cached deltas (dpos, drot) are addded on top of the action deltas.
-        No goal-pose PD error is computed.
+        Position axes (x, y, z) are position deltas in metres. Rotation axes
+        (qx, qy, qz, qw) encode a delta rotation as a unit quaternion (xyzw),
+        converted to axis-angle here. Cached deltas (dpos, drot) are added on top.
         """
         action_dpos = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
@@ -483,13 +491,9 @@ class BimanualFranka(Robot):
             (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
             dtype=np.float64, count=4,
         )
-        # Convert delta quaternion (xyzw) to axis-angle rotation error.
         v = dq[:3]
         v_norm = float(np.linalg.norm(v))
-        if v_norm < 1e-9:
-            action_drot = 2.0 * v
-        else:
-            action_drot = (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
+        action_drot = 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
 
         total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64))
         total_drot = action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))

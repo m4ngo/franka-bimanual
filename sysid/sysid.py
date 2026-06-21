@@ -8,21 +8,23 @@ The input HDF5 must have the structure produced by the sim:
     f[group][episode][field] → (T, D) dataset
 
 Fields consumed from the input:
-    eef_goal_pos   (T, 3) – EE goal position sent to the controller (not recorded)
-    eef_goal_quat  (T, 4) – EE goal quaternion sent to the controller (not recorded)
-    eef_pos        (T, 3) – reference EE position (used for error visualisation)
-    qpos           (T, 7) – joint angles used to initialise the home pose
+    action  (T, 7) – [dx_norm, dy_norm, dz_norm, rx_norm, ry_norm, rz_norm, gripper]
+                     Position deltas in units of _POS_SCALE (0.05 m); rotation as
+                     axis-angle in units of _ROT_SCALE (0.5 rad).
+    eef_pos (T, 3) – reference EE position (used for error visualisation only)
+    qpos    (T, 7) – joint angles used to initialise the home pose
 
 Fields recorded in the output HDF5 (same structure):
-    action         (T, 7) – [goal_pos(3), goal_quat(4)] commanded at each step
-    eef_ang_vel    (T, 3) – actual EE angular velocity from robot state
-    eef_lin_vel    (T, 3) – actual EE linear velocity from robot state
-    eef_pos        (T, 3) – actual EE position from robot state
-    eef_quat       (T, 4) – actual EE quaternion from robot state
-    qpos           (T, 7) – actual joint angles
-    qvel           (T, 7) – actual joint velocities
-    t_sim          (T, 1) – wall-clock time since episode start
-    tau_cmd        (T, 7) – zeros (not accessible via current RPC interface)
+    action      (T, 7) – [dpos(3), drot_quat(4)] — position delta in metres and
+                         rotation delta as unnormalized quaternion [drot/2, 1] (xyzw)
+    eef_ang_vel (T, 3) – actual EE angular velocity from robot state
+    eef_lin_vel (T, 3) – actual EE linear velocity from robot state
+    eef_pos     (T, 3) – actual EE position from robot state
+    eef_quat    (T, 4) – actual EE quaternion from robot state
+    qpos        (T, 7) – actual joint angles
+    qvel        (T, 7) – actual joint velocities
+    t_sim       (T, 1) – wall-clock time since episode start
+    tau_cmd     (T, 7) – zeros (not accessible via current RPC interface)
 
 A comparison HTML visualization is also written alongside the HDF5.
 """
@@ -43,7 +45,7 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "residual_wrapper"))
 
-from env_wrapper import build_action, start_controller  # noqa: E402
+from env_wrapper import start_controller  # noqa: E402
 from lerobot_robot_bimanual_franka import SingleArmFranka
 from _viz import save_comparison_html  # noqa: E402
 
@@ -126,10 +128,11 @@ def _run_episode(
 
     Returns a dict of stacked numpy arrays (one row per step).
     """
-    n_steps = len(traj["eef_pos"])
-    goal_pos_all = traj["eef_goal_pos"]    # (T, 3) — controller target, not recorded
-    goal_quat_all = traj["eef_goal_quat"]  # (T, 4) — controller target, not recorded
-    action_all = traj["action"]  # (T, 7)
+    action_all = traj["action"]  # (T, 7): [dx_norm, dy_norm, dz_norm, rx_norm, ry_norm, rz_norm, gripper]
+    n_steps = len(action_all)
+
+    _POS_SCALE = 0.05  # metres per normalised unit (must match env_wrapper._POS_SCALE)
+    _ROT_SCALE = 0.5   # radians per normalised unit (must match env_wrapper._ROT_SCALE)
 
     buf: dict[str, list] = {k: [] for k in (
         "action", "eef_ang_vel",
@@ -161,19 +164,31 @@ def _run_episode(
             # ee_vel layout: [lin_x, lin_y, lin_z, ang_x, ang_y, ang_z]
 
             # --- build and send action ----------------------------------------
-            goal_pos = goal_pos_all[step].astype(np.float64)
-            goal_quat = goal_quat_all[step].astype(np.float64)
-            # chunk_step: [x, y, z, qx, qy, qz, qw, gripper] (8 elements)
-            chunk_step = np.concatenate([goal_pos, goal_quat, [gripper_norm]])
-            action = build_action(chunk_step, kp=kp, kd=kd)
-            dpos: np.ndarray = action_all[step][0:3].astype(np.float64) * 0.05
-            drot: np.ndarray = action_all[step][3:6].astype(np.float64) * 0.5
-            controller.cache_delta(dpos, drot)
-            controller.send_action(action, True)
+            dpos: np.ndarray = action_all[step][0:3].astype(np.float64) * _POS_SCALE
+            drot: np.ndarray = action_all[step][3:6].astype(np.float64) * _ROT_SCALE
+
+            # Convert axis-angle drot to unnormalized quaternion [drot/2, 1] (xyzw).
+            # _ee_delta recovers the axis-angle via 2·arctan2(|v|, w) which gives
+            # back drot exactly for small angles and is consistent for larger angles.
+            drot_quat = np.array([drot[0] / 2, drot[1] / 2, drot[2] / 2, 1.0], dtype=np.float64)
+
+            action = {
+                "r_x":       float(dpos[0]),
+                "r_y":       float(dpos[1]),
+                "r_z":       float(dpos[2]),
+                "r_qx":      float(drot_quat[0]),
+                "r_qy":      float(drot_quat[1]),
+                "r_qz":      float(drot_quat[2]),
+                "r_qw":      float(drot_quat[3]),
+                "r_gripper": float(gripper_norm),
+                "kp":        kp,
+                "kd":        kd,
+            }
+            controller.send_action(action)
 
             # --- record -------------------------------------------------------
             t_now = time.perf_counter() - t_start
-            buf["action"].append(np.concatenate([goal_pos, goal_quat]).astype(np.float32))
+            buf["action"].append(np.concatenate([dpos, drot_quat]).astype(np.float32))
             buf["eef_ang_vel"].append(np.asarray(ee_vel[3:], dtype=np.float32))
             buf["eef_lin_vel"].append(np.asarray(ee_vel[:3], dtype=np.float32))
             buf["eef_pos"].append(np.asarray(ee_pos, dtype=np.float32))

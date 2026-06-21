@@ -54,7 +54,7 @@ _RIG = dict(
 
 
 def _make_robot() -> BimanualFranka:
-    cfg = BimanualFrankaConfig(**_RIG, use_ee_pos=False)
+    cfg = BimanualFrankaConfig(**_RIG, control_mode="JOINT_POS")
     return make_robot_from_config(cfg)
 
 

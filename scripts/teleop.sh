@@ -12,7 +12,7 @@ lerobot-teleoperate \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
-    --robot.use_ee_pos=false \
+    --robot.control_mode=JOINT_POS \
     --teleop.type=bimanual_gello \
     --teleop.id=gello_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \

@@ -22,4 +22,4 @@ python "$(dirname "$0")/lerobot_record_homed.py" \
     --output-dir "$4" \
     --policy "$3" \
     --home-pose-name "$5" \
-    --use-ee-pos true
+    --control-mode EE_POS

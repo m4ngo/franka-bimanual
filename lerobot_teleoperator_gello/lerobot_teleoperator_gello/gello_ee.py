@@ -2,7 +2,7 @@
 absolute EE pose via Franka FR3 forward kinematics.
 
 Action keys: x, y, z, qx, qy, qz, qw, gripper
-(compatible with BimanualFranka use_ee_pos=True mode)
+(compatible with BimanualFranka EE_POS mode)
 """
 
 from __future__ import annotations

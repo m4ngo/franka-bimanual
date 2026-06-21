@@ -24,6 +24,6 @@ python "$(dirname "$0")/lerobot_record_homed.py" \
     --output-dir "$4" \
     --resume "$5" \
     --home-pose-name "$6" \
-    --use-ee-pos true \
+    --control-mode EE_POS \
     --teleop-mode gello_ee \
     --teleop-id gello_ee_teleop

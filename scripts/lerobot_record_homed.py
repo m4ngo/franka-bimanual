@@ -3,8 +3,7 @@
 Wraps lerobot's `record_loop` with a `BimanualFranka.home(...)` call inserted
 at the start of every episode, so each episode begins from a fixed home pose
 with grippers open. Joint targets in `home_poses/*.json` are driven in joint
-velocity mode by default; when `--use-ee-pos true`, homing uses Cartesian
-velocity toward the FK of those joints (same controller mode as EE teleop).
+velocity mode (JOINT_POS) or Cartesian velocity (EE_POS / EE_DELTA).
 Supports both teleop recording (`--policy` unset) and policy rollout
 (`--policy <hf_repo>`).
 
@@ -49,7 +48,7 @@ from lerobot.utils.utils import init_logging, log_say
 # Importing the plugin packages triggers their @register_subclass decorators,
 # so make_robot_from_config / make_teleoperator_from_config can resolve
 # bimanual_franka / bimanual_gello{,_ee} by name.
-from lerobot_robot_bimanual_franka import BimanualFranka, BimanualFrankaConfig
+from lerobot_robot_bimanual_franka import BimanualFranka, BimanualFrankaConfig, ControlMode
 from lerobot_teleoperator_gello import (
     BimanualGelloConfig,
     BimanualGelloEEConfig,
@@ -68,13 +67,13 @@ def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(use_ee_pos: bool) -> BimanualFranka:
+def _build_robot(control_mode: ControlMode) -> BimanualFranka:
     cfg = BimanualFrankaConfig(
         l_server_ip=_L_SERVER_IP, l_robot_ip=_L_ROBOT_IP,
         l_gripper_ip=_L_GRIPPER_IP, l_port=_L_PORT,
         r_server_ip=_R_SERVER_IP, r_robot_ip=_R_ROBOT_IP,
         r_gripper_ip=_R_GRIPPER_IP, r_port=_R_PORT,
-        use_ee_pos=use_ee_pos,
+        control_mode=control_mode,
     )
     return make_robot_from_config(cfg)
 
@@ -83,14 +82,14 @@ def _build_teleop(mode: str, teleop_id: str):
     if mode == "gello":
         cfg = BimanualGelloConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT),
-            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT),
+            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT, use_noise=True),
+            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT, use_noise=True),
         )
     elif mode == "gello_ee":
         cfg = BimanualGelloEEConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT),
-            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT),
+            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT, use_noise=True),
+            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT, use_noise=True),
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello' or 'gello_ee'.")
@@ -153,7 +152,8 @@ def main() -> None:
     p.add_argument("--num-episodes", type=int, required=True)
     p.add_argument("--task", required=True, help="single_task description")
     p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
-    p.add_argument("--use-ee-pos", type=_str2bool, required=True)
+    p.add_argument("--control-mode", required=True, choices=("JOINT_POS", "EE_POS", "EE_DELTA"),
+                   help="Robot control mode")
     p.add_argument("--teleop-mode", default="gello_ee", choices=("gello", "gello_ee"),
                    help="Teleop type (ignored when --policy is set)")
     p.add_argument("--teleop-id", default="homed_teleop")
@@ -192,7 +192,7 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(use_ee_pos=args.use_ee_pos)
+    robot = _build_robot(control_mode=ControlMode(args.control_mode))
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -240,7 +240,7 @@ def main() -> None:
                     fps=args.fps,
                     home_fps=args.home_fps,
                 )
-                if args.use_ee_pos:
+                if ControlMode(args.control_mode) != ControlMode.JOINT_POS:
                     home_kw["tol_pos_m"] = args.home_tol_m
                     home_kw["tol_rot_rad"] = args.home_tol_rot_rad
                 ok = robot.home(home_q_left=home_q_l, home_q_right=home_q_r, **home_kw)

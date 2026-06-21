@@ -7,7 +7,7 @@ Base policy output  : [dx, dy, dz, dqx, dqy, dqz, dqw, gripper, kp, kd]
                       Per-step EE delta in robot frame.  Position columns (0–2) are
                       metres; rotation columns (3–6) encode the delta as a unit
                       quaternion (xyzw).  These are passed directly to the robot in
-                      use_delta=True mode — no goal-pose PD error is computed.
+                      EE_DELTA mode — no goal-pose PD error is computed.
 
 Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
                       [dx, dy, dz, rx, ry, rz, gripper, kp, kd]

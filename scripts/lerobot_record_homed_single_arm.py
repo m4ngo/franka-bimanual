@@ -47,7 +47,7 @@ from lerobot.utils.control_utils import (
 from lerobot.utils.utils import init_logging, log_say
 
 # Importing the plugin packages triggers their @register_subclass decorators.
-from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
+from lerobot_robot_bimanual_franka import ControlMode, SingleArmFranka, SingleArmFrankaConfig
 from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig
 from lerobot_teleoperator_spacemouse import SpaceMouseConfig
 
@@ -120,29 +120,30 @@ def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(use_ee_pos: bool, use_delta: bool = False) -> SingleArmFranka:
+def _build_robot(control_mode: ControlMode, depth: bool = True) -> SingleArmFranka:
     cfg = SingleArmFrankaConfig(
         r_server_ip=_R_SERVER_IP,
         r_robot_ip=_R_ROBOT_IP,
         r_gripper_ip=_R_GRIPPER_IP,
         r_port=_R_PORT,
-        use_ee_pos=use_ee_pos,
-        use_delta=use_delta,
+        control_mode=control_mode,
+        depth=depth,
     )
     return make_robot_from_config(cfg)
 
 
 def _build_teleop(mode: str, teleop_id: str):
     if mode == "gello":
-        cfg = GelloConfig(id=teleop_id, side="r", port=_R_GELLO_PORT)
+        cfg = GelloConfig(id=teleop_id, side="r", port=_R_GELLO_PORT, use_noise=True)
     elif mode == "gello_ee":
-        cfg = GelloEEConfig(id=teleop_id, side="r", port=_R_GELLO_PORT)
+        cfg = GelloEEConfig(id=teleop_id, side="r", port=_R_GELLO_PORT, use_noise=True)
     elif mode == "spacemouse":
         cfg = SpaceMouseConfig(
             id=teleop_id,
             hidraw_path=_R_SPACEMOUSE_PATH,
             prefix="r_",
             use_delta=True,
+            use_noise=True,
             translation_scale=0.1,
             rotation_scale=0.2,
         )
@@ -206,9 +207,10 @@ def main() -> None:
     p.add_argument("--num-episodes", type=int, required=True)
     p.add_argument("--task", required=True, help="single_task description")
     p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
-    p.add_argument("--use-ee-pos", type=_str2bool, required=True)
-    p.add_argument("--use-delta", type=_str2bool, default=False,
-                   help="Use EE-delta control mode (use_ee_pos must be false)")
+    p.add_argument("--control-mode", required=True, choices=("JOINT_POS", "EE_POS", "EE_DELTA"),
+                   help="Robot control mode")
+    p.add_argument("--depth", type=_str2bool, default=True,
+                   help="Enable depth point-cloud observations (default: true)")
     p.add_argument(
         "--teleop-mode",
         default="gello_ee",
@@ -269,7 +271,7 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(use_ee_pos=args.use_ee_pos, use_delta=args.use_delta)
+    robot = _build_robot(control_mode=ControlMode(args.control_mode), depth=args.depth)
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -314,7 +316,7 @@ def main() -> None:
                     fps=args.fps,
                     home_fps=args.home_fps,
                 )
-                if args.use_ee_pos:
+                if ControlMode(args.control_mode) != ControlMode.JOINT_POS:
                     home_kw["tol_pos_m"] = args.home_tol_m
                     home_kw["tol_rot_rad"] = args.home_tol_rot_rad
                 ok = robot.home(home_q_left=None, home_q_right=home_q_r, **home_kw)

@@ -15,8 +15,8 @@ WORKTABLE_MAX_DECEL = 0.5                # m/s², assumed deceleration for the b
 WORKTABLE_VELOCITY_EPS = 1.0e-4          # m/s, ignore commands smaller than this (float noise)
 
 JOINT_VELOCITY_MAX = 2.0    # rad/s, L2-norm ceiling on joint velocity commands
-EE_LINEAR_VELOCITY_MAX = 0.30   # m/s
-EE_ANGULAR_VELOCITY_MAX = 1.20  # rad/s
+EE_LINEAR_VELOCITY_MAX = 1.0   # m/s
+EE_ANGULAR_VELOCITY_MAX = 2.0  # rad/s
 
 
 def _clamp_joint_velocity(velocity: np.ndarray) -> np.ndarray:

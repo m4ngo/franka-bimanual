@@ -5,8 +5,8 @@
 # Left SpaceMouse:  /dev/hidraw4   (override with --teleop.left_arm_config.hidraw_path=...)
 # Right SpaceMouse: /dev/hidraw5   (override with --teleop.right_arm_config.hidraw_path=...)
 #
-# The robot runs in EE-position mode (use_ee_pos=true) to match the absolute
-# pose commands produced by BimanualSpaceMouse.
+# The robot runs in EE_POS mode to match the absolute pose commands produced
+# by BimanualSpaceMouse.
 
 lerobot-teleoperate \
     --robot.type=bimanual_franka \
@@ -18,7 +18,7 @@ lerobot-teleoperate \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
-    --robot.use_ee_pos=true \
+    --robot.control_mode=EE_POS \
     --teleop.type=bimanual_spacemouse \
     --teleop.id=spacemouse_teleop \
     --teleop.left_arm_config.hidraw_path=/dev/hidraw2 \

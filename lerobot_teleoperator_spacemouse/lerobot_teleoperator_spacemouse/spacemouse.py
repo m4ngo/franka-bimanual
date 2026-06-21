@@ -172,9 +172,6 @@ class SpaceMouse(Teleoperator):
             state.x * t_scale * ty,
             state.z * t_scale * tz,
         ], dtype=np.float64)
-        # Integrate position: spacemouse x/y are swapped relative to robot frame.
-        self.cur_pos = self.cur_pos + delta_pos
-
         # Integrate orientation: compose a small-angle rotation onto cur_rot.
         # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
         delta_rot = Rotation.from_euler("xyz", [
@@ -182,36 +179,35 @@ class SpaceMouse(Teleoperator):
             state.pitch * r_scale * ry,
             state.yaw   * r_scale * rz,
         ])
-        dx, dy, dz, dw = delta_rot.as_quat()
 
+        # Update integrated state using clean (non-noisy) deltas.
+        # Spacemouse x/y are swapped relative to robot frame.
+        self.cur_pos = self.cur_pos + delta_pos
         self.cur_rot = delta_rot * self.cur_rot
 
-        qx, qy, qz, qw = self.cur_rot.as_quat()  # scipy returns xyzw)
+        # Select output pose: delta or absolute.
+        out_pos: np.ndarray = delta_pos if self._use_delta else self.cur_pos
+        out_rot: Rotation   = delta_rot  if self._use_delta else self.cur_rot
 
-        if self._use_delta:
-            return {
-                f"{self._prefix}x":  float(delta_pos[0]),
-                f"{self._prefix}y":  float(delta_pos[1]),
-                f"{self._prefix}z":  float(delta_pos[2]),
-                f"{self._prefix}qx": float(dx),
-                f"{self._prefix}qy": float(dy),
-                f"{self._prefix}qz": float(dz),
-                f"{self._prefix}qw": float(dw),
-                f"{self._prefix}gripper": self._gripper_target_mm,
-                "kp": 0.0,
-                "kd": 0.0
-            }
+        # Apply noise at output only — never to the integrated state.
+        if self.config.use_noise:
+            out_pos = out_pos + np.random.normal(0.0, self.config.noise_pos_scale, 3)
+            out_rot = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot
+
+        x, y, z = out_pos
+        qx, qy, qz, qw = out_rot.as_quat()
+
         return {
-            f"{self._prefix}x":  float(self.cur_pos[0]),
-            f"{self._prefix}y":  float(self.cur_pos[1]),
-            f"{self._prefix}z":  float(self.cur_pos[2]),
-            f"{self._prefix}qx": float(qx),
-            f"{self._prefix}qy": float(qy),
-            f"{self._prefix}qz": float(qz),
-            f"{self._prefix}qw": float(qw),
+            f"{self._prefix}x":       float(x),
+            f"{self._prefix}y":       float(y),
+            f"{self._prefix}z":       float(z),
+            f"{self._prefix}qx":      float(qx),
+            f"{self._prefix}qy":      float(qy),
+            f"{self._prefix}qz":      float(qz),
+            f"{self._prefix}qw":      float(qw),
             f"{self._prefix}gripper": self._gripper_target_mm,
             "kp": 0.0,
-            "kd": 0.0
+            "kd": 0.0,
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

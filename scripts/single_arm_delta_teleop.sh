@@ -10,8 +10,7 @@ lerobot-teleoperate \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.201.10 \
     --robot.r_port=18812 \
-    --robot.use_ee_pos=true \
-    --robot.use_delta=true \
+    --robot.control_mode=EE_DELTA \
     --robot.active_arms=[r] \
     --teleop.type=spacemouse \
     --teleop.id=${MODE}_r_teleop \

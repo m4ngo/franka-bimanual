@@ -4,7 +4,7 @@
 #
 # Like the standard GELLO teleop but the leaders output absolute EE poses
 # (via Franka FR3 forward kinematics) rather than joint angles, so the robot
-# runs in EE-position mode (use_ee_pos=true).
+# runs in EE_POS mode.
 #
 # Left  GELLO: /dev/ttyUSB1   (override with --teleop.left_arm_config.port=...)
 # Right GELLO: /dev/ttyUSB0   (override with --teleop.right_arm_config.port=...)
@@ -19,7 +19,7 @@ lerobot-teleoperate \
     --robot.r_robot_ip=192.168.201.10 \
     --robot.r_gripper_ip=192.168.2.20 \
     --robot.r_port=18812 \
-    --robot.use_ee_pos=true \
+    --robot.control_mode=EE_POS \
     --teleop.type=bimanual_gello_ee \
     --teleop.id=gello_ee_teleop \
     --teleop.left_arm_config.port=/dev/ttyUSB1 \

@@ -22,8 +22,7 @@ _spec.loader.exec_module(_fk_mod)
 franka_fk_chain = _fk_mod.franka_fk_chain
 
 # Offset subtracted from world-frame eef_pos to recover robot base frame.
-WORLD_FRAME_OFFSET = np.array([-0.56, 0.0, 0.912])
-
+WORLD_FRAME_OFFSET = np.array([-0.66, 0.0, 0.912])
 
 def save_comparison_html(
     ref: dict[str, np.ndarray],
