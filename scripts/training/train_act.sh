@@ -15,8 +15,8 @@ lerobot-train \
   --resume=$5 \
   --dataset.repo_id="$1" \
   --policy.type=act \
-  --output_dir="../franka_data/policy/train/act_$1" \
-  --policy.chunk_size=10 \
+  --output_dir="../franka_data/policy/train/act_$2" \
+  --policy.chunk_size=100 \
   --policy.n_action_steps=5 \
   --job_name="act_$1" \
   --policy.device=cuda \
