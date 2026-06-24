@@ -211,8 +211,29 @@ def _apply_world_to_robot(
     R: np.ndarray,
     t: np.ndarray,
 ) -> np.ndarray:
-    """Apply rigid transform: p_robot = R @ p_world + t.  pts: (N, 3)."""
-    return (R @ pts.T).T + t
+    """Apply rigid transform to the xyz columns; pass any extra columns (e.g. RGB) through.
+
+    pts: (N, 3) or (N, 6) — xyz [+ rgb].  Returns same shape.
+    """
+    xyz_out = (R @ pts[:, :3].T).T + t
+    if pts.shape[1] == 3:
+        return xyz_out
+    return np.concatenate([xyz_out, pts[:, 3:]], axis=1)
+
+
+def _pcd_marker(pts: np.ndarray) -> dict:
+    """Build a Plotly marker dict for a point cloud array.
+
+    (N, 6) xyzrgb → per-point hex colors at full opacity (colors are vivid enough
+    on their own; blending with the background washes them out).
+    (N, 3) xyz    → flat dimgray at 0.65 opacity (ghost-style).
+    """
+    if pts.shape[1] >= 6:
+        rgb = (pts[:, 3:6] * 255.0).clip(0, 255).astype(np.uint8)
+        packed = (rgb[:, 0].astype(np.int32) << 16) | (rgb[:, 1].astype(np.int32) << 8) | rgb[:, 2].astype(np.int32)
+        colors = [f"#{c:06x}" for c in packed]
+        return dict(size=2, color=colors, opacity=1.0)
+    return dict(size=2, color="dimgray", opacity=0.65)
 
 
 def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
@@ -220,7 +241,7 @@ def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
     return go.Scatter3d(
         x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
         mode="markers",
-        marker=dict(size=2, color="dimgray", opacity=0.65),
+        marker=_pcd_marker(pts),
         name="point cloud",
     )
 
@@ -338,7 +359,7 @@ def save_episode_html(
     chunk_events = recorder.chunk_events  # sorted ascending by step
 
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
-    pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
     chunk_pts = []
     for ev in chunk_events:
         chunk_pts.append(ev["base_traj"])
@@ -498,7 +519,7 @@ def save_episode_html(
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
-                marker=dict(size=2, color="rgba(80, 80, 80, 0.65)", opacity=0.65),
+                marker=_pcd_marker(pts),
             ))
         frames.append(
             go.Frame(data=frame_data, traces=animated_traces, name=str(t))
@@ -662,7 +683,7 @@ def save_rollout_html(
 
     chunk_events = recorder.chunk_events  # sorted ascending by step
 
-    pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
     chunk_pts = [ev["base_traj"] for ev in chunk_events]
     all_xyz = np.concatenate(
         [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
@@ -780,7 +801,7 @@ def save_rollout_html(
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
-                marker=dict(size=2, color="rgba(80, 80, 80, 0.65)", opacity=0.65),
+                marker=_pcd_marker(pts),
             ))
         frames.append(go.Frame(data=frame_data, traces=animated_traces, name=str(t)))
     fig.frames = frames

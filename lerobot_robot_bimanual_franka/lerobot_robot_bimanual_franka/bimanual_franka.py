@@ -213,7 +213,8 @@ class BimanualFranka(Robot):
             verts = depth_fut.result()
             full_pcd = full_pcd_fut.result()
             if len(full_pcd) > 0:
-                dist2 = np.einsum("ij,ij->i", full_pcd, full_pcd)
+                xyz = full_pcd[:, :3]
+                dist2 = np.einsum("ij,ij->i", xyz, xyz)
                 full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
             self._last_full_point_cloud = full_pcd
             ee_world = self._ee_world_center(kin)

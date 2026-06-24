@@ -66,6 +66,9 @@ class FramosCamera(Camera):
         self._aligner: rs.align | None = None
         self._last_color: np.ndarray | None = None
         self._last_depth: np.ndarray | None = None
+        # Full-resolution color frame (before policy-output resize), kept in sync with
+        # _last_depth so get_full_point_cloud() can look up per-pixel RGB values.
+        self._last_color_full: np.ndarray | None = None
         self._vertices: np.ndarray | None = None
         self._depth_scale: float = 0.001
 
@@ -259,7 +262,20 @@ class FramosCamera(Camera):
         y = (yy.astype(np.float32) - cy) * z / fy
         cam_points = np.stack((x, y, z), axis=1).astype(np.float64, copy=False)
         world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
-        return world_points.astype(np.float32)
+        xyz = world_points.astype(np.float32)
+
+        # Attach per-point RGB when the full-res color frame is available and
+        # its pixel grid matches the depth image (guaranteed when the aligner is
+        # set to align depth→color, which is the default).
+        color_img = self._last_color_full
+        if (
+            color_img is not None
+            and color_img.ndim == 3
+            and color_img.shape[:2] == depth_image.shape[:2]
+        ):
+            rgb = color_img[yy, xx].astype(np.float32) / 255.0  # (N, 3) in [0, 1]
+            return np.concatenate([xyz, rgb], axis=1)            # (N, 6)
+        return xyz
 
     def get_depth(self) -> list[tuple[float, float, float]]:
         depth_image = self._last_depth
@@ -336,6 +352,13 @@ class FramosCamera(Camera):
                 continue
 
             arr = np.asanyarray(color.get_data())
+            # Cache full-resolution frame (format-converted, not yet resized) so
+            # get_full_point_cloud() can look up per-pixel RGB at depth resolution.
+            full_arr = np.ascontiguousarray(arr)
+            if full_arr.ndim == 3 and full_arr.shape[2] == 3 and self._config.color_format.lower() == "bgr8":
+                full_arr = cv2.cvtColor(full_arr, cv2.COLOR_BGR2RGB)
+            self._last_color_full = full_arr
+
             if arr.ndim == 3 and (
                 arr.shape[0] != self._output_height or arr.shape[1] != self._output_width
             ):
