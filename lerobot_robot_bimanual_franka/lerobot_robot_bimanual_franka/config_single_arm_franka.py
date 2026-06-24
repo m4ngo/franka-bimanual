@@ -22,6 +22,11 @@ class SingleArmFrankaConfig(RobotConfig):
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
     world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)
     depth_crop_radius_m: float = 0.4
+    osc_output_max_pos: float = 0.05
+    osc_output_max_rot: float = 0.5
+    osc_kp_base: float = 2.0
+    osc_kp_null: float = 0.5
+    osc_damping_ratio: float = 1.0
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_3_wrist": ArvCameraConfig(name="gripper_bfs_23595719", ip="192.168.1.138", fps=30, width=224, height=224),
