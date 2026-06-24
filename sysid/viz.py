@@ -22,7 +22,7 @@ import numpy as np
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 
-from _viz import save_comparison_html  # noqa: E402
+from _viz import compute_trajectory_errors, save_comparison_html, save_errors_json  # noqa: E402
 
 
 def _load_ref(path: str, episode_idx: int = 2) -> dict[str, np.ndarray]:
@@ -71,6 +71,11 @@ def main() -> None:
 
     out = args.output or str(Path(args.replayed_file).with_suffix(".html"))
     save_comparison_html(ref, recorded, out, fps=args.fps, frame_stride=args.stride)
+
+    traj_name = Path(args.replayed_file).stem
+    errors = compute_trajectory_errors(ref, recorded, name=traj_name)
+    errors_path = str(Path(out).with_suffix(".errors.json"))
+    save_errors_json([errors], errors_path)
 
 
 if __name__ == "__main__":

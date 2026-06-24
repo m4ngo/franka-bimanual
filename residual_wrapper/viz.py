@@ -1,21 +1,28 @@
 """Residual-policy episode visualizer — interactive Plotly HTML.
 
-Call ``EpisodeRecorder.record()`` at each control step, then
-``save_episode_html(recorder, path)`` after the loop to write a
+Call ``EpisodeRecorder.record()`` at each control step and
+``EpisodeRecorder.record_chunk()`` each time inference runs a new action chunk,
+then ``save_episode_html(recorder, path)`` after the loop to write a
 self-contained animated HTML containing:
 
     - 3D arm skeleton animated over the episode (FK chain)
-    - Actual EE trail — where the arm actually was (thin gray)
-    - Total desired trail — base + residual target (solid blue)
-    - Base desired trail  — base-policy-only target (dashed orange)
+    - Actual EE trail — where the arm physically was (thin gray, cumulative)
+    - Base chunk forecast — full projected trajectory from the base policy at
+      the most recent inference (dashed orange); updated each time a new chunk
+      is inferred, stays fixed within a chunk execution window.
+    - Total chunk forecast — base + residual projected trajectory (solid blue);
+      shows what the residual-modified plan looks like over the whole chunk.
     - Time-series panels (right column): kp, kd, commanded gripper
 
 Terminology
 -----------
-actual EE position  : FK(joint_angles from obs) — where the arm physically is.
-base desired        : base_chunk[step, :3] — absolute EE target from the base policy (metres).
-total desired       : base_chunk[step, :3] + dpos — effective PD target after residual delta
-                      (because _ee_pd tracks pos_error = base_target - current + dpos).
+actual EE position : FK(joint_angles from obs) — where the arm physically is.
+base forecast      : ee_pos_at_inference + cumsum(commanded_delta × EE_PD_KP × kp_gain × dt)
+                     over the first _RESIDUAL_HORIZON steps — the expected actual EE
+                     trajectory scaled to match arm movement (not raw commanded deltas,
+                     which are ~10× larger due to the PD velocity scaling).
+total forecast     : same, but residual position corrections are included for the
+                     first _CHUNK_EXEC steps, using the residual policy's kp_gain.
 
 The HTML is self-contained via ``include_plotlyjs="cdn"`` and mirrors the
 animated-slider pattern from multi-fast/utils/distill/pcd_viz.py.
@@ -40,21 +47,28 @@ _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ = (-0.376557, 0.0, 0.0, 0.926393)
 # ---------------------------------------------------------------------------
 
 class EpisodeRecorder:
-    """Accumulates per-step state for post-episode visualization.
+    """Accumulates per-step state and per-inference chunk forecasts for visualization.
 
     Designed to be created by the caller before entering _run_episode and
     accessed afterwards (even if the episode was interrupted early).
+
+    Two recording methods:
+        record()       — called every control step (joint angles, gains, gripper …).
+        record_chunk() — called once per inference event with the full projected
+                         chunk trajectory (base forecast and base+residual forecast).
     """
 
     def __init__(self) -> None:
         self.joint_angles: list[np.ndarray] = []       # (7,) per step
         self.actual_ee_pos: list[np.ndarray] = []      # (3,) actual EE via FK
-        self.base_desired_pos: list[np.ndarray] = []   # (3,) base-policy absolute target
-        self.total_desired_pos: list[np.ndarray] = []  # (3,) base + residual delta target
+        self.base_desired_pos: list[np.ndarray] = []   # (3,) kept for compat; not used by viz
+        self.total_desired_pos: list[np.ndarray] = []  # (3,) kept for compat; not used by viz
         self.kp: list[float] = []
         self.kd: list[float] = []
         self.gripper: list[float] = []
         self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
+        # Per-inference chunk forecast events, sorted by ascending step index.
+        self.chunk_events: list[dict] = []
 
     def record(
         self,
@@ -89,6 +103,36 @@ class EpisodeRecorder:
         self.point_clouds.append(
             np.asarray(point_cloud, dtype=np.float32).copy() if point_cloud is not None else None
         )
+
+    def record_chunk(
+        self,
+        step: int,
+        ee_pos: np.ndarray,
+        base_traj: np.ndarray,
+        total_traj: np.ndarray,
+    ) -> None:
+        """Record one inference event with the full projected chunk trajectory.
+
+        Should be called immediately after inference runs (chunk_used == 0) and
+        before the corresponding record() call for that step.
+
+        Args:
+            step:       Episode step index (== len(recorder) at call time).
+            ee_pos:     (3,) EE position [x, y, z] (m) at inference time.
+            base_traj:  (_RESIDUAL_HORIZON+1, 3) expected actual EE positions in
+                        metres — ee_pos prepended, then cumulative sum of
+                        (commanded_delta × EE_PD_KP × kp_gain × dt) per step.
+                        Scaled to match the actual EE trail, not raw deltas.
+            total_traj: (_RESIDUAL_HORIZON+1, 3) same as base_traj but with the
+                        residual position correction added (using residual kp_gain)
+                        for the first _CHUNK_EXEC steps.
+        """
+        self.chunk_events.append({
+            "step": int(step),
+            "ee_pos": np.asarray(ee_pos[:3], dtype=np.float32).copy(),
+            "base_traj": np.asarray(base_traj, dtype=np.float32).copy(),
+            "total_traj": np.asarray(total_traj, dtype=np.float32).copy(),
+        })
 
     def __len__(self) -> int:
         return len(self.joint_angles)
@@ -176,9 +220,23 @@ def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
     return go.Scatter3d(
         x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
         mode="markers",
-        marker=dict(size=2, color="pink", opacity=0.45),
+        marker=dict(size=2, color="dimgray", opacity=0.65),
         name="point cloud",
     )
+
+
+_EMPTY_FORECAST = np.zeros((1, 3), dtype=np.float32)
+
+
+def _active_chunk_event(chunk_events: list[dict], step_idx: int) -> "dict | None":
+    """Return the most recent chunk event whose step <= step_idx, or None."""
+    active = None
+    for ev in chunk_events:
+        if ev["step"] <= step_idx:
+            active = ev
+        else:
+            break
+    return active
 
 
 # ---------------------------------------------------------------------------
@@ -198,23 +256,24 @@ def save_episode_html(
     """Write a self-contained animated Plotly HTML from recorded episode data.
 
     Layout:
-        Left 65 %  — animated 3D arm skeleton + EE trajectory trails +
-                       point cloud (when available).
-                       actual (thin gray), total desired (solid blue),
-                       base desired (dashed orange).
+        Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray,
+                       cumulative) + chunk forecasts updated at each inference:
+                       total chunk forecast (solid blue, base + residual) and
+                       base chunk forecast (dashed orange, base only).
+                       Optional point cloud when recorder.point_clouds has data.
         Right 35 % — stacked time-series: kp (row 1), kd (row 2), gripper (row 3).
 
     Trace index map (for go.Frame updates):
-        0  skeleton        — animated arm FK chain
-        1  actual trail    — actual EE path (FK from obs joint angles)
-        2  total desired   — base + residual delta target
-        3  base desired    — base-policy-only absolute target
+        0  skeleton            — animated arm FK chain
+        1  actual trail        — cumulative actual EE path (FK from obs)
+        2  total chunk forecast — base + residual projected trajectory for active chunk
+        3  base chunk forecast  — base-policy-only projected trajectory for active chunk
         4  kp metric
         5  kp_true metric
         6  kd metric
-        7  kd_true metric  (not animated via frames)
-        8  gripper metric  (not animated via frames)
-        9  point cloud     — only present when recorder.point_clouds contains data
+        7  kd_true metric
+        8  gripper metric
+        9  point cloud         — only present when recorder.point_clouds contains data
         (static zero-lines appended last, not in any frame update)
 
     Args:
@@ -275,10 +334,18 @@ def save_episode_html(
     # --- forward kinematics --------------------------------------------------
     skeletons = [_skeleton_pts(q) for q in joint_angles]  # T × (9, 3)
 
+    # --- chunk forecast events -----------------------------------------------
+    chunk_events = recorder.chunk_events  # sorted ascending by step
+
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
     pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
+    chunk_pts = []
+    for ev in chunk_events:
+        chunk_pts.append(ev["base_traj"])
+        chunk_pts.append(ev["total_traj"])
     all_xyz = np.concatenate(
-        [actual_pos, total_des_pos, base_des_pos] + skeletons + pcd_for_bbox,
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -313,6 +380,11 @@ def save_episode_html(
         vertical_spacing=0.06,
     )
 
+    # Initial chunk forecast: use the first event covering step 0.
+    _init_ev = _active_chunk_event(chunk_events, indices[0])
+    _init_total_fcast = _init_ev["total_traj"] if _init_ev else _EMPTY_FORECAST
+    _init_base_fcast  = _init_ev["base_traj"]  if _init_ev else _EMPTY_FORECAST
+
     # --- initial traces (step 0) — order must match go.Frame list below ------
     # Trace 0: skeleton
     fig.add_trace(_skeleton_trace(skeletons[0]), row=1, col=1)
@@ -322,14 +394,15 @@ def save_episode_html(
                      width=3, marker_size=2),
         row=1, col=1,
     )
-    # Trace 2: total desired trail (base + residual)
+    # Trace 2: total chunk forecast (base + residual projected trajectory)
     fig.add_trace(
-        _trail_trace(total_des_pos[:1], color="royalblue", name="total desired"),
+        _trail_trace(_init_total_fcast, color="royalblue", name="total chunk forecast"),
         row=1, col=1,
     )
-    # Trace 3: base desired trail
+    # Trace 3: base chunk forecast (base-policy projected trajectory)
     fig.add_trace(
-        _trail_trace(base_des_pos[:1], color="darkorange", name="base desired", dash="dash"),
+        _trail_trace(_init_base_fcast, color="darkorange", name="base chunk forecast",
+                     dash="dash"),
         row=1, col=1,
     )
     # Traces 4-5: kp_gain (solid) and kp_true (dotted)
@@ -362,12 +435,16 @@ def save_episode_html(
 
     frames = []
     for t in range(T):
-        skel  = skeletons[t]
-        ap    = actual_pos[:t + 1]
-        tp    = total_des_pos[:t + 1]
-        bp    = base_des_pos[:t + 1]
-        kp_t  = kp_arr[:t + 1]
-        kd_t  = kd_arr[:t + 1]
+        skel = skeletons[t]
+        ap   = actual_pos[:t + 1]
+        kp_t = kp_arr[:t + 1]
+        kd_t = kd_arr[:t + 1]
+
+        # Chunk forecast: use the most recent inference event at or before this step.
+        ev = _active_chunk_event(chunk_events, indices[t])
+        total_fcast = ev["total_traj"] if ev else _EMPTY_FORECAST
+        base_fcast  = ev["base_traj"]  if ev else _EMPTY_FORECAST
+
         frame_data = [
             # 0: skeleton
             go.Scatter3d(
@@ -376,25 +453,25 @@ def save_episode_html(
                 line=dict(color="dimgray", width=6),
                 marker=dict(size=5, color="dimgray"),
             ),
-            # 1: actual EE trail 0..t
+            # 1: actual EE trail 0..t (cumulative history)
             go.Scatter3d(
                 x=ap[:, 0], y=ap[:, 1], z=ap[:, 2],
                 mode="lines+markers",
                 line=dict(color="slategray", width=3),
                 marker=dict(size=2, color="slategray"),
             ),
-            # 2: total desired trail 0..t
+            # 2: total chunk forecast (base + residual full projected trajectory)
             go.Scatter3d(
-                x=tp[:, 0], y=tp[:, 1], z=tp[:, 2],
+                x=total_fcast[:, 0], y=total_fcast[:, 1], z=total_fcast[:, 2],
                 mode="lines+markers",
                 line=dict(color="royalblue", width=5),
                 marker=dict(size=3, color="royalblue"),
             ),
-            # 3: base desired trail 0..t
+            # 3: base chunk forecast (base-policy full projected trajectory)
             go.Scatter3d(
-                x=bp[:, 0], y=bp[:, 1], z=bp[:, 2],
+                x=base_fcast[:, 0], y=base_fcast[:, 1], z=base_fcast[:, 2],
                 mode="lines+markers",
-                line=dict(color="darkorange", width=5, dash="dash"),
+                line=dict(color="darkorange", width=4, dash="dash"),
                 marker=dict(size=3, color="darkorange"),
             ),
             # 4: kp_gain 0..t
@@ -421,7 +498,7 @@ def save_episode_html(
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
-                marker=dict(size=2, color="rgba(60, 200, 120, 0.45)", opacity=0.45),
+                marker=dict(size=2, color="rgba(80, 80, 80, 0.65)", opacity=0.65),
             ))
         frames.append(
             go.Frame(data=frame_data, traces=animated_traces, name=str(t))
@@ -524,15 +601,15 @@ def save_rollout_html(
 ) -> None:
     """Write a self-contained animated Plotly HTML for a base-policy-only rollout.
 
-    Simpler than save_episode_html: shows only the actual EE trail and the
-    "commanded" trail (recorder.base_desired_pos, i.e. actual_pos + base_delta),
-    with the same kp/kd/gripper time-series panels.  Use this when there is no
-    residual policy and the two-trail layout of save_episode_html would just show
-    two identical overlapping lines.
+    Simpler than save_episode_html: shows the actual EE trail (cumulative, thin
+    gray) and the base chunk forecast (royalblue) — the base policy's full projected
+    trajectory updated each time a new chunk is inferred.  Use this when there is no
+    residual policy.
 
     Layout:
-        Left 65 %  — animated 3D arm skeleton + EE trails + optional point cloud.
-                       actual  (thin gray), commanded (solid royalblue).
+        Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray) +
+                       base chunk forecast (solid royalblue, updated per inference).
+                       Optional point cloud when data is present.
         Right 35 % — stacked time-series: kp (row 1), kd (row 2), gripper (row 3).
 
     Args:
@@ -583,8 +660,15 @@ def save_rollout_html(
 
     skeletons = [_skeleton_pts(q) for q in joint_angles]
 
+    chunk_events = recorder.chunk_events  # sorted ascending by step
+
     pcd_for_bbox = [p for p in pcd_robot if len(p) > 0] if has_pcd else []
-    all_xyz = np.concatenate([actual_pos, commanded_pos] + skeletons + pcd_for_bbox, axis=0)
+    chunk_pts = [ev["base_traj"] for ev in chunk_events]
+    all_xyz = np.concatenate(
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox,
+        axis=0,
+    )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
     pad = float((mx - mn).max()) * 0.05
     x_range = [float(mn[0] - pad), float(mx[0] + pad)]
@@ -600,6 +684,9 @@ def save_rollout_html(
         y=float(extents[1] / ext_max),
         z=float(extents[2] / ext_max),
     )
+
+    _init_ev = _active_chunk_event(chunk_events, indices[0])
+    _init_base_fcast = _init_ev["base_traj"] if _init_ev else _EMPTY_FORECAST
 
     fig = make_subplots(
         rows=3, cols=2,
@@ -621,9 +708,9 @@ def save_rollout_html(
         _trail_trace(actual_pos[:1], color="slategray", name="actual EE", width=3, marker_size=2),
         row=1, col=1,
     )
-    # Trace 2: commanded trail (actual + base delta)
+    # Trace 2: base chunk forecast (full projected trajectory from most recent inference)
     fig.add_trace(
-        _trail_trace(commanded_pos[:1], color="royalblue", name="commanded"),
+        _trail_trace(_init_base_fcast, color="royalblue", name="base chunk forecast"),
         row=1, col=1,
     )
     # Traces 3-4: kp
@@ -650,9 +737,12 @@ def save_rollout_html(
     for t in range(T):
         skel = skeletons[t]
         ap   = actual_pos[:t + 1]
-        cp   = commanded_pos[:t + 1]
         kp_t = kp_arr[:t + 1]
         kd_t = kd_arr[:t + 1]
+
+        ev = _active_chunk_event(chunk_events, indices[t])
+        base_fcast = ev["base_traj"] if ev else _EMPTY_FORECAST
+
         frame_data = [
             go.Scatter3d(
                 x=skel[:, 0], y=skel[:, 1], z=skel[:, 2],
@@ -667,7 +757,7 @@ def save_rollout_html(
                 marker=dict(size=2, color="slategray"),
             ),
             go.Scatter3d(
-                x=cp[:, 0], y=cp[:, 1], z=cp[:, 2],
+                x=base_fcast[:, 0], y=base_fcast[:, 1], z=base_fcast[:, 2],
                 mode="lines+markers",
                 line=dict(color="royalblue", width=5),
                 marker=dict(size=3, color="royalblue"),
@@ -690,7 +780,7 @@ def save_rollout_html(
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
-                marker=dict(size=2, color="rgba(60, 200, 120, 0.45)", opacity=0.45),
+                marker=dict(size=2, color="rgba(80, 80, 80, 0.65)", opacity=0.65),
             ))
         frames.append(go.Frame(data=frame_data, traces=animated_traces, name=str(t)))
     fig.frames = frames

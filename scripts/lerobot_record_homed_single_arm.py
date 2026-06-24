@@ -144,8 +144,8 @@ def _build_teleop(mode: str, teleop_id: str):
             prefix="r_",
             use_delta=True,
             use_noise=True,
-            translation_scale=0.1,
-            rotation_scale=0.2,
+            translation_scale=0.03,
+            rotation_scale=0.05,
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
@@ -349,24 +349,24 @@ def main() -> None:
                     (recorded < args.num_episodes - 1) or events["rerecord_episode"]
                 ):
                     log_say("Reset the environment", args.play_sounds)
-                    if args.policy is not None:
-                        stdin_kb.start()
-                        try:
-                            record_loop(
-                                robot=robot,
-                                events=events,
-                                fps=args.fps,
-                                teleop_action_processor=teleop_proc,
-                                robot_action_processor=robot_action_proc,
-                                robot_observation_processor=robot_obs_proc,
-                                teleop=teleop,
-                                control_time_s=args.reset_time_s,
-                                single_task=args.task,
-                            )
-                        finally:
-                            stdin_kb.stop()
-                    else:
-                        input("Press Enter when ready to start the next episode...")
+                    # if args.policy is not None:
+                    #     stdin_kb.start()
+                    #     try:
+                    #         record_loop(
+                    #             robot=robot,
+                    #             events=events,
+                    #             fps=args.fps,
+                    #             teleop_action_processor=teleop_proc,
+                    #             robot_action_processor=robot_action_proc,
+                    #             robot_observation_processor=robot_obs_proc,
+                    #             teleop=teleop,
+                    #             control_time_s=args.reset_time_s,
+                    #             single_task=args.task,
+                    #         )
+                    #     finally:
+                    #         stdin_kb.stop()
+                    # else:
+                    input("Press Enter when ready to start the next episode...")
 
                 if events["rerecord_episode"]:
                     log_say("Re-record episode", args.play_sounds)

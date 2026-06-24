@@ -172,7 +172,6 @@ def _run_episode(
     chunk_used = _CHUNK_EXEC   # triggers immediate inference on first step
     prev_kp = 0.0
     prev_kd = 0.0
-    last_point_cloud: np.ndarray | None = None
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -201,8 +200,7 @@ def _run_episode(
                 chunk_used = 0
 
                 if residual is not None:
-                    last_point_cloud = extract_point_cloud(obs)
-                    point_cloud = last_point_cloud
+                    point_cloud = extract_point_cloud(obs)
                     processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
@@ -211,6 +209,26 @@ def _run_episode(
                         "gains": np.array([prev_kp, prev_kd], dtype=np.float32),
                     }
                     res_chunk = residual.infer(residual_obs)
+
+                if recorder is not None:
+                    ee3 = ee_pose[:3].astype(np.float32)
+                    # Raw unnormalised position deltas (metres) from postprocessor.
+                    # Cumsum from current EE gives the commanded delta trajectory.
+                    base_deltas = base_chunk[:_RESIDUAL_HORIZON, :3].astype(np.float32)
+                    base_traj = np.vstack([ee3, ee3 + np.cumsum(base_deltas, axis=0)])
+                    if residual is not None and len(res_chunk) > 0:
+                        K_res = min(len(res_chunk), _RESIDUAL_HORIZON)
+                        total_deltas = base_deltas.copy()
+                        total_deltas[:K_res] += res_chunk[:K_res, 2:5].astype(np.float32) * _POS_SCALE
+                        total_traj = np.vstack([ee3, ee3 + np.cumsum(total_deltas, axis=0)])
+                    else:
+                        total_traj = base_traj.copy()
+                    recorder.record_chunk(
+                        step=len(recorder),
+                        ee_pos=ee3,
+                        base_traj=base_traj,
+                        total_traj=total_traj,
+                    )
 
             if residual is not None:
                 res = res_chunk[chunk_used]
@@ -242,7 +260,7 @@ def _run_episode(
                     kp=kp,
                     kd=kd,
                     gripper=action["r_gripper"],
-                    point_cloud=last_point_cloud,
+                    point_cloud=controller.last_full_point_cloud,
                 )
 
             if dataset is not None:

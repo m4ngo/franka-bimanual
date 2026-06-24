@@ -4,10 +4,11 @@ Policy wrappers for the base (LeRobot ACT/diffusion) and residual policies.
 Action spaces
 -------------
 Base policy output  : [dx, dy, dz, dqx, dqy, dqz, dqw, gripper, kp, kd]
-                      Per-step EE delta in robot frame.  Position columns (0–2) are
-                      metres; rotation columns (3–6) encode the delta as a unit
-                      quaternion (xyzw).  These are passed directly to the robot in
-                      EE_DELTA mode — no goal-pose PD error is computed.
+                      Per-step EE delta in robot frame, in physical units as returned
+                      by the lerobot postprocessor.  Position columns (0–2) are in
+                      metres (the units stored in the training dataset).  Rotation
+                      columns (3–6) encode the delta as a unit quaternion (xyzw).
+                      These are forwarded directly to send_action() in EE_DELTA mode.
 
 Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
                       [dx, dy, dz, rx, ry, rz, gripper, kp, kd]
@@ -27,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC
+from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
@@ -73,7 +74,8 @@ class BasePolicy:
         """Run one inference pass.
 
         Returns:
-            (T, 10) numpy array in robot action space (unnormalised).
+            (T, 10) numpy array in physical units (postprocessor applied):
+            positions in metres, rotation as unit quaternion (xyzw), gripper in [0,1].
         """
         obs_t = prepare_observation_for_inference(_format_obs_for_policy(obs), self.device)
         obs_t = self.preprocessor(obs_t)
@@ -161,4 +163,7 @@ class ResidualPolicy:
         with torch.inference_mode():
             out = self.model(pcd_t, proprio_t, base_action_t)  # (1, 45)
 
-        return out.squeeze(0).cpu().numpy().reshape(_CHUNK_EXEC, 9)  # (5, 9)
+        result = out.squeeze(0).cpu().numpy().reshape(_CHUNK_EXEC, 9)  # (5, 9)
+        result[..., :2] = np.clip(result[..., :2], -_GAINS_MAG, _GAINS_MAG)
+        result[..., 2:] = np.clip(result[..., 2:], -_RESIDUAL_MAG, _RESIDUAL_MAG)
+        return result

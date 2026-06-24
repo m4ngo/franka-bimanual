@@ -7,18 +7,18 @@
 # $4 is steps
 # $5 policy type
 
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ] || [ -z "$6" ]; then
-    echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps> <policy_type> <resume> <config_path>"
+if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
+    echo "Usage: $0 <repo_id> <policy_repo_id> <batch_size> <steps> <resume> <config_path>"
     exit 1
 fi
 lerobot-train \
-  --resume=$6 \
+  --resume=$5 \
   --dataset.repo_id="$1" \
-  --policy.type=$5 \
-  --output_dir="../franka_data/policy/train/$5_$1" \
-  --policy.chunk_size=100 \
+  --policy.type=act \
+  --output_dir="../franka_data/policy/train/act_$1" \
+  --policy.chunk_size=10 \
   --policy.n_action_steps=5 \
-  --job_name="$5_$1" \
+  --job_name="act_$1" \
   --policy.device=cuda \
   --wandb.enable=true \
   --policy.repo_id="$2" \

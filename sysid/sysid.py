@@ -27,6 +27,7 @@ Fields recorded in the output HDF5 (same structure):
     tau_cmd     (T, 7) – zeros (not accessible via current RPC interface)
 
 A comparison HTML visualization is also written alongside the HDF5.
+One MP4 video per camera is written alongside the HDF5 (e.g. <stem>_cam_3_wrist.mp4).
 """
 
 import argparse
@@ -39,6 +40,7 @@ import tty
 import time
 from pathlib import Path
 
+import cv2
 import h5py
 import numpy as np
 
@@ -47,7 +49,7 @@ sys.path.insert(0, str(_HERE.parent / "residual_wrapper"))
 
 from env_wrapper import start_controller  # noqa: E402
 from lerobot_robot_bimanual_franka import SingleArmFranka
-from _viz import save_comparison_html  # noqa: E402
+from _viz import compute_trajectory_errors, save_comparison_html, save_errors_json  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +57,10 @@ logger = logging.getLogger(__name__)
 # Default 0.0 → kp_gain = 1.0 (minimum, safest for an open-loop sysid replay).
 _DEFAULT_KP = 0.0
 _DEFAULT_KD = 0.0
+
+# Camera read timeout used when capturing frames inside the step loop.
+# 50 ms is generous for a buffered async_read at 20 Hz control rate.
+_CAM_TIMEOUT_MS = 50.0
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +111,31 @@ def _read_key() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Video helpers
+# ---------------------------------------------------------------------------
+
+def _save_videos(
+    cam_frames: dict[str, list[np.ndarray]],
+    video_dir: Path,
+    stem: str,
+    fps: float,
+) -> None:
+    """Write one MP4 per camera from lists of RGB frames captured during an episode."""
+    video_dir.mkdir(parents=True, exist_ok=True)
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    for cam_name, frames in cam_frames.items():
+        if not frames:
+            continue
+        h, w = frames[0].shape[:2]
+        vpath = video_dir / f"{stem}_{cam_name}.mp4"
+        writer = cv2.VideoWriter(str(vpath), fourcc, fps, (w, h))
+        for frame in frames:
+            writer.write(frame[:, :, ::-1])  # RGB → BGR for OpenCV
+        writer.release()
+        logger.info("saved video %s (%d frames)", vpath, len(frames))
+
+
+# ---------------------------------------------------------------------------
 # Episode replay loop
 # ---------------------------------------------------------------------------
 
@@ -115,6 +146,8 @@ def _run_episode(
     kp: float = _DEFAULT_KP,
     kd: float = _DEFAULT_KD,
     gripper_norm: float = 1.0,
+    video_dir: Path | None = None,
+    video_stem: str = "episode",
 ) -> dict[str, np.ndarray]:
     """Replay *traj* on the robot and record the kinematic response.
 
@@ -123,6 +156,10 @@ def _run_episode(
     q, dq, jacobian, ee_pos, ee_quat, ee_vel_6d).  That snapshot is stored in
     ``controller._cached_kin_state`` so the subsequent ``send_action`` call
     consumes it without an extra RPyC round-trip.
+
+    Camera frames are captured asynchronously at each step using the
+    controller's thread pool.  After the loop, one MP4 is written per camera
+    into *video_dir* (skipped if *video_dir* is None or there are no cameras).
 
     Press right-arrow to end early, Ctrl-C to abort.
 
@@ -138,6 +175,9 @@ def _run_episode(
         "action", "eef_ang_vel",
         "eef_lin_vel", "eef_pos", "eef_quat", "qpos", "qvel", "t_sim", "tau_cmd",
     )}
+
+    record_video = video_dir is not None and bool(controller.cameras)
+    cam_frames: dict[str, list[np.ndarray]] = {n: [] for n in controller.cameras} if record_video else {}
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -186,7 +226,14 @@ def _run_episode(
             }
             controller.send_action(action)
 
-            # --- record -------------------------------------------------------
+            # --- submit camera reads (async, resolved before next sleep) ------
+            if record_video:
+                cam_futs = {
+                    n: controller._camera_pool.submit(cam.async_read, _CAM_TIMEOUT_MS)
+                    for n, cam in controller.cameras.items()
+                }
+
+            # --- record kinematic data ----------------------------------------
             t_now = time.perf_counter() - t_start
             buf["action"].append(np.concatenate([dpos, drot_quat]).astype(np.float32))
             buf["eef_ang_vel"].append(np.asarray(ee_vel[3:], dtype=np.float32))
@@ -202,8 +249,20 @@ def _run_episode(
             sleep_s = dt - elapsed
             if sleep_s > 0:
                 time.sleep(sleep_s)
+
+            # --- collect camera frames after sleeping -------------------------
+            if record_video:
+                for n, fut in cam_futs.items():
+                    try:
+                        frame = fut.result(timeout=0.1)
+                        cam_frames[n].append(frame)
+                    except Exception as e:
+                        logger.warning("Camera %s frame dropped at step %d: %s", n, step, e)
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
+
+    if record_video and cam_frames:
+        _save_videos(cam_frames, video_dir, video_stem, fps)
 
     return {k: np.stack(v) for k, v in buf.items() if v}
 
@@ -262,6 +321,7 @@ def main() -> None:
     controller = start_controller()
     logger.info("robot connected")
 
+    all_errors: list[dict] = []
     try:
         for i in range(0, parse_num_traj(args.traj_file)):
             # Load reference trajectory
@@ -296,6 +356,7 @@ def main() -> None:
                 "replaying %d steps at %.1f Hz (kp=%.2f → gain=%.2f) — press right-arrow to stop early",
                 n_steps, args.fps, args.kp, 10.0 ** args.kp,
             )
+            video_stem = f"{i}_{output}"
             recorded = _run_episode(
                 controller=controller,
                 traj=traj,
@@ -303,6 +364,8 @@ def main() -> None:
                 kp=args.kp,
                 kd=args.kd,
                 gripper_norm=args.gripper_norm,
+                video_dir=Path("sysid/outputs"),
+                video_stem=video_stem,
             )
 
             if not recorded:
@@ -315,6 +378,12 @@ def main() -> None:
             # Visualization
             viz_out = args.viz_out or str(Path(f"sysid/outputs/{i}_" + output).with_suffix(".html"))
             save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
+
+            # Accumulate errors for the summary JSON
+            all_errors.append(compute_trajectory_errors(traj, recorded, name=output))
+
+        errors_path = str(Path("sysid/outputs") / "errors.json")
+        save_errors_json(all_errors, errors_path)
     finally:
         controller.disconnect()
 

@@ -39,6 +39,7 @@ _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraCo
 
 _DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
 _DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
+_FULL_PCD_CROP_RADIUS_M: float = 0.5  # max distance from world origin for viz cloud
 
 logger = logging.getLogger(__name__)
 
@@ -82,6 +83,9 @@ class BimanualFranka(Robot):
         # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
+        # Full (uncropped, unsubsampled) point cloud from the depth camera, cached each
+        # get_observation() call.  None until the first observation is read.
+        self._last_full_point_cloud: np.ndarray | None = None
 
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
         gripper_ip = getattr(self.config, f"{arm}_gripper_ip")
@@ -202,7 +206,16 @@ class BimanualFranka(Robot):
             depth_cam = self.cameras.get(self._depth_cam)
             if depth_cam is None:
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
-            verts = self._camera_pool.submit(getattr(depth_cam, "get_depth")).result()
+            # Submit both depth reads concurrently; get_full_point_cloud only reads
+            # the already-cached _last_depth so both are pure CPU work with no I/O.
+            depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_depth"))
+            full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
+            verts = depth_fut.result()
+            full_pcd = full_pcd_fut.result()
+            if len(full_pcd) > 0:
+                dist2 = np.einsum("ij,ij->i", full_pcd, full_pcd)
+                full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
+            self._last_full_point_cloud = full_pcd
             ee_world = self._ee_world_center(kin)
             flat = self._sample_depth_points(verts, ee_world).reshape(-1)
             for i, v in enumerate(flat):
@@ -390,6 +403,15 @@ class BimanualFranka(Robot):
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
         self.delta_rot = drot
+
+    @property
+    def last_full_point_cloud(self) -> np.ndarray | None:
+        """Full (uncropped, unsubsampled) world-space point cloud from the depth camera.
+
+        Updated every get_observation() call when depth is enabled.
+        Shape: (N, 3) float32 in world-frame metres, or None before the first observation.
+        """
+        return self._last_full_point_cloud
 
     @staticmethod
     def _ee_pose_errors(target: np.ndarray, snap: KinematicSnapshot) -> tuple[np.ndarray, np.ndarray]:

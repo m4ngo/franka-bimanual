@@ -5,6 +5,7 @@ importing robot-specific dependencies.
 """
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 
@@ -23,6 +24,96 @@ franka_fk_chain = _fk_mod.franka_fk_chain
 
 # Offset subtracted from world-frame eef_pos to recover robot base frame.
 WORLD_FRAME_OFFSET = np.array([-0.66, 0.0, 0.912])
+
+def compute_trajectory_errors(
+    ref: dict[str, np.ndarray],
+    recorded: dict[str, np.ndarray],
+    name: str = "",
+) -> dict:
+    """Compute position and rotation tracking errors for one trajectory.
+
+    Returns a dict suitable for inclusion in the errors JSON:
+        name, n_steps,
+        position_error_m:  {mean, max, rms, final},
+        rotation_error_rad: {mean, max, rms, final} or None if ref lacks eef_quat.
+    """
+    ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET  # robot frame
+    rep_pos = recorded["eef_pos"]
+    T_min = min(len(ref_pos), len(rep_pos))
+
+    pos_err_vec  = rep_pos[:T_min] - ref_pos[:T_min]   # (T_min, 3)
+    pos_err_norm = np.linalg.norm(pos_err_vec, axis=1)  # (T_min,)
+
+    def _stats(arr: np.ndarray) -> dict:
+        return {
+            "mean":  float(arr.mean()),
+            "max":   float(arr.max()),
+            "rms":   float(np.sqrt((arr ** 2).mean())),
+            "final": float(arr[-1]),
+        }
+
+    rot_stats = None
+    ref_quat = ref.get("eef_quat")
+    rep_quat = recorded.get("eef_quat")
+    if ref_quat is not None and rep_quat is not None:
+        T_q = min(len(ref_quat), len(rep_quat))
+        rq = ref_quat[:T_q].astype(np.float64)
+        pq = rep_quat[:T_q].astype(np.float64)
+        # normalise
+        rq = rq / np.linalg.norm(rq, axis=1, keepdims=True).clip(1e-9)
+        pq = pq / np.linalg.norm(pq, axis=1, keepdims=True).clip(1e-9)
+        # geodesic angle: 2·arccos(|q1·q2|), robust to double-cover
+        dot = np.clip(np.abs((rq * pq).sum(axis=1)), 0.0, 1.0)
+        rot_err = 2.0 * np.arccos(dot)  # (T_q,) in radians
+        rot_stats = _stats(rot_err)
+
+    return {
+        "name":               name,
+        "n_steps":            int(T_min),
+        "position_error_m":   _stats(pos_err_norm),
+        "rotation_error_rad": rot_stats,
+    }
+
+
+def save_errors_json(
+    trajectory_errors: list[dict],
+    path: str,
+) -> None:
+    """Write per-trajectory and aggregate error stats to a JSON file.
+
+    trajectory_errors: list of dicts returned by compute_trajectory_errors.
+    """
+    def _agg(key: str, sub: str) -> dict | None:
+        vals = [t[key][sub] for t in trajectory_errors if t[key] is not None]
+        if not vals:
+            return None
+        arr = np.array(vals)
+        return {
+            "mean":  float(arr.mean()),
+            "max":   float(arr.max()),
+            "total": float(arr.sum()),
+        }
+
+    pos_agg = {k: _agg("position_error_m", k) for k in ("mean", "max", "rms", "final")}
+    rot_vals = [t["rotation_error_rad"] for t in trajectory_errors if t["rotation_error_rad"] is not None]
+    rot_agg: dict | None = None
+    if rot_vals:
+        rot_agg = {k: _agg("rotation_error_rad", k) for k in ("mean", "max", "rms", "final")}
+
+    payload = {
+        "trajectories": trajectory_errors,
+        "aggregate": {
+            "n_trajectories":    len(trajectory_errors),
+            "position_error_m":  pos_agg,
+            "rotation_error_rad": rot_agg,
+        },
+    }
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"error stats saved to {path}")
+
 
 def save_comparison_html(
     ref: dict[str, np.ndarray],

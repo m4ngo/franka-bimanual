@@ -14,6 +14,8 @@ _POS_SCALE = 0.05       # metres per normalised unit
 _ROT_SCALE = 0.5        # radians per normalised unit
 _CHUNK_EXEC = 5         # steps to execute per inference call (both base and residual)
 _RESIDUAL_HORIZON = 10  # base-chunk steps forwarded to the residual policy as context
+_GAINS_MAG = 0.5        # gains magnitude for clipping
+_RESIDUAL_MAG = 0.2     # residual magnitude for clipping
 
 _EE_ACTION_KEYS = ("r_x", "r_y", "r_z", "r_qx", "r_qy", "r_qz", "r_qw", "r_gripper")
 _ACTION_KEYS = (*_EE_ACTION_KEYS, "kp", "kd")
@@ -59,7 +61,7 @@ def strip_depth(obs: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def process_chunk(chunk: np.ndarray) -> np.ndarray:
-    """Normalise the first _RESIDUAL_HORIZON steps of a delta-action base-policy chunk.
+    """Convert the first _RESIDUAL_HORIZON steps of a base-policy chunk for the residual model.
 
     The base policy outputs per-step EE deltas directly, so no consecutive-pose
     differencing is needed.  Each step's position delta is divided by _POS_SCALE and
@@ -85,7 +87,13 @@ def process_chunk(chunk: np.ndarray) -> np.ndarray:
 
 
 def build_action(chunk_step: np.ndarray, kp: float, kd: float) -> dict:
-    """Build a RobotAction dict from a base-policy chunk row, overriding gains."""
+    """Build a RobotAction dict from a base-policy chunk row, overriding gains.
+
+    BasePolicy.infer() applies the lerobot postprocessor, which denormalises
+    position deltas back to metres (the units stored in the training dataset).
+    We forward them as-is; _ee_delta expects metres directly.  Rotation and
+    gripper are passed through unchanged.
+    """
     action = {k: float(v) for k, v in zip(_EE_ACTION_KEYS, chunk_step[:8])}
     action["kp"] = kp
     action["kd"] = kd

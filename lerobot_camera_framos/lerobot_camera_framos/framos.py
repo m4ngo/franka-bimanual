@@ -228,6 +228,39 @@ class FramosCamera(Camera):
         self._profile = None
         self._aligner = None
 
+    def get_full_point_cloud(self) -> np.ndarray:
+        """Return ALL valid depth pixels projected to world space.
+
+        Uses the depth frame cached by the most recent async_read / _fetch_color call.
+        No subsampling is applied — the returned cloud may contain tens of thousands
+        of points depending on camera resolution and scene coverage.
+
+        Returns:
+            float32 (N, 3) array in world-frame metres; shape (0, 3) if no depth
+            data is available.
+        """
+        depth_image = self._last_depth
+        if depth_image is None:
+            return np.zeros((0, 3), dtype=np.float32)
+
+        depth_m = np.asarray(depth_image, dtype=np.float32) * self._depth_scale
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
+        if not np.any(valid):
+            return np.zeros((0, 3), dtype=np.float32)
+
+        yy, xx = np.nonzero(valid)
+        z = depth_m[yy, xx]
+        fx = float(self._intrinsics[0, 0])
+        fy = float(self._intrinsics[1, 1])
+        cx = float(self._intrinsics[0, 2])
+        cy = float(self._intrinsics[1, 2])
+
+        x = (xx.astype(np.float32) - cx) * z / fx
+        y = (yy.astype(np.float32) - cy) * z / fy
+        cam_points = np.stack((x, y, z), axis=1).astype(np.float64, copy=False)
+        world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+        return world_points.astype(np.float32)
+
     def get_depth(self) -> list[tuple[float, float, float]]:
         depth_image = self._last_depth
         if depth_image is None:

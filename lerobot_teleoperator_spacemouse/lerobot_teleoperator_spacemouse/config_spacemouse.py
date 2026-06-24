@@ -29,8 +29,8 @@ class SpaceMouseLeaderFields:
     prefix: str = ""
     use_delta: bool = False
     use_noise: bool = False
-    noise_pos_scale: float = 0.005   # metres, added to position output each step
-    noise_rot_scale: float = 0.02    # radians (axis-angle), added to rotation output each step
+    noise_pos_scale: float = 0.01   # metres, added to position output each step
+    noise_rot_scale: float = 0.03    # radians (axis-angle), added to rotation output each step
 
     # Initial EE Cartesian position [x, y, z] in metres. Override with
     # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.

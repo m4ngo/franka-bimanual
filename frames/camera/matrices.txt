@@ -6,6 +6,28 @@ Intrinsic matrix:
 Distortion coefficients:
  [[ 9.37354420e-02 -2.74125058e-01  9.12541074e-06  1.35710217e-04  1.23260996e-01]]
 
+=== cam_2 extrinsics — 20260623 (new camera position) ===
+R (board->cam):
+ [[-0.9370905  -0.21090789 -0.27817128]
+ [-0.03893257  0.85502599 -0.51712166]
+ [ 0.34690871 -0.47375987 -0.80944792]]
+t (board->cam):
+ [[ 0.16554867]
+ [-0.12395645]
+ [ 1.18889394]]
+R_cam_in_board:
+ [[-0.9370905  -0.03893257  0.34690871]
+ [-0.21090789  0.85502599 -0.47375987]
+ [-0.27817128 -0.51712166 -0.80944792]]
+t_cam_in_board:
+ [[-0.26212952]
+ [ 0.70415175]
+ [ 0.94429804]]
+Camera position w.r.t. chessboard center (meters):
+ [-0.33212947  0.58415179  0.94429804]
+Reprojection error (px RMS): 3.0797
+
+=== cam_2 extrinsics — previous position (superseded) ===
 R_cam_in_board:
  [[-0.91580561 -0.17701555  0.36050739]
  [-0.34811877  0.797506   -0.49274486]
@@ -14,5 +36,5 @@ t_cam_in_board:
  [[-0.21087565]
  [ 0.50170678]
  [ 0.64699288]]
-Camera position w.r.t. chessboard center (meters):
+Camera position w.r.t. chessboard center (old):
  [-0.2808756   0.38170682  0.64699288]
