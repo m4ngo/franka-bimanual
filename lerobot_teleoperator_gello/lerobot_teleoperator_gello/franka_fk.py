@@ -54,6 +54,34 @@ def franka_fk(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return T[:3, 3].copy(), Rotation.from_matrix(T[:3, :3]).as_quat()
 
 
+def franka_jacobian(q: np.ndarray) -> np.ndarray:
+    """Geometric Jacobian (6×7) for Franka FR3/Panda, expressed in the base frame.
+
+    Uses the same modified DH parameters as franka_fk / franka_fk_chain so the
+    result is guaranteed to be consistent with the FK.  Avoids libfranka's
+    robot.model.zero_jacobian, which returns zeros through the CBRobot wrapper.
+
+    Returns:
+        J: (6, 7) ndarray.  Rows 0-2 are linear velocity (m/s), rows 3-5 are
+           angular velocity (rad/s).  J @ dq gives the EE twist in the base frame.
+    """
+    chain = franka_fk_chain(q)      # out[i] = base→frame{i+1}, out[7] = base→EE
+    p_ee = chain[7][:3, 3]          # EE position in base frame
+
+    J = np.zeros((6, 7), dtype=np.float64)
+    for i in range(7):
+        # z-axis and origin of the frame BEFORE joint i+1 (0-indexed)
+        if i == 0:
+            z = np.array([0.0, 0.0, 1.0])   # base frame z-axis
+            p = np.zeros(3)
+        else:
+            z = chain[i - 1][:3, 2]          # z-axis of frame{i} in base frame
+            p = chain[i - 1][:3, 3]          # origin of frame{i} in base frame
+        J[:3, i] = np.cross(z, p_ee - p)    # linear velocity contribution
+        J[3:, i] = z                         # angular velocity contribution
+    return J
+
+
 def franka_fk_chain(q: np.ndarray) -> np.ndarray:
     """Per-link cumulative transforms base→j1, base→j2, ..., base→EE.
 

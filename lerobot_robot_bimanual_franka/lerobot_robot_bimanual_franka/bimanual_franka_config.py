@@ -11,8 +11,8 @@ _VALID_ARMS: tuple[str, ...] = ("l", "r")
 
 class ControlMode(str, Enum):
     JOINT_POS = "JOINT_POS"  # joint position setpoints → joint velocity PD
-    EE_POS    = "EE_POS"     # absolute EE pose setpoints → VOsc joint velocity
-    EE_DELTA  = "EE_DELTA"   # EE delta commands → accumulated goal pose → VOsc joint velocity
+    EE_POS    = "EE_POS"     # absolute EE pose → OSC Cartesian velocity
+    EE_DELTA  = "EE_DELTA"   # EE delta (robot frame) → OSC Cartesian velocity
 
 
 @RobotConfig.register_subclass("bimanual_franka")
@@ -44,18 +44,20 @@ class BimanualFrankaConfig(RobotConfig):
     world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)
     depth_crop_radius_m: float = 0.4
 
-    # VOsc (Velocity-Space OSC) control parameters
-    # Position delta per step when action component = 1.0 (EE_DELTA only)
+    # OSC (operational-space) control — task-space velocity gains (1/s)
+    # Variable impedance: final kp[i] = osc_kp_base * 10^kp_action; kd = 2*sqrt(kp)*zeta
     osc_output_max_pos: float = 0.05
     # Rotation delta (rad) per step when action magnitude = 1.0 (EE_DELTA only)
     osc_output_max_rot: float = 0.5
     # Base task-space velocity gain (1/s). Final kp = osc_kp_base * 10^kp_action
     osc_kp_base: float = 2.0
-    # Nullspace joint-attraction gain (1/s). Keep low; high values cause oscillation
-    # when joints drift from q0 during EE control.
+    # Unused (nullspace only applied in joint-space VOSC). Kept for config compatibility.
     osc_kp_null: float = 0.5
     # Damping ratio; kd = 2 * sqrt(kp) * osc_damping_ratio (1.0 = critically damped)
     osc_damping_ratio: float = 1.0
+    # Orientation gain relative to position gain: kp_ori = osc_kp_base * osc_kp_ori_ratio.
+    # Set to 0.0 to disable orientation correction entirely (pure position control).
+    osc_kp_ori_ratio: float = 1.0
 
     def __post_init__(self):
         if hasattr(super(), "__post_init__"):

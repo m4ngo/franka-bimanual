@@ -4,11 +4,13 @@ Thin wrapper around `pyspacemouse` that exposes the device as a LeRobot
 :class:`Teleoperator`. Each call to :pymeth:`get_action` integrates the
 device twist into a running absolute EE pose and returns:
 
-- absolute Cartesian position (x, y, z) in metres, updated by the device's
-  linear axes (already normalized to [-1, 1] by pyspacemouse);
-- absolute orientation as a unit quaternion (qx, qy, qz, qw), updated by
-  composing a small-angle rotation from the device's angular axes onto the
-  current orientation;
+- EE position delta (x, y, z): device axes in normalized ``[-1, 1]`` when
+  ``use_delta=True`` (physical scaling lives in the robot's
+  ``osc_output_max_pos``);
+- EE rotation delta (rx, ry, rz): normalized axis-angle components in
+  ``[-1, 1]`` when ``use_delta=True`` (physical scaling lives in
+  ``osc_output_max_rot``); absolute orientation as a unit quaternion when
+  ``use_delta=False``;
 - a ``gripper`` target normalised to ``[0, 1]`` (0 = fully closed,
   1 = ``gripper_norm_max_mm``), latched from the two device buttons:
   left button = close (drive to ``gripper_min_mm``), right button = open
@@ -44,7 +46,8 @@ class SpaceMouse(Teleoperator):
     config_class = SpaceMouseConfig
     name = "spacemouse"
 
-    AXIS_NAMES = ("x", "y", "z", "qx", "qy", "qz", "qw")
+    AXIS_NAMES_POS = ("x", "y", "z", "qx", "qy", "qz", "qw")
+    AXIS_NAMES_DELTA = ("x", "y", "z", "rx", "ry", "rz")
 
     def __init__(self, config: SpaceMouseConfig):
         super().__init__(config)
@@ -64,6 +67,10 @@ class SpaceMouse(Teleoperator):
 
         self._prefix = config.prefix
         self._use_delta = config.use_delta
+
+    @property
+    def axis_names(self) -> tuple[str, ...]:
+        return self.AXIS_NAMES_DELTA if self._use_delta else self.AXIS_NAMES_POS
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -89,7 +96,7 @@ class SpaceMouse(Teleoperator):
 
     @property
     def action_features(self) -> dict[str, type]:
-        return {(self._prefix + axis): float for axis in self.AXIS_NAMES} | {f"{self._prefix}gripper": float, "kp": float, "kd": float}
+        return {(self._prefix + axis): float for axis in self.axis_names} | {f"{self._prefix}gripper": float, "kp": float, "kd": float}
 
     @property
     def feedback_features(self) -> dict[str, type]:
@@ -153,6 +160,21 @@ class SpaceMouse(Teleoperator):
                 break
             last_t = state.t
 
+        # Diagnostic: log the first non-zero axis reading. If you never see
+        # this line while moving the spacemouse, the device is on the wrong
+        # hidraw node (buttons are on a different interface than 6-DOF axes).
+        _ax = (state.x, state.y, state.z, state.roll, state.pitch, state.yaw)
+        if not getattr(self, "_axes_logged", False) and any(abs(v) > 0.01 for v in _ax):
+            self._axes_logged = True
+            logger.info(
+                "%s first non-zero axis reading — x=%.3f y=%.3f z=%.3f roll=%.3f pitch=%.3f yaw=%.3f",
+                self, state.x, state.y, state.z, state.roll, state.pitch, state.yaw,
+            )
+        logger.debug(
+            "%s axes: x=%.3f y=%.3f z=%.3f roll=%.3f pitch=%.3f yaw=%.3f",
+            self, state.x, state.y, state.z, state.roll, state.pitch, state.yaw,
+        )
+
         # Buttons: index 0 = left (close), index 1 = right (open). If both
         # are pressed in the same sample we prefer "open" so an accidental
         # double-press doesn't crush the gripper.
@@ -167,48 +189,69 @@ class SpaceMouse(Teleoperator):
         tx, ty, tz = self.config.translation_signs
         rx, ry, rz = self.config.rotation_signs
 
-        delta_pos = np.array([
-            state.y * t_scale * tx,
-            state.x * t_scale * ty,
-            state.z * t_scale * tz,
-        ], dtype=np.float64)
-        # Integrate orientation: compose a small-angle rotation onto cur_rot.
-        # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
-        delta_rot = Rotation.from_euler("xyz", [
-            state.roll  * r_scale * rx,
-            state.pitch * r_scale * ry,
-            state.yaw   * r_scale * rz,
-        ])
+        dbt = self.config.deadband_translation
+        dbr = self.config.deadband_rotation
 
-        # Update integrated state using clean (non-noisy) deltas.
-        # Spacemouse x/y are swapped relative to robot frame.
+        def _db(v: float, threshold: float) -> float:
+            return 0.0 if abs(v) <= threshold else v
+
+        sx = _db(state.x, dbt)
+        sy = _db(state.y, dbt)
+        sz = _db(state.z, dbt)
+        sroll  = _db(state.roll,  dbr)
+        spitch = _db(state.pitch, dbr)
+        syaw   = _db(state.yaw,   dbr)
+
+        delta_pos = np.array([
+            sy * t_scale * tx,
+            sx * t_scale * ty,
+            sz * t_scale * tz,
+        ], dtype=np.float64)
+        delta_rot_aa = np.array([
+            sroll  * r_scale * rx,
+            spitch * r_scale * ry,
+            syaw   * r_scale * rz,
+        ], dtype=np.float64)
+        delta_rot = Rotation.from_euler("xyz", delta_rot_aa)
+
         self.cur_pos = self.cur_pos + delta_pos
         self.cur_rot = delta_rot * self.cur_rot
 
-        # Select output pose: delta or absolute.
         out_pos: np.ndarray = delta_pos if self._use_delta else self.cur_pos
-        out_rot: Rotation   = delta_rot  if self._use_delta else self.cur_rot
+        if self._use_delta:
+            out_rot_aa = delta_rot_aa
+        else:
+            out_rot_aa = None
+            out_rot_quat = self.cur_rot
 
-        # Apply noise at output only — never to the integrated state.
         if self.config.use_noise:
             out_pos = out_pos + np.random.normal(0.0, self.config.noise_pos_scale, 3)
-            out_rot = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot
+            if self._use_delta:
+                out_rot_aa = out_rot_aa + np.random.normal(0.0, self.config.noise_rot_scale, 3)
+            else:
+                out_rot_quat = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot_quat
 
         x, y, z = out_pos
-        qx, qy, qz, qw = out_rot.as_quat()
-
-        return {
-            f"{self._prefix}x":       float(x),
-            f"{self._prefix}y":       float(y),
-            f"{self._prefix}z":       float(z),
-            f"{self._prefix}qx":      float(qx),
-            f"{self._prefix}qy":      float(qy),
-            f"{self._prefix}qz":      float(qz),
-            f"{self._prefix}qw":      float(qw),
+        action = {
+            f"{self._prefix}x": float(x),
+            f"{self._prefix}y": float(y),
+            f"{self._prefix}z": float(z),
             f"{self._prefix}gripper": self._gripper_target_mm,
             "kp": 0.0,
             "kd": 0.0,
         }
+        if self._use_delta:
+            rx_out, ry_out, rz_out = out_rot_aa
+            action[f"{self._prefix}rx"] = float(rx_out)
+            action[f"{self._prefix}ry"] = float(ry_out)
+            action[f"{self._prefix}rz"] = float(rz_out)
+        else:
+            qx, qy, qz, qw = out_rot_quat.as_quat()
+            action[f"{self._prefix}qx"] = float(qx)
+            action[f"{self._prefix}qy"] = float(qy)
+            action[f"{self._prefix}qz"] = float(qz)
+            action[f"{self._prefix}qw"] = float(qw)
+        return action
 
     def send_feedback(self, feedback: dict[str, float]) -> None:
         # The SpaceMouse Compact has no force-feedback channel.

@@ -9,5 +9,6 @@ Requires-Dist: lerobot_camera_arv
 Requires-Dist: lerobot_camera_framos
 Requires-Dist: net_franky
 Requires-Dist: opencv-python-headless
+Requires-Dist: scipy
 
 A python package for bimanual franka TRI setup. Made for LeRobot

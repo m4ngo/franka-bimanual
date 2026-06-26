@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 
-# Single-arm (right) SpaceMouse teleoperation via VOsc EE_DELTA controller.
+# Single-arm (right) SpaceMouse teleoperation via OSC Cartesian velocity (EE_DELTA).
 #
-# The SpaceMouse emits per-step delta poses (use_delta=true) already in physical
-# units (metres / radians via translation_scale / rotation_scale). We disable
-# the robot-side OSC input normalisation (osc_output_max_pos=1.0,
-# osc_output_max_rot=pi) so the spacemouse scales pass through unchanged.
+# Interface convention: SpaceMouse outputs normalized [-1, 1] on all axes
+# (translation_scale=1.0, rotation_scale=1.0). Physical scaling lives
+# entirely on the robot side:
+#   osc_output_max_pos: device ±1 → EE position delta ±0.05 m per step
+#   osc_output_max_rot: device ±1 → EE rotation delta ±0.5 rad per step
 #
 # Usage:
 #   ./single_arm_spacemouse_teleop.sh [hidraw_path]
@@ -21,13 +22,16 @@ lerobot-teleoperate \
     --robot.r_port=18812 \
     --robot.control_mode=EE_DELTA \
     --robot.active_arms=[r] \
-    --robot.osc_output_max_pos=1.0 \
-    --robot.osc_output_max_rot=3.14159 \
+    --robot.osc_output_max_pos=0.05 \
+    --robot.osc_output_max_rot=0.5 \
+    --robot.osc_kp_base=2.0 \
+    --robot.osc_kp_null=0.0 \
+    --robot.osc_kp_ori_ratio=0.3 \
     --teleop.type=spacemouse \
     --teleop.id=spacemouse_r_teleop \
     --teleop.hidraw_path="$HIDRAW" \
     --teleop.use_delta=true \
     --teleop.prefix="r_" \
-    --teleop.translation_scale=0.02 \
-    --teleop.rotation_scale=0.05 \
+    --teleop.translation_scale=1.0 \
+    --teleop.rotation_scale=1.0 \
     --fps=20

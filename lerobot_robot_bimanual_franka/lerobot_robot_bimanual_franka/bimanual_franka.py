@@ -16,6 +16,7 @@ from .bimanual_franka_config import BimanualFrankaConfig, ControlMode
 from .franka_gripper import FrankaGripper
 from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
+from . import osc as osc_ctl
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 
@@ -24,13 +25,13 @@ _CAMERA_READ_TIMEOUT_MS: float = 5.0
 _CONNECT_TIMEOUT_S = 10.0
 _DEPTH_POINT_COUNT = 2048
 
-# Joint-mode PD gains used in home() (rad/s per rad error)
 JOINT_PD_KP = 2.0
 JOINT_PD_KD = 0.1
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
-EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
+EE_DELTA_KEYS: tuple[str, ...] = ("x", "y", "z", "rx", "ry", "rz", "gripper")
+EE_AXIS_KEYS: tuple[str, ...] = osc_ctl.EE_AXIS_KEYS
 
 _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraConfig: ArvCamera}
 
@@ -39,79 +40,6 @@ _DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
 _FULL_PCD_CROP_RADIUS_M: float = 0.5
 
 logger = logging.getLogger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Math helpers (OSC-style)
-# ---------------------------------------------------------------------------
-
-def _quat_xyzw_to_mat(q: np.ndarray) -> np.ndarray:
-    """Unit quaternion (xyzw) → 3×3 rotation matrix."""
-    x, y, z, w = q
-    n = x*x + y*y + z*z + w*w
-    if n < 1e-12:
-        return np.eye(3, dtype=np.float64)
-    s = 1.0 / n
-    return np.array([
-        [1.0 - 2*s*(y*y + z*z),  2*s*(x*y - z*w),        2*s*(x*z + y*w)],
-        [2*s*(x*y + z*w),        1.0 - 2*s*(x*x + z*z),  2*s*(y*z - x*w)],
-        [2*s*(x*z - y*w),        2*s*(y*z + x*w),        1.0 - 2*s*(x*x + y*y)],
-    ], dtype=np.float64)
-
-
-def _orientation_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
-    """Axis-angle orientation error from 3×3 rotation matrices.
-
-    Matches robosuite OSC orientation_error: 0.5 * sum(cross(rc_i, rd_i)).
-    """
-    return 0.5 * (
-        np.cross(current[:, 0], desired[:, 0]) +
-        np.cross(current[:, 1], desired[:, 1]) +
-        np.cross(current[:, 2], desired[:, 2])
-    )
-
-
-def _quat_xyzw_to_axis_angle(q: np.ndarray) -> np.ndarray:
-    """Unit quaternion (xyzw) → axis-angle (3D vector, magnitude = angle in rad)."""
-    v, w = q[:3], float(np.clip(q[3], -1.0, 1.0))
-    v_norm = float(np.linalg.norm(v))
-    return 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, w))
-
-
-def _axis_angle_to_mat(aa: np.ndarray) -> np.ndarray:
-    """Axis-angle (3D, magnitude = angle) → 3×3 rotation matrix."""
-    angle = float(np.linalg.norm(aa))
-    if angle < 1e-9:
-        return np.eye(3, dtype=np.float64)
-    axis = aa / angle
-    s, c = np.sin(angle), np.cos(angle)
-    K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
-    return c * np.eye(3) + s * K + (1 - c) * np.outer(axis, axis)
-
-
-def _osc_matrices(
-    J: np.ndarray,
-    M: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute dynamically-consistent pseudoinverses and null-space projector.
-
-    Returns (J_bar_pos, J_bar_ori, J_bar_full, N) where:
-      J_bar_* = M⁻¹ J*ᵀ λ*  (dynamically-consistent pseudoinverse)
-      N       = I − J̄·J      (null-space projector)
-    """
-    J_pos, J_ori = J[:3], J[3:]
-    M_inv = np.linalg.inv(M)
-
-    lambda_full = np.linalg.pinv(J @ M_inv @ J.T)
-    lambda_pos  = np.linalg.pinv(J_pos @ M_inv @ J_pos.T)
-    lambda_ori  = np.linalg.pinv(J_ori @ M_inv @ J_ori.T)
-
-    J_bar_full = M_inv @ J.T     @ lambda_full   # (7, 6)
-    J_bar_pos  = M_inv @ J_pos.T @ lambda_pos    # (7, 3)
-    J_bar_ori  = M_inv @ J_ori.T @ lambda_ori    # (7, 3)
-
-    N = np.eye(NUM_JOINTS) - J_bar_full @ J      # (7, 7)
-    return J_bar_pos, J_bar_ori, J_bar_full, N
 
 
 def _make_camera(cfg: CameraConfig) -> Camera:
@@ -157,13 +85,12 @@ class BimanualFranka(Robot):
 
         self._last_full_point_cloud: np.ndarray | None = None
 
-        # VOsc per-arm state (initialized at connect time)
-        self._goal_ori_mat: dict[str, np.ndarray] = {}   # held goal orientation (rotation matrix)
-        self._q0: dict[str, np.ndarray] = {}             # nullspace reference joint config
+        # OSC goal state (initialized at connect time)
+        self._goal_ori_mat: dict[str, np.ndarray] = {}
 
         # OSC gains from config
         self._kp_base = float(config.osc_kp_base)
-        self._kp_null = float(config.osc_kp_null)
+        self._kp_ori_ratio = float(config.osc_kp_ori_ratio)
         self._damping_ratio = float(config.osc_damping_ratio)
         self._out_max_pos = float(config.osc_output_max_pos)
         self._out_max_rot = float(config.osc_output_max_rot)
@@ -203,7 +130,12 @@ class BimanualFranka(Robot):
 
     @property
     def action_features(self) -> dict[str, type]:
-        keys = JOINT_FEATURE_KEYS if self.control_mode == ControlMode.JOINT_POS else EE_FEATURE_KEYS
+        if self.control_mode == ControlMode.JOINT_POS:
+            keys = JOINT_FEATURE_KEYS
+        elif self.control_mode == ControlMode.EE_DELTA:
+            keys = EE_DELTA_KEYS
+        else:
+            keys = EE_FEATURE_KEYS
         d = self._arm_features(keys)
         d["kp"] = float
         d["kd"] = float
@@ -236,12 +168,11 @@ class BimanualFranka(Robot):
                     getattr(self.config, f"{arm}_server_ip"),
                     getattr(self.config, f"{arm}_robot_ip"),
                     getattr(self.config, f"{arm}_port"),
+                    use_cartesian=self.control_mode != ControlMode.JOINT_POS,
                 )
                 snap = self.robot_manager.current_kinematic_state(arm, timeout_s=_CONNECT_TIMEOUT_S)
-                # Initialize VOsc goal orientation and nullspace reference
                 _, _, _, _, _, ee_rot_xyzw, _ = snap
-                self._goal_ori_mat[arm] = _quat_xyzw_to_mat(np.asarray(ee_rot_xyzw, dtype=np.float64))
-                self._q0[arm] = np.asarray(snap[0], dtype=np.float64).copy()
+                self._goal_ori_mat[arm] = osc_ctl.quat_xyzw_to_mat(np.asarray(ee_rot_xyzw, dtype=np.float64))
             for arm in self.active_arms:
                 self.grippers[arm].home()
         except Exception:
@@ -353,10 +284,9 @@ class BimanualFranka(Robot):
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
 
-        # kp: base * 10^(kp_action). kd: 2*sqrt(kp)*damping_ratio (OSC critical-damping formula).
-        kp = self._kp_base * (10.0 ** float(np.clip(action["kp"], -1.0, 1.0)))
-        kd = 2.0 * float(np.sqrt(kp)) * self._damping_ratio
-        # kd action scalar is ignored (reserved).
+        kp_vec, kd_vec = osc_ctl.parse_variable_impedance(
+            action, self._kp_base, self._damping_ratio, self._kp_ori_ratio,
+        )
 
         for arm in self.active_arms:
             self.grippers[arm].move(
@@ -364,127 +294,40 @@ class BimanualFranka(Robot):
                 blocking=False,
             )
 
-        if self.control_mode == ControlMode.EE_DELTA:
-            cmds = self.safety.shape_joint(
-                {arm: self._ee_delta_osc(kp, kd, action, arm, kin[arm],
-                                         self._goal_ori_mat, self._q0,
-                                         self._kp_null, self._out_max_pos, self._out_max_rot,
-                                         self.delta_pos, self.delta_rot)
-                 for arm in self.active_arms},
-                kin,
-            )
-        elif self.control_mode == ControlMode.EE_POS:
-            cmds = self.safety.shape_joint(
-                {arm: self._ee_pos_osc(kp, kd, action, arm, kin[arm],
-                                       self._goal_ori_mat, self._q0, self._kp_null,
-                                       self.delta_pos, self.delta_rot, ignore_action)
-                 for arm in self.active_arms},
-                kin,
-            )
+        use_ee = self.control_mode != ControlMode.JOINT_POS
+        try:
+            if self.control_mode == ControlMode.EE_DELTA:
+                raw = {
+                    arm: osc_ctl.ee_velocity_delta(
+                        action, arm, kin[arm], self._goal_ori_mat,
+                        kp_vec, kd_vec, self._out_max_pos, self._out_max_rot,
+                        self.delta_pos, self.delta_rot,
+                    )
+                    for arm in self.active_arms
+                }
+            elif self.control_mode == ControlMode.EE_POS:
+                raw = {
+                    arm: osc_ctl.ee_velocity_absolute(
+                        action, arm, kin[arm], self._goal_ori_mat,
+                        kp_vec, kd_vec, self.delta_pos, self.delta_rot, ignore_action,
+                    )
+                    for arm in self.active_arms
+                }
+            else:
+                raw = {
+                    arm: self._joint_pd(float(kp_vec[0]), float(kd_vec[0]), action, arm, kin[arm])
+                    for arm in self.active_arms
+                }
+            cmds = self.safety.shape_ee(raw, kin) if use_ee else self.safety.shape_joint(raw, kin)
+        except Exception:
+            logger.exception("OSC computation failed — skipping motion command")
+            return action
+
+        if use_ee:
+            self.robot_manager.move_cartesian_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         else:
-            cmds = self.safety.shape_joint(
-                {arm: self._joint_pd(kp, kd, action, arm, kin[arm]) for arm in self.active_arms},
-                kin,
-            )
-        self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
+            self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action
-
-    @staticmethod
-    def _ee_delta_osc(
-        kp: float,
-        kd: float,
-        action: RobotAction,
-        arm: str,
-        snap: KinematicSnapshot,
-        goal_ori_mat: dict[str, np.ndarray],
-        q0: dict[str, np.ndarray],
-        kp_null: float,
-        out_max_pos: float,
-        out_max_rot: float,
-        dpos: np.ndarray,
-        drot: np.ndarray,
-    ) -> np.ndarray:
-        """VOsc EE_DELTA: scale action, update goal ori (OSC-style), compute joint velocity.
-
-        Position goal is reset each step to current + scaled_delta (OSC EE_DELTA convention).
-        Orientation goal is only updated when the rotation delta is non-zero; otherwise the
-        last goal is held, providing active orientation stabilization at zero input.
-        """
-        q, dq, J, M, ee_pos, ee_rot_xyzw, ee_twist = snap
-        q   = np.asarray(q,   dtype=np.float64)
-        dq  = np.asarray(dq,  dtype=np.float64)
-        J   = np.asarray(J,   dtype=np.float64)
-        M   = np.asarray(M,   dtype=np.float64)
-        ee_pos   = np.asarray(ee_pos,   dtype=np.float64)
-        ee_twist = np.asarray(ee_twist, dtype=np.float64)
-
-        # --- Scale inputs from [-1, 1] to physical units ---
-        raw_dpos = np.array([action[f"{arm}_x"], action[f"{arm}_y"], action[f"{arm}_z"]], dtype=np.float64)
-        raw_dq   = np.array([action[f"{arm}_qx"], action[f"{arm}_qy"], action[f"{arm}_qz"], action[f"{arm}_qw"]], dtype=np.float64)
-        raw_dq  /= max(float(np.linalg.norm(raw_dq)), 1e-12)
-
-        scaled_dpos = raw_dpos * out_max_pos + dpos
-        # Scale: max quaternion axis-angle magnitude is π → maps to out_max_rot
-        raw_aa = _quat_xyzw_to_axis_angle(raw_dq)
-        scaled_drot = raw_aa * (out_max_rot / np.pi) + drot
-
-        # --- OSC goal update ---
-        # Position: always reset to current + delta (no accumulation across steps)
-        goal_pos = ee_pos + scaled_dpos
-
-        # Orientation: only update when the total delta is non-zero (OSC convention —
-        # hold last goal at zero input, enabling active orientation stabilization).
-        if float(np.linalg.norm(scaled_drot)) > 1e-9:
-            goal_ori_mat[arm] = _axis_angle_to_mat(scaled_drot) @ _quat_xyzw_to_mat(
-                np.asarray(ee_rot_xyzw, dtype=np.float64)
-            )
-
-        return _vosc_joint_velocity(
-            goal_pos, goal_ori_mat[arm], q, dq, J, M, ee_pos, ee_twist,
-            np.asarray(ee_rot_xyzw, dtype=np.float64),
-            kp, kd, kp_null, q0[arm],
-        )
-
-    @staticmethod
-    def _ee_pos_osc(
-        kp: float,
-        kd: float,
-        action: RobotAction,
-        arm: str,
-        snap: KinematicSnapshot,
-        goal_ori_mat: dict[str, np.ndarray],
-        q0: dict[str, np.ndarray],
-        kp_null: float,
-        dpos: np.ndarray,
-        drot: np.ndarray,
-        ignore_action: bool,
-    ) -> np.ndarray:
-        """VOsc EE_POS: set goal directly from absolute EE pose action."""
-        q, dq, J, M, ee_pos, ee_rot_xyzw, ee_twist = snap
-        q   = np.asarray(q,   dtype=np.float64)
-        dq  = np.asarray(dq,  dtype=np.float64)
-        J   = np.asarray(J,   dtype=np.float64)
-        M   = np.asarray(M,   dtype=np.float64)
-        ee_pos   = np.asarray(ee_pos,   dtype=np.float64)
-        ee_twist = np.asarray(ee_twist, dtype=np.float64)
-
-        if ignore_action:
-            goal_pos = np.asarray(ee_pos, dtype=np.float64).copy()
-            goal_ori_mat[arm] = _quat_xyzw_to_mat(np.asarray(ee_rot_xyzw, dtype=np.float64))
-        else:
-            target_raw = np.fromiter(
-                (action[f"{arm}_{ax}"] for ax in EE_AXIS_KEYS),
-                dtype=np.float64, count=len(EE_AXIS_KEYS),
-            )
-            target_raw[3:] /= max(float(np.linalg.norm(target_raw[3:])), 1e-12)
-            goal_pos = target_raw[:3] + dpos
-            goal_ori_mat[arm] = _axis_angle_to_mat(drot) @ _quat_xyzw_to_mat(target_raw[3:])
-
-        return _vosc_joint_velocity(
-            goal_pos, goal_ori_mat[arm], q, dq, J, M, ee_pos, ee_twist,
-            np.asarray(ee_rot_xyzw, dtype=np.float64),
-            kp, kd, kp_null, q0[arm],
-        )
 
     @staticmethod
     def _joint_pd(kp: float, kd: float, action: RobotAction, arm: str, snap: KinematicSnapshot) -> np.ndarray:
@@ -511,7 +354,7 @@ class BimanualFranka(Robot):
         """Drive both arms to a saved home configuration.
 
         In EE_POS and EE_DELTA modes, FK converts joint targets to EE setpoints and
-        homing runs VOsc Cartesian PD. In JOINT_POS mode, joint-velocity PD is used.
+        homing runs OSC Cartesian velocity PD. In JOINT_POS mode, joint-velocity PD is used.
         """
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
@@ -549,21 +392,18 @@ class BimanualFranka(Robot):
                 cmds_raw: dict[str, np.ndarray] = {}
                 for arm in names:
                     snap = kin[arm]
-                    q, dq, J, M, ee_pos, ee_rot_xyzw, ee_twist = snap
+                    _, _, _, _, ee_pos, ee_rot_xyzw, ee_twist = snap
                     target = targets_ee[arm]
                     goal_pos = target[:3]
-                    goal_ori = _quat_xyzw_to_mat(target[3:])
-                    cmds_raw[arm] = _vosc_joint_velocity(
-                        goal_pos, goal_ori,
-                        np.asarray(q, dtype=np.float64), np.asarray(dq, dtype=np.float64),
-                        np.asarray(J, dtype=np.float64), np.asarray(M, dtype=np.float64),
-                        np.asarray(ee_pos, dtype=np.float64), np.asarray(ee_twist, dtype=np.float64),
-                        np.asarray(ee_rot_xyzw, dtype=np.float64),
-                        self._kp_base, 2.0 * np.sqrt(self._kp_base) * self._damping_ratio,
-                        self._kp_null, self._q0.get(arm, np.asarray(q, dtype=np.float64)),
+                    goal_ori = osc_ctl.quat_xyzw_to_mat(target[3:])
+                    kp_home = np.full(6, self._kp_base)
+                    kp_home[3:] *= self._kp_ori_ratio
+                    kd_home = 2.0 * np.sqrt(kp_home) * self._damping_ratio
+                    cmds_raw[arm] = osc_ctl.task_space_pd(
+                        goal_pos, goal_ori, ee_pos, ee_rot_xyzw, ee_twist, kp_home, kd_home,
                     )
-                cmds = self.safety.shape_joint(cmds_raw, kin)
-                self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
+                cmds = self.safety.shape_ee(cmds_raw, kin)
+                self.robot_manager.move_cartesian_velocity_batch({a: c.tolist() for a, c in cmds.items()})
 
                 errs = [self._ee_pose_errors(targets_ee[arm], kin[arm]) for arm in names]
                 max_pos = max(float(np.linalg.norm(pe)) for pe, _ in errs)
@@ -645,57 +485,3 @@ class BimanualFranka(Robot):
         rot_error = (2.0 * v if v_norm < 1e-9
                      else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(q_err[3], -1.0, 1.0)))))
         return pos_error, rot_error
-
-
-# ---------------------------------------------------------------------------
-# VOsc core (module-level for readability — avoids repeating in each static method)
-# ---------------------------------------------------------------------------
-
-def _vosc_joint_velocity(
-    goal_pos: np.ndarray,
-    goal_ori_mat: np.ndarray,
-    q: np.ndarray,
-    dq: np.ndarray,
-    J: np.ndarray,
-    M: np.ndarray,
-    ee_pos: np.ndarray,
-    ee_twist: np.ndarray,
-    ee_rot_xyzw: np.ndarray,
-    kp: float,
-    kd: float,
-    kp_null: float,
-    q0: np.ndarray,
-) -> np.ndarray:
-    """Velocity-Space OSC (VOsc): maps task-space PD error to joint velocity.
-
-    Matches robosuite OSC run_controller with uncouple_pos_ori=True, but outputs
-    joint velocity instead of torque:
-
-      q̇ = J̄_pos·F + J̄_ori·T + N·(kp_null·(q₀−q) − kd_null·q̇)
-
-    where J̄_* = M⁻¹ J*ᵀ λ*  (dynamically-consistent pseudoinverse)
-    and   λ*  = pinv(J* M⁻¹ J*ᵀ)
-
-    Franky's impedance controller handles gravity internally, so no gravity
-    compensation term is needed here.
-    """
-    ee_ori_mat = _quat_xyzw_to_mat(ee_rot_xyzw)
-
-    # Task-space PD (identical to OSC desired_force / desired_torque)
-    pos_err = goal_pos - ee_pos
-    ori_err = _orientation_error(goal_ori_mat, ee_ori_mat)
-
-    F = kp * pos_err - kd * ee_twist[:3]
-    T = kp * ori_err - kd * ee_twist[3:]
-
-    # Lambda matrices and dynamically-consistent pseudoinverses
-    J_bar_pos, J_bar_ori, J_bar_full, N = _osc_matrices(J, M)
-
-    # Uncoupled task-space → joint velocity (OSC uncouple_pos_ori=True analog)
-    q_dot = J_bar_pos @ F + J_bar_ori @ T
-
-    # Nullspace: attract joints toward q0 without disturbing EE
-    kd_null = 2.0 * float(np.sqrt(kp_null))
-    q_dot += N @ (kp_null * (q0 - q) - kd_null * dq)
-
-    return q_dot

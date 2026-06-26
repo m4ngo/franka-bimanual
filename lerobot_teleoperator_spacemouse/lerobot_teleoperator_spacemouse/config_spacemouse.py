@@ -20,11 +20,19 @@ class SpaceMouseLeaderFields:
     # Path to the hidraw node. Two SpaceMice appear as separate /dev/hidrawN.
     hidraw_path: str = "/dev/hidraw4"
 
-    # Position increment (metres) per control tick at full axis deflection.
-    # pyspacemouse normalises axis values to [-1, 1].
-    translation_scale: float = 0.02
-    # Rotation increment (radians) per control tick at full axis deflection.
-    rotation_scale: float = 0.05
+    # Gain applied to the raw pyspacemouse axis values (already normalized to
+    # [-1, 1]) before they are emitted as action keys.  Set to 1.0 to pass
+    # through normalized units; the robot-side osc_output_max_pos /
+    # osc_output_max_rot fields then carry all physical-unit meaning.
+    translation_scale: float = 1.0
+    rotation_scale: float = 1.0
+
+    # Deadband applied to raw axis values before any scaling. Axis readings
+    # with absolute value below this threshold are clamped to zero.
+    # Prevents SpaceMouse sensor noise (typ. ±0.01–0.02 at rest) from causing
+    # arm drift when the device is untouched.  Set to 0.0 to disable.
+    deadband_translation: float = 0.05
+    deadband_rotation: float = 0.05
 
     prefix: str = ""
     use_delta: bool = False

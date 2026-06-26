@@ -27,6 +27,7 @@ class SingleArmFrankaConfig(RobotConfig):
     osc_kp_base: float = 2.0
     osc_kp_null: float = 0.5
     osc_damping_ratio: float = 1.0
+    osc_kp_ori_ratio: float = 0.3
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_3_wrist": ArvCameraConfig(name="gripper_bfs_23595719", ip="192.168.1.138", fps=30, width=224, height=224),
