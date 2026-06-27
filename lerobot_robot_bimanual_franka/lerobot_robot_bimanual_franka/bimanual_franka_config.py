@@ -12,7 +12,7 @@ _VALID_ARMS: tuple[str, ...] = ("l", "r")
 class ControlMode(str, Enum):
     JOINT_POS = "JOINT_POS"  # joint position setpoints → joint velocity PD
     EE_POS    = "EE_POS"     # absolute EE pose setpoints → Cartesian velocity PD
-    EE_DELTA  = "EE_DELTA"   # EE delta commands applied directly as Cartesian velocity
+    EE_DELTA  = "EE_DELTA"   # EE delta → OSC-style goal accumulation + Cartesian velocity PD
 
 
 @RobotConfig.register_subclass("bimanual_franka")

@@ -112,7 +112,8 @@ Hardware used by the single-arm wrapper:
 teleop
 - Joint-mode GELLO: `~/franka_ws/scripts/single_arm_teleop.sh gello`
 - EE-mode GELLO (default): `~/franka_ws/scripts/single_arm_teleop.sh` or `~/franka_ws/scripts/single_arm_teleop.sh gello_ee`
-- SpaceMouse delta teleop: `~/franka_ws/scripts/single_arm_delta_teleop.sh`
+- SpaceMouse delta teleop (OSC EE_DELTA): `~/franka_ws/scripts/single_arm_spacemouse_delta_teleop.sh`
+  (alias: `single_arm_delta_teleop.sh`)
 - End teleop with `ctrl+C`
 
 recording (homed)

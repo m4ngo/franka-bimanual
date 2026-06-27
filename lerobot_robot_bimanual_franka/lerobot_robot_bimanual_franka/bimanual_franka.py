@@ -28,6 +28,16 @@ _DEPTH_POINT_COUNT = 2048
 
 JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
 EE_PD_KP, EE_PD_KD = 2.0, 0.1
+# OSC_POSE-aligned EE_DELTA gains (velocity units): kp ≈ 1/policy_dt at 20 Hz.
+# kd is scaled down from the continuous critically-damped value: at 20 Hz we send
+# 100 ms velocity segments and O_dP_EE_c tracks the prior command, so the sim
+# kd would cancel the proportional term.  Inertia decoupling (λ = pinv(J M⁻¹ Jᵀ))
+# is sim-only; pinv(J Jᵀ) without M badly amplifies Cartesian commands on hardware.
+OSC_POLICY_HZ = 20.0
+OSC_EE_KP = OSC_POLICY_HZ / 100
+OSC_EE_DAMPING_RATIO = 1.0
+OSC_EE_KD = 2.0 * np.sqrt(OSC_EE_KP) * OSC_EE_DAMPING_RATIO / OSC_POLICY_HZ
+OSC_UNCOUPLE_POS_ORI = False
 _KP_GAIN_BASE = 10.0
 _KD_GAIN_BASE = 1.0
 
@@ -83,6 +93,9 @@ class BimanualFranka(Robot):
         # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
+        # Persistent EE goals for OSC-style delta tracking (EE_DELTA mode only).
+        self._ee_goal_pos: dict[str, np.ndarray] = {}
+        self._ee_goal_rot: dict[str, np.ndarray] = {}
         # Full (uncropped, unsubsampled) point cloud from the depth camera, cached each
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
@@ -161,6 +174,9 @@ class BimanualFranka(Robot):
                 self.robot_manager.current_kinematic_state(arm, timeout_s=_CONNECT_TIMEOUT_S)
             for arm in self.active_arms:
                 self.grippers[arm].home()
+            if use_ee:
+                kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+                self.reset_ee_goals(kin)
         except Exception:
             self.robot_manager.shutdown()
             raise
@@ -168,6 +184,8 @@ class BimanualFranka(Robot):
     def disconnect(self) -> None:
         self._camera_pool.shutdown(wait=False)
         self._cached_kin_state = None
+        self._ee_goal_pos.clear()
+        self._ee_goal_rot.clear()
         for cam in self.cameras.values():
             cam.disconnect()
         self.robot_manager.shutdown()
@@ -282,7 +300,7 @@ class BimanualFranka(Robot):
 
         if self.control_mode == ControlMode.EE_DELTA:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_delta(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
+                {arm: self._ee_delta_osc(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
                  for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
@@ -364,6 +382,8 @@ class BimanualFranka(Robot):
 
                 if max_pos < tol_pos_m and max_rot < rot_tol:
                     self._cached_kin_state = None
+                    if self.control_mode == ControlMode.EE_DELTA:
+                        self.reset_ee_goals(kin)
                     return True
                 if tick_start >= deadline:
                     self._cached_kin_state = None
@@ -404,6 +424,15 @@ class BimanualFranka(Robot):
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
         self.delta_rot = drot
+
+    def reset_ee_goals(self, kin: dict[str, KinematicSnapshot] | None = None) -> None:
+        """Re-anchor OSC goal poses to the current EE state (e.g. episode start)."""
+        if kin is None:
+            kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+        for arm in self.active_arms:
+            _, _, _, pos, quat, _ = kin[arm]
+            self._ee_goal_pos[arm] = np.asarray(pos, dtype=np.float64)
+            self._ee_goal_rot[arm] = self._quat_xyzw_to_rot(quat)
 
     @property
     def last_full_point_cloud(self) -> np.ndarray | None:
@@ -491,21 +520,116 @@ class BimanualFranka(Robot):
         return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot, ignore_action)
 
     @staticmethod
-    def _ee_delta(
+    def _quat_xyzw_to_rot(q: np.ndarray) -> np.ndarray:
+        x, y, z, w = (float(v) for v in q)
+        n = float(np.sqrt(x * x + y * y + z * z + w * w))
+        if n < 1e-12:
+            return np.eye(3, dtype=np.float64)
+        x, y, z, w = x / n, y / n, z / n, w / n
+        return np.array(
+            [
+                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
+                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
+                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _delta_quat_xyzw_to_axis_angle(dq: np.ndarray) -> np.ndarray:
+        v = dq[:3]
+        v_norm = float(np.linalg.norm(v))
+        if v_norm < 1e-9:
+            return 2.0 * v
+        return (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
+
+    @staticmethod
+    def _axis_angle_to_rot(axis_angle: np.ndarray) -> np.ndarray:
+        angle = float(np.linalg.norm(axis_angle))
+        if angle < 1e-12:
+            return np.eye(3, dtype=np.float64)
+        axis = axis_angle / angle
+        x, y, z = axis
+        c, s = float(np.cos(angle)), float(np.sin(angle))
+        t = 1.0 - c
+        return np.array(
+            [
+                [t * x * x + c, t * x * y - s * z, t * x * z + s * y],
+                [t * x * y + s * z, t * y * y + c, t * y * z - s * x],
+                [t * x * z - s * y, t * y * z + s * x, t * z * z + c],
+            ],
+            dtype=np.float64,
+        )
+
+    @staticmethod
+    def _orientation_error_matrix(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
+        """OSC orientation error: 0.5 * sum_i cross(rc_i, rd_i)."""
+        return 0.5 * (
+            np.cross(current[:, 0], desired[:, 0])
+            + np.cross(current[:, 1], desired[:, 1])
+            + np.cross(current[:, 2], desired[:, 2])
+        )
+
+    @staticmethod
+    def _approx_opspace_decouple(jacobian: np.ndarray, lin_cmd: np.ndarray, ang_cmd: np.ndarray) -> np.ndarray:
+        """Lightweight OSC inertia decoupling via pinv(J J^T) (no mass matrix)."""
+        j_pos = jacobian[:3]
+        j_ori = jacobian[3:]
+        lam_pos = np.linalg.pinv(j_pos @ j_pos.T)
+        lam_ori = np.linalg.pinv(j_ori @ j_ori.T)
+        return np.concatenate((lam_pos @ lin_cmd, lam_ori @ ang_cmd))
+
+    def _ensure_ee_goal(self, arm: str, snap: KinematicSnapshot) -> None:
+        if arm not in self._ee_goal_pos:
+            _, _, _, pos, quat, _ = snap
+            self._ee_goal_pos[arm] = np.asarray(pos, dtype=np.float64)
+            self._ee_goal_rot[arm] = self._quat_xyzw_to_rot(quat)
+
+    def _osc_velocity_from_goal(
+        self,
+        kp_gain: float,
+        kd_gain: float,
+        goal_pos: np.ndarray,
+        goal_rot: np.ndarray,
+        snap: KinematicSnapshot,
+    ) -> np.ndarray:
+        """Task-space PD velocity toward a persistent goal (OSC run_controller analogue)."""
+        _, _, jacobian, pos, quat, twist = snap
+        ee_pos = np.asarray(pos, dtype=np.float64)
+        ee_rot = self._quat_xyzw_to_rot(quat)
+        twist = np.asarray(twist, dtype=np.float64)
+
+        pos_error = goal_pos - ee_pos
+        ori_error = self._orientation_error_matrix(goal_rot, ee_rot)
+
+        kp = OSC_EE_KP * kp_gain
+        kd = OSC_EE_KD * kd_gain
+        lin_cmd = kp * pos_error + kd * (-twist[:3])
+        ang_cmd = kp * ori_error + kd * (-twist[3:])
+
+        if OSC_UNCOUPLE_POS_ORI:
+            return self._approx_opspace_decouple(np.asarray(jacobian, dtype=np.float64), lin_cmd, ang_cmd)
+        return np.concatenate((lin_cmd, ang_cmd))
+
+    def _ee_delta_osc(
+        self,
         kp_gain: float,
         kd_gain: float,
         action: RobotAction,
         arm: str,
         snap: KinematicSnapshot,
         dpos: np.ndarray | None = None,
-        drot: np.ndarray | None = None
+        drot: np.ndarray | None = None,
     ) -> np.ndarray:
-        """Apply EE deltas from action directly as a velocity command.
+        """OSC-style EE delta: accumulate goals, then PD velocity toward them.
 
         Position axes (x, y, z) are position deltas in metres. Rotation axes
         (qx, qy, qz, qw) encode a delta rotation as a unit quaternion (xyzw),
-        converted to axis-angle here. Cached deltas (dpos, drot) are added on top.
+        converted to axis-angle for goal updates (robosuite OSC set_goal analogue).
+        Cached deltas (dpos, drot) are added on top before goal accumulation.
         """
+        self._ensure_ee_goal(arm, snap)
+
         action_dpos = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
             dtype=np.float64, count=3,
@@ -514,12 +638,15 @@ class BimanualFranka(Robot):
             (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
             dtype=np.float64, count=4,
         )
-        v = dq[:3]
-        v_norm = float(np.linalg.norm(v))
-        action_drot = 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
+        action_drot = self._delta_quat_xyzw_to_axis_angle(dq)
 
-        total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64))
-        total_drot = action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))
+        dpos_off = dpos if dpos is not None else np.zeros(3, dtype=np.float64)
+        drot_off = drot if drot is not None else np.zeros(3, dtype=np.float64)
 
-        _, _, _, _, _, twist = snap
-        return (EE_PD_KP * kp_gain) * np.concatenate((total_dpos, total_drot)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)
+        self._ee_goal_pos[arm] = self._ee_goal_pos[arm] + action_dpos + dpos_off
+        delta_rot = self._axis_angle_to_rot(action_drot + drot_off)
+        self._ee_goal_rot[arm] = delta_rot @ self._ee_goal_rot[arm]
+
+        return self._osc_velocity_from_goal(
+            kp_gain, kd_gain, self._ee_goal_pos[arm], self._ee_goal_rot[arm], snap,
+        )
