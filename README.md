@@ -100,6 +100,40 @@ roll out
 - In this case, `<repo_id>` is the repo you want the trajectory to be uploaded to, which can be helpful for debugging or evaluating the policy
 - `output_dir` is recommended to be `~/franka_data/policy/eval/#` where `#` is any name that isn't taken yet in the folder. Record won't work if there is already an existing folder at the given `output_dir`
 
+### Single-arm (right arm only)
+
+These scripts control only the right Franka arm (mario NUC, `192.168.201.10`). For single-arm work you only need the right control box powered, FCI enabled, and `./start_control.sh` running on mario — the left arm and luigi NUC can stay off.
+
+Hardware used by the single-arm wrapper:
+- Right GELLO: `/dev/ttyUSB0`
+- Right SpaceMouse: `/dev/hidraw3`
+- Cameras: right wrist (`cam_3_wrist`, `cam_4_wrist`) and workspace scene (`cam_2_scene`)
+
+teleop
+- Joint-mode GELLO: `~/franka_ws/scripts/single_arm_teleop.sh gello`
+- EE-mode GELLO (default): `~/franka_ws/scripts/single_arm_teleop.sh` or `~/franka_ws/scripts/single_arm_teleop.sh gello_ee`
+- SpaceMouse delta teleop: `~/franka_ws/scripts/single_arm_delta_teleop.sh`
+- End teleop with `ctrl+C`
+
+recording (homed)
+- Each episode starts by driving the arm to a saved home pose in `~/franka_ws/home_poses/`. Pose files are JSON with `r_q` (7 joint angles) and `gripper` (0=closed, 1=open); see `home_poses/home_pose.json` for the default.
+- General homed recording (GELLO joint, GELLO EE, or SpaceMouse):
+  - `~/franka_ws/scripts/single_arm_record_data_homed.sh <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [gello|gello_ee|spacemouse] [depth]`
+  - Example: `~/franka_ws/scripts/single_arm_record_data_homed.sh HuskyMango/test_single 10 pick_block ~/franka_data/data/test_single false home_pose gello_ee true`
+- SpaceMouse delta recording only:
+  - `~/franka_ws/scripts/single_arm_delta_record_data_homed.sh <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [depth]`
+- `home_pose_name` is the filename stem (e.g. `home_pose` loads `home_poses/home_pose.json`)
+- `resume` is `true` to append to an existing local dataset, `false` for a fresh run
+- `depth` is `true` (default) to include depth point-cloud observations, or `false` for RGB-only
+- During recording, right arrow ends the current episode early, left arrow re-records it, and Escape stops the session. Press Enter in the terminal between episodes when prompted.
+
+rollout (homed)
+- Rolls out a pretrained policy on the right arm; each episode homes the arm first.
+- `~/franka_ws/scripts/single_arm_rollout_policy_homed.sh <repo_id> <num_episodes> <policy_repo_id> <output_dir> <home_pose_name> [control_mode] [depth]`
+- Example: `~/franka_ws/scripts/single_arm_rollout_policy_homed.sh eval_test 5 HuskyMango/test_act ~/franka_data/policy/eval/test_single home_pose EE_POS true`
+- `<repo_id>` should start with `eval_` (LeRobot dataset naming convention for eval rollouts)
+- `control_mode` is `JOINT_POS`, `EE_POS` (default), or `EE_DELTA` and must match how the policy was trained
+
 ## Common errors
 teleop
 - Sometimes, teleop will die on its own because of 'UDP timeout'. This usually indicates an error that happened with the arms but wasn't sent to the teleop. Check the SSH for Mario and Luigi, where there is likely to be a more descriptive error mode
