@@ -2,7 +2,7 @@ import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
-from typing import cast
+from typing import cast, Optional
 
 import numpy as np
 
@@ -68,6 +68,8 @@ class BimanualFranka(Robot):
         self.safety = ActionSafetyScreen()
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
+        self._kp_gain = 0.0
+        self._kd_gain = 0.0
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
         self._depth_cam = str(getattr(config, "depth_cam", ""))
@@ -267,12 +269,24 @@ class BimanualFranka(Robot):
             ],
             dtype=np.float64,
         )
+    
+    @property
+    def kp_gain(self) -> float:
+        return self._kp_gain
+    
+    @property
+    def kd_gain(self) -> float:
+        return self._kd_gain
+    
+    @property
+    def kin(self) -> Optional[dict[str, KinematicSnapshot]]:
+        return self._cached_kin_state
 
     def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
-        kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
-        kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(kp_gain))
+        self._kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
+        self._kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(self.kp_gain))
 
         for arm in self.active_arms:
             self.grippers[arm].move(
@@ -282,19 +296,19 @@ class BimanualFranka(Robot):
 
         if self.control_mode == ControlMode.EE_DELTA:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_delta(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
+                {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
                  for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
         elif self.control_mode == ControlMode.EE_POS:
             cmds = self.safety.shape_ee(
-                {arm: self._ee_pd(kp_gain, kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
+                {arm: self._ee_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
                  for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
         else:
             cmds = self.safety.shape_joint(
-                {arm: self._joint_pd(kp_gain, kd_gain, action, arm, kin[arm]) for arm in self.active_arms}, kin
+                {arm: self._joint_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm]) for arm in self.active_arms}, kin
             )
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action

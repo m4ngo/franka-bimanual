@@ -232,8 +232,8 @@ def _pcd_marker(pts: np.ndarray) -> dict:
         rgb = (pts[:, 3:6] * 255.0).clip(0, 255).astype(np.uint8)
         packed = (rgb[:, 0].astype(np.int32) << 16) | (rgb[:, 1].astype(np.int32) << 8) | rgb[:, 2].astype(np.int32)
         colors = [f"#{c:06x}" for c in packed]
-        return dict(size=2, color=colors, opacity=1.0)
-    return dict(size=2, color="dimgray", opacity=0.65)
+        return dict(size=6, color=colors, opacity=1.0)
+    return dict(size=6, color="dimgray", opacity=0.65)
 
 
 def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:

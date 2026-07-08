@@ -136,7 +136,8 @@ class ResidualPolicy:
                 "action_chunk" (10, 9) — normalised delta chunk from base policy
                                          columns 0:7 = [dx, dy, dz, rx, ry, rz, grip]
                                          columns 7:9 = [kp, kd] (dropped before model)
-                "proprio"      (9,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r]
+                "proprio"      (9,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r,
+                                          kp, kd, vx, vy, vz, wx, wy, wz]
                 "point_cloud"  (2048, 3) — xyz in robot/world frame
 
         Returns:

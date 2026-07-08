@@ -200,11 +200,20 @@ def _run_episode(
                 chunk_used = 0
 
                 if residual is not None:
+                    kin = controller.kin
+                    if kin is None:
+                        vel = np.zeros(6)
+                    else:
+                        vel = kin['r'][5]
                     point_cloud = extract_point_cloud(obs)
                     processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
-                        "proprio": split_gripper(ee_pose),
+                        "proprio": np.concatenate([
+                            split_gripper(ee_pose).astype(np.float32),
+                            np.array([controller.kp_gain, controller.kd_gain], dtype=np.float32),
+                            np.asarray(vel, dtype=np.float32),
+                        ]),
                         "point_cloud": point_cloud,
                         "gains": np.array([prev_kp, prev_kd], dtype=np.float32),
                     }
