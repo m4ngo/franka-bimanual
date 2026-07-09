@@ -145,8 +145,8 @@ def _build_teleop(mode: str, teleop_id: str):
             prefix="r_",
             use_delta=True,
             # use_noise=True,
-            # translation_scale=0.05,
-            # rotation_scale=0.5,
+            translation_scale=0.05,
+            rotation_scale=0.5,
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
