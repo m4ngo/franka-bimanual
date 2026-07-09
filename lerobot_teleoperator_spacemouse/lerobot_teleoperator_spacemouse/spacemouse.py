@@ -190,9 +190,9 @@ class SpaceMouse(Teleoperator):
         out_rot: Rotation   = delta_rot  if self._use_delta else self.cur_rot
 
         # Apply noise at output only — never to the integrated state.
-        if self.config.use_noise:
-            out_pos = out_pos + np.random.normal(0.0, self.config.noise_pos_scale, 3)
-            out_rot = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot
+        # if self.config.use_noise:
+        #     out_pos = out_pos + np.random.normal(0.0, self.config.noise_pos_scale, 3)
+        #     out_rot = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot
 
         x, y, z = out_pos
         qx, qy, qz, qw = out_rot.as_quat()

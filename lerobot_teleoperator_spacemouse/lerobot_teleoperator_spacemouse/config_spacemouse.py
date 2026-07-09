@@ -28,7 +28,7 @@ class SpaceMouseLeaderFields:
 
     prefix: str = ""
     use_delta: bool = False
-    use_noise: bool = False
+    # use_noise: bool = False
     noise_pos_scale: float = 0.01   # metres, added to position output each step
     noise_rot_scale: float = 0.03    # radians (axis-angle), added to rotation output each step
 

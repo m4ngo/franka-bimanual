@@ -12,9 +12,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+from scipy.spatial.transform import Rotation
 
 import env_wrapper
 from viz import EpisodeRecorder, save_episode_html, save_rollout_html
+from viz import _propagate_pose_traj
 from env_wrapper import (
     _ACTION_KEYS,
     _CHUNK_EXEC,
@@ -31,7 +33,7 @@ from env_wrapper import (
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import VideoEncodingManager
-from policy_wrapper import BasePolicy, ResidualPolicy
+from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +153,7 @@ def _run_episode(
     fps: float = 20.0,
     task: str = "",
     recorder: "EpisodeRecorder | None" = None,
+    replaying: bool = False
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -178,6 +181,8 @@ def _run_episode(
 
     old_term = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
+    fps_frames = 0
+    fps_window_start = time.perf_counter()
     try:
         while True:
             t_step = time.perf_counter()
@@ -221,37 +226,54 @@ def _run_episode(
 
                 if recorder is not None:
                     ee3 = ee_pose[:3].astype(np.float32)
+                    ee_pose_xyzw = ee_pose[:7].astype(np.float32)
                     # Raw unnormalised position deltas (metres) from postprocessor.
                     # Cumsum from current EE gives the commanded delta trajectory.
                     base_deltas = base_chunk[:_RESIDUAL_HORIZON, :3].astype(np.float32)
+                    base_rotvecs = np.array([
+                        Rotation.from_quat(step[3:7]).as_rotvec() for step in base_chunk[:_RESIDUAL_HORIZON]
+                    ], dtype=np.float32)
                     base_traj = np.vstack([ee3, ee3 + np.cumsum(base_deltas, axis=0)])
+                    base_traj_pose = _propagate_pose_traj(ee_pose_xyzw, base_deltas, base_rotvecs)
                     if residual is not None and len(res_chunk) > 0:
                         K_res = min(len(res_chunk), _RESIDUAL_HORIZON)
                         total_deltas = base_deltas.copy()
                         total_deltas[:K_res] += res_chunk[:K_res, 2:5].astype(np.float32) * _POS_SCALE
+                        total_rotvecs = base_rotvecs.copy()
+                        total_rotvecs[:K_res] += res_chunk[:K_res, 5:8].astype(np.float32) * _ROT_SCALE
                         total_traj = np.vstack([ee3, ee3 + np.cumsum(total_deltas, axis=0)])
+                        total_traj_pose = _propagate_pose_traj(ee_pose_xyzw, total_deltas, total_rotvecs)
                     else:
                         total_traj = base_traj.copy()
+                        total_traj_pose = base_traj_pose.copy()
                     recorder.record_chunk(
                         step=len(recorder),
                         ee_pos=ee3,
                         base_traj=base_traj,
                         total_traj=total_traj,
+                        base_traj_pose=base_traj_pose,
+                        total_traj_pose=total_traj_pose,
                     )
 
             if residual is not None:
                 res = res_chunk[chunk_used]
                 dpos = res[2:5] * _POS_SCALE
                 drot = res[5:8] * _ROT_SCALE
-                kp = float(res[0])
-                kd = float(res[1])
+                if replaying:
+                    # residual is visualized only; base/trajectory gains drive execution
+                    kp = float(base_chunk[chunk_used, 8])
+                    kd = float(base_chunk[chunk_used, 9])
+                else:
+                    kp = float(res[0])
+                    kd = float(res[1])
             else:
                 dpos = np.zeros(3, dtype=np.float32)
                 drot = np.zeros(3, dtype=np.float32)
                 kp = float(base_chunk[chunk_used, 8])
                 kd = float(base_chunk[chunk_used, 9])
 
-            controller.cache_delta(dpos, drot)
+            if not replaying:
+                controller.cache_delta(dpos, drot)
             action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
             controller.send_action(action)
 
@@ -288,6 +310,16 @@ def _run_episode(
             prev_kd = kd
             chunk_used += 1
 
+
+            fps_frames += 1
+            now = time.perf_counter()
+            window_s = now - fps_window_start
+            if window_s >= 1.0:
+                actual_fps = fps_frames / window_s
+                logger.info("loop fps: %.2f target: %.2f", actual_fps, fps)
+                fps_window_start = now
+                fps_frames = 0
+
             elapsed = time.perf_counter() - t_step
             sleep_s = dt - elapsed
             if sleep_s > 0:
@@ -323,7 +355,7 @@ def _str2bool(v: str) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--base-policy", required=True, help="Path to base policy checkpoint")
+    parser.add_argument("--base-policy", required=False, help="Path to base policy checkpoint")
     parser.add_argument(
         "--residual-policy",
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
@@ -367,6 +399,7 @@ def main() -> None:
                         help="Directory to write per-episode Plotly HTML visualizations")
     parser.add_argument("--viz-stride", type=int, default=1,
                         help="Animate every Nth step in the visualization (default 1)")
+    parser.add_argument("--replay-dataset", default=None, help="HuggingFace id for the dataset to replay from")
 
     args = parser.parse_args()
 
@@ -375,7 +408,7 @@ def main() -> None:
     if args.repo_id and not args.task:
         parser.error("--task is required when --repo-id is set")
 
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, force=True)
 
     if args.home_pose_name:
         pose = json.loads((_POSES_DIR / f"{args.home_pose_name}.json").read_text())
@@ -389,9 +422,14 @@ def main() -> None:
     controller = env_wrapper.start_controller()
     print("robot initialized!")
 
-    print(f"attempting to start base policy: {args.base_policy}")
-    base_policy = BasePolicy(args.base_policy, device=args.device)
-    print("base policy started!")
+    if args.replay_dataset is None:
+        print(f"attempting to start base policy: {args.base_policy}")
+        base_policy = BasePolicy(args.base_policy, device=args.device)
+        print("base policy started!")
+    else:
+        print(f"attempting to fetch replay dataset: {args.replay_dataset}")
+        base_policy = Trajectory(args.replay_dataset, device=args.device)
+        print("replay dataset found!")
 
     residual: ResidualPolicy | None = None
     if args.no_residual:
@@ -423,6 +461,7 @@ def main() -> None:
                     controller, base_policy, residual,
                     dataset=None, episode_time_s=None,
                     fps=args.fps, recorder=recorder,
+                    replaying=args.replay_dataset is not None
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -457,6 +496,7 @@ def main() -> None:
                         fps=args.fps,
                         task=args.task,
                         recorder=recorder,
+                        replaying=args.replay_dataset is not None
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:

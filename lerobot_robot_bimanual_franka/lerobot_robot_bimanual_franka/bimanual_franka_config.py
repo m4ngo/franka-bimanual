@@ -28,6 +28,9 @@ class BimanualFrankaConfig(RobotConfig):
     r_port: int
     control_mode: ControlMode
     active_arms: tuple[str, ...] = _VALID_ARMS
+    use_noise: bool = False
+    noise_pos_scale: float = 0.005   # metres, added to position output each step
+    noise_rot_scale: float = 0.01   # radians (axis-angle), added to rotation output each step
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_1": ArvCameraConfig(name="gripper_bfs_23595723", ip="192.168.0.142", fps=30, width=224, height=224),

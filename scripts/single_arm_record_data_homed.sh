@@ -37,4 +37,5 @@ python "$(dirname "$0")/lerobot_record_homed_single_arm.py" \
     --control-mode "$CONTROL_MODE" \
     --depth "$DEPTH" \
     --teleop-mode "$MODE" \
-    --teleop-id "${MODE}_single_arm_teleop"
+    --teleop-id "${MODE}_single_arm_teleop" \
+    --noise True

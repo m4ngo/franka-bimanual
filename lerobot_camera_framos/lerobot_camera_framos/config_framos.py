@@ -19,7 +19,7 @@ class FramosCameraConfig(CameraConfig):
     depth_format: str = "z16"
     #: librealsense only accepts discrete FPS (typically 6/15/30/60/90 on D415e).
     #: If unset, FPS is snapped from `CameraConfig.fps` automatically in `FramosCamera`.
-    streaming_fps: int | None = None
+    streaming_fps: int | None = 30
     options: dict[str, float] = field(default_factory=dict)
     # Camera calibration defaults copied from frames/camera/matrices.txt.
     intrinsic_matrix: tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]] = (

@@ -13,6 +13,7 @@ from lerobot.types import RobotAction, RobotObservation
 
 from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
+from scipy.spatial.transform import Rotation
 
 from .bimanual_franka_config import BimanualFrankaConfig, ControlMode
 from .franka_gripper import FrankaGripper
@@ -27,9 +28,12 @@ _CONNECT_TIMEOUT_S = 10.0
 _DEPTH_POINT_COUNT = 2048
 
 JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
-EE_PD_KP, EE_PD_KD = 2.0, 0.1
+EE_PD_KP, EE_PD_KD = 4.0, 1.0
 _KP_GAIN_BASE = 10.0
 _KD_GAIN_BASE = 1.0
+
+_EE_TRANSLATION_FUDGE_FACTOR = 2.0
+_EE_ROTATION_FUDGE_FACTOR = 1.0
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -295,8 +299,18 @@ class BimanualFranka(Robot):
             )
 
         if self.control_mode == ControlMode.EE_DELTA:
+
+            # print(action["r_z"])
+            # unnormalize actions
+            for arm in self.active_arms:
+                for ax in ("x", "y", "z"):
+                    action[f"{arm}_{ax}"] *= _EE_TRANSLATION_FUDGE_FACTOR
+                for ax in ("qx", "qy", "qz", "qw"):
+                    action[f"{arm}_{ax}"] *= _EE_ROTATION_FUDGE_FACTOR
+
+            # print(action)
             cmds = self.safety.shape_ee(
-                {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot)
+                {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
                  for arm in self.active_arms}, kin
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
@@ -512,7 +526,10 @@ class BimanualFranka(Robot):
         arm: str,
         snap: KinematicSnapshot,
         dpos: np.ndarray | None = None,
-        drot: np.ndarray | None = None
+        drot: np.ndarray | None = None,
+        use_noise: bool = False,
+        noise_pos_scale: float = 0.01,
+        noise_rot_scale: float = 0.03,
     ) -> np.ndarray:
         """Apply EE deltas from action directly as a velocity command.
 
@@ -532,8 +549,15 @@ class BimanualFranka(Robot):
         v_norm = float(np.linalg.norm(v))
         action_drot = 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
 
-        total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64))
-        total_drot = action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))
+        if use_noise:
+            pos_noise = np.random.normal(0.0, noise_pos_scale, 3)
+            rot_noise = Rotation.from_euler("xyz", np.random.normal(0.0, noise_rot_scale, 3)).as_rotvec()
+        else:
+            pos_noise = 0
+            rot_noise = 0
+
+        total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64)) + pos_noise
+        total_drot = (action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))) + rot_noise
 
         _, _, _, _, _, twist = snap
         return (EE_PD_KP * kp_gain) * np.concatenate((total_dpos, total_drot)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)

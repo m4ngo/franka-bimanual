@@ -120,7 +120,7 @@ def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(control_mode: ControlMode, depth: bool = True) -> SingleArmFranka:
+def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = False) -> SingleArmFranka:
     cfg = SingleArmFrankaConfig(
         r_server_ip=_R_SERVER_IP,
         r_robot_ip=_R_ROBOT_IP,
@@ -128,6 +128,7 @@ def _build_robot(control_mode: ControlMode, depth: bool = True) -> SingleArmFran
         r_port=_R_PORT,
         control_mode=control_mode,
         depth=depth,
+        use_noise=noise
     )
     return make_robot_from_config(cfg)
 
@@ -143,9 +144,9 @@ def _build_teleop(mode: str, teleop_id: str):
             hidraw_path=_R_SPACEMOUSE_PATH,
             prefix="r_",
             use_delta=True,
-            use_noise=True,
-            translation_scale=0.03,
-            rotation_scale=0.05,
+            # use_noise=True,
+            # translation_scale=0.05,
+            # rotation_scale=0.5,
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
@@ -262,6 +263,7 @@ def main() -> None:
         default=None,
         help="EE homing only: max axis-angle error (rad); defaults to --home-tol-rad",
     )
+    p.add_argument("--noise", type=bool, default=False, help="Whether to add noise to actions or not")
 
     args = p.parse_args()
     init_logging()
@@ -271,7 +273,7 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(control_mode=ControlMode(args.control_mode), depth=args.depth)
+    robot = _build_robot(control_mode=ControlMode(args.control_mode), depth=args.depth, noise=args.noise)
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()

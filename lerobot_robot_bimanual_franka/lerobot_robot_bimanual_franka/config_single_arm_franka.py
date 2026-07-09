@@ -17,6 +17,9 @@ class SingleArmFrankaConfig(RobotConfig):
     r_port: int
     control_mode: ControlMode
     active_arms: tuple[str, ...] = ("r",)
+    use_noise: bool = False
+    noise_pos_scale: float = 0.005   # metres, added to position output each step
+    noise_rot_scale: float = 0.02    # radians (axis-angle), added to rotation output each step
     depth: bool = True
     depth_cam: str = "cam_2_scene"
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)

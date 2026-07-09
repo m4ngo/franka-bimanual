@@ -14,9 +14,9 @@ uv pip install --no-deps -e ~/franka_ws/lerobot_teleoperator_gello      -C edita
 uv pip install --no-deps -e ~/franka_ws/lerobot_teleoperator_spacemouse -C editable_mode=compat
 
 # Uninstall
-uv pip uninstall lerobot_camera_arv lerobot_camera_framos \
-                 lerobot_robot_bimanual_franka \
-                 lerobot_teleoperator_gello lerobot_teleoperator_spacemouse
+# uv pip uninstall lerobot_camera_arv lerobot_camera_framos \
+#                  lerobot_robot_bimanual_franka \
+#                  lerobot_teleoperator_gello lerobot_teleoperator_spacemouse
 
 # Verify everything resolves to the uv venv
 which python                  # should be /home/franka/.venv/bin/python

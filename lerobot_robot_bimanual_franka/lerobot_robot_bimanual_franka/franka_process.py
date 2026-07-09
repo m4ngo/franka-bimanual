@@ -24,7 +24,7 @@ RPYC_TIMEOUT_S = 10
 
 _JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
 _JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.3, 1.0)
+_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
 _TORQUE_THRESHOLD = 100.0  # Nm
 _FORCE_THRESHOLD = 200.0   # N
 _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
@@ -34,6 +34,7 @@ _RECOVERABLE_ERRORS = (
     "communication_constrains_violation",
     'current mode ("Reflex")',
     "type of motion cannot change",
+    "singularity"
 )
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)

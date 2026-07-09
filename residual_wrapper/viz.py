@@ -40,6 +40,23 @@ from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
 # Default world→robot transform (matches BimanualFrankaConfig defaults).
 _DEFAULT_WORLD_IN_ROBOT_T = (0.669, 0.003, 0.120)
 _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ = (-0.376557, 0.0, 0.0, 0.926393)
+_AXIS_COLORS = (
+    "rgba(220, 40, 40, 0.92)",
+    "rgba(40, 170, 80, 0.92)",
+    "rgba(50, 90, 235, 0.92)",
+)
+_FORECAST_AXIS_LENGTH = 0.038
+_CURRENT_AXIS_COLORS = _AXIS_COLORS
+_TOTAL_AXIS_COLORS = (
+    "rgba(190, 55, 210, 0.82)",
+    "rgba(45, 155, 180, 0.82)",
+    "rgba(70, 115, 255, 0.82)",
+)
+_BASE_AXIS_COLORS = (
+    "rgba(235, 95, 35, 0.82)",
+    "rgba(95, 180, 70, 0.82)",
+    "rgba(55, 120, 220, 0.82)",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -110,6 +127,8 @@ class EpisodeRecorder:
         ee_pos: np.ndarray,
         base_traj: np.ndarray,
         total_traj: np.ndarray,
+        base_traj_pose: np.ndarray | None = None,
+        total_traj_pose: np.ndarray | None = None,
     ) -> None:
         """Record one inference event with the full projected chunk trajectory.
 
@@ -126,12 +145,22 @@ class EpisodeRecorder:
             total_traj: (_RESIDUAL_HORIZON+1, 3) same as base_traj but with the
                         residual position correction added (using residual kp_gain)
                         for the first _CHUNK_EXEC steps.
+            base_traj_pose:
+                        Optional (_RESIDUAL_HORIZON+1, 7) [xyz + xyzw] pose
+                        trajectory for the base forecast.
+            total_traj_pose:
+                        Optional (_RESIDUAL_HORIZON+1, 7) [xyz + xyzw] pose
+                        trajectory for the total forecast.
         """
+        base_traj_pose_arr = None if base_traj_pose is None else np.asarray(base_traj_pose, dtype=np.float32).copy()
+        total_traj_pose_arr = None if total_traj_pose is None else np.asarray(total_traj_pose, dtype=np.float32).copy()
         self.chunk_events.append({
             "step": int(step),
             "ee_pos": np.asarray(ee_pos[:3], dtype=np.float32).copy(),
             "base_traj": np.asarray(base_traj, dtype=np.float32).copy(),
             "total_traj": np.asarray(total_traj, dtype=np.float32).copy(),
+            "base_traj_pose": base_traj_pose_arr,
+            "total_traj_pose": total_traj_pose_arr,
         })
 
     def __len__(self) -> int:
@@ -146,6 +175,92 @@ def _skeleton_pts(q: np.ndarray) -> np.ndarray:
     """Return (9, 3) skeleton positions: robot base origin + 7 joint frames + EE."""
     chain = franka_fk_chain(q)  # (8, 4, 4)
     return np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # (9, 3)
+
+
+def _fk_pose(q: np.ndarray) -> np.ndarray:
+    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q."""
+    chain = franka_fk_chain(q)
+    pose = np.empty(7, dtype=np.float32)
+    pose[:3] = chain[7, :3, 3]
+    pose[3:] = Rotation.from_matrix(chain[7, :3, :3]).as_quat().astype(np.float32)
+    return pose
+
+
+def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
+    """Return (T, 7) EE poses for a list of joint-angle vectors."""
+    return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
+
+
+def _propagate_pose_traj(
+    start_pose: np.ndarray,
+    pos_deltas: np.ndarray,
+    rot_deltas: np.ndarray,
+) -> np.ndarray:
+    """Integrate a local-frame pose trajectory from position and rotvec deltas.
+
+    The rotational delta is composed on the right: R_next = R_current * R_delta.
+    That matches the EE-local increment convention used by the controller.
+    """
+    start_pose = np.asarray(start_pose, dtype=np.float64)
+    pos_deltas = np.asarray(pos_deltas, dtype=np.float64)
+    rot_deltas = np.asarray(rot_deltas, dtype=np.float64)
+    pose_traj = np.empty((len(pos_deltas) + 1, 7), dtype=np.float32)
+    pose_traj[0, :3] = start_pose[:3]
+    pose_traj[0, 3:] = start_pose[3:7]
+
+    current_pos = start_pose[:3].copy()
+    current_rot = Rotation.from_quat(start_pose[3:7])
+    for i, (dpos, drot) in enumerate(zip(pos_deltas, rot_deltas), start=1):
+        current_pos = current_pos + dpos
+        current_rot = current_rot * Rotation.from_rotvec(drot)
+        pose_traj[i, :3] = current_pos
+        pose_traj[i, 3:] = current_rot.as_quat()
+    return pose_traj
+
+
+def _pose_axis_segments(poses: np.ndarray, axis_idx: int, length: float) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Return line-segment coordinates for a colored local axis over a pose list."""
+    poses = np.asarray(poses, dtype=np.float64)
+    if len(poses) == 0:
+        return [], [], []
+
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    zs: list[float | None] = []
+    for pose in poses:
+        origin = pose[:3]
+        rot = Rotation.from_quat(pose[3:7]).as_matrix()
+        tip = origin + rot[:, axis_idx] * length
+        xs.extend([float(origin[0]), float(tip[0]), None])
+        ys.extend([float(origin[1]), float(tip[1]), None])
+        zs.extend([float(origin[2]), float(tip[2]), None])
+    return xs, ys, zs
+
+
+def _pose_axes_traces(
+    poses: np.ndarray,
+    name_prefix: str,
+    length: float,
+    colors: tuple[str, str, str] = _AXIS_COLORS,
+    width: int = 4,
+    opacity: float = 1.0,
+) -> list[go.Scatter3d]:
+    """Build three local x/y/z axis traces for a pose trajectory."""
+    traces: list[go.Scatter3d] = []
+    for axis_idx, color in enumerate(colors):
+        xs, ys, zs = _pose_axis_segments(poses, axis_idx, length)
+        traces.append(
+            go.Scatter3d(
+                x=xs, y=ys, z=zs,
+                mode="lines",
+                line=dict(color=color, width=width),
+                opacity=opacity,
+                name=f"{name_prefix} axis {axis_idx}",
+                showlegend=False,
+                hoverinfo="skip",
+            )
+        )
+    return traces
 
 
 def _skeleton_trace(pts: np.ndarray) -> go.Scatter3d:
@@ -353,7 +468,9 @@ def save_episode_html(
             pcd_robot.append(transformed)
 
     # --- forward kinematics --------------------------------------------------
-    skeletons = [_skeleton_pts(q) for q in joint_angles]  # T × (9, 3)
+    fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
+    skeletons = [item[0] for item in fk_frames]  # T × (9, 3)
+    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)  # T × (7,)
 
     # --- chunk forecast events -----------------------------------------------
     chunk_events = recorder.chunk_events  # sorted ascending by step
@@ -370,7 +487,7 @@ def save_episode_html(
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
-    pad = float((mx - mn).max()) * 0.05
+    pad = max(float((mx - mn).max()) * 0.05, _FORECAST_AXIS_LENGTH * 1.5)
     x_range = [float(mn[0] - pad), float(mx[0] + pad)]
     y_range = [float(mn[1] - pad), float(mx[1] + pad)]
     z_range = [float(mn[2] - pad), float(mx[2] + pad)]
@@ -405,6 +522,8 @@ def save_episode_html(
     _init_ev = _active_chunk_event(chunk_events, indices[0])
     _init_total_fcast = _init_ev["total_traj"] if _init_ev else _EMPTY_FORECAST
     _init_base_fcast  = _init_ev["base_traj"]  if _init_ev else _EMPTY_FORECAST
+    _init_total_pose = _init_ev["total_traj_pose"] if (_init_ev and _init_ev.get("total_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
+    _init_base_pose = _init_ev["base_traj_pose"] if (_init_ev and _init_ev.get("base_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
 
     # --- initial traces (step 0) — order must match go.Frame list below ------
     # Trace 0: skeleton
@@ -426,33 +545,43 @@ def save_episode_html(
                      dash="dash"),
         row=1, col=1,
     )
-    # Traces 4-5: kp_gain (solid) and kp_true (dotted)
+    # Trace 4-6: live EE orientation triad.
+    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95):
+        fig.add_trace(axis_trace, row=1, col=1)
+    # Trace 7-9: total forecast orientation triad trail.
+    for axis_trace in _pose_axes_traces(_init_total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68):
+        fig.add_trace(axis_trace, row=1, col=1)
+    # Trace 10-12: base forecast orientation triad trail.
+    for axis_trace in _pose_axes_traces(_init_base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68):
+        fig.add_trace(axis_trace, row=1, col=1)
+    # Traces 13-14: kp_gain (solid) and kp_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
     fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
                              line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
                   row=1, col=2)
-    # Traces 6-7: kd_gain (solid) and kd_true (dotted)
+    # Traces 15-16: kd_gain (solid) and kd_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
     fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
                              line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
                   row=2, col=2)
-    # Trace 8: gripper
+    # Trace 17: gripper
     fig.add_trace(
         _metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"),
         row=3, col=2,
     )
-    # Trace 9 (optional): point cloud at step 0 in robot space
+    # Trace 18 (optional): point cloud at step 0 in robot space
     if has_pcd:
         fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
 
     # --- animation frames ----------------------------------------------------
-    # Traces 0-8 are always animated; trace 9 (point cloud) is added when present.
+    # Traces 0-17 are always animated; trace 18 (point cloud) is added when present.
     # Index mapping:
-    #   0 skeleton  1 actual  2 total  3 base  4 kp_gain  5 kp_true
-    #   6 kd_gain   7 kd_true 8 gripper  [9 point cloud]
-    animated_traces = [0, 1, 2, 3, 4, 5, 6, 7, 8]
+    #   0 skeleton  1 actual  2 total  3 base  4-6 current EE axes
+    #   7-9 total forecast axes  10-12 base forecast axes
+    #   13 kp_gain  14 kp_true  15 kd_gain  16 kd_true  17 gripper  [18 point cloud]
+    animated_traces = list(range(18))
     if has_pcd:
-        animated_traces.append(9)
+        animated_traces.append(18)
 
     frames = []
     for t in range(T):
@@ -460,13 +589,16 @@ def save_episode_html(
         ap   = actual_pos[:t + 1]
         kp_t = kp_arr[:t + 1]
         kd_t = kd_arr[:t + 1]
+        current_pose = ee_poses[t:t + 1]
 
         # Chunk forecast: use the most recent inference event at or before this step.
         ev = _active_chunk_event(chunk_events, indices[t])
         total_fcast = ev["total_traj"] if ev else _EMPTY_FORECAST
         base_fcast  = ev["base_traj"]  if ev else _EMPTY_FORECAST
+        total_pose = ev["total_traj_pose"] if (ev and ev.get("total_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
+        base_pose = ev["base_traj_pose"] if (ev and ev.get("base_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
 
-        frame_data = [
+        frame_data: list[object] = [
             # 0: skeleton
             go.Scatter3d(
                 x=skel[:, 0], y=skel[:, 1], z=skel[:, 2],
@@ -495,27 +627,32 @@ def save_episode_html(
                 line=dict(color="darkorange", width=4, dash="dash"),
                 marker=dict(size=3, color="darkorange"),
             ),
-            # 4: kp_gain 0..t
+        ]
+        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95))
+        frame_data.extend(_pose_axes_traces(total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68))
+        frame_data.extend(_pose_axes_traces(base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68))
+        frame_data.extend([
+            # 13: kp_gain 0..t
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
                        line=dict(color="crimson", width=2)),
-            # 5: kp_true 0..t
+            # 14: kp_true 0..t
             go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
                        line=dict(color="crimson", width=2, dash="dot")),
-            # 6: kd_gain 0..t
+            # 15: kd_gain 0..t
             go.Scatter(x=ts[:t + 1], y=kd_t, mode="lines",
                        line=dict(color="seagreen", width=2)),
-            # 7: kd_true 0..t
+            # 16: kd_true 0..t
             go.Scatter(x=ts[:t + 1], y=10**(kd_t * 2 * np.sqrt(kp_t)), mode="lines",
                        line=dict(color="seagreen", width=2, dash="dot")),
-            # 8: gripper 0..t
+            # 17: gripper 0..t
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
-        ]
+        ])
         if has_pcd:
             pts = pcd_robot[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
-            # 9: point cloud at step t
+            # 18: point cloud at step t
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
@@ -679,7 +816,9 @@ def save_rollout_html(
                 transformed = transformed[idx]
             pcd_robot.append(transformed)
 
-    skeletons = [_skeleton_pts(q) for q in joint_angles]
+    fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
+    skeletons = [item[0] for item in fk_frames]
+    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)
 
     chunk_events = recorder.chunk_events  # sorted ascending by step
 
@@ -691,7 +830,7 @@ def save_rollout_html(
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
-    pad = float((mx - mn).max()) * 0.05
+    pad = max(float((mx - mn).max()) * 0.05, _FORECAST_AXIS_LENGTH * 1.5)
     x_range = [float(mn[0] - pad), float(mx[0] + pad)]
     y_range = [float(mn[1] - pad), float(mx[1] + pad)]
     z_range = [float(mn[2] - pad), float(mx[2] + pad)]
@@ -708,6 +847,7 @@ def save_rollout_html(
 
     _init_ev = _active_chunk_event(chunk_events, indices[0])
     _init_base_fcast = _init_ev["base_traj"] if _init_ev else _EMPTY_FORECAST
+    _init_base_pose = _init_ev["base_traj_pose"] if (_init_ev and _init_ev.get("base_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
 
     fig = make_subplots(
         rows=3, cols=2,
@@ -734,25 +874,31 @@ def save_rollout_html(
         _trail_trace(_init_base_fcast, color="royalblue", name="base chunk forecast"),
         row=1, col=1,
     )
-    # Traces 3-4: kp
+    # Trace 3-5: live EE orientation triad.
+    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95):
+        fig.add_trace(axis_trace, row=1, col=1)
+    # Trace 6-8: base forecast orientation triad trail.
+    for axis_trace in _pose_axes_traces(_init_base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68):
+        fig.add_trace(axis_trace, row=1, col=1)
+    # Traces 9-10: kp
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
     fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
                              line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
                   row=1, col=2)
-    # Traces 5-6: kd
+    # Traces 11-12: kd
     fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
     fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
                              line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
                   row=2, col=2)
-    # Trace 7: gripper
+    # Trace 13: gripper
     fig.add_trace(_metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"), row=3, col=2)
-    # Trace 8 (optional): point cloud
+    # Trace 14 (optional): point cloud
     if has_pcd:
         fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
 
-    animated_traces = [0, 1, 2, 3, 4, 5, 6, 7]
+    animated_traces = list(range(14))
     if has_pcd:
-        animated_traces.append(8)
+        animated_traces.append(14)
 
     frames = []
     for t in range(T):
@@ -760,11 +906,13 @@ def save_rollout_html(
         ap   = actual_pos[:t + 1]
         kp_t = kp_arr[:t + 1]
         kd_t = kd_arr[:t + 1]
+        current_pose = ee_poses[t:t + 1]
 
         ev = _active_chunk_event(chunk_events, indices[t])
         base_fcast = ev["base_traj"] if ev else _EMPTY_FORECAST
+        base_pose = ev["base_traj_pose"] if (ev and ev.get("base_traj_pose") is not None) else np.zeros((0, 7), dtype=np.float32)
 
-        frame_data = [
+        frame_data: list[object] = [
             go.Scatter3d(
                 x=skel[:, 0], y=skel[:, 1], z=skel[:, 2],
                 mode="lines+markers",
@@ -783,6 +931,10 @@ def save_rollout_html(
                 line=dict(color="royalblue", width=5),
                 marker=dict(size=3, color="royalblue"),
             ),
+        ]
+        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95))
+        frame_data.extend(_pose_axes_traces(base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68))
+        frame_data.extend([
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
                        line=dict(color="crimson", width=2)),
             go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
@@ -793,7 +945,7 @@ def save_rollout_html(
                        line=dict(color="seagreen", width=2, dash="dot")),
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
-        ]
+        ])
         if has_pcd:
             pts = pcd_robot[t]
             if len(pts) == 0:

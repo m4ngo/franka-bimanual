@@ -32,6 +32,7 @@ from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.datasets import LeRobotDataset 
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,26 @@ class BasePolicy:
             step = self.postprocessor(chunk[i : i + 1]).squeeze(0).cpu().numpy()
             steps.append(step)
         return np.stack(steps)  # (T, action_dim)
+    
+class Trajectory(BasePolicy):
+    def __init__(self, path: str, device: str = "cuda") -> None:
+        self.reset()
+        actions = LeRobotDataset(path, episodes=[0]).select_columns("action")
+        self.trajectory = actions_array = np.array(actions["action"]) 
+    
+    def reset(self) -> None:
+        self.cur_step = 0
+
+    def infer(self, obs: dict) -> np.ndarray:
+        """Run one inference pass.
+
+        Returns:
+            (T, 10) numpy array in physical units (postprocessor applied):
+            positions in metres, rotation as unit quaternion (xyzw), gripper in [0,1].
+        """
+        res = self.trajectory[self.cur_step : self.cur_step + 10]
+        self.cur_step += 5
+        return res
 
 
 class ResidualPolicy:
