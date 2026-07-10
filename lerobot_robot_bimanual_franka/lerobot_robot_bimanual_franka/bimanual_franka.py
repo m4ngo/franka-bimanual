@@ -76,7 +76,10 @@ class BimanualFranka(Robot):
         self._kd_gain = 0.0
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
-        self._depth_cam = str(getattr(config, "depth_cam", ""))
+        if config.depth_cam[0] in self.cameras.keys():
+            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], None)
+        else:
+            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], _make_camera(config.depth_cam[1]))
         self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
 
         world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))
@@ -156,6 +159,8 @@ class BimanualFranka(Robot):
                     cam.connect()
                 except Exception as e:
                     logger.warning("Camera %s failed to connect: %s", n, e)
+            if self._use_depth and self._depth_cam[1] is not None:
+                self._depth_cam[1].connect()
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
                     arm,
@@ -209,7 +214,10 @@ class BimanualFranka(Robot):
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
 
         if self._use_depth:
-            depth_cam = self.cameras.get(self._depth_cam)
+            if self._depth_cam[0] in self.cameras.keys():
+                depth_cam = self.cameras.get(self._depth_cam[0])
+            else:
+                depth_cam = self._depth_cam[1]
             if depth_cam is None:
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
             # Submit both depth reads concurrently; get_full_point_cloud only reads

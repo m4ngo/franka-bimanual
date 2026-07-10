@@ -34,7 +34,7 @@ _RECOVERABLE_ERRORS = (
     "communication_constrains_violation",
     'current mode ("Reflex")',
     "type of motion cannot change",
-    "singularity"
+    "singular"
 )
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)
