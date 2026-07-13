@@ -90,8 +90,10 @@ RUN uv pip install wandb
 # --- Your training code -----------------------------------------------------
 COPY train.sh /workspace/scripts/train.sh
 COPY train_multigpu.sh /workspace/scripts/train_multigpu.sh
+COPY train_diffusion_multigpu.sh /workspace/scripts/train_diffusion_multigpu.sh
 RUN chmod +x /workspace/scripts/train.sh
 RUN chmod +x /workspace/scripts/train_multigpu.sh
+RUN chmod +x /workspace/scripts/train_diffusion_multigpu.sh
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /workspace
