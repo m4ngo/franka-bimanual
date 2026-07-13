@@ -2,10 +2,10 @@
 #SBATCH --job-name=act-train
 #SBATCH --qos=normal
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
-#SBATCH --time=08:00:00
-#SBATCH --output=/gpfs/projects/YOUR_GROUP_NAME/logs/slurm-%j.out
+#SBATCH --time=00:20:00
+#SBATCH --output=/gpfs/projects/weirdlab/atsai06/logs/slurm-%j.out
 # NOTE: Slurm expands #SBATCH directives before the script body runs, so you
 # cannot reference the $HYAK_PROJECT variable set below in this line --
 # replace YOUR_GROUP_NAME literally, matching the export below.
