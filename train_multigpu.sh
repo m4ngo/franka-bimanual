@@ -35,7 +35,7 @@ echo "Using lerobot-train at: $LEROBOT_TRAIN_BIN"
 accelerate launch \
   --multi_gpu \
   --num_processes="${NUM_GPUS}" \
-  "$LEROBOT_TRAIN_BIN" \
+  "$(which lerobot-train)" \
   --resume=$5 \
   --dataset.repo_id="$1" \
   --policy.type=act \
