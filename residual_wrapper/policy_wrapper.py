@@ -31,7 +31,8 @@ import torch
 from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
-from lerobot.policies.utils import prepare_observation_for_inference
+from lerobot.policies.utils import prepare_observation_for_inference, populate_queues
+from lerobot.utils.constants import ACTION, OBS_IMAGES
 from lerobot.datasets import LeRobotDataset 
 
 logger = logging.getLogger(__name__)
@@ -72,16 +73,23 @@ class BasePolicy:
         self.policy.reset()
 
     def infer(self, obs: dict) -> np.ndarray:
-        """Run one inference pass.
-
-        Returns:
-            (T, 10) numpy array in physical units (postprocessor applied):
-            positions in metres, rotation as unit quaternion (xyzw), gripper in [0,1].
-        """
         obs_t = prepare_observation_for_inference(_format_obs_for_policy(obs), self.device)
         obs_t = self.preprocessor(obs_t)
+        obs_only = {k: v for k, v in obs_t.items() if k.startswith("observation.")}
+
         with torch.inference_mode():
-            chunk = self.policy.predict_action_chunk(obs_t)  # (1, T, action_dim)
+            if hasattr(self.policy, "_queues") and self.policy._queues is not None:
+                # Mirror what select_action does before calling predict_action_chunk (lerobot 0.5.1
+                # has no offline mode for predict_action_chunk — queues must be pre-populated).
+                batch_for_queues = dict(obs_only)
+                if self.policy.config.image_features:
+                    batch_for_queues[OBS_IMAGES] = torch.stack(
+                        [batch_for_queues[key] for key in self.policy.config.image_features], dim=-4
+                    )
+                self.policy._queues = populate_queues(self.policy._queues, batch_for_queues)
+                chunk = self.policy.predict_action_chunk(batch_for_queues)  # (1, T, action_dim)
+            else:
+                chunk = self.policy.predict_action_chunk(obs_only)
         chunk = chunk.squeeze(0)  # (T, action_dim)
 
         # Unnormalise each step via the postprocessor.
@@ -91,7 +99,7 @@ class BasePolicy:
             step = self.postprocessor(chunk[i : i + 1]).squeeze(0).cpu().numpy()
             steps.append(step)
         return np.stack(steps)  # (T, action_dim)
-    
+
 class Trajectory(BasePolicy):
     def __init__(self, path: str, device: str = "cuda") -> None:
         self.reset()

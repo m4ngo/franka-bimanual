@@ -19,7 +19,7 @@ lerobot-train \
   --policy.num_train_timesteps=100 \
   --policy.num_inference_steps=10 \
   --policy.horizon=16 \
-  --policy.n_action_steps=5 \
+  --policy.n_action_steps=10 \
   --policy.n_obs_steps=2 \
   --output_dir="../franka_data/policy/train/$diffusion_$1" \
   --job_name="diffusion_$1" \

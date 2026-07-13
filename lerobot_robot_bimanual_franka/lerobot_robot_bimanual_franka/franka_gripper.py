@@ -65,6 +65,7 @@ def close_gripper(controller):
         self._rpc_open = ns["open_gripper"]
         self._is_open = True
         self._position_ts: float | None = None
+        self._last_send: float = time.time()
 
     @staticmethod
     def _clamp_mm(position_mm: float) -> float:
@@ -84,18 +85,20 @@ def close_gripper(controller):
         return None
 
     def move(self, position_mm: float, speed: float = _MOVE_SPEED_M_S, blocking: bool = False) -> bool:
-        if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open:
+        if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = False
             self._position_mm = self.GRIPPER_TRUE_MAX_MM
             self._position_ts = time.monotonic()
             # store time
             self.grasp(0.0, speed, self._DEFAULT_FORCE)
-        elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open:
+            self._last_send = time.time()
+        elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = True
             self._position_mm = 0
             self._position_ts = time.monotonic()
             # store time
             self.open(speed)
+            self._last_send = time.time()
         return True
 
     def home(self) -> bool:

@@ -88,7 +88,7 @@ RUN uv pip install --no-deps "lerobot[training] @ git+https://github.com/hugging
 RUN uv pip install wandb
 
 # --- Your training code -----------------------------------------------------
-COPY scripts/train.sh /workspace/scripts/train.sh
+COPY train.sh /workspace/scripts/train.sh
 COPY train_multigpu.sh /workspace/scripts/train_multigpu.sh
 RUN chmod +x /workspace/scripts/train.sh
 RUN chmod +x /workspace/scripts/train_multigpu.sh
