@@ -62,7 +62,7 @@ docker push <you>/lerobot-act-train:v0.5.1
 ssh <UWNetID>@tillicum.hyak.uw.edu
 salloc --qos=debug --gres=gpu:1 --cpus-per-task=8 --mem=200G --time=00:30:00
 cd /gpfs/projects/<your-group>/
-apptainer pull lerobot-train.sif docker://<you>/lerobot-act-train:v0.5.1
+apptainer pull lerobot-train.sif docker://atsai06/lerobot-act-train:v0.5.1
 exit   # release the debug allocation
 
 # 3. Copy code + submit
