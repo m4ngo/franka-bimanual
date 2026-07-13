@@ -11,12 +11,12 @@
 # replace YOUR_GROUP_NAME literally, matching the export below.
 
 # --- Fill these in for your project -----------------------------------------
-export HYAK_PROJECT="weirdlab"          # e.g. matches /gpfs/projects/<this>
+export HYAK_PROJECT="weirdlab/atsai06"          # e.g. matches /gpfs/projects/<this>
 SIF_PATH="/gpfs/projects/${HYAK_PROJECT}/lerobot-train.sif"
-DATASET_REPO_ID="HuskyMango/test"               # HF dataset repo_id
-POLICY_REPO_ID="HuskyMango/test_act"            # HF model repo_id to push to
+DATASET_REPO_ID="HuskyMango/bowl-7-10"               # HF dataset repo_id
+POLICY_REPO_ID="HuskyMango/act-hyak-test"            # HF model repo_id to push to
 PER_GPU_BATCH_SIZE=8                            # effective batch = this * num GPUs
-STEPS=100000
+STEPS=10000
 RESUME=false
 # -----------------------------------------------------------------------------
 

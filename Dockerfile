@@ -15,6 +15,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         software-properties-common \
         ca-certificates \
         curl \
+        xz-utils \
         git \
         cmake \
         build-essential \
@@ -31,15 +32,27 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libswscale-dev \
         libswresample-dev \
         libavfilter-dev \
-        ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Confirm ffmpeg has libsvtav1 -- lerobot's default TorchCodec video decoding
-# path expects this. If missing, the conda-forge ffmpeg build is the more
-# reliable source (see note at bottom of file) but adds a conda dependency.
-RUN ffmpeg -encoders 2>/dev/null | grep -q libsvtav1 \
-    && echo "libsvtav1 OK" \
-    || echo "WARNING: libsvtav1 not found -- video decode may fall back to pyav, verify this matches your workstation behavior"
+# Install a static ffmpeg build directly (bypassing apt's ffmpeg package).
+# This avoids relying on Ubuntu 22.04's ffmpeg, which frequently lacks
+# libsvtav1 support anyway, and sidesteps any apt-layer corruption issues.
+# johnvansickle.com builds are the standard trusted static ffmpeg source.
+RUN curl -fsSL https://johnvansickle.com/ffmpeg/releases/ffmpeg-release-amd64-static.tar.xz \
+        -o /tmp/ffmpeg-static.tar.xz \
+    && tar -xf /tmp/ffmpeg-static.tar.xz -C /tmp \
+    && mv /tmp/ffmpeg-*-amd64-static/ffmpeg /usr/local/bin/ffmpeg \
+    && mv /tmp/ffmpeg-*-amd64-static/ffprobe /usr/local/bin/ffprobe \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg-static.tar.xz /tmp/ffmpeg-*-amd64-static
+
+# Sanity check that ffmpeg runs at all. Note: libsvtav1 (AV1 *encoding*) is
+# NOT required here -- this container only trains against already-recorded
+# datasets, so it only ever *decodes* video. AV1 decoding uses libdav1d,
+# which this static build includes (see `--enable-libdav1d` in the ffmpeg
+# -version config line). libsvtav1 would only matter if this container were
+# also recording/re-encoding datasets, which it isn't.
+RUN ffmpeg -version
 
 # --- uv ----------------------------------------------------------------
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -80,4 +93,7 @@ RUN chmod +x /workspace/scripts/train.sh
 
 ENV PYTHONUNBUFFERED=1
 WORKDIR /workspace
-ENTRYPOINT ["/bin/bash"]
+# No ENTRYPOINT: this lets `docker run <image> lerobot-train --help` (or any
+# other command) execute directly via PATH lookup, rather than being passed
+# as an argument TO bash (which was previously misinterpreting lerobot-train
+# as a shell script instead of running its #!/.../python3 shebang).
