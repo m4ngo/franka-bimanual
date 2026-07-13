@@ -24,14 +24,6 @@ fi
 NUM_GPUS="${SLURM_GPUS_ON_NODE:-$(nvidia-smi -L | wc -l)}"
 echo "Launching accelerate with NUM_GPUS=${NUM_GPUS}"
 
-LEROBOT_TRAIN_BIN="$(command -v lerobot-train || true)"
-if [ -z "$LEROBOT_TRAIN_BIN" ]; then
-    echo "ERROR: lerobot-train not found on PATH. Did you activate your venv/module?" >&2
-    echo "PATH=$PATH" >&2
-    exit 1
-fi
-echo "Using lerobot-train at: $LEROBOT_TRAIN_BIN"
-
 accelerate launch \
   --multi_gpu \
   --num_processes="${NUM_GPUS}" \
