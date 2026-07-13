@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH --job-name=act-train
 #SBATCH --qos=normal
-#SBATCH --gres=gpu:4
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=32
-#SBATCH --mem=800G
+#SBATCH --mem=200G
 #SBATCH --time=08:00:00
 #SBATCH --output=/gpfs/projects/YOUR_GROUP_NAME/logs/slurm-%j.out
 # NOTE: Slurm expands #SBATCH directives before the script body runs, so you
