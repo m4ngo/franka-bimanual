@@ -96,6 +96,8 @@ class BimanualFranka(Robot):
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
 
+
+
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
         gripper_ip = getattr(self.config, f"{arm}_gripper_ip")
         if gripper_ip == getattr(self.config, f"{arm}_robot_ip"):
@@ -193,6 +195,12 @@ class BimanualFranka(Robot):
             n: self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS)
             for n, cam in self.cameras.items()
         }
+
+        standalone_depth_cam = None
+        if self._use_depth and self._depth_cam[0] not in self.cameras:
+            standalone_depth_cam = self._depth_cam[1]
+            depth_color_fut = self._camera_pool.submit(standalone_depth_cam.async_read, _CAMERA_READ_TIMEOUT_MS)
+
         kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = kin
 
@@ -212,6 +220,12 @@ class BimanualFranka(Robot):
                 logger.warning("Camera %s read failed: %s", n, e)
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
+
+        if standalone_depth_cam is not None:
+            try:
+                depth_color_fut.result()  # prime the buffer; result unused, not part of obs
+            except Exception as e:
+                logger.warning("Standalone depth camera color read failed: %s", e)
 
         if self._use_depth:
             if self._depth_cam[0] in self.cameras.keys():
@@ -372,7 +386,7 @@ class BimanualFranka(Robot):
         for arm in targets_q:
             self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
-        use_ee_homing = self.control_mode != ControlMode.JOINT_POS
+        use_ee_homing = False # self.control_mode != ControlMode.JOINT_POS
         rate_hz = float(home_fps if home_fps is not None else (max(fps, 60) if use_ee_homing else fps))
         period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s

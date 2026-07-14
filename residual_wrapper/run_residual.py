@@ -211,6 +211,7 @@ def _run_episode(
                     else:
                         vel = kin['r'][5]
                     point_cloud = extract_point_cloud(obs)
+                    # base_chunk = np.repeat(base_chunk, 2, axis=0)
                     processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],

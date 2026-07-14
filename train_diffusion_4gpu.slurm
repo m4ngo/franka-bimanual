@@ -16,7 +16,7 @@ SIF_PATH="/gpfs/projects/${HYAK_PROJECT}/lerobot-train.sif"
 DATASET_REPO_ID="HuskyMango/bowl-7-10"               # HF dataset repo_id
 POLICY_REPO_ID="HuskyMango/diffusion-bowl-7-13"            # HF model repo_id to push to
 PER_GPU_BATCH_SIZE=16                            # effective batch = this * num GPUs
-STEPS=200000
+STEPS=80000
 RESUME=false
 # -----------------------------------------------------------------------------
 

@@ -53,7 +53,7 @@ USB/serial device access) won't build or function in a generic container.
 
 ```bash
 # 1. Local build + smoke test (on your Ubuntu workstation)
-docker build -t <you>/lerobot-act-train:v0.5.1 .
+docker build --platform linux/amd64 -t atsai06/lerobot-act-train:v0.5.1 .
 docker run --rm --gpus all <you>/lerobot-act-train:v0.5.1 \
   ffmpeg -encoders | grep libsvtav1   # sanity check per TODO #2
 docker push <you>/lerobot-act-train:v0.5.1
