@@ -296,7 +296,12 @@ def _run_episode(
 
             if not replaying:
                 controller.cache_delta(dpos, drot)
+            # print('base grip', base_chunk[chunk_used][8])
+            # print('res grip', res[8])
             action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
+            # print(action)
+            if residual is not None:
+                action["r_gripper"] += res[8]
             controller.send_action(action)
 
             if recorder is not None:
@@ -313,8 +318,10 @@ def _run_episode(
                     kp=kp,
                     kd=kd,
                     gripper=action["r_gripper"],
-                    # point_cloud=controller.last_full_point_cloud,
-                    point_cloud=point_cloud,
+                    res_gripper=res[8] if residual is not None else 0,
+                    point_cloud=controller.last_full_point_cloud,
+                    # point_cloud=point_cloud,
+                    res_rotvec=drot,
                 )
 
             if dataset is not None:

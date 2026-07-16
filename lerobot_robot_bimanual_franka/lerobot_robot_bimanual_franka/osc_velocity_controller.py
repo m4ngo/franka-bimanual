@@ -152,6 +152,7 @@ class OSCVelocityController:
         ee_twist: np.ndarray,
         J: np.ndarray,
         q: np.ndarray,
+        rot_fudge: float = 1.0,
         q_nullspace_target: np.ndarray | None = None,
         kp: np.ndarray | float | None = None,
         damping_ratio: float | None = None,
@@ -187,7 +188,7 @@ class OSCVelocityController:
         assert J.shape[0] == 6, f"expected J with 6 task rows, got {J.shape}"
 
         pos_error = goal_pos - ee_pos
-        ori_error = orientation_error_from_quats(goal_quat_xyzw, ee_quat_xyzw)
+        ori_error = orientation_error_from_quats(goal_quat_xyzw, ee_quat_xyzw) * rot_fudge
         pose_error = np.concatenate([pos_error, ori_error])
 
         # Pure proportional task-space velocity law. Unlike torque-domain OSC,

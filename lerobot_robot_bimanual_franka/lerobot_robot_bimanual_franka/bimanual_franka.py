@@ -34,9 +34,10 @@ EE_PD_KP, EE_PD_KD = 3.5, 0.2
 _KP_GAIN_BASE = 10.0
 _KD_GAIN_BASE = 1.0
 OSC_BASE_KP = 5.0
+_GRIP_ACCUM_SPEED = 0.5
 
 _EE_TRANSLATION_FUDGE_FACTOR = 1.2
-_EE_ROTATION_FUDGE_FACTOR = 0.005
+_EE_ROTATION_FUDGE_FACTOR = 0.9
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -77,6 +78,7 @@ class BimanualFranka(Robot):
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
         self._kp_gain = 0.0
         self._kd_gain = 0.0
+        self._gripper_accum: dict[str, float] = {arm: 1.0 for arm in self.active_arms}
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
         if config.depth_cam[0] in self.cameras.keys():
@@ -250,14 +252,15 @@ class BimanualFranka(Robot):
             # full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
             verts = depth_fut.result()
             # full_pcd = full_pcd_fut.result()
-            full_pcd = verts
-            if len(full_pcd) > 0:
-                xyz = full_pcd[:, :3]
-                dist2 = np.einsum("ij,ij->i", xyz, xyz)
-                full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
-            self._last_full_point_cloud = full_pcd
+            # full_pcd = verts
+            # if len(full_pcd) > 0:
+            #     xyz = full_pcd[:, :3]
+            #     dist2 = np.einsum("ij,ij->i", xyz, xyz)
+            #     full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
+            # self._last_full_point_cloud = full_pcd
             ee_world = self._ee_world_center(kin)
-            flat = self._sample_depth_points(verts, ee_world).reshape(-1).astype(np.float64)
+            self._last_full_point_cloud = self._sample_depth_points(verts, ee_world)
+            flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
             obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
 
@@ -344,8 +347,9 @@ class BimanualFranka(Robot):
         self._kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(self.kp_gain))
 
         for arm in self.active_arms:
+            self._gripper_accum[arm] = np.clip(self._gripper_accum[arm] + (action[f"{arm}_gripper"]) * _GRIP_ACCUM_SPEED, -1.0, 1.0)
             self.grippers[arm].move(
-                np.clip(action[f"{arm}_gripper"], 0.0, 1.0) * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
+                (self._gripper_accum[arm] + 1.0) / 2.0 * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
                 blocking=False,
             )
 
@@ -365,7 +369,7 @@ class BimanualFranka(Robot):
             #      for arm in self.active_arms}, kin
             # )
             cmds = self.safety.shape_joint(
-                {arm: self._qdot_ee_delta(arm, action, kin[arm], self.delta_pos, self.delta_rot)
+                {arm: self._qdot_ee_delta(arm, action, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
                  for arm in self.active_arms}, kin
             )
 
@@ -494,6 +498,9 @@ class BimanualFranka(Robot):
         snap,  # KinematicSnapshot = (q, dq, J, ee_pos, ee_quat_xyzw, ee_twist)
         dpos_cached: np.ndarray,
         drot_cached: np.ndarray,
+        use_noise: bool,
+        noise_pos_scale: float,
+        noise_rot_scale: float,
     ) -> np.ndarray:
         """Replacement for the old `_ee_delta`. Integrates the incoming delta
         action into a persistent per-arm goal pose (mirroring robosuite OSC's
@@ -501,17 +508,26 @@ class BimanualFranka(Robot):
         goal with OSCVelocityController -- rather than treating the raw delta as
         a one-shot velocity command every tick.
         """
+
+        if use_noise:
+            pos_noise = np.random.normal(0.0, noise_pos_scale, 3)
+            rot_noise = Rotation.from_euler("xyz", np.random.normal(0.0, noise_rot_scale, 3)).as_quat()
+        else:
+            pos_noise = 0
+            rot_noise = 0
+
+
         q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
         ee_quat_xyzw = np.asarray(ee_quat_xyzw, dtype=np.float64)
         action_dpos = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
             dtype=np.float64, count=3,
-        )
+        ) + pos_noise
         action_dquat_xyzw = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
             dtype=np.float64, count=4,
-        )
+        ) + rot_noise
 
         # ---- integrate delta into the persistent goal (position: simple sum;
         #      orientation: compose as delta * goal) ----
@@ -556,6 +572,7 @@ class BimanualFranka(Robot):
             q=np.asarray(q, dtype=np.float64),
             q_nullspace_target=self._home_q.get(arm),
             kp=self.kp_gain * OSC_BASE_KP,
+            rot_fudge=_EE_ROTATION_FUDGE_FACTOR
     )
 
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:

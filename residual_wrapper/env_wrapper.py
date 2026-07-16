@@ -15,7 +15,9 @@ _ROT_SCALE = 0.5        # radians per normalised unit
 _CHUNK_EXEC = 5         # steps to execute per inference call (both base and residual)
 _RESIDUAL_HORIZON = 10  # base-chunk steps forwarded to the residual policy as context
 _GAINS_MAG = 0.5        # gains magnitude for clipping
-_RESIDUAL_MAG = 0.2     # residual magnitude for clipping
+_RESIDUAL_MAG = 1.0     # residual magnitude for clipping
+_RESIDUAL_TRANS_MAG = 0.2
+_RESIDUAL_ROT_MAG = 0.2
 
 _EE_ACTION_KEYS = ("r_x", "r_y", "r_z", "r_qx", "r_qy", "r_qz", "r_qw", "r_gripper")
 _ACTION_KEYS = (*_EE_ACTION_KEYS, "kp", "kd")

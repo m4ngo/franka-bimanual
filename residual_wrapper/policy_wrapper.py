@@ -28,7 +28,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG
+from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG, _RESIDUAL_TRANS_MAG, _RESIDUAL_ROT_MAG
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference, populate_queues
@@ -199,5 +199,7 @@ class ResidualPolicy:
 
         result = out.squeeze(0).cpu().numpy().reshape(_CHUNK_EXEC, 9)  # (5, 9)
         result[..., :2] = np.clip(result[..., :2], -_GAINS_MAG, _GAINS_MAG)
-        result[..., 2:] = np.clip(result[..., 2:], -_RESIDUAL_MAG, _RESIDUAL_MAG)
+        result[..., 2:5] = np.clip(result[..., 2:5], -_RESIDUAL_TRANS_MAG, _RESIDUAL_TRANS_MAG)
+        result[..., 5:8] = np.clip(result[..., 5:8], -_RESIDUAL_ROT_MAG, _RESIDUAL_ROT_MAG)
+        result[..., 8] = np.clip(result[..., 8], -_RESIDUAL_MAG, _RESIDUAL_MAG)
         return result

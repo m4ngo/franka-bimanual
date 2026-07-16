@@ -8,7 +8,7 @@ import numpy as np
 
 from .franka_process import KinematicSnapshot
 
-WORKTABLE_HEIGHT = 0.12                  # m, base-frame Z of the worktable surface
+WORKTABLE_HEIGHT = 0.11                  # m, base-frame Z of the worktable surface
 CUSTOM_END_EFFECTOR_Z_EXTENSION = 0.00   # m, extra tool reach below the EE frame
 WORKTABLE_DISTANCE_MIN = 0.03            # m, minimum clearance; downward velocity zeroed at/past this
 WORKTABLE_MAX_DECEL = 0.5                # m/s², assumed deceleration for the braking envelope

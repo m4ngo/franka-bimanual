@@ -192,10 +192,14 @@ class FramosCamera(Camera):
         )
 
     def read(self) -> NDArray[Any]:
-        return self._fetch_color(timeout_ms=1000.0, allow_stale=False)
+        if self._config.enable_color:
+            return self._fetch_color(timeout_ms=1000.0, allow_stale=False)
+        return self.read_depth()
 
     def async_read(self, timeout_ms: float = 500) -> NDArray[Any]:
-        return self._fetch_color(timeout_ms=timeout_ms, allow_stale=True)
+        if self._config.enable_color:
+            return self._fetch_color(timeout_ms=timeout_ms, allow_stale=True)
+        return self.read_depth(timeout_ms=timeout_ms)
 
     def read_depth(self, timeout_ms: float = 1000.0) -> NDArray[Any]:
         if self._pipeline is None:
@@ -217,6 +221,7 @@ class FramosCamera(Camera):
             return self._blank_depth()
         arr = np.asanyarray(depth.get_data())
         self._last_depth = arr
+        # print("hi")
         return arr.copy()
 
     def disconnect(self) -> None:
@@ -267,14 +272,14 @@ class FramosCamera(Camera):
         # Attach per-point RGB when the full-res color frame is available and
         # its pixel grid matches the depth image (guaranteed when the aligner is
         # set to align depth→color, which is the default).
-        color_img = self._last_color_full
-        if (
-            color_img is not None
-            and color_img.ndim == 3
-            and color_img.shape[:2] == depth_image.shape[:2]
-        ):
-            rgb = color_img[yy, xx].astype(np.float32) / 255.0  # (N, 3) in [0, 1]
-            return np.concatenate([xyz, rgb], axis=1)            # (N, 6)
+        # color_img = self._last_color_full
+        # if (
+        #     color_img is not None
+        #     and color_img.ndim == 3
+        #     and color_img.shape[:2] == depth_image.shape[:2]
+        # ):
+        #     rgb = color_img[yy, xx].astype(np.float32) / 255.0  # (N, 3) in [0, 1]
+        #     return np.concatenate([xyz, rgb], axis=1)            # (N, 6)
         return xyz
 
     def get_depth(self) -> list[tuple[float, float, float]]:

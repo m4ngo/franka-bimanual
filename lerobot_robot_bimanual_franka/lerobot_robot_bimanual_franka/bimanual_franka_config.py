@@ -43,7 +43,7 @@ class BimanualFrankaConfig(RobotConfig):
     )
     depth: bool = True
     depth_cam: tuple[str, CameraConfig] = (
-            "cam_2", FramosCameraConfig(name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=30, width=224, height=224),
+            "cam_2", FramosCameraConfig(enable_color=False, name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=30, width=224, height=224),
     )
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
     world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)

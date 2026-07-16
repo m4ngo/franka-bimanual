@@ -44,8 +44,8 @@ class SpaceMouseLeaderFields:
     rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
 
     # Gripper travel limits (mm). Right button → open, left button → close.
-    gripper_min_mm: float = 0.1
-    gripper_max_mm: float = 0.9
+    gripper_min_mm: float = -1.0
+    gripper_max_mm: float = 1.0
     # Gripper target on connect, before any button press.
     initial_gripper_mm: float = 0.9
 

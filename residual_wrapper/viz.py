@@ -47,11 +47,6 @@ _AXIS_COLORS = (
 )
 _FORECAST_AXIS_LENGTH = 0.038
 _CURRENT_AXIS_COLORS = _AXIS_COLORS
-_TOTAL_AXIS_COLORS = (
-    "rgba(190, 55, 210, 0.82)",
-    "rgba(45, 155, 180, 0.82)",
-    "rgba(70, 115, 255, 0.82)",
-)
 _BASE_AXIS_COLORS = (
     "rgba(235, 95, 35, 0.82)",
     "rgba(95, 180, 70, 0.82)",
@@ -83,6 +78,8 @@ class EpisodeRecorder:
         self.kp: list[float] = []
         self.kd: list[float] = []
         self.gripper: list[float] = []
+        self.res_gripper: list[float] = []
+        self.res_rotvecs: list[np.ndarray] = []       # (3,) executed residual rotvec (rad) per step
         self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
         # Per-inference chunk forecast events, sorted by ascending step index.
         self.chunk_events: list[dict] = []
@@ -98,7 +95,9 @@ class EpisodeRecorder:
         kp: float,
         kd: float,
         gripper: float,
+        res_gripper: float,
         point_cloud: np.ndarray | None = None,
+        res_rotvec: np.ndarray | None = None,
     ) -> None:
         """Record one control step.
 
@@ -111,6 +110,8 @@ class EpisodeRecorder:
             kd:                Derivative gain   (normalised, range [-1, 1]).
             gripper:           Commanded gripper normalised to [0, 1].
             point_cloud:       (N, 3) point cloud in world space, or None.
+            res_rotvec:        (3,) residual rotation correction executed this
+                               step, as a rotvec in radians; None records zeros.
         """
         self.joint_angles.append(np.asarray(q, dtype=np.float64).copy())
         self.actual_ee_pos.append(np.asarray(actual_ee_pos[:3], dtype=np.float32).copy())
@@ -119,8 +120,13 @@ class EpisodeRecorder:
         self.kp.append(float(kp))
         self.kd.append(float(kd))
         self.gripper.append(float(gripper))
+        self.res_gripper.append(float(res_gripper))
         self.point_clouds.append(
             np.asarray(point_cloud, dtype=np.float32).copy() if point_cloud is not None else None
+        )
+        self.res_rotvecs.append(
+            np.asarray(res_rotvec, dtype=np.float32).copy() if res_rotvec is not None
+            else np.zeros(3, dtype=np.float32)
         )
 
     def record_chunk(
@@ -259,8 +265,16 @@ def _pose_axes_traces(
     colors: tuple[str, str, str] = _AXIS_COLORS,
     width: int = 4,
     opacity: float = 1.0,
+    dash: str = "solid",
+    legendgroup: str | None = None,
 ) -> list[go.Scatter3d]:
-    """Build three local x/y/z axis traces for a pose trajectory."""
+    """Build three local x/y/z axis traces for a pose trajectory.
+
+    All triads share the same RGB axis colors so x/y/z correspondence holds
+    across current/total/base; groups are told apart by dash style and by
+    toggling. When legendgroup is set, the first axis trace carries a legend
+    entry that toggles the whole triad (plotly's default groupclick).
+    """
     traces: list[go.Scatter3d] = []
     for axis_idx, color in enumerate(colors):
         xs, ys, zs = _pose_axis_segments(poses, axis_idx, length)
@@ -268,14 +282,34 @@ def _pose_axes_traces(
             go.Scatter3d(
                 x=xs, y=ys, z=zs,
                 mode="lines",
-                line=dict(color=color, width=width),
+                line=dict(color=color, width=width, dash=dash),
                 opacity=opacity,
-                name=f"{name_prefix} axis {axis_idx}",
-                showlegend=False,
+                name=name_prefix if (legendgroup and axis_idx == 0) else f"{name_prefix} axis {axis_idx}",
+                legendgroup=legendgroup,
+                showlegend=bool(legendgroup) and axis_idx == 0,
                 hoverinfo="skip",
             )
         )
     return traces
+
+
+def _select_poses(poses: np.ndarray, idxs: tuple[int, ...]) -> np.ndarray:
+    """Pick waypoint poses by index, dropping indices past the end.
+
+    Used to draw orientation triads at a sparse set of semantically meaningful
+    waypoints (e.g. end of executed chunk, end of horizon) instead of every
+    step, which reads as clutter.
+    """
+    poses = np.asarray(poses)
+    if len(poses) == 0:
+        return poses.reshape(0, 7)
+    sel: list[int] = []
+    for i in idxs:
+        if i < 0:
+            i += len(poses)
+        if 0 <= i < len(poses) and i not in sel:
+            sel.append(i)
+    return poses[sel]
 
 
 def _skeleton_trace(pts: np.ndarray) -> go.Scatter3d:
@@ -378,6 +412,60 @@ def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
 
 _EMPTY_FORECAST = np.zeros((1, 3), dtype=np.float32)
 
+# Executed steps per chunk (_CHUNK_EXEC in env_wrapper; duplicated to keep viz
+# free of robot-stack imports).
+_EXEC_STEPS = 5
+# Waypoint marker colorscales, matching multi-fast pcd_viz: base yellow→red,
+# total (student) cyan→blue. Step-k on both traces shares the same color rank so
+# base/total divergence is readable waypoint-by-waypoint.
+_BASE_FCAST_COLORSCALE = [[0.0, "yellow"], [1.0, "red"]]
+_TOTAL_FCAST_COLORSCALE = [[0.0, "cyan"], [1.0, "blue"]]
+
+
+def _forecast_traces(
+    fcast: np.ndarray,
+    colorscale: list,
+    line_color: str,
+    name: str,
+    cmax: int,
+    show_legend: bool = False,
+) -> tuple[go.Scatter3d, go.Scatter3d]:
+    """Build (executed, lookahead) Scatter3d pair for one chunk forecast.
+
+    The first _EXEC_STEPS waypoints (plus the current-EE anchor at index 0) are
+    drawn solid; the remaining horizon is drawn dashed, sharing its first point
+    with the executed segment so the polylines connect. Waypoint markers are
+    colored by within-chunk timestep on a fixed [0, cmax] scale.
+    """
+    fcast = np.asarray(fcast, dtype=np.float32)
+    n = len(fcast)
+    exec_end = min(n, _EXEC_STEPS + 1)
+    executed = fcast[:exec_end]
+    ts_exec = np.arange(exec_end)
+    if n > exec_end:
+        lookahead = fcast[exec_end - 1:]
+        ts_look = np.arange(exec_end - 1, n)
+    else:
+        lookahead = np.zeros((0, 3), dtype=np.float32)
+        ts_look = np.zeros((0,), dtype=np.int64)
+    exec_trace = go.Scatter3d(
+        x=executed[:, 0], y=executed[:, 1], z=executed[:, 2],
+        mode="lines+markers",
+        line=dict(color=line_color, width=5),
+        marker=dict(size=6, color=ts_exec, colorscale=colorscale, cmin=0, cmax=cmax),
+        name=name,
+        showlegend=show_legend,
+    )
+    look_trace = go.Scatter3d(
+        x=lookahead[:, 0], y=lookahead[:, 1], z=lookahead[:, 2],
+        mode="lines+markers",
+        line=dict(color=line_color, width=3, dash="dash"),
+        marker=dict(size=4, color=ts_look, colorscale=colorscale, cmin=0, cmax=cmax),
+        name=f"{name} (lookahead)",
+        showlegend=False,
+    )
+    return exec_trace, look_trace
+
 
 def _active_chunk_event(chunk_events: list[dict], step_idx: int) -> "dict | None":
     """Return the most recent chunk event whose step <= step_idx, or None."""
@@ -417,14 +505,16 @@ def save_episode_html(
     Trace index map (for go.Frame updates):
         0  skeleton            — animated arm FK chain
         1  actual trail        — cumulative actual EE path (FK from obs)
-        2  total chunk forecast — base + residual projected trajectory for active chunk
-        3  base chunk forecast  — base-policy-only projected trajectory for active chunk
-        4  kp metric
-        5  kp_true metric
-        6  kd metric
-        7  kd_true metric
-        8  gripper metric
-        9  point cloud         — only present when recorder.point_clouds contains data
+        2  total chunk forecast — executed segment (base + residual), timestep-colored markers
+        3  base chunk forecast  — executed segment (base only), timestep-colored markers
+        4-6   current EE orientation triad
+        7-9   total forecast triad — final executed waypoint only
+        10-12 base forecast triads — matching executed waypoint + horizon end
+        13-17 kp / kp_true / kd / kd_true / gripper metrics
+        18-20 executed residual rotvec components (rad)
+        21 total forecast lookahead — dashed remainder of the horizon (empty: no residual past _EXEC_STEPS)
+        22 base forecast lookahead  — dashed remainder of the horizon
+        23 point cloud        — only present when recorder.point_clouds contains data
         (static zero-lines appended last, not in any frame update)
 
     Args:
@@ -462,6 +552,11 @@ def save_episode_html(
     kp_arr           = np.array([recorder.kp[i]      for i in indices])
     kd_arr           = np.array([recorder.kd[i]      for i in indices])
     grip_arr         = np.array([recorder.gripper[i] for i in indices])
+    res_grip_arr     = np.array([recorder.res_gripper[i] for i in indices])
+    # Backward compat: recorders predating res_rotvecs plot a zero panel.
+    res_rot_arr      = (np.array([recorder.res_rotvecs[i] for i in indices])
+                        if len(recorder.res_rotvecs) == T_full
+                        else np.zeros((T, 3), dtype=np.float32))  # (T, 3)
     ts               = np.array(indices, dtype=np.float32)
 
     # --- point clouds: transform world→robot and subsample -------------------
@@ -477,9 +572,9 @@ def save_episode_html(
                 pcd_robot.append(empty)
                 continue
             transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
-            if len(transformed) > pcd_max_pts:
-                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
-                transformed = transformed[idx]
+            # if len(transformed) > pcd_max_pts:
+            #     idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
+            #     transformed = transformed[idx]
             pcd_robot.append(transformed)
 
     # --- forward kinematics --------------------------------------------------
@@ -521,14 +616,15 @@ def save_episode_html(
     # Col 1 (65 %): 3D scene spanning all 3 rows.
     # Col 2 (35 %): three stacked 2D panels — kp, kd, gripper.
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=4, cols=2,
         specs=[
-            [{"type": "scene", "rowspan": 3}, {"type": "xy"}],
+            [{"type": "scene", "rowspan": 4}, {"type": "xy"}],
+            [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
         ],
         column_widths=[0.65, 0.35],
-        row_heights=[0.33, 0.33, 0.34],
+        row_heights=[0.25, 0.25, 0.25, 0.25],
         horizontal_spacing=0.04,
         vertical_spacing=0.06,
     )
@@ -549,25 +645,30 @@ def save_episode_html(
                      width=3, marker_size=2),
         row=1, col=1,
     )
-    # Trace 2: total chunk forecast (base + residual projected trajectory)
-    fig.add_trace(
-        _trail_trace(_init_total_fcast, color="royalblue", name="total chunk forecast"),
-        row=1, col=1,
-    )
-    # Trace 3: base chunk forecast (base-policy projected trajectory)
-    fig.add_trace(
-        _trail_trace(_init_base_fcast, color="darkorange", name="base chunk forecast",
-                     dash="dash"),
-        row=1, col=1,
-    )
-    # Trace 4-6: live EE orientation triad.
-    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95):
+    # Fixed marker colorscale ceiling: full horizon length across all events.
+    fcast_cmax = max((len(ev["total_traj"]) for ev in chunk_events), default=2) - 1
+    # Trace 2: total chunk forecast, executed segment only (base + residual).
+    # The residual only modifies the first _EXEC_STEPS deltas, so a "total
+    # lookahead" would just re-plot base deltas; truncate instead (matches
+    # multi-fast pcd_viz, where only the base trajectory gets a lookahead).
+    _init_total_exec, _init_total_look = _forecast_traces(
+        _init_total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
+        "total chunk forecast", fcast_cmax, show_legend=True)
+    fig.add_trace(_init_total_exec, row=1, col=1)
+    # Trace 3: base chunk forecast, executed segment (base-policy only)
+    _init_base_exec, _init_base_look = _forecast_traces(
+        _init_base_fcast, _BASE_FCAST_COLORSCALE, "gray",
+        "base chunk forecast", fcast_cmax, show_legend=True)
+    fig.add_trace(_init_base_exec, row=1, col=1)
+    # Trace 4-6: live EE orientation triad (toggleable via legend).
+    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, width=5, opacity=0.95, legendgroup="current ee"):
         fig.add_trace(axis_trace, row=1, col=1)
-    # Trace 7-9: total forecast orientation triad trail.
-    for axis_trace in _pose_axes_traces(_init_total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68):
+    # Trace 7-9: total forecast triad at the final executed waypoint only.
+    for axis_trace in _pose_axes_traces(_select_poses(_init_total_pose, (_EXEC_STEPS,)), "total forecast triad", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, legendgroup="total triad"):
         fig.add_trace(axis_trace, row=1, col=1)
-    # Trace 10-12: base forecast orientation triad trail.
-    for axis_trace in _pose_axes_traces(_init_base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68):
+    # Trace 10-12: base forecast triads (dashed) at the matching executed waypoint
+    # (direct comparison vs the residual) and at the end of the lookahead horizon.
+    for axis_trace in _pose_axes_traces(_select_poses(_init_base_pose, (_EXEC_STEPS, -1)), "base forecast triad", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, dash="dash", legendgroup="base triad"):
         fig.add_trace(axis_trace, row=1, col=1)
     # Traces 13-14: kp_gain (solid) and kp_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
@@ -584,19 +685,30 @@ def save_episode_html(
         _metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"),
         row=3, col=2,
     )
-    # Trace 18 (optional): point cloud at step 0 in robot space
+    # Traces 18-20: executed residual rotation (rotvec components, rad)
+    for c_idx, (c_color, c_name) in enumerate(zip(_AXIS_COLORS, ("res rx", "res ry", "res rz"))):
+        fig.add_trace(_metric_trace(ts[:1], res_rot_arr[:1, c_idx], c_color, c_name), row=4, col=2)
+    # Traces 21-22: dashed lookahead segments of the two chunk forecasts
+    fig.add_trace(_init_total_look, row=1, col=1)
+    fig.add_trace(_init_base_look, row=1, col=1)
+    # Trace 23 (optional): point cloud at step 0 in robot space
     if has_pcd:
         fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
-
+    # Trace 23 (or 24 if pcd present): res_gripper, same panel as gripper
+    fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
     # --- animation frames ----------------------------------------------------
-    # Traces 0-17 are always animated; trace 18 (point cloud) is added when present.
+    # Traces 0-22 are always animated; trace 23 (point cloud) is added when present.
     # Index mapping:
-    #   0 skeleton  1 actual  2 total  3 base  4-6 current EE axes
-    #   7-9 total forecast axes  10-12 base forecast axes
-    #   13 kp_gain  14 kp_true  15 kd_gain  16 kd_true  17 gripper  [18 point cloud]
-    animated_traces = list(range(18))
+    #   0 skeleton  1 actual  2 total executed  3 base executed  4-6 current EE axes
+    #   7-9 total forecast triad (final executed waypoint)
+    #   10-12 base forecast triads (matching waypoint + horizon end)
+    #   13 kp_gain  14 kp_true  15 kd_gain  16 kd_true  17 gripper  18-20 res rotvec
+    #   21 total lookahead  22 base lookahead  [23 point cloud]
+    animated_traces = list(range(23))
     if has_pcd:
-        animated_traces.append(18)
+        animated_traces.append(23)
+    res_grip_trace_idx = len(fig.data) - 1  # index of the res_gripper trace just added
+    animated_traces.append(res_grip_trace_idx)
 
     frames = []
     for t in range(T):
@@ -628,24 +740,23 @@ def save_episode_html(
                 line=dict(color="slategray", width=3),
                 marker=dict(size=2, color="slategray"),
             ),
-            # 2: total chunk forecast (base + residual full projected trajectory)
-            go.Scatter3d(
-                x=total_fcast[:, 0], y=total_fcast[:, 1], z=total_fcast[:, 2],
-                mode="lines+markers",
-                line=dict(color="royalblue", width=5),
-                marker=dict(size=3, color="royalblue"),
-            ),
-            # 3: base chunk forecast (base-policy full projected trajectory)
-            go.Scatter3d(
-                x=base_fcast[:, 0], y=base_fcast[:, 1], z=base_fcast[:, 2],
-                mode="lines+markers",
-                line=dict(color="darkorange", width=4, dash="dash"),
-                marker=dict(size=3, color="darkorange"),
-            ),
         ]
-        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95))
-        frame_data.extend(_pose_axes_traces(total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68))
-        frame_data.extend(_pose_axes_traces(base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68))
+        # 2-3: executed forecast segments; lookahead pair appended as 18-19 below.
+        # Total forecast is truncated to the executed segment — no residual
+        # exists past _EXEC_STEPS, so its "lookahead" trace stays empty.
+        total_exec_tr, total_look_tr = _forecast_traces(
+            total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
+            "total chunk forecast", fcast_cmax)
+        base_exec_tr, base_look_tr = _forecast_traces(
+            base_fcast, _BASE_FCAST_COLORSCALE, "gray",
+            "base chunk forecast", fcast_cmax)
+        frame_data.append(total_exec_tr)
+        frame_data.append(base_exec_tr)
+        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, width=5, opacity=0.95))
+        # 7-9: total forecast triad at the final executed waypoint only
+        frame_data.extend(_pose_axes_traces(_select_poses(total_pose, (_EXEC_STEPS,)), "total forecast", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8))
+        # 10-12: base forecast triads (dashed) at the matching executed waypoint + horizon end
+        frame_data.extend(_pose_axes_traces(_select_poses(base_pose, (_EXEC_STEPS, -1)), "base forecast", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, dash="dash"))
         frame_data.extend([
             # 13: kp_gain 0..t
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
@@ -662,17 +773,27 @@ def save_episode_html(
             # 17: gripper 0..t
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
+            # 18-20: executed residual rotvec components 0..t
+            *[go.Scatter(x=ts[:t + 1], y=res_rot_arr[:t + 1, c_idx], mode="lines",
+                         line=dict(color=c_color, width=2))
+              for c_idx, c_color in enumerate(_AXIS_COLORS)],
         ])
+        # 21-22: dashed lookahead segments of the two chunk forecasts
+        frame_data.append(total_look_tr)
+        frame_data.append(base_look_tr)
         if has_pcd:
             pts = pcd_robot[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
-            # 18: point cloud at step t
+            # 23: point cloud at step t
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
                 marker=_pcd_marker(pts),
             ))
+        # res_gripper 0..t
+        frame_data.append(go.Scatter(x=ts[:t + 1], y=res_grip_arr[:t + 1], mode="lines",
+                                     line=dict(color="goldenrod", width=2)))
         frames.append(
             go.Frame(data=frame_data, traces=animated_traces, name=str(t))
         )
@@ -741,23 +862,21 @@ def save_episode_html(
     fig.update_yaxes(title_text="kp",      row=1, col=2)
     fig.update_yaxes(title_text="kd",      row=2, col=2)
     fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(title_text="res rot (rad)", row=4, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=3, col=2)
+    fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=4, col=2)
 
-    # Zero-reference lines for kp and kd (static — appended after the 7 animated
-    # traces so go.Frame updates don't touch them).
+    # Zero-reference lines for kp, kd, and residual rotation (static — appended
+    # after the animated traces so go.Frame updates don't touch them).
     _zero_line = dict(color="black", width=1, dash="dot")
-    fig.add_trace(
-        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
-                   line=_zero_line, showlegend=False, hoverinfo="skip"),
-        row=1, col=2,
-    )
-    fig.add_trace(
-        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
-                   line=_zero_line, showlegend=False, hoverinfo="skip"),
-        row=2, col=2,
-    )
+    for _zl_row in (1, 2, 4):
+        fig.add_trace(
+            go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
+                       line=_zero_line, showlegend=False, hoverinfo="skip"),
+            row=_zl_row, col=2,
+        )
 
     fig.write_html(path, include_plotlyjs="cdn")
 
@@ -812,6 +931,7 @@ def save_rollout_html(
     kp_arr         = np.array([recorder.kp[i]      for i in indices])
     kd_arr         = np.array([recorder.kd[i]      for i in indices])
     grip_arr       = np.array([recorder.gripper[i] for i in indices])
+    res_grip_arr       = np.array([recorder.res_gripper[i] for i in indices])
     ts             = np.array(indices, dtype=np.float32)
 
     R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
@@ -910,10 +1030,12 @@ def save_rollout_html(
     # Trace 14 (optional): point cloud
     if has_pcd:
         fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+    fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
 
     animated_traces = list(range(14))
     if has_pcd:
         animated_traces.append(14)
+    animated_traces.append(len(fig.data) - 1)
 
     frames = []
     for t in range(T):
@@ -970,6 +1092,8 @@ def save_rollout_html(
                 mode="markers",
                 marker=_pcd_marker(pts),
             ))
+        frame_data.append(go.Scatter(x=ts[:t + 1], y=res_grip_arr[:t + 1], mode="lines",
+                                     line=dict(color="goldenrod", width=2)))
         frames.append(go.Frame(data=frame_data, traces=animated_traces, name=str(t)))
     fig.frames = frames
 

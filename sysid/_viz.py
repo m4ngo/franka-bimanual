@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from scipy.spatial.transform import Rotation
 
 _HERE = Path(__file__).resolve().parent
 
@@ -24,6 +25,88 @@ franka_fk_chain = _fk_mod.franka_fk_chain
 
 # Offset subtracted from world-frame eef_pos to recover robot base frame.
 WORLD_FRAME_OFFSET = np.array([-0.66, 0.0, 0.912])
+
+# --- EE orientation triad settings (mirrors residual wrapper's viz) ---------
+_FORECAST_AXIS_LENGTH = 0.038
+_REF_AXIS_COLORS = (
+    "rgba(235, 95, 35, 0.82)",
+    "rgba(95, 180, 70, 0.82)",
+    "rgba(55, 120, 220, 0.82)",
+)
+_REP_AXIS_COLORS = (
+    "rgba(220, 40, 40, 0.92)",
+    "rgba(40, 170, 80, 0.92)",
+    "rgba(50, 90, 235, 0.92)",
+)
+
+
+def _fk_pose(q: np.ndarray) -> np.ndarray:
+    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q."""
+    chain = franka_fk_chain(q)
+    pose = np.empty(7, dtype=np.float32)
+    pose[:3] = chain[7, :3, 3]
+    pose[3:] = Rotation.from_matrix(chain[7, :3, :3]).as_quat().astype(np.float32)
+    return pose
+
+
+def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
+    """Return (T, 7) EE poses for a list of joint-angle vectors."""
+    return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
+
+
+def _pose_axis_segments(poses: np.ndarray, axis_idx: int, length: float) -> tuple[list[float | None], list[float | None], list[float | None]]:
+    """Return line-segment coordinates for a colored local axis over a pose list."""
+    poses = np.asarray(poses, dtype=np.float64)
+    if len(poses) == 0:
+        return [], [], []
+
+    xs: list[float | None] = []
+    ys: list[float | None] = []
+    zs: list[float | None] = []
+    for pose in poses:
+        origin = pose[:3]
+        rot = Rotation.from_quat(pose[3:7]).as_matrix()
+        tip = origin + rot[:, axis_idx] * length
+        xs.extend([float(origin[0]), float(tip[0]), None])
+        ys.extend([float(origin[1]), float(tip[1]), None])
+        zs.extend([float(origin[2]), float(tip[2]), None])
+    return xs, ys, zs
+
+
+def _pose_axes_traces(
+    poses: np.ndarray,
+    name_prefix: str,
+    length: float,
+    colors: tuple[str, str, str],
+    width: int = 4,
+    opacity: float = 1.0,
+    dash: str = "solid",
+    legendgroup: str | None = None,
+) -> list[go.Scatter3d]:
+    """Build three local x/y/z axis traces for a pose trajectory.
+
+    All triads share the same RGB axis colors so x/y/z correspondence holds
+    across series; groups are told apart by color family and by toggling.
+    When legendgroup is set, the first axis trace carries a legend entry that
+    toggles the whole triad (plotly's default groupclick).
+    """
+    traces: list[go.Scatter3d] = []
+    for axis_idx, color in enumerate(colors):
+        xs, ys, zs = _pose_axis_segments(poses, axis_idx, length)
+        traces.append(
+            go.Scatter3d(
+                x=xs, y=ys, z=zs,
+                mode="lines",
+                line=dict(color=color, width=width, dash=dash),
+                opacity=opacity,
+                name=name_prefix if (legendgroup and axis_idx == 0) else f"{name_prefix} axis {axis_idx}",
+                legendgroup=legendgroup,
+                showlegend=bool(legendgroup) and axis_idx == 0,
+                hoverinfo="skip",
+            )
+        )
+    return traces
+
 
 def compute_trajectory_errors(
     ref: dict[str, np.ndarray],
@@ -130,6 +213,8 @@ def save_comparison_html(
     Left (65 %)  : animated arm skeleton + trails:
                      reference EE path (growing, dashed orange — current step)
                      replayed EE path (growing, solid blue — current step)
+                     reference EE orientation triad (animated, orange-family axes)
+                     replayed EE orientation triad (animated, red/green/blue axes)
     Right (35 %) : three stacked time-series panels (static full data + moving cursor):
                      row 1  per-axis position error (x/y/z)
                      row 2  L2 position error norm
@@ -179,6 +264,11 @@ def save_comparison_html(
 
     rep_skeletons = _build_skeletons(rep_q_s) if rep_q_s is not None else None
     ref_skeletons = _build_skeletons(ref_q_s) if ref_q_s is not None else None
+
+    # Pre-compute EE orientation poses (quat) in robot frame, in sync with the
+    # skeletons above, for the animated orientation triads.
+    ref_poses = _poses_from_qs(ref_q_s) if ref_q_s is not None else None
+    rep_poses = _poses_from_qs(rep_q_s) if rep_q_s is not None else None
 
     # -----------------------------------------------------------------------
     fig = make_subplots(
@@ -312,6 +402,24 @@ def save_comparison_html(
         name="replayed EE",
     ), 1, 1)
 
+    # --- Reference EE orientation triad (animated, x/y/z axes) ---
+    ref_pose0 = ref_poses[:1] if ref_poses is not None else np.zeros((0, 7), dtype=np.float32)
+    for axis_trace in _pose_axes_traces(
+        ref_pose0, "reference ee", _FORECAST_AXIS_LENGTH,
+        colors=_REF_AXIS_COLORS, width=4, opacity=0.85,
+        dash="dash", legendgroup="reference ee",
+    ):
+        _add_anim(axis_trace, 1, 1)
+
+    # --- Replayed EE orientation triad (animated, x/y/z axes) ---
+    rep_pose0 = rep_poses[:1] if rep_poses is not None else np.zeros((0, 7), dtype=np.float32)
+    for axis_trace in _pose_axes_traces(
+        rep_pose0, "replayed ee", _FORECAST_AXIS_LENGTH,
+        colors=_REP_AXIS_COLORS, width=5, opacity=0.95,
+        legendgroup="replayed ee",
+    ):
+        _add_anim(axis_trace, 1, 1)
+
     def _yrange(arr, pad=0.05):
         lo, hi = float(arr.min()), float(arr.max())
         span = max(hi - lo, 0.01)
@@ -374,6 +482,20 @@ def save_comparison_html(
             mode="lines+markers",
             line=dict(color="royalblue", width=4),
             marker=dict(size=3, color="royalblue"),
+        ))
+
+        # Reference EE orientation triad at this frame (single pose -> 3 axis traces)
+        ref_pose_fi = ref_poses[fi:fi + 1] if ref_poses is not None else np.zeros((0, 7), dtype=np.float32)
+        fd.extend(_pose_axes_traces(
+            ref_pose_fi, "reference ee", _FORECAST_AXIS_LENGTH,
+            colors=_REF_AXIS_COLORS, width=4, opacity=0.85, dash="dash",
+        ))
+
+        # Replayed EE orientation triad at this frame
+        rep_pose_fi = rep_poses[fi:fi + 1] if rep_poses is not None else np.zeros((0, 7), dtype=np.float32)
+        fd.extend(_pose_axes_traces(
+            rep_pose_fi, "replayed ee", _FORECAST_AXIS_LENGTH,
+            colors=_REP_AXIS_COLORS, width=5, opacity=0.95,
         ))
 
         fd.append(_cursor(float(t_val), *yr_err))
