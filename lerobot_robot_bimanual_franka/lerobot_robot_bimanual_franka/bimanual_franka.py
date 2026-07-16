@@ -35,8 +35,8 @@ _KP_GAIN_BASE = 10.0
 _KD_GAIN_BASE = 1.0
 OSC_BASE_KP = 5.0
 
-_EE_TRANSLATION_FUDGE_FACTOR = 1.75
-_EE_ROTATION_FUDGE_FACTOR = 0.01
+_EE_TRANSLATION_FUDGE_FACTOR = 1.2
+_EE_ROTATION_FUDGE_FACTOR = 0.005
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -245,19 +245,20 @@ class BimanualFranka(Robot):
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
             # Submit both depth reads concurrently; get_full_point_cloud only reads
             # the already-cached _last_depth so both are pure CPU work with no I/O.
-            depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_depth"))
-            full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
+            # depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_depth"))
+            depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
+            # full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
             verts = depth_fut.result()
-            full_pcd = full_pcd_fut.result()
+            # full_pcd = full_pcd_fut.result()
+            full_pcd = verts
             if len(full_pcd) > 0:
                 xyz = full_pcd[:, :3]
                 dist2 = np.einsum("ij,ij->i", xyz, xyz)
                 full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
             self._last_full_point_cloud = full_pcd
             ee_world = self._ee_world_center(kin)
-            flat = self._sample_depth_points(verts, ee_world).reshape(-1)
-            for i, v in enumerate(flat):
-                obs[f"depth_{i}"] = float(v)
+            flat = self._sample_depth_points(verts, ee_world).reshape(-1).astype(np.float64)
+            obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
@@ -265,10 +266,15 @@ class BimanualFranka(Robot):
         ee_robot = np.asarray(kin[arm][3], dtype=np.float64)
         return self._r_robot_in_world @ ee_robot + self._t_robot_in_world
 
-    def _sample_depth_points(self, verts: list[tuple[float, float, float]], center: np.ndarray) -> np.ndarray:
-        points = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    def _sample_depth_points(self, verts: np.ndarray, center: np.ndarray) -> np.ndarray:
+        points = np.asarray(verts, dtype=np.float64)
         if points.size == 0:
             return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            raise ValueError(
+                f"expected (N, 3) or (N, 3+C) point cloud, got shape {points.shape}"
+            )
+        points = points[:, :3]
 
         points = points[np.isfinite(points).all(axis=1)]
         if points.shape[0] == 0:
@@ -277,15 +283,17 @@ class BimanualFranka(Robot):
         deltas = points - center.reshape(1, 3)
         dist2 = np.einsum("ij,ij->i", deltas, deltas)
         cropped = points[dist2 <= (self._depth_crop_radius_m ** 2)]
+        total = cropped.shape[0]
 
-        if cropped.shape[0] == 0:
+        if total == 0:
             sampled = np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float64)
-        elif cropped.shape[0] >= _DEPTH_POINT_COUNT:
-            idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
-            sampled = cropped[idx]
         else:
-            reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
-            sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
+            # idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
+            idx = np.random.choice(np.arange(0,total), size=_DEPTH_POINT_COUNT, replace=False)
+            sampled = cropped[idx]
+        # else:
+        #     reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
+        #     sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
 
         return np.asarray(sampled, dtype=np.float32)
 
@@ -526,7 +534,7 @@ class BimanualFranka(Robot):
                 axis = drot_cached / angle
                 s, c = np.sin(angle / 2.0), np.cos(angle / 2.0)
                 bx, by, bz, bw = axis[0] * s, axis[1] * s, axis[2] * s, c
-                gx, gy, gz, gw = self._goal_quat_xyzw[arm]
+                gx, gy, gz, gw = goal_quat_xyzw
                 composed = np.array([
                     bw * gx + bx * gw + by * gz - bz * gy,
                     bw * gy - bx * gz + by * gw + bz * gx,
