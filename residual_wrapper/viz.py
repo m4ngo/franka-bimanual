@@ -86,6 +86,8 @@ class EpisodeRecorder:
         self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
         # Per-inference chunk forecast events, sorted by ascending step index.
         self.chunk_events: list[dict] = []
+        # Per-inference network-input clouds (post crop/downsample/re-centering).
+        self.policy_pcd_events: list[dict] = []
 
     def record(
         self,
@@ -161,6 +163,19 @@ class EpisodeRecorder:
             "total_traj": np.asarray(total_traj, dtype=np.float32).copy(),
             "base_traj_pose": base_traj_pose_arr,
             "total_traj_pose": total_traj_pose_arr,
+        })
+
+    def record_policy_pcd(self, step: int, pcd: np.ndarray) -> None:
+        """Record the exact cloud fed to the residual network at one inference event.
+
+        Args:
+            step: Episode step index at inference time.
+            pcd:  (N, 3) float array, already cropped/downsampled/re-centered —
+                  taken verbatim from ResidualPolicy.last_network_pcd.
+        """
+        self.policy_pcd_events.append({
+            "step": int(step),
+            "pcd": np.asarray(pcd, dtype=np.float32).copy(),
         })
 
     def __len__(self) -> int:
@@ -1028,6 +1043,163 @@ def save_rollout_html(
         go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
                    line=_zero_line, showlegend=False, hoverinfo="skip"),
         row=2, col=2,
+    )
+
+    fig.write_html(path, include_plotlyjs="cdn")
+
+
+def save_policy_pcd_npz(
+    events: list[dict],
+    path: str,
+    center_on_eef: bool = False,
+    fps: float = 20.0,
+) -> None:
+    """Save per-inference network-input clouds for offline comparison plotting.
+
+    Companion to plot_policy_pcd.py, which overlays any number of these dumps
+    (e.g. real vs sim rollouts) in one animated HTML.
+
+    Args:
+        events:        recorder.policy_pcd_events — list of {"step", "pcd"}.
+        path:          output .npz path.
+        center_on_eef: whether the clouds are EE-centered (from the checkpoint).
+        fps:           control-loop fps, stored for animation timing.
+    """
+    if not events:
+        return
+    np.savez_compressed(
+        path,
+        pcds=np.stack([ev["pcd"][:, :3] for ev in events]).astype(np.float32),
+        steps=np.array([ev["step"] for ev in events], dtype=np.int64),
+        center_on_eef=np.bool_(center_on_eef),
+        fps=np.float64(fps),
+    )
+
+
+_SERIES_COLORS = ("dimgray", "crimson", "royalblue", "darkorange", "seagreen", "purple")
+
+
+def save_policy_pcd_html(
+    series: list[tuple[str, list[dict]]],
+    path: str,
+    title: str = "Network-input point cloud",
+    frame_stride: int = 1,
+    fps: float = 20.0,
+) -> None:
+    """Write an animated Plotly HTML overlaying network-input clouds per series.
+
+    One frame per inference event. Each series (e.g. a real rollout and a sim
+    rollout) gets a flat color; a series shorter than the longest one holds its
+    last cloud for the remaining frames.
+
+    Args:
+        series:       list of (label, events) where events is a list of
+                      {"step", "pcd"} dicts as recorded by record_policy_pcd.
+        path:         output HTML path.
+        title:        figure title.
+        frame_stride: animate every Nth inference event.
+        fps:          control-loop fps; sets frame duration via the chunk period.
+    """
+    stride = max(1, int(frame_stride))
+    series = [(label, events[::stride]) for label, events in series if events]
+    if not series:
+        return
+    n_frames = max(len(events) for _, events in series)
+    # Slider labels come from the longest series' step indices.
+    label_events = max(series, key=lambda s: len(s[1]))[1]
+
+    # Shared cubic axis range across all frames so the animation doesn't rescale.
+    all_pts = np.concatenate(
+        [ev["pcd"][:, :3] for _, events in series for ev in events], axis=0
+    )
+    lo = all_pts.min(axis=0)
+    hi = all_pts.max(axis=0)
+    center = (lo + hi) / 2.0
+    half = max(float((hi - lo).max()) / 2.0, 0.05) * 1.05
+    x_range = [float(center[0] - half), float(center[0] + half)]
+    y_range = [float(center[1] - half), float(center[1] + half)]
+    z_range = [float(center[2] - half), float(center[2] + half)]
+
+    def _series_trace(s_idx: int, label: str, pts: np.ndarray) -> go.Scatter3d:
+        return go.Scatter3d(
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+            mode="markers",
+            marker=dict(size=4, color=_SERIES_COLORS[s_idx % len(_SERIES_COLORS)], opacity=0.55),
+            name=label,
+        )
+
+    def _frame_data(i: int) -> list[go.Scatter3d]:
+        # Hold the last cloud when a series has fewer events than the longest.
+        return [
+            _series_trace(s, label, events[min(i, len(events) - 1)]["pcd"])
+            for s, (label, events) in enumerate(series)
+        ]
+
+    # Traces 0..M-1: animated clouds. Trace M: static origin marker — the EE
+    # position for center_on_eef checkpoints, the world origin otherwise.
+    fig = go.Figure(
+        data=[
+            *_frame_data(0),
+            go.Scatter3d(
+                x=[0.0], y=[0.0], z=[0.0], mode="markers",
+                marker=dict(size=8, color="gold", symbol="diamond"),
+                name="origin / EE",
+            ),
+        ],
+        frames=[
+            go.Frame(data=_frame_data(i), traces=list(range(len(series))), name=str(i))
+            for i in range(n_frames)
+        ],
+    )
+
+    # Real time between inference events (one chunk = _CHUNK_EXEC steps).
+    frame_duration_ms = int(1000.0 * 5 * frame_stride / max(fps, 1e-6))
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis=dict(range=x_range, autorange=False, title="x (m)"),
+            yaxis=dict(range=y_range, autorange=False, title="y (m)"),
+            zaxis=dict(range=z_range, autorange=False, title="z (m)"),
+            aspectmode="cube",
+        ),
+        updatemenus=[dict(
+            type="buttons",
+            showactive=False,
+            x=0.0, y=0.0, xanchor="left", yanchor="top",
+            buttons=[
+                dict(
+                    label="Play",
+                    method="animate",
+                    args=[None, dict(
+                        frame=dict(duration=frame_duration_ms, redraw=True),
+                        fromcurrent=True,
+                        transition=dict(duration=0),
+                    )],
+                ),
+                dict(
+                    label="Pause",
+                    method="animate",
+                    args=[[None], dict(
+                        frame=dict(duration=0, redraw=False),
+                        mode="immediate",
+                    )],
+                ),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="step: "),
+            pad=dict(t=40),
+            steps=[dict(
+                method="animate",
+                args=[[str(i)], dict(
+                    mode="immediate",
+                    frame=dict(duration=0, redraw=True),
+                    transition=dict(duration=0),
+                )],
+                label=str(label_events[min(i, len(label_events) - 1)]["step"]),
+            ) for i in range(n_frames)],
+        )],
     )
 
     fig.write_html(path, include_plotlyjs="cdn")

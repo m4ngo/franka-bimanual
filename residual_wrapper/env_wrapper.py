@@ -41,6 +41,24 @@ def current_ee_pose(obs: dict) -> np.ndarray:
     return np.concatenate([pos, quat_xyzw, [obs["r_gripper"]]]).astype(np.float32)
 
 
+def ee_pose_to_world(
+    ee_pose: np.ndarray,
+    r_robot_in_world: np.ndarray,
+    t_robot_in_world: np.ndarray,
+) -> np.ndarray:
+    """Map [x, y, z, qx, qy, qz, qw, gripper] from robot base frame to world frame.
+
+    The depth-camera point cloud is produced in world frame, but franka_fk
+    returns the EE pose in the robot base frame; use this before any
+    subtraction/comparison between the two (e.g. center_on_eef proprio).
+    """
+    out = ee_pose.copy()
+    out[:3] = (r_robot_in_world @ ee_pose[:3].astype(np.float64) + t_robot_in_world).astype(np.float32)
+    q_world = Rotation.from_matrix(r_robot_in_world) * Rotation.from_quat(ee_pose[3:7])
+    out[3:7] = q_world.as_quat().astype(np.float32)
+    return out
+
+
 def split_gripper(obs: np.ndarray) -> np.ndarray:
     grip: float = obs[7]
     return np.concatenate([obs, np.array([-grip], dtype=np.float32)])
@@ -110,7 +128,7 @@ def start_controller() -> SingleArmFranka:
         r_robot_ip="192.168.201.10",
         r_gripper_ip="192.168.201.10",
         r_port=18812,
-        control_mode="EE_DELTA",
+        control_mode="EE_DELTA"
     )
     robot = SingleArmFranka(config)
     robot.connect()

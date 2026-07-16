@@ -152,6 +152,9 @@ class ResidualPolicy:
 
         data_kwargs = ckpt.get("data_kwargs", {})
         self.center_on_eef: bool = bool(data_kwargs.get("center_on_eef", False))
+        # Exact cloud fed to the network on the most recent infer() call
+        # (post crop/downsample/re-centering); for diagnostics.
+        self.last_network_pcd: np.ndarray | None = None
         logger.info(
             "ResidualPolicy loaded: cls=%s encoder=%s center_on_eef=%s",
             policy_cls.__name__, encoder_type, self.center_on_eef,
@@ -185,6 +188,7 @@ class ResidualPolicy:
         if self.center_on_eef:
             pcd = pcd.copy()
             pcd[:, :3] -= proprio[:3]  # subtract EEF xyz
+        self.last_network_pcd = pcd
 
         pcd_t = torch.as_tensor(pcd, dtype=torch.float32, device=self.device).unsqueeze(0)
         proprio_t = torch.as_tensor(proprio, dtype=torch.float32, device=self.device).unsqueeze(0)

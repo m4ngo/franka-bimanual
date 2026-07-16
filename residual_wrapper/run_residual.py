@@ -15,9 +15,10 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import env_wrapper
-from viz import EpisodeRecorder, save_episode_html, save_rollout_html
+from viz import EpisodeRecorder, save_episode_html, save_rollout_html, save_policy_pcd_npz
 from viz import _propagate_pose_traj
 from env_wrapper import (
+    ee_pose_to_world,
     _ACTION_KEYS,
     _CHUNK_EXEC,
     _RESIDUAL_HORIZON,
@@ -153,7 +154,8 @@ def _run_episode(
     fps: float = 20.0,
     task: str = "",
     recorder: "EpisodeRecorder | None" = None,
-    replaying: bool = False
+    replaying: bool = False,
+    proprio_frame: str = "robot",
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -195,13 +197,19 @@ def _run_episode(
                 if key == "right":
                     print("\r\nearly stop requested", flush=True)
                     break
-
+            
+            # times = []
+            # times.append(time.perf_counter())
             obs = controller.get_observation()
+            # times.append(time.perf_counter())
             ee_pose = current_ee_pose(obs)
+            # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
+            # times.append(time.perf_counter())
 
             if chunk_used >= _CHUNK_EXEC:
                 base_chunk = base_policy.infer(obs_no_depth)
+                # times.append(time.perf_counter())
                 chunk_used = 0
 
                 if residual is not None:
@@ -211,12 +219,23 @@ def _run_episode(
                     else:
                         vel = kin['r'][5]
                     point_cloud = extract_point_cloud(obs)
+                    # The cloud is world-frame; franka_fk is robot-frame. In world
+                    # mode, map the proprio pose into world so center_on_eef
+                    # subtracts a point in the same frame as the cloud.
+                    if proprio_frame == "world":
+                        proprio_pose = ee_pose_to_world(
+                            ee_pose,
+                            controller._r_robot_in_world,
+                            controller._t_robot_in_world,
+                        )
+                    else:
+                        proprio_pose = ee_pose
                     # base_chunk = np.repeat(base_chunk, 2, axis=0)
                     processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
                         "proprio": np.concatenate([
-                            split_gripper(ee_pose).astype(np.float32),
+                            split_gripper(proprio_pose).astype(np.float32),
                             np.array([controller.kp_gain, controller.kd_gain], dtype=np.float32),
                             np.asarray(vel, dtype=np.float32),
                         ]),
@@ -224,6 +243,8 @@ def _run_episode(
                         "gains": np.array([prev_kp, prev_kd], dtype=np.float32),
                     }
                     res_chunk = residual.infer(residual_obs)
+                    if recorder is not None and residual.last_network_pcd is not None:
+                        recorder.record_policy_pcd(len(recorder), residual.last_network_pcd)
 
                 if recorder is not None:
                     ee3 = ee_pose[:3].astype(np.float32)
@@ -292,7 +313,8 @@ def _run_episode(
                     kp=kp,
                     kd=kd,
                     gripper=action["r_gripper"],
-                    point_cloud=controller.last_full_point_cloud,
+                    # point_cloud=controller.last_full_point_cloud,
+                    point_cloud=point_cloud,
                 )
 
             if dataset is not None:
@@ -323,6 +345,8 @@ def _run_episode(
 
             elapsed = time.perf_counter() - t_step
             sleep_s = dt - elapsed
+            # times.append(time.perf_counter())  # NEW: t6, before sleep
+            # print(times, "sleep_s=", sleep_s)
             if sleep_s > 0:
                 time.sleep(sleep_s)
     finally:
@@ -348,6 +372,11 @@ def _save_viz(
     else:
         save_episode_html(recorder, path, title=f"residual — {title}",
                           frame_stride=frame_stride, fps=fps)
+    if recorder.policy_pcd_events:
+        pcd_path = (path[:-len(".html")] if path.endswith(".html") else path) + "_policy_pcd.npz"
+        centered = residual is not None and residual.center_on_eef
+        save_policy_pcd_npz(recorder.policy_pcd_events, pcd_path, center_on_eef=centered, fps=fps)
+        print(f"saved policy-input clouds to {pcd_path} (plot with plot_policy_pcd.py)")
 
 
 def _str2bool(v: str) -> bool:
@@ -364,10 +393,14 @@ def main() -> None:
     )
     parser.add_argument("--no-residual", action="store_true",
                         help="Disable the residual policy; run base policy only")
+    parser.add_argument("--proprio-frame", choices=("robot", "world"), default="robot",
+                        help="Frame for the residual proprio pose: 'robot' = raw franka_fk "
+                             "(current behavior), 'world' = transformed to the world frame "
+                             "the point cloud lives in")
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu)")
     parser.add_argument(
         "--home-pose-name",
-        default=None,
+        default="home_pose",
         help=f"Name of a saved pose JSON in {_POSES_DIR} (overrides --home-q)",
     )
     parser.add_argument(
@@ -462,7 +495,8 @@ def main() -> None:
                     controller, base_policy, residual,
                     dataset=None, episode_time_s=None,
                     fps=args.fps, recorder=recorder,
-                    replaying=args.replay_dataset is not None
+                    replaying=args.replay_dataset is not None,
+                    proprio_frame=args.proprio_frame,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -497,7 +531,8 @@ def main() -> None:
                         fps=args.fps,
                         task=args.task,
                         recorder=recorder,
-                        replaying=args.replay_dataset is not None
+                        replaying=args.replay_dataset is not None,
+                        proprio_frame=args.proprio_frame,
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:
