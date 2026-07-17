@@ -1,0 +1,103 @@
+{
+  "status": "aborted",
+  "timestamp": "2026-07-16T21:11:00-07:00",
+  "hostname": "deepblue.cs.washington.edu",
+  "argv": [
+    "sysid/sysid.py",
+    "/home/franka/sysid/sim_rotation_only/data.hdf5"
+  ],
+  "args": {
+    "traj_file": "/home/franka/sysid/sim_rotation_only/data.hdf5",
+    "fps": 20.0,
+    "kp": 0.0,
+    "kd": 0.0,
+    "gripper_norm": 1.0,
+    "home_max_time_s": 5.0,
+    "home_tol_rad": 0.005,
+    "home_tol_m": 0.005,
+    "viz_stride": 1,
+    "out_root": null,
+    "tag": null
+  },
+  "traj_file": "/home/franka/sysid/sim_rotation_only/data.hdf5",
+  "traj_file_sha256": "ce29d6af389ccd1c0dba9dffe245fc055eac6e2ff649a86ef8e51f01177f8ab7",
+  "episodes": [
+    "traj_sine_ax3_a0.5_f0.25_rep0",
+    "traj_sine_ax3_a0.5_f0.5_rep0",
+    "traj_sine_ax3_a0.5_f1_rep0",
+    "traj_sine_ax3_a1_f0.25_rep0",
+    "traj_sine_ax3_a1_f0.5_rep0",
+    "traj_sine_ax3_a1_f1_rep0",
+    "traj_sine_ax4_a0.5_f0.25_rep0",
+    "traj_sine_ax4_a0.5_f0.5_rep0",
+    "traj_sine_ax4_a0.5_f1_rep0",
+    "traj_sine_ax4_a1_f0.25_rep0",
+    "traj_sine_ax4_a1_f0.5_rep0",
+    "traj_sine_ax4_a1_f1_rep0",
+    "traj_sine_ax5_a0.5_f0.25_rep0",
+    "traj_sine_ax5_a0.5_f0.5_rep0",
+    "traj_sine_ax5_a0.5_f1_rep0",
+    "traj_sine_ax5_a1_f0.25_rep0",
+    "traj_sine_ax5_a1_f0.5_rep0",
+    "traj_sine_ax5_a1_f1_rep0"
+  ],
+  "episodes_completed": [],
+  "derived_gains": {
+    "kp_gain": 1.0,
+    "effective_velocity_kp": 5.0,
+    "kd_note": "kd action is inert on this stack (_KD_GAIN_BASE == 1.0; OSCVelocityController's law has no kd term)"
+  },
+  "constants": {
+    "bimanual_franka": {
+      "_EE_TRANSLATION_FUDGE_FACTOR": 1.2,
+      "_EE_ROTATION_FUDGE_FACTOR": 0.9,
+      "OSC_BASE_KP": 5.0,
+      "_KP_GAIN_BASE": 10.0,
+      "_KD_GAIN_BASE": 1.0,
+      "EE_PD_KP": 3.5,
+      "EE_PD_KD": 0.2,
+      "JOINT_PD_KP": 2.0,
+      "JOINT_PD_KD": 0.1
+    },
+    "osc_velocity_controller": {
+      "DEFAULT_KP": 3.5,
+      "DEFAULT_DAMPING_RATIO": 1.0,
+      "DEFAULT_NULLSPACE_KP": 1.0,
+      "DEFAULT_DLS_DAMPING": 0.01,
+      "DEFAULT_MAX_QDOT": 2.5
+    },
+    "safety": {
+      "JOINT_VELOCITY_MAX": 2.0,
+      "EE_LINEAR_VELOCITY_MAX": 1.0,
+      "EE_ANGULAR_VELOCITY_MAX": 2.0,
+      "WORKTABLE_HEIGHT": 0.11,
+      "WORKTABLE_DISTANCE_MIN": 0.03,
+      "WORKTABLE_MAX_DECEL": 0.5,
+      "CUSTOM_END_EFFECTOR_Z_EXTENSION": 0.0
+    },
+    "franka_process": {
+      "VELOCITY_COMMAND_DURATION_MS": 100,
+      "_JOINT_RELATIVE_DYNAMICS": [
+        1.0,
+        0.25,
+        1.0
+      ],
+      "_EE_DELTA_RELATIVE_DYNAMICS": [
+        1.0,
+        0.25,
+        1.0
+      ],
+      "_JOINT_STIFFNESS": [
+        350.0,
+        350.0,
+        300.0,
+        500.0,
+        350.0,
+        150.0,
+        150.0
+      ],
+      "_TORQUE_THRESHOLD": 100.0,
+      "_FORCE_THRESHOLD": 200.0
+    }
+  }
+}

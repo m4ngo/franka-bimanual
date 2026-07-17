@@ -236,6 +236,69 @@ class FramosCamera(Camera):
         self._profile = None
         self._aligner = None
 
+    def get_cropped_point_cloud(
+        self,
+        center: np.ndarray | None = None,
+        radius_m: float | None = None,
+        num_points: int = 2048,
+    ) -> np.ndarray:
+        """Project depth to world space, optionally crop to a sphere around `center`,
+        then randomly subsample to `num_points`. Cropping/downsampling happens here,
+        before the array crosses the thread-pool boundary, so far fewer points get
+        unprojected/copied than in the old full-cloud path.
+        """
+        depth_image = self._last_depth
+        if depth_image is None:
+            return np.zeros((num_points, 3), dtype=np.float32)
+
+        depth_m = np.asarray(depth_image, dtype=np.float32) * self._depth_scale
+        valid = np.isfinite(depth_m) & (depth_m > 0.0)
+        if not np.any(valid):
+            return np.zeros((num_points, 3), dtype=np.float32)
+
+        yy, xx = np.nonzero(valid)
+        z = depth_m[yy, xx]
+        fx = float(self._intrinsics[0, 0])
+        fy = float(self._intrinsics[1, 1])
+        cx = float(self._intrinsics[0, 2])
+        cy = float(self._intrinsics[1, 2])
+
+        # --- cheap pre-crop in camera frame, before the R/t matmul, when possible ---
+        # If center is given, convert it into camera frame first so we can reject
+        # points before doing the full world transform on them.
+        if center is not None and radius_m is not None:
+            # center_cam = R^T @ (center_world - t)
+            center_cam = self._r_world_from_cam.T @ (np.asarray(center, dtype=np.float64) - self._t_world_from_cam)
+            x_cam = (xx.astype(np.float64) - cx) * z / fx
+            y_cam = (yy.astype(np.float64) - cy) * z / fy
+            d2 = (x_cam - center_cam[0]) ** 2 + (y_cam - center_cam[1]) ** 2 + (z - center_cam[2]) ** 2
+            keep = d2 <= (radius_m ** 2)
+            if not np.any(keep):
+                return np.zeros((num_points, 3), dtype=np.float32)
+            yy, xx, z = yy[keep], xx[keep], z[keep]
+
+        x = (xx.astype(np.float32) - cx) * z / fx
+        y = (yy.astype(np.float32) - cy) * z / fy
+        cam_points = np.stack((x, y, z), axis=1).astype(np.float64, copy=False)
+        world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+
+        # Exact crop in world frame too (camera-frame crop above is a sphere in cam
+        # space, which is the same sphere in world space since rotation/translation
+        # preserve distances -- but keep this as a safety net / handles center=None).
+        if center is not None and radius_m is not None:
+            deltas = world_points - np.asarray(center, dtype=np.float64).reshape(1, 3)
+            dist2 = np.einsum("ij,ij->i", deltas, deltas)
+            world_points = world_points[dist2 <= (radius_m ** 2)]
+
+        total = world_points.shape[0]
+        if total == 0:
+            return np.zeros((num_points, 3), dtype=np.float32)
+        if total >= num_points:
+            idx = np.random.choice(total, size=num_points, replace=False)
+        else:
+            idx = np.random.choice(total, size=num_points, replace=True)
+        return world_points[idx].astype(np.float32)
+
     def get_full_point_cloud(self) -> np.ndarray:
         """Return ALL valid depth pixels projected to world space.
 

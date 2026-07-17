@@ -81,10 +81,12 @@ class BimanualFranka(Robot):
         self._gripper_accum: dict[str, float] = {arm: 1.0 for arm in self.active_arms}
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
-        if config.depth_cam[0] in self.cameras.keys():
-            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], None)
-        else:
-            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], _make_camera(config.depth_cam[1]))
+        self._depth_cam: dict[str, Optional[Camera]] = dict()
+        for s, cam in config.depth_cam.items():
+            if s in self.cameras.keys():
+                self._depth_cam[s] = None
+                continue
+            self._depth_cam[s] = _make_camera(cam)
         self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
 
         world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))
@@ -97,7 +99,7 @@ class BimanualFranka(Robot):
         # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
-        # Full (uncropped, unsubsampled) point cloud from the depth camera, cached each
+        # Cropped and subsampled point cloud from the depth camera, cached each
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
         self._osc_vel: dict[str, OSCVelocityController] = {
@@ -169,8 +171,14 @@ class BimanualFranka(Robot):
                     cam.connect()
                 except Exception as e:
                     logger.warning("Camera %s failed to connect: %s", n, e)
-            if self._use_depth and self._depth_cam[1] is not None:
-                self._depth_cam[1].connect()
+            if self._use_depth and len(self._depth_cam) > 0:
+                for s, cam in self._depth_cam.items():
+                    try:
+                        if cam is None:
+                            continue
+                        cam.connect()
+                    except Exception as e:
+                        logger.warning("Camera %s failed to connect: %s", s, e)
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
                     arm,
@@ -206,14 +214,19 @@ class BimanualFranka(Robot):
             for n, cam in self.cameras.items()
         }
 
-        standalone_depth_cam = None
-        if self._use_depth and self._depth_cam[0] not in self.cameras:
-            standalone_depth_cam = self._depth_cam[1]
-            depth_color_fut = self._camera_pool.submit(standalone_depth_cam.async_read, _CAMERA_READ_TIMEOUT_MS)
+        standalone_depth_cam = []
+        depth_color_fut = []
+        if self._use_depth:
+            for s, cam in self._depth_cam.items():
+                if cam is None:
+                    continue
+                standalone_depth_cam.append(cam)
+                depth_color_fut.append(self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS))
 
         kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         self._cached_kin_state = kin
+        ee_world = self._ee_world_center(kin)
 
         obs: RobotObservation = {}
 
@@ -232,34 +245,35 @@ class BimanualFranka(Robot):
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
 
-        if standalone_depth_cam is not None:
+        if len(standalone_depth_cam) > 0:
             try:
-                depth_color_fut.result()  # prime the buffer; result unused, not part of obs
+                for fut in depth_color_fut:
+                    fut.result()  # prime the buffer; result unused, not part of obs
             except Exception as e:
                 logger.warning("Standalone depth camera color read failed: %s", e)
 
         if self._use_depth:
-            if self._depth_cam[0] in self.cameras.keys():
-                depth_cam = self.cameras.get(self._depth_cam[0])
-            else:
-                depth_cam = self._depth_cam[1]
-            if depth_cam is None:
+            depth_cams = []
+            for s, cam in self._depth_cam.items():
+                if cam is None:
+                    depth_cams.append(self.cameras.get(s))
+                else:
+                    depth_cams.append(cam)
+            if len(depth_cams) <= 0:
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
-            # Submit both depth reads concurrently; get_full_point_cloud only reads
-            # the already-cached _last_depth so both are pure CPU work with no I/O.
-            # depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_depth"))
-            depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
-            # full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
-            verts = depth_fut.result()
-            # full_pcd = full_pcd_fut.result()
-            # full_pcd = verts
-            # if len(full_pcd) > 0:
-            #     xyz = full_pcd[:, :3]
-            #     dist2 = np.einsum("ij,ij->i", xyz, xyz)
-            #     full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
-            # self._last_full_point_cloud = full_pcd
-            ee_world = self._ee_world_center(kin)
-            self._last_full_point_cloud = self._sample_depth_points(verts, ee_world)
+
+            depth_futs = []
+            clouds: list[np.ndarray] = []
+            for c in depth_cams:
+                depth_futs.append(self._camera_pool.submit(
+                    c.get_cropped_point_cloud, ee_world, self._depth_crop_radius_m, _DEPTH_POINT_COUNT // len(depth_cams)
+                ))
+                
+            for fut in depth_futs:
+                clouds.append(fut.result())
+
+            self._last_full_point_cloud = np.concatenate(clouds,axis=0) # self._sample_depth_points(np.concatenate(clouds,axis=0), ee_world)
+            # print(self._last_full_point_cloud)
             flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
             obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
@@ -581,7 +595,7 @@ class BimanualFranka(Robot):
 
     @property
     def last_full_point_cloud(self) -> np.ndarray | None:
-        """Full (uncropped, unsubsampled) world-space point cloud from the depth camera.
+        """Cropped and subsampled world-space point cloud from the depth camera.
 
         Updated every get_observation() call when depth is enabled.
         Shape: (N, 3) float32 in world-frame metres, or None before the first observation.

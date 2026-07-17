@@ -861,7 +861,7 @@ def save_episode_html(
     x_end = float(ts[-1]) + 1
     fig.update_yaxes(title_text="kp",      row=1, col=2)
     fig.update_yaxes(title_text="kd",      row=2, col=2)
-    fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_yaxes(title_text="res rot (rad)", row=4, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
@@ -1152,7 +1152,7 @@ def save_rollout_html(
     x_end = float(ts[-1]) + 1
     fig.update_yaxes(title_text="kp",      row=1, col=2)
     fig.update_yaxes(title_text="kd",      row=2, col=2)
-    fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=3, col=2)

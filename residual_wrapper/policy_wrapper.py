@@ -137,14 +137,16 @@ class ResidualPolicy:
 
         self.device = torch.device(device)
         ckpt = torch.load(checkpoint_path, map_location=device)
+        # print(ckpt["model_init_kwargs"])
+        ckpt["model_init_kwargs"]["disable_pcd"] = True
         if "model_init_kwargs" not in ckpt:
             raise KeyError("Checkpoint missing 'model_init_kwargs'.")
 
         encoder_type = ckpt["model_init_kwargs"].get("encoder_type", "pointnet_lite")
         policy_cls = (
             CrossAttentionPolicy
-            if encoder_type in ("pointnet_xa", "pointnet_xa2")
-            else MultiTaskPointCloudPolicy
+            # if encoder_type in ("pointnet_xa", "pointnet_xa2")
+            # else MultiTaskPointCloudPolicy
         )
         self.model = policy_cls(**ckpt["model_init_kwargs"])
         self.model.load_state_dict(ckpt["model"])

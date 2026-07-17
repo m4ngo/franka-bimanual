@@ -54,6 +54,60 @@ def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
     return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
 
 
+def _normalized_quats(quats_xyzw: np.ndarray) -> np.ndarray:
+    q = np.asarray(quats_xyzw, dtype=np.float64)
+    return q / np.linalg.norm(q, axis=1, keepdims=True).clip(1e-9)
+
+
+def _relative_rotvec_series(quats_xyzw: np.ndarray, quat0_xyzw: np.ndarray | None = None) -> np.ndarray:
+    """(T, 4) xyzw quats -> (T, 3) rotation-vectors relative to ``quat0_xyzw``
+    (default: the first sample).
+
+    rotvec(t) = as_rotvec(R0^-1 · R(t)) — the rotation accumulated since the
+    start, expressed in the start frame. Start-relative series from sim and
+    real are directly comparable as long as both trajectories begin at the
+    same pose (both are homed to the reference qpos[0]).
+    """
+    q = _normalized_quats(quats_xyzw)
+    q0 = q[0] if quat0_xyzw is None else _normalized_quats(np.asarray(quat0_xyzw)[None, :])[0]
+    return (Rotation.from_quat(q0).inv() * Rotation.from_quat(q)).as_rotvec()
+
+
+def _geodesic_angles(q1_xyzw: np.ndarray, q2_xyzw: np.ndarray) -> np.ndarray:
+    """(T,) geodesic angle (rad) between two (T, 4) xyzw quaternion series.
+
+    2·arccos(|q1·q2|) — robust to the quaternion double cover.
+    """
+    a = _normalized_quats(q1_xyzw)
+    b = _normalized_quats(q2_xyzw)
+    dot = np.clip(np.abs((a * b).sum(axis=1)), 0.0, 1.0)
+    return 2.0 * np.arccos(dot)
+
+
+def _fault_steps(fault_count: np.ndarray) -> np.ndarray:
+    """Step indices where the cumulative recovery counter incremented."""
+    fc = np.asarray(fault_count, dtype=np.int64).ravel()
+    return np.flatnonzero(np.diff(np.concatenate([[0], fc])) > 0)
+
+
+def _align_goal_quats(ref_quat: np.ndarray, goal_quat: np.ndarray) -> tuple[np.ndarray, float]:
+    """Remove the constant frame offset between eef_goal_quat and eef_quat.
+
+    The sim collector records the OSC goal in the controller's EEF-site frame,
+    which on the Panda differs from the recorded eef_quat observable by a
+    constant body-frame rotation (measured: 90° about z). Estimated from t=0 —
+    valid for probe trajectories whose first commanded delta is ~zero (sines
+    start at zero amplitude); for a dataset whose first action carries a real
+    rotation delta, up to that one step's delta is absorbed into the estimate.
+
+    Returns (goal_quat corrected into the eef_quat frame family, offset in deg).
+    """
+    gq = Rotation.from_quat(_normalized_quats(goal_quat))
+    C = Rotation.from_quat(_normalized_quats(ref_quat[:1])[0]).inv() * gq[0]
+    corrected = (gq * C.inv()).as_quat()
+    return corrected, float(np.degrees(C.magnitude()))
+
+
 def _pose_axis_segments(poses: np.ndarray, axis_idx: int, length: float) -> tuple[list[float | None], list[float | None], list[float | None]]:
     """Return line-segment coordinates for a colored local axis over a pose list."""
     poses = np.asarray(poses, dtype=np.float64)
@@ -112,13 +166,21 @@ def compute_trajectory_errors(
     ref: dict[str, np.ndarray],
     recorded: dict[str, np.ndarray],
     name: str = "",
+    joint_vel_l2_max: float = 2.0,   # safety.JOINT_VELOCITY_MAX; literal because this module stays free of robot imports
+    saturation_level: float = 0.9,
 ) -> dict:
-    """Compute position and rotation tracking errors for one trajectory.
+    """Position/rotation tracking errors plus run-health diagnostics.
 
     Returns a dict suitable for inclusion in the errors JSON:
         name, n_steps,
-        position_error_m:  {mean, max, rms, final},
-        rotation_error_rad: {mean, max, rms, final} or None if ref lacks eef_quat.
+        position_error_m / rotation_error_rad — absolute real-vs-sim errors {mean, max, rms, final}
+        start_aligned      — same errors with the t=0 offset removed (homing residual excluded)
+        initial_offset     — the t=0 position/rotation offset itself
+        goal_decomposition — real and sim lag vs the sim OSC's internal goal (needs ref eef_goal_quat)
+        timing_dt_s        — realized control-period stats from recorded t_sim
+        qvel_l2            — peak joint-velocity L2 norm and the fraction of steps within
+                             `saturation_level` of the safety clamp (those steps identify the
+                             safety screen, not the controller)
     """
     ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET  # robot frame
     rep_pos = recorded["eef_pos"]
@@ -126,6 +188,7 @@ def compute_trajectory_errors(
 
     pos_err_vec  = rep_pos[:T_min] - ref_pos[:T_min]   # (T_min, 3)
     pos_err_norm = np.linalg.norm(pos_err_vec, axis=1)  # (T_min,)
+    pos_aligned  = np.linalg.norm(pos_err_vec - pos_err_vec[0], axis=1)
 
     def _stats(arr: np.ndarray) -> dict:
         return {
@@ -136,25 +199,76 @@ def compute_trajectory_errors(
         }
 
     rot_stats = None
+    rot_aligned_stats = None
+    initial_rot = None
+    goal_decomp = None
     ref_quat = ref.get("eef_quat")
     rep_quat = recorded.get("eef_quat")
     if ref_quat is not None and rep_quat is not None:
         T_q = min(len(ref_quat), len(rep_quat))
-        rq = ref_quat[:T_q].astype(np.float64)
-        pq = rep_quat[:T_q].astype(np.float64)
-        # normalise
-        rq = rq / np.linalg.norm(rq, axis=1, keepdims=True).clip(1e-9)
-        pq = pq / np.linalg.norm(pq, axis=1, keepdims=True).clip(1e-9)
-        # geodesic angle: 2·arccos(|q1·q2|), robust to double-cover
-        dot = np.clip(np.abs((rq * pq).sum(axis=1)), 0.0, 1.0)
-        rot_err = 2.0 * np.arccos(dot)  # (T_q,) in radians
+        rot_err = _geodesic_angles(ref_quat[:T_q], rep_quat[:T_q])
         rot_stats = _stats(rot_err)
+        initial_rot = float(rot_err[0])
+
+        # Start-aligned: angle between the two start-relative rotations, so the
+        # homing residual at t=0 doesn't contaminate the tracking comparison.
+        def _rel(qs: np.ndarray) -> Rotation:
+            q = _normalized_quats(qs[:T_q])
+            return Rotation.from_quat(q[0]).inv() * Rotation.from_quat(q)
+
+        rot_aligned_stats = _stats((_rel(ref_quat).inv() * _rel(rep_quat)).magnitude())
+
+        goal_quat = ref.get("eef_goal_quat")
+        if goal_quat is not None:
+            goal_quat, frame_offset_deg = _align_goal_quats(ref_quat, goal_quat)
+            T_g = min(T_q, len(goal_quat))
+            goal_decomp = {
+                "real_vs_goal_rad": _stats(_geodesic_angles(rep_quat[:T_g], goal_quat[:T_g])),
+                "sim_vs_goal_rad":  _stats(_geodesic_angles(ref_quat[:T_g], goal_quat[:T_g])),
+                "frame_offset_deg": frame_offset_deg,
+            }
+
+    timing = None
+    t_sim = recorded.get("t_sim")
+    if t_sim is not None and len(t_sim) > 1:
+        dts = np.diff(np.asarray(t_sim, dtype=np.float64).ravel())
+        timing = {
+            "mean": float(dts.mean()),
+            "p95":  float(np.percentile(dts, 95)),
+            "max":  float(dts.max()),
+        }
+
+    qvel_info = None
+    qvel = recorded.get("qvel")
+    if qvel is not None and len(qvel):
+        qn = np.linalg.norm(np.asarray(qvel, dtype=np.float64), axis=1)
+        qvel_info = {
+            "max": float(qn.max()),
+            "saturated_fraction": float((qn > saturation_level * joint_vel_l2_max).mean()),
+        }
+
+    faults = None
+    if recorded.get("fault_count") is not None and len(recorded["fault_count"]):
+        steps = _fault_steps(recorded["fault_count"])
+        faults = {"count": len(steps), "step_indices": [int(s) for s in steps]}
 
     return {
         "name":               name,
         "n_steps":            int(T_min),
         "position_error_m":   _stats(pos_err_norm),
         "rotation_error_rad": rot_stats,
+        "start_aligned": {
+            "position_error_m":   _stats(pos_aligned),
+            "rotation_error_rad": rot_aligned_stats,
+        },
+        "initial_offset": {
+            "position_m":   float(pos_err_norm[0]),
+            "rotation_rad": initial_rot,
+        },
+        "goal_decomposition": goal_decomp,
+        "timing_dt_s": timing,
+        "qvel_l2": qvel_info,
+        "faults": faults,
     }
 
 
@@ -183,12 +297,21 @@ def save_errors_json(
     if rot_vals:
         rot_agg = {k: _agg("rotation_error_rad", k) for k in ("mean", "max", "rms", "final")}
 
+    # Run-level reflex rollup: which episodes were fault-corrupted, at a glance.
+    faulty = {t["name"]: t["faults"]["count"]
+              for t in trajectory_errors if t.get("faults") and t["faults"]["count"] > 0}
+
     payload = {
         "trajectories": trajectory_errors,
         "aggregate": {
             "n_trajectories":    len(trajectory_errors),
             "position_error_m":  pos_agg,
             "rotation_error_rad": rot_agg,
+            "faults": {
+                "episodes_with_faults": len(faulty),
+                "total_recoveries": sum(faulty.values()),
+                "by_episode": faulty,
+            },
         },
     }
 
@@ -196,6 +319,96 @@ def save_errors_json(
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2)
     print(f"error stats saved to {path}")
+
+
+def save_aggregate_html(
+    items: list[tuple[str, dict[str, np.ndarray], dict[str, np.ndarray]]],
+    path: str,
+    title: str = "Sysid aggregate: sim (orange) vs real (blue)",
+    fps: float = 20.0,
+) -> None:
+    """One static overview across all episodes of a run.
+
+    items: list of (episode_name, ref_traj, recorded_traj).
+
+    Layout
+    ------
+    Left        : 3D overlay of every EE path — sim orange, real blue
+                  (Scatter3d has no dash support, so color/opacity carry the coding).
+    Right row 1 : start-relative rotation magnitude per episode, sim dashed / real solid.
+    Right row 2 : real-vs-sim geodesic rotation error per episode (the drift-curve
+                  family), one qualitative color per episode.
+    One legend entry per episode toggles all of its traces across panels.
+    """
+    fig = make_subplots(
+        rows=2, cols=2,
+        specs=[
+            [{"type": "scene", "rowspan": 2}, {"type": "xy"}],
+            [None,                             {"type": "xy"}],
+        ],
+        column_widths=[0.5, 0.5],
+        horizontal_spacing=0.05,
+        vertical_spacing=0.1,
+        subplot_titles=(None, "start-relative |rotation| (rad)", "rotation error real↔sim (rad)"),
+    )
+    palette = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628",
+               "#f781bf", "#999999", "#66c2a5", "#fc8d62", "#8da0cb", "#e78ac3",
+               "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3", "#1b9e77", "#d95f02"]
+
+    for idx, (name, ref, recorded) in enumerate(items):
+        ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET
+        rep_pos = recorded["eef_pos"]
+        fig.add_trace(go.Scatter3d(
+            x=ref_pos[:, 0], y=ref_pos[:, 1], z=ref_pos[:, 2],
+            mode="lines", line=dict(color="darkorange", width=3), opacity=0.45,
+            name=name, legendgroup=name, showlegend=True,
+        ), row=1, col=1)
+        fig.add_trace(go.Scatter3d(
+            x=rep_pos[:, 0], y=rep_pos[:, 1], z=rep_pos[:, 2],
+            mode="lines", line=dict(color="royalblue", width=3), opacity=0.45,
+            name=name, legendgroup=name, showlegend=False,
+        ), row=1, col=1)
+
+        ref_quat = ref.get("eef_quat")
+        rep_quat = recorded.get("eef_quat")
+        if ref_quat is None or rep_quat is None:
+            continue
+        m_ref = np.linalg.norm(_relative_rotvec_series(ref_quat), axis=1)
+        m_rep = np.linalg.norm(_relative_rotvec_series(rep_quat), axis=1)
+        fig.add_trace(go.Scatter(
+            x=np.arange(len(m_ref), dtype=np.float32) / fps, y=m_ref,
+            mode="lines", line=dict(color="darkorange", width=1, dash="dash"),
+            opacity=0.6, name=name, legendgroup=name, showlegend=False,
+        ), row=1, col=2)
+        fig.add_trace(go.Scatter(
+            x=np.arange(len(m_rep), dtype=np.float32) / fps, y=m_rep,
+            mode="lines", line=dict(color="royalblue", width=1.5),
+            opacity=0.7, name=name, legendgroup=name, showlegend=False,
+        ), row=1, col=2)
+
+        T_min = min(len(ref_quat), len(rep_quat))
+        gap = _geodesic_angles(rep_quat[:T_min], ref_quat[:T_min])
+        fig.add_trace(go.Scatter(
+            x=np.arange(T_min, dtype=np.float32) / fps, y=gap,
+            mode="lines", line=dict(color=palette[idx % len(palette)], width=1.5),
+            name=name, legendgroup=name, showlegend=False,
+        ), row=2, col=2)
+
+    fig.update_layout(
+        title=dict(text=f"{title}<br><sup>{len(items)} episodes</sup>", x=0.5, xanchor="center"),
+        legend=dict(font=dict(size=9), itemsizing="constant"),
+        margin=dict(l=0, r=10, t=70, b=40),
+        scene=dict(xaxis_title="x (m)", yaxis_title="y (m)", zaxis_title="z (m)",
+                   aspectmode="data"),
+    )
+    fig.update_yaxes(title_text="|rotvec| (rad)",  row=1, col=2)
+    fig.update_yaxes(title_text="rot error (rad)", row=2, col=2)
+    for r in (1, 2):
+        fig.update_xaxes(title_text="time (s)", row=r, col=2)
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fig.write_html(path, include_plotlyjs="cdn")
+    print(f"aggregate visualization saved to {path}")
 
 
 def save_comparison_html(
@@ -213,18 +426,22 @@ def save_comparison_html(
     Left (65 %)  : animated arm skeleton + trails:
                      reference EE path (growing, dashed orange — current step)
                      replayed EE path (growing, solid blue — current step)
+                     sim OSC goal path (static, dotted — when ref has eef_goal_pos)
                      reference EE orientation triad (animated, orange-family axes)
                      replayed EE orientation triad (animated, red/green/blue axes)
-    Right (35 %) : three stacked time-series panels (static full data + moving cursor):
-                     row 1  per-axis position error (x/y/z)
-                     row 2  L2 position error norm
-                     row 3  per-joint qpos (ref dashed, replayed solid; 7 joints each)
+    Right (35 %) : four stacked time-series panels (static full data + moving cursor):
+                     row 1  start-relative rotation per axis (real solid, sim dashed,
+                            sim OSC goal dotted — when ref has eef_goal_quat)
+                     row 2  rotation error angles: real↔sim gap, real↔goal, sim↔goal
+                     row 3  per-axis position error (x/y/z) + L2 norm
+                     row 4  per-joint qpos (ref dashed, replayed solid; 7 joints each)
     """
     ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET      # (T_ref, 3) — robot frame
     rep_pos = recorded["eef_pos"]                       # (T_rep, 3)
     T_rep = len(rep_pos)
     T_ref = len(ref_pos)
     ts_full = np.arange(T_rep, dtype=np.float32) / fps
+    ts_ref_full = np.arange(T_ref, dtype=np.float32) / fps
 
     # Position error
     T_min = min(T_ref, T_rep)
@@ -232,6 +449,37 @@ def save_comparison_html(
     pos_err_norm = np.linalg.norm(pos_err, axis=1)     # (T_min,)
     mean_err = float(pos_err_norm.mean())
     max_err  = float(pos_err_norm.max())
+
+    # Rotation series (start-relative) and sim-OSC-goal overlays
+    ref_quat  = ref.get("eef_quat")
+    rep_quat  = recorded.get("eef_quat")
+    goal_quat = ref.get("eef_goal_quat")
+    goal_pos  = ref.get("eef_goal_pos")
+    goal_pos  = goal_pos - WORLD_FRAME_OFFSET if goal_pos is not None else None
+
+    have_rot = ref_quat is not None and rep_quat is not None
+    rot_ref = rot_rep = rot_goal = None
+    rot_err_gap = rot_err_real_goal = rot_err_sim_goal = None
+    rot_subtitle = ""
+    if have_rot:
+        rot_ref = _relative_rotvec_series(ref_quat)     # (T_ref, 3)
+        rot_rep = _relative_rotvec_series(rep_quat)     # (T_rep, 3)
+        rot_err_gap = _geodesic_angles(rep_quat[:T_min], ref_quat[:T_min])
+        if goal_quat is not None:
+            # Undo the collector's constant goal-frame offset, then express the
+            # goal relative to the reference start so ref/goal share a base.
+            goal_quat, _ = _align_goal_quats(ref_quat, goal_quat)
+            rot_goal = _relative_rotvec_series(goal_quat, quat0_xyzw=ref_quat[0])
+            T_gr = min(T_min, len(goal_quat))
+            rot_err_real_goal = _geodesic_angles(rep_quat[:T_gr], goal_quat[:T_gr])
+            T_gs = min(T_ref, len(goal_quat))
+            rot_err_sim_goal = _geodesic_angles(ref_quat[:T_gs], goal_quat[:T_gs])
+        rot_subtitle = (f" | rot err max {np.degrees(rot_err_gap.max()):.1f}°"
+                        f" mean {np.degrees(rot_err_gap.mean()):.1f}°")
+
+    fault_steps = (_fault_steps(recorded["fault_count"])
+                   if recorded.get("fault_count") is not None else np.array([], dtype=np.int64))
+    fault_note = f" | {len(fault_steps)} reflex recoveries" if len(fault_steps) else ""
 
     ref_qpos = ref.get("qpos")       # (T_ref, 7) or None
     rep_qpos = recorded.get("qpos")  # (T_rep, 7)
@@ -272,14 +520,15 @@ def save_comparison_html(
 
     # -----------------------------------------------------------------------
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=4, cols=2,
         specs=[
-            [{"type": "scene", "rowspan": 3}, {"type": "xy"}],
+            [{"type": "scene", "rowspan": 4}, {"type": "xy"}],
+            [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
         ],
         column_widths=[0.65, 0.35],
-        row_heights=[0.33, 0.33, 0.34],
+        row_heights=[0.25, 0.25, 0.25, 0.25],
         horizontal_spacing=0.04,
         vertical_spacing=0.06,
     )
@@ -304,34 +553,89 @@ def save_comparison_html(
         name="replayed EE (full)",
         showlegend=True,
     ), row=1, col=1)
+    if goal_pos is not None:
+        fig.add_trace(go.Scatter3d(
+            x=goal_pos[:, 0], y=goal_pos[:, 1], z=goal_pos[:, 2],
+            mode="lines",
+            line=dict(color="seagreen", width=2, dash="dot"),
+            opacity=0.25,
+            name="sim OSC goal (full)",
+            showlegend=True,
+        ), row=1, col=1)
 
     joint_colors = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628", "#f781bf"]
+    axis_colors = ["crimson", "seagreen", "steelblue"]
     ts_err = ts_full[:T_min]
-    for i, (ax, c) in enumerate(zip("xyz", ["crimson", "seagreen", "steelblue"])):
+
+    # Row 1 — start-relative rotation per axis: real solid, sim dashed, goal dotted.
+    if have_rot:
+        for i, ax in enumerate("xyz"):
+            c = axis_colors[i]
+            fig.add_trace(go.Scatter(
+                x=ts_full, y=rot_rep[:, i],
+                mode="lines", line=dict(color=c, width=2),
+                name=f"rot_{ax} real", legendgroup=f"rot{ax}",
+            ), row=1, col=2)
+            fig.add_trace(go.Scatter(
+                x=ts_ref_full, y=rot_ref[:, i],
+                mode="lines", line=dict(color=c, width=1.5, dash="dash"),
+                name=f"rot_{ax} sim", legendgroup=f"rot{ax}",
+            ), row=1, col=2)
+            if rot_goal is not None:
+                fig.add_trace(go.Scatter(
+                    x=ts_ref_full[:len(rot_goal)], y=rot_goal[:, i],
+                    mode="lines", line=dict(color=c, width=1, dash="dot"),
+                    name=f"rot_{ax} goal", legendgroup=f"rot{ax}",
+                    showlegend=False,
+                ), row=1, col=2)
+
+    # Row 2 — rotation error angles: the sim2real gap, plus each side's lag
+    # behind the sim OSC's internal goal (controller-law comparison).
+    if rot_err_gap is not None:
+        fig.add_trace(go.Scatter(
+            x=ts_err[:len(rot_err_gap)], y=rot_err_gap,
+            mode="lines", line=dict(color="crimson", width=2),
+            name="rot err real↔sim",
+        ), row=2, col=2)
+        if rot_err_real_goal is not None:
+            fig.add_trace(go.Scatter(
+                x=ts_full[:len(rot_err_real_goal)], y=rot_err_real_goal,
+                mode="lines", line=dict(color="royalblue", width=1.5, dash="dash"),
+                name="rot err real↔goal",
+            ), row=2, col=2)
+        if rot_err_sim_goal is not None:
+            fig.add_trace(go.Scatter(
+                x=ts_ref_full[:len(rot_err_sim_goal)], y=rot_err_sim_goal,
+                mode="lines", line=dict(color="darkorange", width=1.5, dash="dot"),
+                name="rot err sim↔goal",
+            ), row=2, col=2)
+
+    # Row 3 — per-axis position error + L2 norm.
+    for i, (ax, c) in enumerate(zip("xyz", axis_colors)):
         fig.add_trace(go.Scatter(
             x=ts_err, y=pos_err[:, i],
             mode="lines", line=dict(color=c, width=2),
             name=f"err_{ax}",
-        ), row=1, col=2)
+        ), row=3, col=2)
     fig.add_trace(go.Scatter(
         x=ts_err, y=np.zeros(T_min),
         mode="lines", line=dict(color="black", width=1, dash="dot"),
         showlegend=False, hoverinfo="skip",
-    ), row=1, col=2)
-
+    ), row=3, col=2)
     fig.add_trace(go.Scatter(
         x=ts_err, y=pos_err_norm,
         mode="lines", line=dict(color="darkorchid", width=2),
         name="L2 err (m)",
-    ), row=2, col=2)
+    ), row=3, col=2)
     fig.add_trace(go.Scatter(
         x=[ts_err[0], ts_err[-1]],
         y=[mean_err, mean_err],
         mode="lines", line=dict(color="darkorchid", width=1, dash="dash"),
         name=f"mean {mean_err*1000:.1f} mm",
         showlegend=False, hoverinfo="skip",
-    ), row=2, col=2)
+    ), row=3, col=2)
 
+    # Row 4 — per-joint qpos overlay (or EE velocity norm fallback).
     if ref_qpos is not None and rep_qpos is not None:
         T_q = min(len(ref_qpos), T_rep)
         ts_q = ts_full[:T_q]
@@ -341,19 +645,19 @@ def save_comparison_html(
                 x=ts_q, y=ref_qpos[:T_q, j],
                 mode="lines", line=dict(color=c, width=1.5, dash="dash"),
                 name=f"ref q{j+1}", legendgroup=f"q{j+1}",
-            ), row=3, col=2)
+            ), row=4, col=2)
             fig.add_trace(go.Scatter(
                 x=ts_q, y=rep_qpos[:T_q, j],
                 mode="lines", line=dict(color=c, width=2),
                 name=f"rep q{j+1}", legendgroup=f"q{j+1}",
-            ), row=3, col=2)
+            ), row=4, col=2)
     else:
         vel_norm = np.linalg.norm(recorded["eef_lin_vel"], axis=1)
         fig.add_trace(go.Scatter(
             x=ts_full, y=vel_norm,
             mode="lines", line=dict(color="steelblue", width=2),
             name="|EE vel| (m/s)",
-        ), row=3, col=2)
+        ), row=4, col=2)
 
     # -----------------------------------------------------------------------
     # Animated traces (updated by each go.Frame)
@@ -425,9 +729,28 @@ def save_comparison_html(
         span = max(hi - lo, 0.01)
         return lo - span * pad, hi + span * pad
 
-    yr_err = _yrange(pos_err)
-    yr_l2  = (0.0, float(pos_err_norm.max()) * 1.1 + 1e-4)
+    if have_rot:
+        rot_stack = [rot_rep.ravel(), rot_ref.ravel()]
+        if rot_goal is not None:
+            rot_stack.append(rot_goal.ravel())
+        yr_rot = _yrange(np.concatenate(rot_stack))
+        rerr_all = np.concatenate([a for a in (rot_err_gap, rot_err_real_goal, rot_err_sim_goal)
+                                   if a is not None])
+        yr_rerr = (0.0, float(rerr_all.max()) * 1.1 + 1e-4)
+    else:
+        yr_rot, yr_rerr = (-1.0, 1.0), (0.0, 1.0)
+    yr_pos = _yrange(np.concatenate([pos_err.ravel(), pos_err_norm]))
     yr_q   = _yrange(rep_qpos) if rep_qpos is not None else (-1.0, 1.0)
+
+    # Reflex/recovery markers: deviations at these ticks are fault-caused, not
+    # controller-caused. Plain traces — add_vline chokes on scene subplots.
+    for r, (lo, hi) in zip((1, 2, 3, 4), (yr_rot, yr_rerr, yr_pos, yr_q)):
+        for s in fault_steps:
+            fig.add_trace(go.Scatter(
+                x=[float(s) / fps] * 2, y=[lo, hi], mode="lines",
+                line=dict(color="red", width=1, dash="dot"), opacity=0.6,
+                showlegend=False, hoverinfo="skip",
+            ), row=r, col=2)
 
     def _cursor(t_val, y_lo, y_hi):
         return go.Scatter(
@@ -437,9 +760,10 @@ def save_comparison_html(
             showlegend=False, hoverinfo="skip",
         )
 
-    _add_anim(_cursor(0.0, *yr_err), 1, 2)
-    _add_anim(_cursor(0.0, *yr_l2),  2, 2)
-    _add_anim(_cursor(0.0, *yr_q),   3, 2)
+    _add_anim(_cursor(0.0, *yr_rot),  1, 2)
+    _add_anim(_cursor(0.0, *yr_rerr), 2, 2)
+    _add_anim(_cursor(0.0, *yr_pos),  3, 2)
+    _add_anim(_cursor(0.0, *yr_q),    4, 2)
 
     # -----------------------------------------------------------------------
     # Animation frames
@@ -498,8 +822,9 @@ def save_comparison_html(
             colors=_REP_AXIS_COLORS, width=5, opacity=0.95,
         ))
 
-        fd.append(_cursor(float(t_val), *yr_err))
-        fd.append(_cursor(float(t_val), *yr_l2))
+        fd.append(_cursor(float(t_val), *yr_rot))
+        fd.append(_cursor(float(t_val), *yr_rerr))
+        fd.append(_cursor(float(t_val), *yr_pos))
         fd.append(_cursor(float(t_val), *yr_q))
 
         frames.append(go.Frame(data=fd, traces=anim_idxs, name=str(fi)))
@@ -511,6 +836,7 @@ def save_comparison_html(
     # -----------------------------------------------------------------------
     all_xyz = np.concatenate(
         [ref_pos, rep_pos]
+        + ([goal_pos] if goal_pos is not None else [])
         + (ref_skeletons or [])
         + (rep_skeletons or []),
         axis=0,
@@ -524,7 +850,8 @@ def save_comparison_html(
     t_end = float(ts_full[-1]) + 0.1
     fig.update_layout(
         title=dict(
-            text=f"{title}<br><sup>max err {max_err*1000:.1f} mm | mean err {mean_err*1000:.1f} mm</sup>",
+            text=f"{title}<br><sup>max err {max_err*1000:.1f} mm | mean err {mean_err*1000:.1f} mm"
+                 f"{rot_subtitle}{fault_note}</sup>",
             x=0.5, xanchor="center",
         ),
         showlegend=True,
@@ -565,10 +892,11 @@ def save_comparison_html(
         )],
     )
 
-    fig.update_yaxes(title_text="pos error (m)", row=1, col=2, range=list(yr_err))
-    fig.update_yaxes(title_text="L2 error (m)",  row=2, col=2, range=list(yr_l2))
-    fig.update_yaxes(title_text="q (rad)",        row=3, col=2)
-    for r in (1, 2, 3):
+    fig.update_yaxes(title_text="rotation (rad)",  row=1, col=2, range=list(yr_rot))
+    fig.update_yaxes(title_text="rot error (rad)", row=2, col=2, range=list(yr_rerr))
+    fig.update_yaxes(title_text="pos error (m)",   row=3, col=2, range=list(yr_pos))
+    fig.update_yaxes(title_text="q (rad)",          row=4, col=2)
+    for r in (1, 2, 3, 4):
         fig.update_xaxes(title_text="time (s)", row=r, col=2, range=[0.0, t_end])
 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)

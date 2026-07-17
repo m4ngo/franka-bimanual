@@ -31,13 +31,17 @@ One MP4 video per camera is written alongside the HDF5 (e.g. <stem>_cam_3_wrist.
 """
 
 import argparse
+import hashlib
+import json
 import logging
 import os
 import select
+import socket
 import sys
 import termios
 import tty
 import time
+from datetime import datetime
 from pathlib import Path
 
 import cv2
@@ -49,7 +53,13 @@ sys.path.insert(0, str(_HERE.parent / "residual_wrapper"))
 
 from env_wrapper import start_controller  # noqa: E402
 from lerobot_robot_bimanual_franka import SingleArmFranka
-from _viz import compute_trajectory_errors, save_comparison_html, save_errors_json  # noqa: E402
+from lerobot_robot_bimanual_franka import (  # noqa: E402  (constants snapshot for run.json)
+    bimanual_franka as _bf_mod,
+    franka_process as _fp_mod,
+    osc_velocity_controller as _osc_mod,
+    safety as _safety_mod,
+)
+from _viz import compute_trajectory_errors, save_aggregate_html, save_comparison_html, save_errors_json  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
@@ -172,8 +182,8 @@ def _run_episode(
     _ROT_SCALE = 0.5   # radians per normalised unit (must match env_wrapper._ROT_SCALE)
 
     buf: dict[str, list] = {k: [] for k in (
-        "action", "eef_ang_vel",
-        "eef_lin_vel", "eef_pos", "eef_quat", "qpos", "qvel", "t_sim", "tau_cmd",
+        "action", "action_norm", "eef_ang_vel", "eef_lin_vel", "eef_pos",
+        "eef_quat", "fault_count", "qpos", "qvel", "t_sim", "tau_cmd",
     )}
 
     record_video = video_dir is not None and bool(controller.cameras)
@@ -236,6 +246,10 @@ def _run_episode(
             # --- record kinematic data ----------------------------------------
             t_now = time.perf_counter() - t_start
             buf["action"].append(np.concatenate([dpos, drot_quat]).astype(np.float32))
+            buf["action_norm"].append(action_all[step].astype(np.float32))
+            # Cumulative recoverable-error recoveries (reflexes etc.) so analysis
+            # can flag ticks where tracking was interrupted. Local attribute read.
+            buf["fault_count"].append(np.int32(controller.robot_manager.recovery_counts().get("r", 0)))
             buf["eef_ang_vel"].append(np.asarray(ee_vel[3:], dtype=np.float32))
             buf["eef_lin_vel"].append(np.asarray(ee_vel[:3], dtype=np.float32))
             buf["eef_pos"].append(np.asarray(ee_pos, dtype=np.float32))
@@ -271,14 +285,93 @@ def _run_episode(
 # HDF5 output
 # ---------------------------------------------------------------------------
 
-def save_sysid_hdf5(recorded: dict[str, np.ndarray], path: str) -> None:
-    """Write the recorded episode to an HDF5 file with the sim-compatible layout."""
+def save_sysid_hdf5(recorded: dict[str, np.ndarray], path: str, attrs: dict | None = None) -> None:
+    """Write the recorded episode to an HDF5 file with the sim-compatible layout.
+
+    ``attrs`` are stamped onto the episode group so each file stays
+    interpretable when separated from its run directory (None values skipped).
+    """
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with h5py.File(path, "w") as f:
         ep = f.create_group("data").create_group("episode_0")
         for field, arr in recorded.items():
             ep.create_dataset(field, data=arr, compression="gzip", compression_opts=4)
+        for key, val in (attrs or {}).items():
+            if val is not None:
+                ep.attrs[key] = val
     logger.info("saved %d steps to %s", next(iter(recorded.values())).shape[0], path)
+
+
+# ---------------------------------------------------------------------------
+# Run metadata
+# ---------------------------------------------------------------------------
+
+# Stack constants snapshotted into run.json, read live from the modules so the
+# record can't drift from the code. getattr(..., None): a renamed constant
+# shows up as null in the JSON instead of crashing the run.
+_METADATA_CONSTANTS: dict[str, tuple[object, tuple[str, ...]]] = {
+    "bimanual_franka": (_bf_mod, (
+        "_EE_TRANSLATION_FUDGE_FACTOR", "_EE_ROTATION_FUDGE_FACTOR",
+        "OSC_BASE_KP", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
+        "EE_PD_KP", "EE_PD_KD", "JOINT_PD_KP", "JOINT_PD_KD",
+    )),
+    "osc_velocity_controller": (_osc_mod, (
+        "DEFAULT_KP", "DEFAULT_DAMPING_RATIO", "DEFAULT_NULLSPACE_KP",
+        "DEFAULT_DLS_DAMPING", "DEFAULT_MAX_QDOT",
+    )),
+    "safety": (_safety_mod, (
+        "JOINT_VELOCITY_MAX", "EE_LINEAR_VELOCITY_MAX", "EE_ANGULAR_VELOCITY_MAX",
+        "WORKTABLE_HEIGHT", "WORKTABLE_DISTANCE_MIN", "WORKTABLE_MAX_DECEL",
+        "CUSTOM_END_EFFECTOR_Z_EXTENSION",
+    )),
+    "franka_process": (_fp_mod, (
+        "VELOCITY_COMMAND_DURATION_MS", "_JOINT_RELATIVE_DYNAMICS",
+        "_EE_DELTA_RELATIVE_DYNAMICS", "_JOINT_STIFFNESS",
+        "_TORQUE_THRESHOLD", "_FORCE_THRESHOLD",
+    )),
+}
+
+
+def _sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str]) -> dict:
+    """Everything needed to interpret a run directory later, gathered up front."""
+    constants = {
+        mod_name: {name: getattr(mod, name, None) for name in names}
+        for mod_name, (mod, names) in _METADATA_CONSTANTS.items()
+    }
+    kp_gain = 10.0 ** args.kp
+    osc_base_kp = constants["bimanual_franka"]["OSC_BASE_KP"]
+    return {
+        "status": "running",
+        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "hostname": socket.gethostname(),
+        "argv": sys.argv,
+        "args": vars(args),
+        "traj_file": str(Path(args.traj_file).resolve()),
+        "traj_file_sha256": _sha256(args.traj_file),
+        "episodes": episode_names,
+        "episodes_completed": [],
+        "derived_gains": {
+            "kp_gain": kp_gain,
+            "effective_velocity_kp": kp_gain * osc_base_kp if osc_base_kp is not None else None,
+            "kd_note": "kd action is inert on this stack (_KD_GAIN_BASE == 1.0; "
+                       "OSCVelocityController's law has no kd term)",
+        },
+        "constants": constants,
+    }
+
+
+def _write_run_json(run_dir: Path, meta: dict) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    with open(run_dir / "run.json", "w") as fh:
+        json.dump(meta, fh, indent=2, default=str)
 
 
 # ---------------------------------------------------------------------------
@@ -307,23 +400,57 @@ def main() -> None:
                         help="Joint-angle convergence tolerance (rad) for homing")
     parser.add_argument("--home-tol-m", type=float, default=0.005,
                         help="EE position convergence tolerance (m) for homing")
-    parser.add_argument("--viz-out", default=None,
-                        help="Path for the comparison HTML; defaults to <output>.html")
     parser.add_argument("--viz-stride", type=int, default=1,
                         help="Animate every Nth step in the visualization (use 2-4 for long episodes)")
+    parser.add_argument("--out-root", default="~/sysid/outputs",
+                        help="Parent directory for per-run output directories")
+    parser.add_argument("--tag", default=None,
+                        help="Run-directory suffix; defaults to the reference dataset's "
+                             "parent directory name")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
     logger.setLevel(logging.DEBUG)
 
-    # Connect robot
-    logger.info("connecting to robot...")
-    controller = start_controller()
-    logger.info("robot connected")
+    # Run directory: <out_root>/<timestamp>_<tag>. The tag defaults to the
+    # reference dataset's parent directory name — datasets live one per
+    # directory, so the directory name carries the sim condition
+    # (e.g. kp_actn0.50_damp_actn0.50).
+    tag = args.tag or Path(args.traj_file).resolve().parent.name
+    out_root = Path(args.out_root).expanduser()
+    run_dir = out_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
 
+    with h5py.File(args.traj_file, "r") as f:
+        episode_names = list(f[list(f.keys())[0]].keys())
+
+    meta = _collect_run_metadata(args, episode_names)
+    _write_run_json(run_dir, meta)
+    logger.info("run directory: %s", run_dir)
+
+    # Per-episode HDF5 attrs: enough to interpret a file separated from run.json.
+    base_attrs = {
+        "traj_file": meta["traj_file"],
+        "kp": args.kp,
+        "kd": args.kd,
+        "fps": args.fps,
+        "gripper_norm": args.gripper_norm,
+        "kp_gain": 10.0 ** args.kp,
+        "ee_translation_fudge_factor": getattr(_bf_mod, "_EE_TRANSLATION_FUDGE_FACTOR", None),
+        "ee_rotation_fudge_factor": getattr(_bf_mod, "_EE_ROTATION_FUDGE_FACTOR", None),
+        "osc_base_kp": getattr(_bf_mod, "OSC_BASE_KP", None),
+        "max_qdot": getattr(_osc_mod, "DEFAULT_MAX_QDOT", None),
+    }
+
+    controller = None
     all_errors: list[dict] = []
+    episode_pairs: list[tuple[str, dict, dict]] = []
     try:
-        for i in range(0, parse_num_traj(args.traj_file)):
+        # Connect robot
+        logger.info("connecting to robot...")
+        controller = start_controller()
+        logger.info("robot connected")
+
+        for i in range(0, len(episode_names)):
             # Load reference trajectory
             logger.info("loading trajectory from %s", args.traj_file)
             name, traj = parse_traj(args.traj_file, i)
@@ -364,28 +491,46 @@ def main() -> None:
                 kp=args.kp,
                 kd=args.kd,
                 gripper_norm=args.gripper_norm,
-                video_dir=Path("sysid/outputs"),
+                video_dir=run_dir,
                 video_stem=video_stem,
             )
 
             if not recorded:
-                logger.warning("no steps recorded; exiting")
-                return
+                logger.warning("no steps recorded; stopping sweep")
+                break
 
             # Save HDF5
-            save_sysid_hdf5(recorded, f"sysid/outputs/{i}_" + output + ".hdf5")
+            save_sysid_hdf5(recorded, str(run_dir / f"{i}_{output}.hdf5"), attrs={
+                **base_attrs,
+                "reference_episode": name,
+                "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+            })
 
             # Visualization
-            viz_out = args.viz_out or str(Path(f"sysid/outputs/{i}_" + output).with_suffix(".html"))
+            viz_out = str(run_dir / f"{i}_{output}.html")
             save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
 
-            # Accumulate errors for the summary JSON
+            # Accumulate errors; rewrite the summary after every episode so an
+            # aborted run still keeps stats for what it completed.
             all_errors.append(compute_trajectory_errors(traj, recorded, name=output))
+            save_errors_json(all_errors, str(run_dir / "errors.json"))
+            meta["episodes_completed"].append(name)
+            episode_pairs.append((name, traj, recorded))
 
-        errors_path = str(Path("sysid/outputs") / "errors.json")
-        save_errors_json(all_errors, errors_path)
+        if episode_pairs:
+            try:
+                save_aggregate_html(episode_pairs, str(run_dir / "aggregate.html"), fps=args.fps)
+            except Exception:
+                logger.exception("aggregate visualization failed")
+
+        meta["status"] = "completed"
+    except BaseException:
+        meta["status"] = "aborted"
+        raise
     finally:
-        controller.disconnect()
+        _write_run_json(run_dir, meta)
+        if controller is not None:
+            controller.disconnect()
 
 
 if __name__ == "__main__":

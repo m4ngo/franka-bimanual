@@ -116,6 +116,9 @@ class RobotDriver:
 
     def __init__(self, server_ip: str, robot_ip: str, port: int, use_ee_delta: bool = False):
         self.use_ee_delta = use_ee_delta
+        # Cumulative count of recoverable-error recoveries (reflexes etc.) —
+        # lets recording scripts flag ticks where tracking was interrupted.
+        self.recovery_count = 0
         self._jac: NDArray | None = None
         self._jac_q: NDArray | None = None
 
@@ -149,6 +152,7 @@ class RobotDriver:
             self._rpc_send_jv(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
+                self.recovery_count += 1
                 try:
                     self.robot.recover_from_errors()
                 except Exception:
@@ -163,6 +167,7 @@ class RobotDriver:
             rpc(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
+                self.recovery_count += 1
                 try:
                     self.robot.recover_from_errors()
                 except Exception:
@@ -198,6 +203,10 @@ class MultiRobotWrapper:
     @property
     def num_alive(self) -> int:
         return sum(1 for d in self.drivers.values() if d.is_alive)
+
+    def recovery_counts(self) -> dict[str, int]:
+        """Cumulative recoverable-error recoveries per arm (see RobotDriver.recovery_count)."""
+        return {n: d.recovery_count for n, d in self.drivers.items()}
 
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
         futs = [(n, self._pool.submit(fn, n)) for n in names]
