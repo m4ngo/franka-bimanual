@@ -23,26 +23,26 @@ class SingleArmFrankaConfig(RobotConfig):
     depth: bool = True
     depth_cam: dict[str, CameraConfig] = field(
         default_factory=lambda: {
-            "cam_2_scene": FramosCameraConfig(enable_color=False, name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=30, width=224, height=224,
-                                                intrinsic_matrix = (
-                                                    (946.73319511, 0.0, 632.15541524),
-                                                    (0.0, 963.49477373, 368.33009756),
-                                                    (0.0, 0.0, 1.0),
-                                                ),
-                                                distortion_coeffs = (
-                                                    -7.46601288e-02,
-                                                    2.27627524e+00,
-                                                    -2.34761926e-03,
-                                                    2.86842857e-03,
-                                                    -1.06307592e+01
-                                                ),
-                                                r_cam_in_world  = (
-                                                    (-0.93549331, -0.02391077, 0.35253446),
-                                                    (-0.21260197, 0.83499221, -0.50753169),
-                                                    (-0.28222806, -0.54974202, -0.7862131),
-                                                ),
-                                                t_cam_in_world = (-0.33514749, 0.63967298, 0.912236053)
-                                            ),
+            # "cam_2_scene": FramosCameraConfig(enable_color=False, name="workspace_framos_d71", ip="192.168.0.116", serial_number="6CD146030D71", fps=30, width=224, height=224,
+            #                                     intrinsic_matrix = (
+            #                                         (946.73319511, 0.0, 632.15541524),
+            #                                         (0.0, 963.49477373, 368.33009756),
+            #                                         (0.0, 0.0, 1.0),
+            #                                     ),
+            #                                     distortion_coeffs = (
+            #                                         -7.46601288e-02,
+            #                                         2.27627524e+00,
+            #                                         -2.34761926e-03,
+            #                                         2.86842857e-03,
+            #                                         -1.06307592e+01
+            #                                     ),
+            #                                     r_cam_in_world  = (
+            #                                         (-0.93549331, -0.02391077, 0.35253446),
+            #                                         (-0.21260197, 0.83499221, -0.50753169),
+            #                                         (-0.28222806, -0.54974202, -0.7862131),
+            #                                     ),
+            #                                     t_cam_in_world = (-0.33514749, 0.63967298, 0.912236053)
+            #                                 ),
             "cam_6_scene": FramosCameraConfig(name="workspace_framos_d63", ip="192.168.1.102", serial_number="6CD146030D63", fps=30, width=224, height=224),
         }
     )

@@ -85,7 +85,7 @@ def get_state(robot):
         tuple(float(x) for x in s.dq),
         tuple(float(x) for x in s.O_T_EE.translation),
         tuple(float(x) for x in s.O_T_EE.quaternion),
-        tuple(float(x) for x in s.O_dP_EE_c.linear) + tuple(float(x) for x in s.O_dP_EE_c.angular),
+        tuple(float(x) for x in s.O_dP_EE_d.linear) + tuple(float(x) for x in s.O_dP_EE_d.angular),
     )
 
 def get_jacobian(robot):
