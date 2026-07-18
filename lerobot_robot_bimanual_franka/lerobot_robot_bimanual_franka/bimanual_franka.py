@@ -47,7 +47,6 @@ _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraCo
 
 _DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
 _DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
-_FULL_PCD_CROP_RADIUS_M: float = 0.5  # max distance from world origin for viz cloud
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +274,7 @@ class BimanualFranka(Robot):
             self._last_full_point_cloud = np.concatenate(clouds,axis=0) # self._sample_depth_points(np.concatenate(clouds,axis=0), ee_world)
             # print(self._last_full_point_cloud)
             flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
+            # print(flat.shape)
             obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
 
