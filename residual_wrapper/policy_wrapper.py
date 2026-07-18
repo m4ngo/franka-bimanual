@@ -138,7 +138,7 @@ class ResidualPolicy:
         self.device = torch.device(device)
         ckpt = torch.load(checkpoint_path, map_location=device)
         # print(ckpt["model_init_kwargs"])
-        ckpt["model_init_kwargs"]["disable_pcd"] = True
+        # ckpt["model_init_kwargs"]["disable_pcd"] = True
         if "model_init_kwargs" not in ckpt:
             raise KeyError("Checkpoint missing 'model_init_kwargs'.")
 
@@ -153,7 +153,7 @@ class ResidualPolicy:
         self.model.to(self.device).eval()
 
         data_kwargs = ckpt.get("data_kwargs", {})
-        self.center_on_eef: bool = bool(data_kwargs.get("center_on_eef", False))
+        self.center_on_eef: bool = True # bool(data_kwargs.get("center_on_eef", False))
         # Exact cloud fed to the network on the most recent infer() call
         # (post crop/downsample/re-centering); for diagnostics.
         self.last_network_pcd: np.ndarray | None = None
@@ -170,7 +170,7 @@ class ResidualPolicy:
                 "action_chunk" (10, 9) — normalised delta chunk from base policy
                                          columns 0:7 = [dx, dy, dz, rx, ry, rz, grip]
                                          columns 7:9 = [kp, kd] (dropped before model)
-                "proprio"      (9,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r,
+                "proprio"      (17,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r,
                                           kp, kd, vx, vy, vz, wx, wy, wz]
                 "point_cloud"  (2048, 3) — xyz in robot/world frame
 

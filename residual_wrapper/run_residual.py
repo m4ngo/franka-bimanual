@@ -155,7 +155,7 @@ def _run_episode(
     task: str = "",
     recorder: "EpisodeRecorder | None" = None,
     replaying: bool = False,
-    proprio_frame: str = "robot",
+    proprio_frame: str = "world",
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -400,7 +400,7 @@ def main() -> None:
     )
     parser.add_argument("--no-residual", action="store_true",
                         help="Disable the residual policy; run base policy only")
-    parser.add_argument("--proprio-frame", choices=("robot", "world"), default="robot",
+    parser.add_argument("--proprio-frame", choices=("robot", "world"), default="world",
                         help="Frame for the residual proprio pose: 'robot' = raw franka_fk "
                              "(current behavior), 'world' = transformed to the world frame "
                              "the point cloud lives in")
