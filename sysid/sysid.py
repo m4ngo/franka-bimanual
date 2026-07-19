@@ -71,6 +71,7 @@ from pathlib import Path
 import cv2
 import h5py
 import numpy as np
+from tqdm import tqdm
 
 _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE.parent / "residual_wrapper"))
@@ -440,7 +441,12 @@ def _run_episode(
     interactive = sys.stdin.isatty()
     old_term = termios.tcgetattr(sys.stdin) if interactive else None
     if interactive:
-        tty.setraw(sys.stdin)
+        # cbreak, not raw: keypresses arrive unbuffered for the early-stop
+        # poll, but native Ctrl-C (SIGINT even mid-sleep / mid-RPC) and newline
+        # output processing are preserved, so the progress bar and any log
+        # lines render cleanly.
+        tty.setcbreak(sys.stdin)
+    bar = tqdm(total=n_steps, desc=video_stem, unit="step", dynamic_ncols=True)
     try:
         for step in range(n_steps):
             t_step = time.perf_counter()
@@ -450,7 +456,7 @@ def _run_episode(
                 if key == "ctrl_c":
                     raise KeyboardInterrupt
                 if key == "right":
-                    print("\r\nearly stop requested", flush=True)
+                    bar.write("early stop requested")
                     stop_reason = "early_stop"
                     break
 
@@ -539,6 +545,10 @@ def _run_episode(
                     flush_path, attrs=flush_attrs, quiet=True,
                 )
 
+            if track:
+                bar.set_postfix_str(f"err={float(np.linalg.norm(pos_err)) * 1000:.1f}mm", refresh=False)
+            bar.update(1)
+
             elapsed = time.perf_counter() - t_step
             sleep_s = dt - elapsed
             if sleep_s > 0:
@@ -553,6 +563,7 @@ def _run_episode(
                     except Exception as e:
                         logger.warning("Camera %s frame dropped at step %d: %s", n, step, e)
     finally:
+        bar.close()
         if old_term is not None:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
@@ -724,8 +735,10 @@ def main() -> None:
                              "parent directory name")
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.DEBUG, format="%(levelname)s %(name)s: %(message)s")
-    logger.setLevel(logging.DEBUG)
+    # INFO: the only DEBUG emitters in this pipeline are the camera drivers
+    # (frame-drain notices); everything sysid relies on is INFO/WARNING.
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    logger.setLevel(logging.INFO)
 
     if args.mode == "replay" and not args.traj_file:
         parser.error("replay mode requires a traj_file")
@@ -787,7 +800,9 @@ def main() -> None:
             controller = _MockController(trans_fudge=trans_fudge)
         else:
             logger.info("connecting to robot...")
-            controller = stack.start_controller()
+            # No cameras: sysid consumes kinematics only, and skipping the rig
+            # drops the per-tick reads, GigE traffic, and MP4 writes.
+            controller = stack.start_controller(with_cameras=False)
             logger.info("robot connected")
 
         for i in range(0, len(episode_names)):

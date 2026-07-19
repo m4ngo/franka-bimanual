@@ -124,13 +124,16 @@ def build_action(chunk_step: np.ndarray, kp: float, kd: float) -> dict:
 # Robot connection
 # ---------------------------------------------------------------------------
 
-def start_controller() -> SingleArmFranka:
+def start_controller(with_cameras: bool = True) -> SingleArmFranka:
+    """with_cameras=False skips the camera rig entirely (no GigE connects, no
+    per-tick reads) for kinematics-only consumers like sysid collection."""
     config = SingleArmFrankaConfig(
         r_server_ip="192.168.3.10",
         r_robot_ip="192.168.201.10",
         r_gripper_ip="192.168.201.10",
         r_port=18812,
-        control_mode="EE_DELTA"
+        control_mode="EE_DELTA",
+        **({} if with_cameras else {"cameras": {}}),
     )
     robot = SingleArmFranka(config)
     robot.connect()
