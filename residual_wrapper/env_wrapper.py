@@ -36,10 +36,34 @@ _DEPTH_FLAT_SIZE = _DEPTH_POINT_COUNT * 3
 # Observation helpers
 # ---------------------------------------------------------------------------
 
-def current_ee_pose(obs: dict) -> np.ndarray:
-    """Return [x, y, z, qx, qy, qz, qw, gripper] for the right arm via FK."""
+# --- Sim-convention correction (sim-trained policies) -----------------------
+# franka_fk returns the Franka TCP position but the FLANGE orientation: its DH
+# tail carries the hand's 0.1034 m translation but not the hand's 45° mounting
+# rotation. Sim-trained students expect robosuite's obs convention instead:
+# grip-SITE position + hand-BODY orientation. Without the correction the
+# student sees quaternions rotated 45.03° from its training distribution and
+# positions offset 6.9 mm from the (world-calibrated) point cloud. Constants
+# measured at matched joint configs across postures, std 0.0 — see
+# SYSID_UPDATE.md in multi-fast (2026-07-18); pinned by multi-fast
+# scripts/sysid/test_controller_parity.py.
+_SIM_CONV_ROT = Rotation.from_rotvec([0.0, 0.0, -0.785891])  # fk(flange) -> hand-body
+_SIM_CONV_POS_TOOL = np.array([0.0, 0.0, -0.0069])           # fk(TCP) -> grip site, tool frame (m)
+
+
+def current_ee_pose(obs: dict, sim_convention: bool = True) -> np.ndarray:
+    """Return [x, y, z, qx, qy, qz, qw, gripper] for the right arm via FK.
+
+    sim_convention (default True): express the pose in the sim-training obs
+    convention (grip-site position, hand-body orientation) so sim-trained
+    policies see in-distribution proprio. False returns the raw franka_fk
+    convention (TCP position, flange orientation) for legacy comparison runs.
+    """
     q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
     pos, quat_xyzw = franka_fk(q)
+    if sim_convention:
+        r_fk = Rotation.from_quat(quat_xyzw)
+        pos = pos + r_fk.apply(_SIM_CONV_POS_TOOL)
+        quat_xyzw = (r_fk * _SIM_CONV_ROT).as_quat()
     return np.concatenate([pos, quat_xyzw, [obs["r_gripper"]]]).astype(np.float32)
 
 
