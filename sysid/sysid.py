@@ -434,6 +434,7 @@ def _run_episode(
     dt = 1.0 / fps
     t_start = time.perf_counter()
     start_pos = start_quat = None  # track-mode anchor, set on the first tick
+    stop_reason = None  # None = ran to completion; else "early_stop" / "track_abort"
     # Keyboard early-stop only when stdin is a real terminal (dry runs under
     # pipes/CI and nohup'd sessions have no tty to put in raw mode).
     interactive = sys.stdin.isatty()
@@ -450,6 +451,7 @@ def _run_episode(
                     raise KeyboardInterrupt
                 if key == "right":
                     print("\r\nearly stop requested", flush=True)
+                    stop_reason = "early_stop"
                     break
 
             # --- read kinematic state ----------------------------------------
@@ -474,6 +476,7 @@ def _run_episode(
                         "tracking error %.3f m exceeds --track-abort-m %.3f at step %d; aborting episode",
                         float(np.linalg.norm(pos_err)), track_abort_m, step,
                     )
+                    stop_reason = "track_abort"
                     break
                 # Divide by the fudge so the post-fudge goal the controller
                 # pursues is exactly the reference.
@@ -556,7 +559,7 @@ def _run_episode(
     if record_video and cam_frames:
         _save_videos(cam_frames, video_dir, video_stem, fps)
 
-    return {k: np.stack(v) for k, v in buf.items() if v}
+    return {k: np.stack(v) for k, v in buf.items() if v}, stop_reason
 
 
 # ---------------------------------------------------------------------------
@@ -830,7 +833,7 @@ def main() -> None:
                 "running %d steps at %.1f Hz (kp=%.2f → gain=%.2f) — press right-arrow to stop early",
                 n_steps, args.fps, args.kp, 10.0 ** args.kp,
             )
-            recorded = _run_episode(
+            recorded, stop_reason = _run_episode(
                 controller=controller,
                 traj=traj,
                 fps=args.fps,
@@ -854,6 +857,50 @@ def main() -> None:
             # Save HDF5 (final atomic write over any mid-episode flush)
             save_sysid_hdf5(recorded, out_path, attrs=episode_attrs)
 
+            # Per-episode sanity summary — makes run.json sufficient for the
+            # post-run check (step counts, faults, aborts, tracking lag).
+            n_rec = len(next(iter(recorded.values())))
+            summary = {
+                "episode": name,
+                "steps": n_rec,
+                "expected_steps": n_steps,
+                "stop_reason": stop_reason,
+                "max_fault_count": int(recorded["fault_count"].max()),
+            }
+            if "eef_goal_pos" in recorded:
+                lag = np.linalg.norm(
+                    recorded["eef_goal_pos"] - recorded["eef_pos"], axis=1
+                )
+                summary["lag_mm"] = {
+                    "mean": round(float(lag.mean() * 1e3), 2),
+                    "max": round(float(lag.max() * 1e3), 2),
+                }
+            if "eef_goal_quat" in recorded:
+                gq = recorded["eef_goal_quat"].astype(np.float64)
+                mq = recorded["eef_quat"].astype(np.float64)
+                gq /= np.maximum(np.linalg.norm(gq, axis=1, keepdims=True), 1e-12)
+                mq /= np.maximum(np.linalg.norm(mq, axis=1, keepdims=True), 1e-12)
+                ang = 2.0 * np.arccos(np.clip(np.abs((gq * mq).sum(axis=1)), -1.0, 1.0))
+                summary["lag_deg"] = {
+                    "mean": round(float(np.degrees(ang.mean())), 2),
+                    "max": round(float(np.degrees(ang.max())), 2),
+                }
+            ok = (stop_reason is None and n_rec == n_steps
+                  and summary["max_fault_count"] == 0)
+            summary["ok"] = ok
+            meta.setdefault("episode_summaries", []).append(summary)
+            _write_run_json(run_dir, meta)  # keep run.json current per episode
+            log = logger.info if ok else logger.warning
+            lag_str = ""
+            if "lag_mm" in summary:
+                lag_str += ", lag mean %.1f / max %.1f mm" % (
+                    summary["lag_mm"]["mean"], summary["lag_mm"]["max"])
+            if "lag_deg" in summary:
+                lag_str += ", ori lag mean %.1f / max %.1f deg" % (
+                    summary["lag_deg"]["mean"], summary["lag_deg"]["max"])
+            log("episode %s: %d/%d steps, faults=%d, stop=%s%s",
+                name, n_rec, n_steps, summary["max_fault_count"], stop_reason, lag_str)
+
             # Visualization + error stats (replay mode only: they compare
             # against the sim reference trajectory; track-mode analysis lives
             # in multi-fast's fit pipeline, which consumes the logged goals).
@@ -870,6 +917,16 @@ def main() -> None:
                 save_aggregate_html(episode_pairs, str(run_dir / "aggregate.html"), fps=args.fps)
             except Exception:
                 logger.exception("aggregate visualization failed")
+
+        # End-of-run verdict line (also derivable from run.json episode_summaries).
+        summaries = meta.get("episode_summaries", [])
+        bad = [s for s in summaries if not s["ok"]]
+        if bad:
+            logger.warning("RUN CHECK: %d/%d episodes flagged: %s",
+                           len(bad), len(summaries), [s["episode"] for s in bad])
+        else:
+            logger.info("RUN CHECK: all %d episodes clean (full length, no faults, no aborts)",
+                        len(summaries))
 
         meta["status"] = "completed"
     except BaseException:
