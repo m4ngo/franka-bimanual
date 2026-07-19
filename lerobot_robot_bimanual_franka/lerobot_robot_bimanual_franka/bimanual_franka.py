@@ -21,7 +21,7 @@ from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
-from .osc_velocity_controller import OSCVelocityController
+from .osc_torque_controller import OSCTorqueController
 from .franka_jacobian import zero_jacobian  # the new analytic module
 
 IMAGE_CHANNELS = 3
@@ -101,8 +101,8 @@ class BimanualFranka(Robot):
         # Cropped and subsampled point cloud from the depth camera, cached each
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
-        self._osc_vel: dict[str, OSCVelocityController] = {
-            arm: OSCVelocityController(num_joints=NUM_JOINTS) for arm in self.active_arms
+        self._osc_vel: dict[str, OSCTorqueController] = {
+            arm: OSCTorqueController(num_joints=NUM_JOINTS) for arm in self.active_arms
         }
         self._home_q: dict[str, np.ndarray] = {} # nullspace target; set in home()
 
@@ -357,6 +357,7 @@ class BimanualFranka(Robot):
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
         kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
+        dyn = self.robot_manager.current_dynamics_batch(list(self.active_arms))
         self._kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
         self._kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(self.kp_gain))
 
@@ -382,12 +383,8 @@ class BimanualFranka(Robot):
             #     {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
             #      for arm in self.active_arms}, kin
             # )
-            cmds = self.safety.shape_joint(
-                {arm: self._qdot_ee_delta(arm, action, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
-                 for arm in self.active_arms}, kin
-            )
-
-            self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
+            cmds = {arm: self._tau_ee_delta(arm, action, kin[arm], dyn[arm], ...) for arm in self.active_arms}
+            self.robot_manager.move_joint_torque_batch({a: c.tolist() for a, c in cmds.items()})
         elif self.control_mode == ControlMode.EE_POS:
             cmds = self.safety.shape_ee(
                 {arm: self._ee_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
@@ -505,7 +502,7 @@ class BimanualFranka(Robot):
             if elapsed < period_s:
                 time.sleep(period_s - elapsed)
 
-    def _qdot_ee_delta(
+    def _tau_ee_delta(
         self,
         arm: str,
         action,  # RobotAction
@@ -576,7 +573,8 @@ class BimanualFranka(Robot):
         # ---- servo current EE toward the (now-updated) goal ----
 
         q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
-        return self._osc_vel[arm].compute_qdot(
+        mass_matrix, coriolis = self._last_dynamics[arm]  # see point 4
+        return self._osc_tau[arm].compute_tau(
             goal_pos=goal_pos,
             goal_quat_xyzw=goal_quat_xyzw,
             ee_pos=ee_pos,
@@ -584,10 +582,13 @@ class BimanualFranka(Robot):
             ee_twist=np.asarray(ee_twist, dtype=np.float64),
             J=np.asarray(J, dtype=np.float64),
             q=np.asarray(q, dtype=np.float64),
+            dq=np.asarray(dq_, dtype=np.float64),
+            mass_matrix=mass_matrix,
+            coriolis=coriolis,
             q_nullspace_target=self._home_q.get(arm),
             kp=self.kp_gain * OSC_BASE_KP,
-            rot_fudge=_EE_ROTATION_FUDGE_FACTOR
-    )
+            rot_fudge=_EE_ROTATION_FUDGE_FACTOR,
+        )
 
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos

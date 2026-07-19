@@ -1,8 +1,18 @@
-"""Direct-RPyC Franka driver for the bimanual plugin.
+"""Direct-RPyC pylibfranka driver for the bimanual plugin.
 
-Bypasses net_franky.franky (singleton (IP,PORT)) by calling rpyc.classic.connect
-once per arm. Motion construction and state packing run server-side via helpers
-installed at connect time, so each per-loop op is one RPyC round-trip per arm.
+Replaces the old franky-based driver. The 1 kHz torque control loop
+(readOnce/writeOnce on pylibfranka's ActiveControlBase) must run inside the
+server process that owns the Robot -- see pylibfranka_server.py -- so each
+per-loop op here is one RPyC round-trip per arm, same shape as the old
+franky driver, just calling `tick(tau)` instead of `send_jv`/`send_ee`.
+
+Because BimanualFranka's OSC torque law needs the mass matrix, Coriolis
+vector, and Jacobian to all come from the *same* RobotState snapshot (see
+osc_torque_controller.py's module docstring), get_kinematic_state() now
+returns those alongside q/dq/pose/twist in one bundle, and send_torque()
+folds the *previous* tick's read together with *this* tick's torque write
+into a single RPyC call (mirroring pylibfranka's own readOnce-then-writeOnce
+control loop shape).
 """
 
 import logging
@@ -15,167 +25,118 @@ from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-VELOCITY_COMMAND_DURATION_MS = 100
 NUM_JOINTS = 7
-EE_DELTA_DIMS = 6
-
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
 RPYC_TIMEOUT_S = 10
-
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
-_JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_TORQUE_THRESHOLD = 100.0  # Nm
-_FORCE_THRESHOLD = 200.0   # N
-_JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
-
-_RECOVERABLE_ERRORS = (
-    "UDP receive: Timeout",
-    "communication_constrains_violation",
-    'current mode ("Reflex")',
-    "type of motion cannot change",
-    "singular"
-)
+_CONNECT_TIMEOUT_S = 10.0
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)
+# Kept as the public shape consumed by bimanual_franka.py's KinematicSnapshot
+# unpacking (`q, dq, J, ee_pos, ee_quat_xyzw, ee_twist = snap`); the extra
+# dynamics terms needed for torque control (mass matrix, Coriolis) are
+# carried on a separate DynamicsSnapshot returned alongside it, since they
+# weren't part of the original interface and existing non-torque call sites
+# (e.g. _patch_jacobian) don't need them.
 KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
+# (mass_matrix (7,7), coriolis (7,))
+DynamicsSnapshot = tuple[NDArray, NDArray]
 
 
-# All motion construction lives here so each loop op is one RPyC round-trip.
-# brine encodes immutable types only — tuples of native floats are brineable,
-# but lists are NOT (they cross the wire as netrefs, costing one round-trip
-# per element access and spamming AttributeError into the server log when
-# numpy probes them for __array__). Always exchange data as tuples.
-# CBRobot.get_last_callback_data leaks state_mutex on AttributeError, so we
-# read cb_robot.state directly under a `with` block and recover any mutex left
-# locked by a previously crashed session.
-_SERVER_HELPERS = f"""
-import threading, numpy as _np
-import franky as _fr
-import net_franky.cb_robot as _cbm
-
-if not _cbm.state_mutex.acquire(blocking=False):
-    _cbm.state_mutex = threading.Lock()
-    _cbm.state = None
-else:
-    _cbm.state_mutex.release()
-
-_DUR = _fr.Duration({VELOCITY_COMMAND_DURATION_MS})
-_EE_DYN = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
-_ZERO3 = _np.zeros(3)
-_ZERO_J = _np.zeros({NUM_JOINTS})
-
-def init_robot(ip, ee):
-    r = _cbm.CBRobot(ip)
-    r.recover_from_errors()
-    if ee:
-        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
-    else:
-        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_JOINT_RELATIVE_DYNAMICS!r})
-    r.set_collision_behavior({_TORQUE_THRESHOLD}, {_FORCE_THRESHOLD})
-    r.set_joint_impedance({_JOINT_STIFFNESS!r})
-    return r
-
-def get_state(robot):
-    with _cbm.state_mutex:
-        s = _cbm.state
-    s = s.robot_state if s is not None else robot.state
-    return (
-        tuple(float(x) for x in s.q),
-        tuple(float(x) for x in s.dq),
-        tuple(float(x) for x in s.O_T_EE.translation),
-        tuple(float(x) for x in s.O_T_EE.quaternion),
-        tuple(float(x) for x in s.O_dP_EE_d.linear) + tuple(float(x) for x in s.O_dP_EE_d.angular),
+def _unpack_bundle(bundle: tuple) -> tuple[KinematicSnapshot, DynamicsSnapshot]:
+    """Unpack the flat tuple returned by pylibfranka_server._RobotSession._bundle_state."""
+    q, dq, J_flat, ee_pos, ee_quat_xyzw, ee_twist, M_flat, C, g = bundle
+    J = np.array(J_flat).reshape(6, NUM_JOINTS)
+    M = np.array(M_flat).reshape(NUM_JOINTS, NUM_JOINTS)
+    snap: KinematicSnapshot = (
+        np.array(q),
+        np.array(dq),
+        J,
+        np.array(ee_pos),
+        np.array(ee_quat_xyzw),
+        np.array(ee_twist),
     )
-
-def get_jacobian(robot):
-    j = _np.asarray(robot.model.zero_jacobian(_fr.Frame.EndEffector, robot.state))
-    return tuple(float(x) for x in j.flat)
-
-def send_jv(robot, vel):
-    robot.move(_fr.JointVelocityMotion(_np.asarray(vel, dtype=_np.float64), _DUR), asynchronous=True)
-
-def send_ee(robot, twist):
-    t = _np.asarray(twist, dtype=_np.float64)
-    robot.move(_fr.CartesianVelocityMotion(_fr.Twist(t[:3], t[3:]), _DUR, _EE_DYN), asynchronous=True)
-
-def stop(robot, use_ee):
-    if use_ee:
-        m = _fr.CartesianVelocityMotion(_fr.Twist(_ZERO3, _ZERO3), _DUR, _EE_DYN)
-    else:
-        m = _fr.JointVelocityMotion(_ZERO_J, _DUR)
-    robot.move(m, asynchronous=False)
-"""
+    dyn: DynamicsSnapshot = (M, np.array(C))
+    return snap, dyn
 
 
 class RobotDriver:
-    """One arm: one RPyC connection, one robot handle, one set of helpers.
+    """One arm: one RPyC connection to the pylibfranka torque server.
 
     Single-threaded per-instance; the wrapper executor owns serialization.
     """
 
     def __init__(self, server_ip: str, robot_ip: str, port: int, use_ee_delta: bool = False):
+        # use_ee_delta kept for constructor-signature compatibility with the
+        # old franky driver's call sites; torque control doesn't have a
+        # separate "ee delta" transport mode -- BimanualFranka's OSC layer
+        # is what turns ee-delta actions into torques now.
         self.use_ee_delta = use_ee_delta
-        # Cumulative count of recoverable-error recoveries (reflexes etc.) —
-        # lets recording scripts flag ticks where tracking was interrupted.
         self.recovery_count = 0
-        self._jac: NDArray | None = None
-        self._jac_q: NDArray | None = None
+        self.robot_ip = robot_ip
 
-        self._conn = rpyc.classic.connect(server_ip, port)
-        self._conn._config["sync_request_timeout"] = RPYC_TIMEOUT_S
-        self._conn.execute(_SERVER_HELPERS)
-        ns = self._conn.namespace
-        self._rpc_state = ns["get_state"]
-        self._rpc_jacobian = ns["get_jacobian"]
-        self._rpc_send_jv = ns["send_jv"]
-        self._rpc_send_ee = ns["send_ee"]
-        self._rpc_stop = ns["stop"]
-        self.robot = ns["init_robot"](robot_ip, use_ee_delta)
+        self._conn = rpyc.connect(
+            server_ip, port,
+            config={"sync_request_timeout": RPYC_TIMEOUT_S, "allow_pickle": True},
+        )
+        self._conn.root.init_robot(robot_ip, True)
+        self._conn.root.start_torque_control(robot_ip)
+
+        self._last_dyn: DynamicsSnapshot | None = None
 
     @property
     def is_alive(self) -> bool:
         return not self._conn.closed
 
     def get_kinematic_state(self) -> KinematicSnapshot:
-        q_l, dq_l, p_l, r_l, v_l = self._rpc_state(self.robot)
-        q = np.array(q_l)
-        if self._jac is None or float(np.max(np.abs(q - self._jac_q))) > _JACOBIAN_CACHE_Q_THRESHOLD:
-            self._jac = np.array(self._rpc_jacobian(self.robot)).reshape(6, 7)
-            self._jac_q = q.copy()
-        return q, np.array(dq_l), self._jac, np.array(p_l), np.array(r_l), np.array(v_l)
+        """Read-only tick (writes no torque). Also caches the dynamics terms
+        from this snapshot so a subsequent send_torque() in the same control
+        step reuses a consistent (M, C) rather than issuing an extra RPC."""
+        bundle, err = self._conn.root.tick(self.robot_ip, None)
+        if err is not None:
+            self._handle_error(err)
+            raise ConnectionError(f"pylibfranka tick() failed for {self.robot_ip}: {err}")
+        snap, dyn = _unpack_bundle(bundle)
+        self._last_dyn = dyn
+        return snap
 
-    def send_joint_velocity(self, vel: list[float]) -> None:
-        """Joint-space velocity RPC (joint-mode teleop and `home()` when not in EE mode)."""
-        # tuple() so brine encodes by value (lists go over as netrefs).
-        try:
-            self._rpc_send_jv(self.robot, tuple(vel))
-        except Exception as e:
-            if any(t in str(e) for t in _RECOVERABLE_ERRORS):
-                self.recovery_count += 1
-                try:
-                    self.robot.recover_from_errors()
-                except Exception:
-                    pass
-            logger.warning("send_joint_velocity: %s", e)
+    def dynamics_from_last_read(self) -> DynamicsSnapshot:
+        """(mass_matrix, coriolis) from the most recent get_kinematic_state()
+        call on this arm. Raises if none has been taken yet this step."""
+        if self._last_dyn is None:
+            raise RuntimeError(
+                "dynamics_from_last_read() called before get_kinematic_state(); "
+                "torque control needs a state read this tick first."
+            )
+        return self._last_dyn
 
-    def send_velocity(self, vel: list[float]) -> None:
-        """Cartesian twist when `use_ee_delta`, else joint velocity (normal teleop)."""
-        # tuple() so brine encodes by value (lists go over as netrefs).
-        rpc = self._rpc_send_ee if self.use_ee_delta else self._rpc_send_jv
+    def send_torque(self, tau: list[float]) -> KinematicSnapshot:
+        """Write a torque command and return the resulting fresh state
+        (i.e. this doubles as next tick's read, same as pylibfranka's own
+        readOnce/writeOnce loop shape)."""
+        bundle, err = self._conn.root.tick(self.robot_ip, list(tau))
+        if err is not None:
+            self._handle_error(err)
+            raise ConnectionError(f"pylibfranka tick() failed for {self.robot_ip}: {err}")
+        snap, dyn = _unpack_bundle(bundle)
+        self._last_dyn = dyn
+        return snap
+
+    def _handle_error(self, err: str) -> None:
+        self.recovery_count += 1
+        logger.warning("RobotDriver(%s): %s", self.robot_ip, err)
         try:
-            rpc(self.robot, tuple(vel))
-        except Exception as e:
-            if any(t in str(e) for t in _RECOVERABLE_ERRORS):
-                self.recovery_count += 1
-                try:
-                    self.robot.recover_from_errors()
-                except Exception:
-                    pass
-            logger.warning("send_velocity: %s", e)
+            # Server already attempted automatic_error_recovery() and torn
+            # down its ActiveControlBase; re-arm torque control here so the
+            # next tick() call succeeds instead of failing again.
+            self._conn.root.start_torque_control(self.robot_ip)
+        except Exception:
+            pass
 
     def stop(self) -> None:
-        self._rpc_stop(self.robot, self.use_ee_delta)
+        try:
+            self._conn.root.stop(self.robot_ip)
+        except Exception as e:
+            logger.warning("stop(): %s", e)
 
     def shutdown(self) -> None:
         try:
@@ -205,7 +166,6 @@ class MultiRobotWrapper:
         return sum(1 for d in self.drivers.values() if d.is_alive)
 
     def recovery_counts(self) -> dict[str, int]:
-        """Cumulative recoverable-error recoveries per arm (see RobotDriver.recovery_count)."""
         return {n: d.recovery_count for n, d in self.drivers.items()}
 
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
@@ -215,14 +175,19 @@ class MultiRobotWrapper:
     def current_kinematic_state(self, name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> KinematicSnapshot:
         return self.drivers[name].get_kinematic_state()
 
-    def current_kinematic_state_batch(self, names: list[str], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> dict[str, KinematicSnapshot]:
+    def current_kinematic_state_batch(
+        self, names: list[str], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    ) -> dict[str, KinematicSnapshot]:
         return self._gather(lambda n: self.drivers[n].get_kinematic_state(), names, timeout_s)
 
-    def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True) -> None:
-        self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n]), list(vels))
+    def current_dynamics_batch(self, names: list[str]) -> dict[str, DynamicsSnapshot]:
+        """(mass_matrix, coriolis) per arm, from each arm's most recent read."""
+        return {n: self.drivers[n].dynamics_from_last_read() for n in names}
 
-    def move_ee_delta_batch(self, twists: dict[str, list], asynchronous: bool = True) -> None:
-        self._gather(lambda n: self.drivers[n].send_velocity(twists[n]), list(twists))
+    def move_joint_torque_batch(self, taus: dict[str, list], asynchronous: bool = True) -> dict[str, KinematicSnapshot]:
+        """Send torques for this control step; returns the fresh state read
+        back with each write (see RobotDriver.send_torque)."""
+        return self._gather(lambda n: self.drivers[n].send_torque(taus[n]), list(taus))
 
     def stop_all_motion(self) -> None:
         self._gather(lambda n: self.drivers[n].stop(), [n for n, d in self.drivers.items() if d.is_alive])
