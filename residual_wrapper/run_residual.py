@@ -156,6 +156,7 @@ def _run_episode(
     recorder: "EpisodeRecorder | None" = None,
     replaying: bool = False,
     proprio_frame: str = "world",
+    sim_proprio_convention: bool = True,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -202,7 +203,7 @@ def _run_episode(
             # times.append(time.perf_counter())
             obs = controller.get_observation()
             # times.append(time.perf_counter())
-            ee_pose = current_ee_pose(obs)
+            ee_pose = current_ee_pose(obs, sim_convention=sim_proprio_convention)
             # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
             # times.append(time.perf_counter())
@@ -404,6 +405,11 @@ def main() -> None:
                         help="Frame for the residual proprio pose: 'robot' = raw franka_fk "
                              "(current behavior), 'world' = transformed to the world frame "
                              "the point cloud lives in")
+    parser.add_argument("--raw-proprio", action="store_true",
+                        help="A/B control: skip the sim-convention proprio correction "
+                             "(45\u00b0 flange-vs-body quat + 6.9 mm TCP-vs-site pos; see "
+                             "env_wrapper.current_ee_pose) and feed the legacy raw "
+                             "franka_fk pose to the residual policy")
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu)")
     parser.add_argument(
         "--home-pose-name",
@@ -504,6 +510,7 @@ def main() -> None:
                     fps=args.fps, recorder=recorder,
                     replaying=args.replay_dataset is not None,
                     proprio_frame=args.proprio_frame,
+                    sim_proprio_convention=not args.raw_proprio,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -540,6 +547,7 @@ def main() -> None:
                         recorder=recorder,
                         replaying=args.replay_dataset is not None,
                         proprio_frame=args.proprio_frame,
+                        sim_proprio_convention=not args.raw_proprio,
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:
