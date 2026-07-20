@@ -243,11 +243,11 @@ def _run_episode(
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
                         "proprio": np.concatenate([
                             split_gripper(proprio_pose).astype(np.float32),
-                            np.array([controller.kp_gain, controller.kd_gain], dtype=np.float32),
+                            # Sim controller_state convention: [damping_norm, kp_norm].
+                            np.array([prev_kd, prev_kp], dtype=np.float32),
                             np.asarray(vel, dtype=np.float32),
                         ]),
                         "point_cloud": point_cloud,
-                        "gains": np.array([prev_kp, prev_kd], dtype=np.float32),
                     }
                     res_chunk = residual.infer(residual_obs)
                     if recorder is not None and residual.last_network_pcd is not None:
@@ -293,8 +293,9 @@ def _run_episode(
                     kp = float(base_chunk[chunk_used, 8])
                     kd = float(base_chunk[chunk_used, 9])
                 else:
-                    kp = float(res[0])
-                    kd = float(res[1])
+                    # Residual layout is [damping, stiffness, ...] (multi-fast convention).
+                    kp = float(res[1])
+                    kd = float(res[0])
             else:
                 dpos = np.zeros(3, dtype=np.float32)
                 drot = np.zeros(3, dtype=np.float32)

@@ -17,7 +17,8 @@ Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
                       Derived by converting each base-chunk step's delta quat to a rotvec
                       and dividing by the respective scales.
 
-Residual output     : (_CHUNK_EXEC, 9) chunk — [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
+Residual output     : (_CHUNK_EXEC, 9) chunk — [damping, stiffness, dx, dy, dz, rx, ry, rz, grip_delta]
+                      (gains first, DAMPING before stiffness — multi-fast convention)
                       per step (normalised, same scales as input).  Gains are at
                       indices 0–1, positional/rotational deltas at 2–7, gripper at 8.
 """
@@ -170,12 +171,12 @@ class ResidualPolicy:
                 "action_chunk" (10, 9) — normalised delta chunk from base policy
                                          columns 0:7 = [dx, dy, dz, rx, ry, rz, grip]
                                          columns 7:9 = [kp, kd] (dropped before model)
-                "proprio"      (17,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r,
-                                          kp, kd, vx, vy, vz, wx, wy, wz]
+                "proprio"      (17,)    — [x, y, z, qx, qy, qz, qw, finger_qpos_m, -finger_qpos_m,
+                                          damping_norm, kp_norm, vx, vy, vz, wx, wy, wz]
                 "point_cloud"  (2048, 3) — xyz in robot/world frame
 
         Returns:
-            (_CHUNK_EXEC, 9) — per step: [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
+            (_CHUNK_EXEC, 9) — per step: [damping, stiffness, dx, dy, dz, rx, ry, rz, grip_delta]
                                all normalised (gains-first layout from variable-impedance
                                sim training).
         """

@@ -85,9 +85,16 @@ def ee_pose_to_world(
     return out
 
 
+# Panda finger-joint range (m); robosuite gripper_qpos = [width/2, -width/2].
+_PANDA_FINGER_MAX_M = 0.04
+
+
 def split_gripper(obs: np.ndarray) -> np.ndarray:
-    grip: float = obs[7]
-    return np.concatenate([obs, np.array([-grip], dtype=np.float32)])
+    """Replace normalized gripper obs[7] with sim-convention finger qpos (g, -g) in meters."""
+    g = obs[7] * _PANDA_FINGER_MAX_M
+    out = obs.astype(np.float32).copy()
+    out[7] = g
+    return np.concatenate([out, np.array([-g], dtype=np.float32)])
 
 
 def extract_point_cloud(obs: dict) -> np.ndarray:
