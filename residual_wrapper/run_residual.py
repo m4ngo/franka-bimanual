@@ -1,6 +1,7 @@
 """Entry point for running and recording residual-policy episodes on the Franka."""
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -155,6 +156,7 @@ def _run_episode(
     replaying: bool = False,
     proprio_frame: str = "world",
     sim_proprio_convention: bool = True,
+    dump_dir: "Path | None" = None,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -176,6 +178,9 @@ def _run_episode(
     chunk_used = _CHUNK_EXEC   # triggers immediate inference on first step
     prev_kp = 0.0
     prev_kd = 0.0
+    infer_idx = 0
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -251,6 +256,17 @@ def _run_episode(
                         "point_cloud": point_cloud,
                     }
                     res_chunk = residual.infer(residual_obs)
+                    if dump_dir is not None:
+                        np.savez_compressed(
+                            dump_dir / f"obs_{infer_idx:05d}.npz",
+                            base_chunk_raw=base_chunk.astype(np.float32),
+                            action_chunk=residual_obs["action_chunk"],
+                            proprio=residual_obs["proprio"],
+                            point_cloud=residual_obs["point_cloud"],
+                            network_pcd=residual.last_network_pcd,
+                            res_chunk=res_chunk.astype(np.float32),
+                        )
+                    infer_idx += 1
                     if recorder is not None and residual.last_network_pcd is not None:
                         recorder.record_policy_pcd(len(recorder), residual.last_network_pcd)
 
@@ -432,6 +448,10 @@ def main() -> None:
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
         help="Path to residual policy checkpoint (best.pt)",
     )
+    parser.add_argument("--dump-obs-dir", default=None,
+                        help="Dump every residual_obs bundle (+ residual output) to npz under "
+                             "this dir, one timestamped run subdir per invocation; feeds the "
+                             "Tier 1/2 checks in STUDENT_INPUT_PARITY.md")
     parser.add_argument("--no-residual", action="store_true",
                         help="Disable the residual policy; run base policy only")
     parser.add_argument("--proprio-frame", choices=("robot", "world"), default="world",
@@ -519,6 +539,28 @@ def main() -> None:
         residual = ResidualPolicy(args.residual_policy, device=args.device)
         print("residual policy started")
 
+    dump_root: "Path | None" = None
+    if args.dump_obs_dir:
+        if residual is None:
+            print("--dump-obs-dir ignored: residual_obs only exists with a residual policy")
+        else:
+            dump_root = Path(args.dump_obs_dir).expanduser() / time.strftime("%Y%m%d_%H%M%S")
+            dump_root.mkdir(parents=True, exist_ok=True)
+            h = hashlib.sha256()
+            with open(args.residual_policy, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            (dump_root / "meta.json").write_text(json.dumps({
+                "residual_policy": str(Path(args.residual_policy).resolve()),
+                "residual_policy_sha256": h.hexdigest(),
+                "base_policy": args.base_policy or args.replay_dataset,
+                "proprio_frame": args.proprio_frame,
+                "raw_proprio": bool(args.raw_proprio),
+                "fps": args.fps,
+                "argv": sys.argv,
+            }, indent=2))
+            print(f"dumping residual obs bundles to {dump_root}")
+
     home_kwargs = dict(
         home_q_left=None,
         home_q_right=home_q,
@@ -544,6 +586,7 @@ def main() -> None:
                     replaying=args.replay_dataset is not None,
                     proprio_frame=args.proprio_frame,
                     sim_proprio_convention=not args.raw_proprio,
+                    dump_dir=dump_root / "ep000" if dump_root else None,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -581,6 +624,7 @@ def main() -> None:
                         replaying=args.replay_dataset is not None,
                         proprio_frame=args.proprio_frame,
                         sim_proprio_convention=not args.raw_proprio,
+                        dump_dir=dump_root / f"ep{dataset.num_episodes:03d}" if dump_root else None,
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:
