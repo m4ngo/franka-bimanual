@@ -121,8 +121,13 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
 - **F8 — crop geometry**: box (sim) vs sphere (real); per-camera quota vs
   single-view sampling; no real analogue of wrist-view training clouds.
 
+- **F9 — gripper residual clip mismatch** (found 2026-07-19 while speccing the
+  parity scripts): sim eval clips channels 2:9 (pose AND grip) to
+  ±residual_mag (0.2); real clips grip to ±`_RESIDUAL_MAG` (1.0)
+  (`policy_wrapper.py:206` / `env_wrapper.py:18`). Fix: `_RESIDUAL_MAG = 0.2`.
+
 Status: F1-F4, F6, F7 fixed 2026-07-19; F5, F8 OPEN (measurement questions —
-Tier 2 audit). Update this list as fixes land.
+Tier 2 audit); F9 OPEN (one-line fix). Update this list as fixes land.
 
 ---
 
