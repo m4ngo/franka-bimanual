@@ -1,273 +1,195 @@
-"""
-Torque-domain OSC controller, replacing OSCVelocityController now that
-BimanualFranka drives the arm via pylibfranka's start_torque_control()
-instead of franky joint-velocity commands.
+"""Torque-domain OSC controller — aligned 1:1 with robosuite's
+OperationalSpaceController.run_controller() in "variable_kp" impedance mode.
 
-This mirrors robosuite's OperationalSpaceController.run_controller() almost
-exactly (see osc.py): task-space PD wrench -> operational-space projection
-via lambda = (J M^-1 J^T)^-1 -> torques = J^T @ F_task + nullspace torques.
+Uses rotation MATRICES for orientation error (not quaternions) to match
+robosuite exactly and avoid quaternion-composition-order bugs.
 
-Two differences from robosuite's osc.py, both driven by what pylibfranka
-gives us:
-
-1. No `+ torque_compensation` (robosuite adds gravity compensation itself,
-   since MuJoCo's underlying torque actuators are not gravity-compensated).
-   pylibfranka's `start_torque_control()` gravity-compensates internally
-   (per the pylibfranka docs: "gravity is automatically compensated"), so
-   adding `g` again here would double-compensate. Coriolis is *not*
-   mentioned as auto-compensated, so we add `-C` explicitly (opposing the
-   Coriolis torque, matching the standard robot-dynamics convention
-   tau = M*qddot + C + g).
-
-2. Where osc.py reads `self.mass_matrix` / `self.J_full` etc. off `self`
-   (populated by the surrounding Controller/sim base class each `update()`),
-   here those quantities arrive per-call as arguments, since they're read
-   from a single pylibfranka RobotState snapshot on the RPyC server side
-   (see pylibfranka_server.py._RobotSession._bundle_state) to keep M, C, g,
-   J, and the pose all mutually consistent for one control tick.
-
-Variable impedance mirrors robosuite's impedance_mode="variable_kp": kp is
-settable per-call, kd is always re-derived as critically damped (or at the
-given damping ratio).
+variable_kp semantics (see robosuite OperationalSpaceController.set_goal):
+    kp is supplied as an action every tick, clipped to [kp_min, kp_max].
+    kd is always derived as kd = 2*sqrt(kp) (critically damped) -- there is
+    no independent damping_ratio action in this mode.
 """
 
 from __future__ import annotations
-
 import numpy as np
 
-# Torque-domain PD gains. NOT the same units/magnitude as the old
-# velocity-domain DEFAULT_KP=3.5 in osc_velocity_controller.py -- these are
-# task-space stiffness/damping now (N/m, Nm/rad and their *sqrt-derived*
-# damping terms), same role as robosuite osc.py's default kp=150.
+# Matches osc.py OperationalSpaceController defaults exactly.
 DEFAULT_KP = 150.0
-DEFAULT_DAMPING_RATIO = 1.0
-
-# Nullspace joint torque gain (Nm/rad), analogous role to robosuite's
-# nullspace_torques() internal joint-space stiffness.
+DEFAULT_KP_LIMITS = (0.0, 300.0)
 DEFAULT_NULLSPACE_KP = 10.0
 DEFAULT_NULLSPACE_KD = 2.0 * np.sqrt(DEFAULT_NULLSPACE_KP)
-
-# Final safety clip on the resulting joint torque command, Nm. Kept well
-# under the FR3 continuous joint torque limits as a last-resort backstop;
-# the primary safety envelope is set_collision_behavior() on the server.
-DEFAULT_MAX_TAU = 15.0
-
-
-def quat_xyzw_conjugate(q_xyzw: np.ndarray) -> np.ndarray:
-    x, y, z, w = q_xyzw
-    return np.array([-x, -y, -z, w], dtype=np.float64)
+DEFAULT_MAX_TAU = 35.0  # Conservative uniform clamp; robot has no per-joint enforcement,
+                         # so this is our only safety margin. Panda datasheet nominal
+                         # per-joint limits range ~87 N*m (joints 1-4) down to ~12 N*m
+                         # (joints 5-7) -- 35 sits well clear of the weak wrist joints
+                         # while being far less choking than the old 15 N*m default.
 
 
-def quat_xyzw_multiply(q1_xyzw: np.ndarray, q2_xyzw: np.ndarray) -> np.ndarray:
-    """q1 * q2, both (x, y, z, w)."""
-    x1, y1, z1, w1 = q1_xyzw
-    x2, y2, z2, w2 = q2_xyzw
-    return np.array(
-        [
-            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-        ],
-        dtype=np.float64,
-    )
+def quat_xyzw_to_mat(q_xyzw: np.ndarray) -> np.ndarray:
+    x, y, z, w = q_xyzw / max(float(np.linalg.norm(q_xyzw)), 1e-12)
+    return np.array([
+        [1 - 2*(y*y+z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+        [2*(x*y + z*w), 1 - 2*(x*x+z*z), 2*(y*z - x*w)],
+        [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x+y*y)],
+    ], dtype=np.float64)
 
 
-def orientation_error_from_quats(goal_quat_xyzw: np.ndarray, current_quat_xyzw: np.ndarray) -> np.ndarray:
-    """Axis-angle (rad, 3-vector) rotation taking current -> goal. Same role
-    as robosuite's orientation_error(goal_mat, current_mat)."""
-    g = goal_quat_xyzw / max(float(np.linalg.norm(goal_quat_xyzw)), 1e-12)
-    c = current_quat_xyzw / max(float(np.linalg.norm(current_quat_xyzw)), 1e-12)
+def mat_to_quat_xyzw(R: np.ndarray) -> np.ndarray:
+    m00, m01, m02 = R[0]; m10, m11, m12 = R[1]; m20, m21, m22 = R[2]
+    tr = m00 + m11 + m22
+    if tr > 0:
+        s = 0.5 / np.sqrt(tr + 1.0); w = 0.25 / s
+        x = (m21 - m12) * s; y = (m02 - m20) * s; z = (m10 - m01) * s
+    elif m00 > m11 and m00 > m22:
+        s = 2.0 * np.sqrt(1.0 + m00 - m11 - m22); w = (m21 - m12) / s
+        x = 0.25 * s; y = (m01 + m10) / s; z = (m02 + m20) / s
+    elif m11 > m22:
+        s = 2.0 * np.sqrt(1.0 + m11 - m00 - m22); w = (m02 - m20) / s
+        x = (m01 + m10) / s; y = 0.25 * s; z = (m12 + m21) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + m22 - m00 - m11); w = (m10 - m01) / s
+        x = (m02 + m20) / s; y = (m12 + m21) / s; z = 0.25 * s
+    q = np.array([x, y, z, w])
+    return q / max(float(np.linalg.norm(q)), 1e-12)
 
-    q_err = quat_xyzw_multiply(g, quat_xyzw_conjugate(c))
-    q_err /= max(float(np.linalg.norm(q_err)), 1e-12)
-    if q_err[3] < 0.0:
-        q_err = -q_err  # shortest-path equivalent rotation
 
-    v = q_err[:3]
-    v_norm = float(np.linalg.norm(v))
-    if v_norm < 1e-9:
-        return 2.0 * v
-    angle = 2.0 * np.arctan2(v_norm, float(np.clip(q_err[3], -1.0, 1.0)))
-    return (v / v_norm) * angle
+def orientation_error(desired: np.ndarray, current: np.ndarray) -> np.ndarray:
+    """EXACT robosuite formula: 0.5*(rc1 x rd1 + rc2 x rd2 + rc3 x rd3),
+    columns of the rotation matrices. Do NOT replace with a quaternion
+    axis-angle error -- different convention, breaks rotation control."""
+    rc1, rc2, rc3 = current[0:3, 0], current[0:3, 1], current[0:3, 2]
+    rd1, rd2, rd3 = desired[0:3, 0], desired[0:3, 1], desired[0:3, 2]
+    return 0.5 * (np.cross(rc1, rd1) + np.cross(rc2, rd2) + np.cross(rc3, rd3))
 
 
-def opspace_matrices(mass_matrix: np.ndarray, J_full: np.ndarray, J_pos: np.ndarray, J_ori: np.ndarray):
-    """Same decomposition as robosuite.utils.control_utils.opspace_matrices:
-    lambda_full = (J M^-1 J^T)^-1 (with pinv fallback near singularities),
-    and the corresponding position-only / orientation-only lambdas plus the
-    nullspace projector N = I - Jbar @ J."""
+def opspace_matrices(mass_matrix, J_full, J_pos, J_ori):
+    """Exact port of control_utils.opspace_matrices -- uses pinv, not inv,
+    on the lambda matrices (matches osc.py: inv on mass_matrix, pinv on the
+    lambda inversions, for numerical stability against singular Jacobians)."""
     mass_matrix_inv = np.linalg.inv(mass_matrix)
 
-    def _lambda(J):
-        lambda_inv = J @ mass_matrix_inv @ J.T
-        try:
-            return np.linalg.inv(lambda_inv)
-        except np.linalg.LinAlgError:
-            return np.linalg.pinv(lambda_inv)
+    def _lambda_inv(J):
+        return J @ mass_matrix_inv @ J.T
 
-    lambda_full = _lambda(J_full)
-    lambda_pos = _lambda(J_pos)
-    lambda_ori = _lambda(J_ori)
+    lambda_full = np.linalg.pinv(_lambda_inv(J_full))
+    lambda_pos = np.linalg.pinv(_lambda_inv(J_pos))
+    lambda_ori = np.linalg.pinv(_lambda_inv(J_ori))
 
     Jbar = mass_matrix_inv @ J_full.T @ lambda_full
-    n = mass_matrix.shape[0]
-    nullspace_matrix = np.eye(n) - Jbar @ J_full
-
+    nullspace_matrix = np.eye(mass_matrix.shape[0]) - Jbar @ J_full
     return lambda_full, lambda_pos, lambda_ori, nullspace_matrix
 
 
-def nullspace_torques(
-    mass_matrix: np.ndarray,
-    nullspace_matrix: np.ndarray,
-    q_target: np.ndarray,
-    q: np.ndarray,
-    dq: np.ndarray,
-    kp: float = DEFAULT_NULLSPACE_KP,
-    kd: float = DEFAULT_NULLSPACE_KD,
-) -> np.ndarray:
-    """Same role as robosuite's nullspace_torques(): a joint-space PD torque
-    toward q_target, projected through the nullspace so it doesn't disturb
-    the commanded task-space wrench."""
-    pd = kp * (q_target - q) - kd * dq
-    return nullspace_matrix.T @ (mass_matrix @ pd)
+def nullspace_torques(mass_matrix, nullspace_matrix, initial_joint, joint_pos, joint_vel,
+                       joint_kp=DEFAULT_NULLSPACE_KP):
+    """Exact port of control_utils.nullspace_torques -- joint_kv is always
+    derived as sqrt(joint_kp)*2 here (matches osc.py exactly); this differs
+    from critical damping of joint_kp itself (2*sqrt(joint_kp)) only in that
+    osc.py uses this specific (slightly off-critical) formula intentionally,
+    so we replicate it rather than "fixing" it."""
+    joint_kv = np.sqrt(joint_kp) * 2
+    pose_torques = mass_matrix @ (joint_kp * (initial_joint - joint_pos) - joint_kv * joint_vel)
+    return nullspace_matrix.T @ pose_torques
 
 
 class OSCTorqueController:
-    """Per-arm torque-domain OSC. One instance per arm (holds gain state)."""
+    """Torque-domain OSC controller, variable_kp impedance mode only.
 
-    def __init__(
-        self,
-        num_joints: int,
-        kp: np.ndarray | float = DEFAULT_KP,
-        damping_ratio: float = DEFAULT_DAMPING_RATIO,
-        nullspace_kp: float = DEFAULT_NULLSPACE_KP,
-        max_tau: float = DEFAULT_MAX_TAU,
-        uncouple_pos_ori: bool = True,
-    ) -> None:
+    kp is a scalar action supplied every compute_tau() call (broadcast to
+    all 6 pos/ori DOF, matching robosuite's nums2array(kp, 6) behavior for a
+    scalar kp input). kd is always 2*sqrt(kp) -- critically damped, exactly
+    as osc.py's variable_kp mode computes it in set_goal().
+    """
+
+    def __init__(self, num_joints, kp_limits=DEFAULT_KP_LIMITS, max_tau=DEFAULT_MAX_TAU,
+                 uncouple_pos_ori=True, nullspace_kp=DEFAULT_NULLSPACE_KP):
         self.num_joints = num_joints
-        self.damping_ratio = float(damping_ratio)
-        self.nullspace_kp = float(nullspace_kp)
-        self.nullspace_kd = 2.0 * np.sqrt(self.nullspace_kp)
+        self.kp_min, self.kp_max = float(kp_limits[0]), float(kp_limits[1])
         self.max_tau = float(max_tau)
         self.uncoupling = bool(uncouple_pos_ori)
-        self.set_impedance(kp, damping_ratio)
+        self.nullspace_kp = float(nullspace_kp)
+        self.nullspace_kd = 2.0 * np.sqrt(self.nullspace_kp)
 
-    @staticmethod
-    def _as_six(kp: np.ndarray | float) -> np.ndarray:
-        arr = np.asarray(kp, dtype=np.float64)
-        if arr.ndim == 0:
-            return np.full(6, float(arr))
-        assert arr.shape == (6,), f"kp must be scalar or shape (6,), got {arr.shape}"
-        return arr
+        self.goal_pos: np.ndarray | None = None
+        self.goal_ori: np.ndarray | None = None
+        self._reference_pos: np.ndarray | None = None
+        self._reference_ori: np.ndarray | None = None
 
-    def set_impedance(self, kp: np.ndarray | float, damping_ratio: float | None = None) -> None:
-        """Mirrors robosuite's impedance_mode="variable_kp": kp is set
-        per-call, kd is always re-derived as critically damped (or at the
-        given damping ratio)."""
-        self.kp = self._as_six(kp)
-        if damping_ratio is not None:
-            self.damping_ratio = float(damping_ratio)
-        self.kd = 2.0 * np.sqrt(self.kp) * self.damping_ratio
+    def init_goal(self, ee_pos, ee_quat_xyzw):
+        """Call once (e.g. right after home()) to fix the REFERENCE pose that
+        all subsequent absolute-offset teleop deltas are applied on top of.
+        This reference is NOT updated every tick -- see set_goal_from_offset."""
+        self._reference_pos = np.asarray(ee_pos, dtype=np.float64).copy()
+        self._reference_ori = quat_xyzw_to_mat(np.asarray(ee_quat_xyzw, dtype=np.float64))
+        self.goal_pos = self._reference_pos.copy()
+        self.goal_ori = self._reference_ori.copy()
 
-    def compute_tau(
-        self,
-        goal_pos: np.ndarray,
-        goal_quat_xyzw: np.ndarray,
-        ee_pos: np.ndarray,
-        ee_quat_xyzw: np.ndarray,
-        ee_twist: np.ndarray,
-        J: np.ndarray,
-        q: np.ndarray,
-        dq: np.ndarray,
-        mass_matrix: np.ndarray,
-        coriolis: np.ndarray,
-        rot_fudge: float = 1.0,
-        q_nullspace_target: np.ndarray | None = None,
-        kp: np.ndarray | float | None = None,
-        damping_ratio: float | None = None,
-    ) -> np.ndarray:
-        """
-        Args:
-            goal_pos: (3,) desired EE position
-            goal_quat_xyzw: (4,) desired EE orientation quaternion (x,y,z,w)
-            ee_pos: (3,) current EE position
-            ee_quat_xyzw: (4,) current EE orientation
-            ee_twist: (6,) current EE spatial velocity [linear(3), angular(3)]
-            J: (6, num_joints) Jacobian, rows = [linear; angular]
-            q: (num_joints,) current joint config
-            dq: (num_joints,) current joint velocities
-            mass_matrix: (num_joints, num_joints) joint-space mass matrix,
-                from the SAME RobotState snapshot as J/q/dq (see module
-                docstring -- these must not be mixed across ticks)
-            coriolis: (num_joints,) Coriolis force vector, same snapshot
-            q_nullspace_target: (num_joints,) reference config for the
-                redundant-DoF nullspace bias (e.g. home pose). If None, no
-                nullspace term is added.
-            kp/damping_ratio: optional per-call impedance override
-                (variable impedance), same semantics as set_impedance().
+    def set_goal_from_offset(self, offset_dpos: np.ndarray, offset_dquat_xyzw: np.ndarray):
+        """Teleop reports offset_dpos/offset_dquat_xyzw as an ABSOLUTE offset
+        from teleop's own rest pose (re-sent fresh every tick, decaying back to
+        zero/identity on release) -- NOT a per-tick incremental delta. The goal
+        must be recomputed fresh from the fixed reference pose every call, never
+        composed onto the previous goal -- composing every tick made the goal
+        orientation run away, since the same offset got re-applied ~20x/sec
+        instead of being a one-time step."""
+        if self.goal_pos is None:
+            raise RuntimeError("call init_goal() before set_goal_from_offset()")
+        self.goal_pos = self._reference_pos + np.asarray(offset_dpos, dtype=np.float64)
+        delta_mat = quat_xyzw_to_mat(np.asarray(offset_dquat_xyzw, dtype=np.float64))
+        self.goal_ori = delta_mat @ self._reference_ori
 
-        Returns:
-            (num_joints,) joint torque command, NOT including gravity
-            compensation (pylibfranka's torque-control mode adds that
-            internally -- see module docstring).
-        """
-        if kp is not None:
-            self.set_impedance(kp, damping_ratio)
+    def compute_tau(self, ee_pos, ee_quat_xyzw, ee_twist, J, q, dq, mass_matrix, coriolis,
+                     kp, kd, q_nullspace_target=None):
+        """kp: scalar (broadcast to 6 DOF) or length-6 array. kd is always
+        derived as 2*sqrt(kp), critically damped, matching osc.py's
+        variable_kp mode -- there is no separate damping_ratio input."""
+        kp_arr = np.asarray(kp, dtype=np.float64)
+        kp6 = np.full(6, float(kp_arr)) if kp_arr.ndim == 0 else kp_arr
+        kp6 = np.clip(kp6, self.kp_min, self.kp_max)
+        if kd is None:
+            kd6 = 2.0 * np.sqrt(kp6)
+        else:
+            kd_arr = np.asarray(kd, dtype=np.float64)
+            kd6 = np.full(6, float(kd_arr)) if kd_arr.ndim == 0 else kd_arr
 
-        goal_pos = np.asarray(goal_pos, dtype=np.float64)
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
+        current_ori = quat_xyzw_to_mat(np.asarray(ee_quat_xyzw, dtype=np.float64))
         ee_twist = np.asarray(ee_twist, dtype=np.float64)
         J = np.asarray(J, dtype=np.float64)
-        q = np.asarray(q, dtype=np.float64)
-        dq = np.asarray(dq, dtype=np.float64)
+        q = np.asarray(q, dtype=np.float64); dq = np.asarray(dq, dtype=np.float64)
         mass_matrix = np.asarray(mass_matrix, dtype=np.float64)
         coriolis = np.asarray(coriolis, dtype=np.float64)
-        assert J.shape[0] == 6, f"expected J with 6 task rows, got {J.shape}"
 
-        pos_error = goal_pos - ee_pos
-        ori_error = orientation_error_from_quats(goal_quat_xyzw, ee_quat_xyzw) * rot_fudge
+        position_error = self.goal_pos - ee_pos
+        ori_error = orientation_error(self.goal_ori, current_ori)
 
         vel_pos_error = -ee_twist[:3]
         vel_ori_error = -ee_twist[3:]
 
-        # F_r = kp * pos_err + kd * vel_err  (same structure as osc.py)
-        desired_force = self.kp[0:3] * pos_error + self.kd[0:3] * vel_pos_error
-        desired_torque = self.kp[3:6] * ori_error + self.kd[3:6] * vel_ori_error
+        desired_force = kp6[0:3] * position_error + kd6[0:3] * vel_pos_error
+        desired_torque = kp6[3:6] * ori_error + kd6[3:6] * vel_ori_error
 
-        J_pos = J[:3, :]
-        J_ori = J[3:, :]
+        J_pos, J_ori = J[:3, :], J[3:, :]
         lambda_full, lambda_pos, lambda_ori, nullspace_matrix = opspace_matrices(mass_matrix, J, J_pos, J_ori)
 
         if self.uncoupling:
-            decoupled_force = lambda_pos @ desired_force
-            decoupled_torque = lambda_ori @ desired_torque
-            decoupled_wrench = np.concatenate([decoupled_force, decoupled_torque])
+            decoupled_wrench = np.concatenate([lambda_pos @ desired_force, lambda_ori @ desired_torque])
         else:
-            desired_wrench = np.concatenate([desired_force, desired_torque])
-            decoupled_wrench = lambda_full @ desired_wrench
+            decoupled_wrench = lambda_full @ np.concatenate([desired_force, desired_torque])
 
-        # Gamma (without gravity/nullspace) = J^T * F - Coriolis.
-        # No `+ gravity`: pylibfranka's start_torque_control() gravity-
-        # compensates internally, so adding g here would double-compensate.
+        # No +gravity term: pylibfranka torque-control gravity-compensates
+        # internally, unlike osc.py's self.torque_compensation (mujoco does not).
         tau = J.T @ decoupled_wrench - coriolis
 
         if q_nullspace_target is not None:
             tau = tau + nullspace_torques(
-                mass_matrix,
-                nullspace_matrix,
-                np.asarray(q_nullspace_target, dtype=np.float64),
-                q,
-                dq,
-                kp=self.nullspace_kp,
-                kd=self.nullspace_kd,
+                mass_matrix, nullspace_matrix,
+                np.asarray(q_nullspace_target, dtype=np.float64), q, dq,
+                joint_kp=self.nullspace_kp,
             )
 
-        # Uniform scale-down (not per-joint clip) to preserve direction --
-        # per-joint clipping breaks the torque proportionality the OSC
-        # projection solved for and can produce a stable, non-progressing
-        # limit cycle once any single joint saturates.
         peak = float(np.max(np.abs(tau)))
         if peak > self.max_tau:
             tau = tau * (self.max_tau / peak)
+
         return tau

@@ -21,7 +21,7 @@ from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
-from .osc_torque_controller import OSCTorqueController
+from .osc_torque_controller import OSCTorqueController, DEFAULT_KP_LIMITS
 from .franka_jacobian import zero_jacobian  # the new analytic module
 
 IMAGE_CHANNELS = 3
@@ -29,15 +29,29 @@ _CAMERA_READ_TIMEOUT_MS: float = 5.0
 _CONNECT_TIMEOUT_S = 10.0
 _DEPTH_POINT_COUNT = 2048
 
+# action_features always exposes a single global 'kp'/'kd' (NOT per-arm) --
+# this is a fixed contract that upstream teleop/policy code depends on and
+# must not change. The SAME action['kp']/['kd'] keys are interpreted
+# differently depending on self.control_mode:
+#   - JOINT_POS / EE_POS: bounded to [-1, 1], exponentially remapped to a
+#     wide gain range via _KP_GAIN_BASE/_KD_GAIN_BASE (see _resolve_pd_gains).
+#   - EE_DELTA (torque/OSC): action['kp'] is used directly as the raw OSC
+#     impedance gain (clipped to DEFAULT_KP_LIMITS inside
+#     OSCTorqueController.compute_tau), matching osc.py's variable_kp mode.
+#     kd is always derived as 2*sqrt(kp) in this mode -- action['kd'] is
+#     ignored for EE_DELTA.
 JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
 EE_PD_KP, EE_PD_KD = 3.5, 0.2
 _KP_GAIN_BASE = 10.0
 _KD_GAIN_BASE = 1.0
-OSC_BASE_KP = 5.0
-_GRIP_ACCUM_SPEED = 0.5
 
-_EE_TRANSLATION_FUDGE_FACTOR = 1.2
-_EE_ROTATION_FUDGE_FACTOR = 0.9
+OSC_BASE_KP = 10.0
+OSC_BASE_KD = 1.0
+
+_GRIP_ACCUM_SPEED = 0.5  # Fixed; gripper speed is decoupled from OSC/PD gains.
+
+_EE_TRANSLATION_FUDGE_FACTOR = 1.0
+_EE_ROTATION_FUDGE_FACTOR = 1.0
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -75,8 +89,9 @@ class BimanualFranka(Robot):
         self.safety = ActionSafetyScreen()
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
-        self._kp_gain = 0.0
-        self._kd_gain = 0.0
+        # Only used by JOINT_POS / EE_POS PD paths; torque mode reads kp directly from the action dict.
+        self._pd_kp_gain = 0.0
+        self._pd_kd_gain = 0.0
         self._gripper_accum: dict[str, float] = {arm: 1.0 for arm in self.active_arms}
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
@@ -101,11 +116,12 @@ class BimanualFranka(Robot):
         # Cropped and subsampled point cloud from the depth camera, cached each
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
-        self._osc_vel: dict[str, OSCTorqueController] = {
-            arm: OSCTorqueController(num_joints=NUM_JOINTS) for arm in self.active_arms
+        self._osc_tau: dict[str, OSCTorqueController] = {
+            arm: OSCTorqueController(num_joints=NUM_JOINTS, kp_limits=DEFAULT_KP_LIMITS)
+            for arm in self.active_arms
         }
-        self._home_q: dict[str, np.ndarray] = {} # nullspace target; set in home()
-
+        self._osc_initialized: list[str] = []
+        self._home_q: dict[str, np.ndarray] = {}  # nullspace target; set in home()
 
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
         gripper_ip = getattr(self.config, f"{arm}_gripper_ip")
@@ -142,6 +158,9 @@ class BimanualFranka(Robot):
 
     @property
     def action_features(self) -> dict[str, type]:
+        """Original global action-space contract, unchanged: single scalar
+        'kp'/'kd' keys (not per-arm). See the module-level comment above for
+        how these are interpreted depending on self.control_mode."""
         keys = JOINT_FEATURE_KEYS if self.control_mode == ControlMode.JOINT_POS else EE_FEATURE_KEYS
         d = self._arm_features(keys)
         d["kp"] = float
@@ -267,14 +286,12 @@ class BimanualFranka(Robot):
                 depth_futs.append(self._camera_pool.submit(
                     c.get_cropped_point_cloud, ee_world, self._depth_crop_radius_m, _DEPTH_POINT_COUNT // len(depth_cams)
                 ))
-                
+
             for fut in depth_futs:
                 clouds.append(fut.result())
 
-            self._last_full_point_cloud = np.concatenate(clouds,axis=0) # self._sample_depth_points(np.concatenate(clouds,axis=0), ee_world)
-            # print(self._last_full_point_cloud)
+            self._last_full_point_cloud = np.concatenate(clouds, axis=0)
             flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
-            # print(flat.shape)
             obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
 
@@ -282,37 +299,6 @@ class BimanualFranka(Robot):
         arm = "r" if "r" in self.active_arms else self.active_arms[0]
         ee_robot = np.asarray(kin[arm][3], dtype=np.float64)
         return self._r_robot_in_world @ ee_robot + self._t_robot_in_world
-
-    def _sample_depth_points(self, verts: np.ndarray, center: np.ndarray) -> np.ndarray:
-        points = np.asarray(verts, dtype=np.float64)
-        if points.size == 0:
-            return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
-        if points.ndim != 2 or points.shape[1] < 3:
-            raise ValueError(
-                f"expected (N, 3) or (N, 3+C) point cloud, got shape {points.shape}"
-            )
-        points = points[:, :3]
-
-        points = points[np.isfinite(points).all(axis=1)]
-        if points.shape[0] == 0:
-            return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
-
-        deltas = points - center.reshape(1, 3)
-        dist2 = np.einsum("ij,ij->i", deltas, deltas)
-        cropped = points[dist2 <= (self._depth_crop_radius_m ** 2)]
-        total = cropped.shape[0]
-
-        if total == 0:
-            sampled = np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float64)
-        else:
-            # idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
-            idx = np.random.choice(np.arange(0,total), size=_DEPTH_POINT_COUNT, replace=False)
-            sampled = cropped[idx]
-        # else:
-        #     reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
-        #     sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
-
-        return np.asarray(sampled, dtype=np.float32)
 
     @staticmethod
     def _quat_wxyz_to_rot(q: tuple[float, float, float, float]) -> np.ndarray:
@@ -329,19 +315,21 @@ class BimanualFranka(Robot):
             ],
             dtype=np.float64,
         )
-    
+
     @property
-    def kp_gain(self) -> float:
-        return self._kp_gain
-    
+    def pd_kp_gain(self) -> float:
+        """Exponentially-remapped kp for JOINT_POS/EE_POS PD paths only."""
+        return self._pd_kp_gain
+
     @property
-    def kd_gain(self) -> float:
-        return self._kd_gain
-    
+    def pd_kd_gain(self) -> float:
+        """Exponentially-remapped kd for JOINT_POS/EE_POS PD paths only."""
+        return self._pd_kd_gain
+
     @property
     def kin(self) -> Optional[dict[str, KinematicSnapshot]]:
         return self._cached_kin_state
-    
+
     @staticmethod
     def _patch_jacobian(snap: KinematicSnapshot) -> KinematicSnapshot:
         """franky's zero_jacobian returns all-zero on this build; recompute
@@ -353,24 +341,34 @@ class BimanualFranka(Robot):
         J_real = zero_jacobian(q, ee_pos_base=ee_pos)
         return (q, dq, J_real, ee_pos, ee_quat_xyzw, ee_twist)
 
+    @staticmethod
+    def _resolve_pd_gains(action: RobotAction) -> tuple[float, float]:
+        """JOINT_POS/EE_POS only: map the global action['kp']/['kd'] in
+        [-1, 1] to a wide gain range via exponential scaling. Independent of
+        EE_DELTA/torque mode, which uses the same keys but reads action['kp']
+        directly as a raw OSC gain -- see _tau_ee_delta."""
+        kp_raw = float(np.clip(action["kp"], -1.0, 1.0))
+        kd_raw = float(np.clip(action["kd"], -1.0, 1.0))
+        kp_gain = _KP_GAIN_BASE ** kp_raw
+        kd_gain = _KD_GAIN_BASE ** (kd_raw * 2 * np.sqrt(kp_gain))
+        return kp_gain, kd_gain
+
     def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
         kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         dyn = self.robot_manager.current_dynamics_batch(list(self.active_arms))
-        self._kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
-        self._kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(self.kp_gain))
 
         for arm in self.active_arms:
-            self._gripper_accum[arm] = np.clip(self._gripper_accum[arm] + (action[f"{arm}_gripper"]) * _GRIP_ACCUM_SPEED, -1.0, 1.0)
+            self._gripper_accum[arm] = np.clip(
+                self._gripper_accum[arm] + action[f"{arm}_gripper"] * _GRIP_ACCUM_SPEED, -1.0, 1.0
+            )
             self.grippers[arm].move(
                 (self._gripper_accum[arm] + 1.0) / 2.0 * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
                 blocking=False,
             )
 
         if self.control_mode == ControlMode.EE_DELTA:
-
-            # print(action["r_z"])
             # unnormalize actions
             for arm in self.active_arms:
                 for ax in ("x", "y", "z"):
@@ -378,22 +376,35 @@ class BimanualFranka(Robot):
                 for ax in ("qx", "qy", "qz", "qw"):
                     action[f"{arm}_{ax}"] *= _EE_ROTATION_FUDGE_FACTOR
 
-            # print(action)
-            # cmds = self.safety.shape_ee(
-            #     {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
-            #      for arm in self.active_arms}, kin
-            # )
-            cmds = {arm: self._tau_ee_delta(arm, action, kin[arm], dyn[arm], ...) for arm in self.active_arms}
+            cmds = {
+                arm: self._tau_ee_delta(
+                    arm, action, kin[arm], dyn[arm], self.delta_pos, self.delta_rot,
+                    self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale,
+                )
+                for arm in self.active_arms
+            }
             self.robot_manager.move_joint_torque_batch({a: c.tolist() for a, c in cmds.items()})
         elif self.control_mode == ControlMode.EE_POS:
+            pd_kp_gain, pd_kd_gain = self._resolve_pd_gains(action)
             cmds = self.safety.shape_ee(
-                {arm: self._ee_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
-                 for arm in self.active_arms}, kin
+                {
+                    arm: self._ee_pd(
+                        pd_kp_gain, pd_kd_gain, action, arm, kin[arm],
+                        self.delta_pos, self.delta_rot, ignore_action,
+                    )
+                    for arm in self.active_arms
+                },
+                kin,
             )
             self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
         else:
+            pd_kp_gain, pd_kd_gain = self._resolve_pd_gains(action)
             cmds = self.safety.shape_joint(
-                {arm: self._joint_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm]) for arm in self.active_arms}, kin
+                {
+                    arm: self._joint_pd(pd_kp_gain, pd_kd_gain, action, arm, kin[arm])
+                    for arm in self.active_arms
+                },
+                kin,
             )
             self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         return action
@@ -417,6 +428,10 @@ class BimanualFranka(Robot):
         In EE_POS and EE_DELTA modes, FK converts them to EE setpoints and homing
         runs Cartesian-velocity PD. In JOINT_POS mode, joint-velocity PD is used.
 
+        After homing, re-initializes each arm's OSC goal reference pose so that
+        subsequent EE_DELTA teleop offsets are applied relative to the new home,
+        not a stale pre-home reference.
+
         Control rate: ``home_fps`` if set; else EE modes use ``max(fps, 60)``, joint
         mode uses ``fps``.
         """
@@ -435,7 +450,7 @@ class BimanualFranka(Robot):
         for arm in targets_q:
             self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
-        use_ee_homing = False # self.control_mode != ControlMode.JOINT_POS
+        use_ee_homing = False  # self.control_mode != ControlMode.JOINT_POS
         rate_hz = float(home_fps if home_fps is not None else (max(fps, 60) if use_ee_homing else fps))
         period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s
@@ -463,6 +478,7 @@ class BimanualFranka(Robot):
 
                 if max_pos < tol_pos_m and max_rot < rot_tol:
                     self._cached_kin_state = None
+                    self._reinit_osc_goals(names)
                     return True
                 if tick_start >= deadline:
                     self._cached_kin_state = None
@@ -470,6 +486,7 @@ class BimanualFranka(Robot):
                         "home(): EE timeout after %.2fs (pos err %.4f m, rot err %.4f rad)",
                         max_time_s, max_pos, max_rot,
                     )
+                    self._reinit_osc_goals(names)
                     return False
 
                 elapsed = time.perf_counter() - tick_start
@@ -492,34 +509,58 @@ class BimanualFranka(Robot):
                 self._cached_kin_state = None
                 for arm in names:
                     self._home_q[arm] = targets_q[arm].copy()
+                self._reinit_osc_goals(names)
                 return True
             if tick_start >= deadline:
                 self._cached_kin_state = None
                 logger.warning("home(): timeout after %.2fs, max joint error %.4f rad", max_time_s, max_err)
+                self._reinit_osc_goals(names)
                 return False
 
             elapsed = time.perf_counter() - tick_start
             if elapsed < period_s:
                 time.sleep(period_s - elapsed)
 
+    def _reinit_osc_goals(self, arms: list[str]) -> None:
+        """Re-anchor each arm's OSC reference pose to wherever it physically
+        ended up after homing, and reset the home() joint target used for
+        nullspace control. Without this, EE_DELTA teleop offsets after a
+        home() would still be computed relative to the pre-home reference
+        pose recorded by init_goal(), which is now stale."""
+        kin = self.robot_manager.current_kinematic_state_batch(arms)
+        kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
+        for arm in arms:
+            q, _, _, ee_pos, ee_quat_xyzw, _ = kin[arm]
+            self._home_q[arm] = np.asarray(q, dtype=np.float64).copy()
+            if arm in self.active_arms and self.control_mode == ControlMode.EE_DELTA:
+                self._osc_tau[arm].init_goal(ee_pos, ee_quat_xyzw)
+                if arm not in self._osc_initialized:
+                    self._osc_initialized.append(arm)
+
     def _tau_ee_delta(
         self,
         arm: str,
         action,  # RobotAction
         snap,  # KinematicSnapshot = (q, dq, J, ee_pos, ee_quat_xyzw, ee_twist)
+        last_dyn,
         dpos_cached: np.ndarray,
         drot_cached: np.ndarray,
         use_noise: bool,
         noise_pos_scale: float,
         noise_rot_scale: float,
     ) -> np.ndarray:
-        """Replacement for the old `_ee_delta`. Integrates the incoming delta
-        action into a persistent per-arm goal pose (mirroring robosuite OSC's
-        set_goal() under use_delta=True), then servos the current EE toward that
-        goal with OSCVelocityController -- rather than treating the raw delta as
-        a one-shot velocity command every tick.
-        """
+        """Servo the arm toward a persistent per-arm OSC goal pose (mirroring
+        robosuite OSC's set_goal() under use_delta=True), using variable_kp
+        torque control matching osc.py's run_controller() exactly.
 
+        action[f'{arm}_x/y/z'] and action[f'{arm}_qx/qy/qz/qw'] are ABSOLUTE
+        offsets from teleop's own rest pose (re-sent fresh every tick, decaying
+        back to zero/identity on release) -- NOT per-tick incremental deltas.
+        drot_cached (from cache_delta()) is currently NOT applied to the OSC
+        goal orientation -- see set_goal_from_offset in osc_torque_controller.py.
+        If your safety/shaping layer relies on drot_cached reaching the torque
+        controller, that needs a deliberate decision, not a silent default.
+        """
         if use_noise:
             pos_noise = np.random.normal(0.0, noise_pos_scale, 3)
             rot_noise = Rotation.from_euler("xyz", np.random.normal(0.0, noise_rot_scale, 3)).as_quat()
@@ -527,10 +568,9 @@ class BimanualFranka(Robot):
             pos_noise = 0
             rot_noise = 0
 
-
         q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
-        ee_quat_xyzw = np.asarray(ee_quat_xyzw, dtype=np.float64)
+
         action_dpos = np.fromiter(
             (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
             dtype=np.float64, count=3,
@@ -540,55 +580,24 @@ class BimanualFranka(Robot):
             dtype=np.float64, count=4,
         ) + rot_noise
 
-        # ---- integrate delta into the persistent goal (position: simple sum;
-        #      orientation: compose as delta * goal) ----
-        goal_pos = ee_pos + action_dpos + dpos_cached
+        if arm not in self._osc_initialized:
+            self._osc_tau[arm].init_goal(ee_pos, ee_quat_xyzw)
+            self._osc_initialized.append(arm)
 
-        dq = action_dquat_xyzw / max(float(np.linalg.norm(action_dquat_xyzw)), 1e-12)
-        gx, gy, gz, gw = ee_quat_xyzw
-        dx, dy, dz, dw = dq
-        new_quat = np.array([
-            dw * gx + dx * gw + dy * gz - dz * gy,
-            dw * gy - dx * gz + dy * gw + dz * gx,
-            dw * gz + dx * gy - dy * gx + dz * gw,
-            dw * gw - dx * gx - dy * gy - dz * gz,
-        ])
-        goal_quat_xyzw = new_quat / max(float(np.linalg.norm(new_quat)), 1e-12)
+        self._osc_tau[arm].set_goal_from_offset(action_dpos + dpos_cached, action_dquat_xyzw)
 
-        if drot_cached is not None and np.any(drot_cached):
-            angle = float(np.linalg.norm(drot_cached))
-            if angle > 1e-9:
-                axis = drot_cached / angle
-                s, c = np.sin(angle / 2.0), np.cos(angle / 2.0)
-                bx, by, bz, bw = axis[0] * s, axis[1] * s, axis[2] * s, c
-                gx, gy, gz, gw = goal_quat_xyzw
-                composed = np.array([
-                    bw * gx + bx * gw + by * gz - bz * gy,
-                    bw * gy - bx * gz + by * gw + bz * gx,
-                    bw * gz + bx * gy - by * gx + bz * gw,
-                    bw * gw - bx * gx - by * gy - bz * gz,
-                ])
-                goal_quat_xyzw = composed / max(float(np.linalg.norm(composed)), 1e-12)
-
-        # ---- servo current EE toward the (now-updated) goal ----
-
-        q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
-        mass_matrix, coriolis = self._last_dynamics[arm]  # see point 4
-        return self._osc_tau[arm].compute_tau(
-            goal_pos=goal_pos,
-            goal_quat_xyzw=goal_quat_xyzw,
-            ee_pos=ee_pos,
-            ee_quat_xyzw=ee_quat_xyzw,
-            ee_twist=np.asarray(ee_twist, dtype=np.float64),
-            J=np.asarray(J, dtype=np.float64),
-            q=np.asarray(q, dtype=np.float64),
-            dq=np.asarray(dq_, dtype=np.float64),
-            mass_matrix=mass_matrix,
-            coriolis=coriolis,
+        mass_matrix, coriolis = last_dyn
+        kp_gain, kd_gain = self._resolve_pd_gains(action)
+        kp = kp_gain * OSC_BASE_KP  # define OSC_BASE_KP = DEFAULT_KP (150) near top of file
+        kd = kd_gain * OSC_BASE_KD  # define OSC_BASE_KP = DEFAULT_KP (150) near top of file
+        tau = self._osc_tau[arm].compute_tau(
+            ee_pos=ee_pos, ee_quat_xyzw=ee_quat_xyzw, ee_twist=ee_twist,
+            J=J, q=q, dq=dq_, mass_matrix=mass_matrix, coriolis=coriolis,
+            kp=kp,
+            kd=kd,
             q_nullspace_target=self._home_q.get(arm),
-            kp=self.kp_gain * OSC_BASE_KP,
-            rot_fudge=_EE_ROTATION_FUDGE_FACTOR,
         )
+        return tau
 
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
@@ -678,47 +687,3 @@ class BimanualFranka(Robot):
             dtype=np.float64, count=len(EE_AXIS_KEYS),
         )
         return BimanualFranka._ee_velocity_toward_pose(kp_gain, kd_gain, target, snap, dpos, drot, ignore_action)
-
-    @staticmethod
-    def _ee_delta(
-        kp_gain: float,
-        kd_gain: float,
-        action: RobotAction,
-        arm: str,
-        snap: KinematicSnapshot,
-        dpos: np.ndarray | None = None,
-        drot: np.ndarray | None = None,
-        use_noise: bool = False,
-        noise_pos_scale: float = 0.01,
-        noise_rot_scale: float = 0.03,
-    ) -> np.ndarray:
-        """Apply EE deltas from action directly as a velocity command.
-
-        Position axes (x, y, z) are position deltas in metres. Rotation axes
-        (qx, qy, qz, qw) encode a delta rotation as a unit quaternion (xyzw),
-        converted to axis-angle here. Cached deltas (dpos, drot) are added on top.
-        """
-        action_dpos = np.fromiter(
-            (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
-            dtype=np.float64, count=3,
-        )
-        dq = np.fromiter(
-            (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
-            dtype=np.float64, count=4,
-        )
-        v = dq[:3]
-        v_norm = float(np.linalg.norm(v))
-        action_drot = 2.0 * v if v_norm < 1e-9 else (v / v_norm) * (2.0 * np.arctan2(v_norm, float(np.clip(dq[3], -1.0, 1.0))))
-
-        if use_noise:
-            pos_noise = np.random.normal(0.0, noise_pos_scale, 3)
-            rot_noise = Rotation.from_euler("xyz", np.random.normal(0.0, noise_rot_scale, 3)).as_rotvec()
-        else:
-            pos_noise = 0
-            rot_noise = 0
-
-        total_dpos = action_dpos + (dpos if dpos is not None else np.zeros(3, dtype=np.float64)) + pos_noise
-        total_drot = (action_drot + (drot if drot is not None else np.zeros(3, dtype=np.float64))) + rot_noise
-
-        _, _, _, _, _, twist = snap
-        return (EE_PD_KP * kp_gain) * np.concatenate((total_dpos, total_drot)) - (EE_PD_KD * kd_gain) * np.asarray(twist, dtype=np.float64)

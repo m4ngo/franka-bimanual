@@ -78,8 +78,8 @@ class RobotDriver:
             server_ip, port,
             config={"sync_request_timeout": RPYC_TIMEOUT_S, "allow_pickle": True},
         )
-        self._conn.root.init_robot(robot_ip, True)
-        self._conn.root.start_torque_control(robot_ip)
+        self._conn.root.exposed_init_robot(robot_ip, True)
+        self._conn.root.exposed_start_torque_control(robot_ip)
 
         self._last_dyn: DynamicsSnapshot | None = None
 
@@ -91,7 +91,7 @@ class RobotDriver:
         """Read-only tick (writes no torque). Also caches the dynamics terms
         from this snapshot so a subsequent send_torque() in the same control
         step reuses a consistent (M, C) rather than issuing an extra RPC."""
-        bundle, err = self._conn.root.tick(self.robot_ip, None)
+        bundle, err = self._conn.root.exposed_tick(self.robot_ip, None)
         if err is not None:
             self._handle_error(err)
             raise ConnectionError(f"pylibfranka tick() failed for {self.robot_ip}: {err}")
@@ -113,7 +113,7 @@ class RobotDriver:
         """Write a torque command and return the resulting fresh state
         (i.e. this doubles as next tick's read, same as pylibfranka's own
         readOnce/writeOnce loop shape)."""
-        bundle, err = self._conn.root.tick(self.robot_ip, list(tau))
+        bundle, err = self._conn.root.exposed_tick(self.robot_ip, list(tau))
         if err is not None:
             self._handle_error(err)
             raise ConnectionError(f"pylibfranka tick() failed for {self.robot_ip}: {err}")
@@ -128,13 +128,13 @@ class RobotDriver:
             # Server already attempted automatic_error_recovery() and torn
             # down its ActiveControlBase; re-arm torque control here so the
             # next tick() call succeeds instead of failing again.
-            self._conn.root.start_torque_control(self.robot_ip)
+            self._conn.root.exposed_start_torque_control(self.robot_ip)
         except Exception:
             pass
 
     def stop(self) -> None:
         try:
-            self._conn.root.stop(self.robot_ip)
+            self._conn.root.exposed_stop(self.robot_ip)
         except Exception as e:
             logger.warning("stop(): %s", e)
 
