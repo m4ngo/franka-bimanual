@@ -267,10 +267,16 @@ def _run_episode(
                     base_traj_pose = _propagate_pose_traj(ee_pose_xyzw, base_deltas, base_rotvecs)
                     if residual is not None and len(res_chunk) > 0:
                         K_res = min(len(res_chunk), _RESIDUAL_HORIZON)
+                        # Same headroom clip as the execution path so plots show
+                        # what actually runs.
                         total_deltas = base_deltas.copy()
-                        total_deltas[:K_res] += res_chunk[:K_res, 2:5].astype(np.float32) * _POS_SCALE
+                        total_deltas[:K_res] = np.clip(
+                            base_deltas[:K_res] / _POS_SCALE + res_chunk[:K_res, 2:5], -1.0, 1.0
+                        ).astype(np.float32) * _POS_SCALE
                         total_rotvecs = base_rotvecs.copy()
-                        total_rotvecs[:K_res] += res_chunk[:K_res, 5:8].astype(np.float32) * _ROT_SCALE
+                        total_rotvecs[:K_res] = np.clip(
+                            base_rotvecs[:K_res] / _ROT_SCALE + res_chunk[:K_res, 5:8], -1.0, 1.0
+                        ).astype(np.float32) * _ROT_SCALE
                         total_traj = np.vstack([ee3, ee3 + np.cumsum(total_deltas, axis=0)])
                         total_traj_pose = _propagate_pose_traj(ee_pose_xyzw, total_deltas, total_rotvecs)
                     else:
@@ -287,8 +293,12 @@ def _run_episode(
 
             if residual is not None:
                 res = res_chunk[chunk_used]
-                dpos = res[2:5] * _POS_SCALE
-                drot = res[5:8] * _ROT_SCALE
+                # Sim executes clip(base + residual, -1, 1) per normalized channel;
+                # clip the residual to the base's remaining headroom to match.
+                b_pos = base_chunk[chunk_used, :3].astype(np.float64) / _POS_SCALE
+                b_rot = Rotation.from_quat(base_chunk[chunk_used, 3:7]).as_rotvec() / _ROT_SCALE
+                dpos = (np.clip(b_pos + res[2:5], -1.0, 1.0) - b_pos) * _POS_SCALE
+                drot = (np.clip(b_rot + res[5:8], -1.0, 1.0) - b_rot) * _ROT_SCALE
                 if replaying:
                     # residual is visualized only; base/trajectory gains drive execution
                     kp = float(base_chunk[chunk_used, 8])
@@ -310,7 +320,7 @@ def _run_episode(
             action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
             # print(action)
             if residual is not None:
-                action["r_gripper"] += res[8]
+                action["r_gripper"] = float(np.clip(action["r_gripper"] + res[8], -1.0, 1.0))
             controller.send_action(action)
 
             if recorder is not None:

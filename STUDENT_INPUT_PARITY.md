@@ -45,7 +45,7 @@ No normalization or noise is applied to proprio in the student pipeline
 | frame | camera → world via stored extrinsics (`dataset.py:251`) | world via chessboard calibration |
 | crop | axis-aligned BOX, half_extent 0.4 m around eef (`pointcloud.py:275`) | SPHERE, radius 0.4 m around eef (`bimanual_franka.py:302`) — F8 |
 | count | 4096 stored → 2048 random subsample at train (eval ~4096) | 2048, fixed per-camera quota |
-| centering | `center_on_eef: True` (train.yaml) — subtract world eef_pos | hardcoded True in `policy_wrapper.py:156`, ckpt `data_kwargs` IGNORED — F6 |
+| centering | `center_on_eef: True` (train.yaml) — subtract world eef_pos | from `ckpt["data_kwargs"]`, enforced in `_prepare_pcd` (F6 fixed 2026-07-19) |
 | rgb | dropped (`use_rgb: False`) → xyz only | xyz only |
 
 ### 1c. base_action (70,) = 10 steps × 7
@@ -66,7 +66,7 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
 | step | sim (`StudentPredictor.predict_diffused`) | real |
 |---|---|---|
 | clip | gains ±0.5, residual ±0.2 | same constants (`policy_wrapper.py:203-206`) |
-| combine | `clip(base + residual, −1, 1)` | `cache_delta` add, NO final clip — F7 |
+| combine | `clip(base + residual, −1, 1)` | residual headroom-clipped so executed total == sim's clip (F7 fixed 2026-07-19) |
 | gains | `[damping, kp]` → env exp-maps | `kp = res[0]; kd = res[1]` — **F1: reads damping as kp** |
 
 ---
@@ -105,14 +105,24 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
 - **F5 — world-frame origin**: verify real calibrated world origin/axes match
   robosuite's world (table height!). Absolute eef_pos enters every token.
   Check training-data eef_pos range vs real (Tier 2 catches this).
-- **F6 — `center_on_eef` hardcoded** (`policy_wrapper.py:156`): honor
-  `ckpt["data_kwargs"]` for center_on_eef, num_points, use_rgb,
-  crop_half_extent.
-- **F7 — missing final clip** on base+residual sum (sim: ±1 normalized).
+- **F6 — `center_on_eef` hardcoded** — FIXED 2026-07-19: `ResidualPolicy` now
+  reads center_on_eef, num_points, use_rgb, crop_half_extent from
+  `ckpt["data_kwargs"]` and enforces them in `_prepare_pcd` (crop -> resample
+  -> center, matching the sim dataset order; with-replacement resample when
+  short). use_rgb=True checkpoints fail loudly at load (real cloud is
+  xyz-only). Resolved values + frame/proprio_keys logged at load.
+- **F7 — missing final clip** — FIXED 2026-07-19: the residual is clipped to
+  the base's remaining headroom (`res_eff = clip(b + r, -1, 1) - b` per
+  normalized channel) so the executed total equals sim's
+  `clip(base + residual, -1, 1)` in all cases, including base channels
+  already outside the envelope. Applied on the execution path and mirrored in
+  the recorder's total-trajectory viz; gripper sum clipped to [-1, 1].
+  Fuzz-tested: executed total == sim's clipped total over random b/r.
 - **F8 — crop geometry**: box (sim) vs sphere (real); per-camera quota vs
   single-view sampling; no real analogue of wrist-view training clouds.
 
-Status: F1-F4 fixed 2026-07-19; F5-F8 OPEN. Update this list as fixes land.
+Status: F1-F4, F6, F7 fixed 2026-07-19; F5, F8 OPEN (measurement questions —
+Tier 2 audit). Update this list as fixes land.
 
 ---
 

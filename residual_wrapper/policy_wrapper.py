@@ -153,15 +153,44 @@ class ResidualPolicy:
         self.model.load_state_dict(ckpt["model"])
         self.model.to(self.device).eval()
 
+        # Preprocessing comes from the checkpoint's data_kwargs (the training
+        # contract), never hardcoded.
         data_kwargs = ckpt.get("data_kwargs", {})
-        self.center_on_eef: bool = True # bool(data_kwargs.get("center_on_eef", False))
+        self.center_on_eef: bool = bool(data_kwargs.get("center_on_eef", False))
+        self.num_points: int = int(data_kwargs.get("num_points", 2048))
+        self.use_rgb: bool = bool(data_kwargs.get("use_rgb", False))
+        crop = data_kwargs.get("crop_half_extent", None)
+        self.crop_half_extent: float | None = None if crop is None else float(crop)
+        if self.use_rgb:
+            raise ValueError(
+                "Checkpoint trained with use_rgb=True; the real cloud is xyz-only. "
+                "Retrain without RGB or use a different checkpoint."
+            )
         # Exact cloud fed to the network on the most recent infer() call
         # (post crop/downsample/re-centering); for diagnostics.
         self.last_network_pcd: np.ndarray | None = None
         logger.info(
-            "ResidualPolicy loaded: cls=%s encoder=%s center_on_eef=%s",
-            policy_cls.__name__, encoder_type, self.center_on_eef,
+            "ResidualPolicy loaded: cls=%s encoder=%s center_on_eef=%s num_points=%d "
+            "crop_half_extent=%s (frame=%s proprio_keys=%s)",
+            policy_cls.__name__, encoder_type, self.center_on_eef, self.num_points,
+            self.crop_half_extent, data_kwargs.get("frame"), data_kwargs.get("proprio_keys"),
         )
+
+    def _prepare_pcd(self, pcd: np.ndarray, eef_pos: np.ndarray) -> np.ndarray:
+        """Apply the checkpoint's preprocessing: crop -> resample -> center
+        (same order as the sim dataset path)."""
+        pcd = pcd[:, :3]
+        if self.crop_half_extent is not None:
+            mask = np.all(np.abs(pcd - eef_pos) <= self.crop_half_extent, axis=1)
+            if mask.any():
+                pcd = pcd[mask]
+        if len(pcd) != self.num_points:
+            idx = np.random.choice(len(pcd), self.num_points, replace=len(pcd) < self.num_points)
+            pcd = pcd[idx]
+        pcd = pcd.copy()
+        if self.center_on_eef:
+            pcd -= eef_pos
+        return pcd
 
     def infer(self, obs: dict) -> np.ndarray:
         """Run one residual inference pass.
@@ -187,10 +216,7 @@ class ResidualPolicy:
         # Feed only the 7 per-step channels the model was trained on; drop kp/kd.
         base_action = action_chunk[:, :7].flatten().astype(np.float32)  # (70,)
 
-        pcd = point_cloud.astype(np.float32)
-        if self.center_on_eef:
-            pcd = pcd.copy()
-            pcd[:, :3] -= proprio[:3]  # subtract EEF xyz
+        pcd = self._prepare_pcd(point_cloud.astype(np.float32), proprio[:3])
         self.last_network_pcd = pcd
 
         pcd_t = torch.as_tensor(pcd, dtype=torch.float32, device=self.device).unsqueeze(0)
