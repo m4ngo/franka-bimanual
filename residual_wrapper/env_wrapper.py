@@ -9,6 +9,7 @@ from scipy.spatial.transform import Rotation
 
 from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk
+from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 
 _POS_SCALE = 0.05       # metres per normalised unit
 _ROT_SCALE = 0.5        # radians per normalised unit
@@ -87,6 +88,28 @@ def ee_pose_to_world(
 
 # Panda finger-joint range (m); robosuite gripper_qpos = [width/2, -width/2].
 _PANDA_FINGER_MAX_M = 0.04
+
+# Canonical right-arm home configuration (rad), shared by rollout/check scripts.
+DEFAULT_HOME_Q = [
+    -0.28223089288736675, -0.5594522989991991, -0.4191884798561259,
+    -1.82212661700904, 0.06416041394704838, 1.5246974433097138, -0.7569427650529224,
+]
+
+
+def measured_ee_twist_world(snap, r_robot_in_world: np.ndarray) -> np.ndarray:
+    """Measured EE twist [lin(3), ang(3)] = J(q) @ dq, rotated base -> world.
+
+    The firmware's EE-velocity fields are commanded (O_dP_EE_d) or broken
+    (measured reads returned zeros on this build), so compute the twist from
+    measured joint velocities; J is recomputed analytically, never trusted
+    from the snapshot.
+    """
+    q, dq, _J, ee_pos, _quat, _twist = snap
+    J = zero_jacobian(np.asarray(q, dtype=np.float64),
+                      ee_pos_base=np.asarray(ee_pos, dtype=np.float64))
+    tw = J @ np.asarray(dq, dtype=np.float64)
+    R = np.asarray(r_robot_in_world, dtype=np.float64)
+    return np.concatenate([R @ tw[:3], R @ tw[3:]]).astype(np.float32)
 
 
 def split_gripper(obs: np.ndarray) -> np.ndarray:

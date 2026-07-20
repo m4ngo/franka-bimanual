@@ -32,7 +32,7 @@ Sim concat order = `proprio_keys` order (`cfg/distill/train.yaml:69`,
 | 3:7 | `robot0_eef_quat` — xyzw, world frame | fk quat + 45° hand-body correction, world-rotated | fixed by `--raw-proprio` commit; verify numerically (Tier 3) |
 | 7:9 | `robot0_gripper_qpos` — TWO finger joint positions, METERS (≈ ±0.02–0.04) | `split_gripper` = `(g, −g)`, g = r_gripper × 0.04 m (Panda hand on rig; width/80 mm obs) | F3 fixed 2026-07-19 |
 | 9:11 | `controller_state` = `[damping_norm, kp_norm]`, log-normalized, [0,0] at defaults (`utils/envs/robomimic.py:181-187`) | `[prev_kd, prev_kp]` — last-applied normalized gain actions (= sim convention) | F2 fixed 2026-07-19 |
-| 11:17 | `robot0_eef_vel` — MEASURED world-frame twist | `O_dP_EE_d` — COMMANDED twist, ROBOT-BASE frame, never world-rotated | **F4: frame + semantics** |
+| 11:17 | `robot0_eef_vel` — MEASURED world-frame twist | `J(q) @ dq` measured twist, rotated to the proprio frame | F4 fixed 2026-07-19 |
 
 No normalization or noise is applied to proprio in the student pipeline
 (train-time z-rotation augment co-rotates pos/quat/vel about world z only).
@@ -92,9 +92,16 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
   `split_gripper` converts the normalized [0,1] width obs (vs 80 mm) to exact
   Panda finger qpos: `g = r_gripper * 0.04` m, slots 7:9 = `(g, -g)` —
   physically identical to robosuite's `robot0_gripper_qpos`.
-- **F4 — eef_vel**: rotate into world frame; prefer measured over commanded
-  twist if available (`O_dP_EE_c` vs `O_dP_EE_d` — note sysid.py records the
-  d-variant; check what training used before matching).
+- **F4 — eef_vel** — FIXED 2026-07-19: proprio slots 11:17 now carry the
+  MEASURED twist `J(q) @ dq` (analytic Jacobian recomputed per call, measured
+  joint velocities), rotated into the proprio frame (world by default) via
+  `env_wrapper.measured_ee_twist_world`. Replaces the commanded `O_dP_EE_d`
+  hack (direct measured-EE-vel reads return zeros on this franky build).
+  Validated against finite-difference of franka_fk to ~1e-6 across random
+  configs; rest state gives exact zeros. On-robot sanity check still pending
+  (compare against numerical diff of consecutive measured poses during
+  motion). sysid.py recordings still log the firmware d-variant — separate
+  contract, unchanged.
 - **F5 — world-frame origin**: verify real calibrated world origin/axes match
   robosuite's world (table height!). Absolute eef_pos enters every token.
   Check training-data eef_pos range vs real (Tier 2 catches this).
@@ -105,7 +112,7 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
 - **F8 — crop geometry**: box (sim) vs sphere (real); per-camera quota vs
   single-view sampling; no real analogue of wrist-view training clouds.
 
-Status: F1-F3 fixed 2026-07-19; F4-F8 OPEN. Update this list as fixes land.
+Status: F1-F4 fixed 2026-07-19; F5-F8 OPEN. Update this list as fixes land.
 
 ---
 

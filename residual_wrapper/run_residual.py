@@ -28,6 +28,7 @@ from env_wrapper import (
     build_action,
     current_ee_pose,
     extract_point_cloud,
+    measured_ee_twist_world,
     process_chunk,
     split_gripper,
     strip_depth,
@@ -39,10 +40,7 @@ from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 logger = logging.getLogger(__name__)
 
 _POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
-_DEFAULT_HOME_Q = [
-    -0.28223089288736675, -0.5594522989991991, -0.4191884798561259,
-    -1.82212661700904, 0.06416041394704838, 1.5246974433097138, -0.7569427650529224,
-]
+from env_wrapper import DEFAULT_HOME_Q as _DEFAULT_HOME_Q  # noqa: E402
 
 
 def _stdin_key_pressed() -> bool:
@@ -224,7 +222,10 @@ def _run_episode(
                     if kin is None:
                         vel = np.zeros(6)
                     else:
-                        vel = kin['r'][5]
+                        # Measured twist (J @ dq), in the same frame as the proprio pose.
+                        r_w = (controller._r_robot_in_world if proprio_frame == "world"
+                               else np.eye(3))
+                        vel = measured_ee_twist_world(kin['r'], r_w)
                     point_cloud = extract_point_cloud(obs)
                     # The cloud is world-frame; franka_fk is robot-frame. In world
                     # mode, map the proprio pose into world so center_on_eef
