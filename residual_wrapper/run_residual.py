@@ -186,6 +186,12 @@ def _run_episode(
     tty.setraw(sys.stdin)
     fps_frames = 0
     fps_window_start = time.perf_counter()
+    busy_ms_window: list[float] = []        # per-step busy time (pre-sleep), current window
+    chunk_busy_ms_window: list[float] = []  # subset: steps that ran inference
+    # Fixed-cadence deadline: sleeping to an absolute clock lets the idle slack
+    # of ordinary steps absorb the few ms that inference steps overrun, so the
+    # loop averages the target rate instead of accumulating per-step deficits.
+    t_deadline = time.perf_counter() + dt
     try:
         while True:
             t_step = time.perf_counter()
@@ -342,21 +348,36 @@ def _run_episode(
             chunk_used += 1
 
 
+            elapsed = time.perf_counter() - t_step
+            busy_ms_window.append(elapsed * 1000.0)
+            if chunk_used == 1:  # this iteration ran inference
+                chunk_busy_ms_window.append(elapsed * 1000.0)
+
             fps_frames += 1
             now = time.perf_counter()
             window_s = now - fps_window_start
             if window_s >= 1.0:
                 actual_fps = fps_frames / window_s
-                logger.info("loop fps: %.2f target: %.2f", actual_fps, fps)
+                chunk_avg = (sum(chunk_busy_ms_window) / len(chunk_busy_ms_window)
+                             if chunk_busy_ms_window else 0.0)
+                logger.info(
+                    "loop fps: %.2f target: %.2f busy avg/max: %.1f/%.1f ms (chunk-step avg: %.1f ms)",
+                    actual_fps, fps,
+                    sum(busy_ms_window) / len(busy_ms_window), max(busy_ms_window), chunk_avg,
+                )
                 fps_window_start = now
                 fps_frames = 0
+                busy_ms_window.clear()
+                chunk_busy_ms_window.clear()
 
-            elapsed = time.perf_counter() - t_step
-            sleep_s = dt - elapsed
-            # times.append(time.perf_counter())  # NEW: t6, before sleep
-            # print(times, "sleep_s=", sleep_s)
+            sleep_s = t_deadline - time.perf_counter()
             if sleep_s > 0:
                 time.sleep(sleep_s)
+            t_deadline += dt
+            # After a large stall (episode-start model warmup, operator pause),
+            # resync instead of racing to repay an unpayable debt.
+            if t_deadline < time.perf_counter():
+                t_deadline = time.perf_counter() + dt
     finally:
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
