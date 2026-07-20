@@ -3,6 +3,15 @@
 The gripper runs on its own RPyC connection so width commands never share a
 transport with arm motion. A single background worker keeps `grasp()` and
 `open()` off the caller thread.
+
+This version drives the gripper through `pylibfranka.Gripper` instead of
+`franky.Gripper`. pylibfranka's `grasp()` and `move()` calls are blocking
+(there is no `grasp_async`/`open_async` in pylibfranka), so the
+non-blocking behavior that `franky`'s async calls used to provide is now
+supplied entirely by the local `ThreadPoolExecutor`: each call is submitted
+to the single worker thread and returns immediately to the caller, while
+the actual blocking RPyC round-trip (and the blocking gripper motion on
+the other end) happens on that worker thread.
 """
 
 from __future__ import annotations
@@ -36,22 +45,20 @@ class FrankaGripper:
         self._conn._config["sync_request_timeout"] = RPYC_TIMEOUT_S
         self._conn.execute(
             """
-import franky as _fr
+import pylibfranka as _pf
 
 def init_gripper(ip):
-    return _fr.Gripper(ip)
+    return _pf.Gripper(ip)
 
 def home_gripper(controller):
-    controller.homing()
-    return True
+    return bool(controller.homing())
 
 def grasp_gripper(controller, width_m, speed_m_s, force_n):
-    controller.grasp_async(width_m, speed_m_s, force_n, epsilon_outer=1.0, epsilon_inner=1.0)
-    return True
+    return bool(controller.grasp(width_m, speed_m_s, force_n, epsilon_inner=1.0, epsilon_outer=1.0))
 
 def open_gripper(controller, speed_m_s):
-    controller.open_async(speed_m_s)
-    return True
+    max_width = controller.read_once().max_width
+    return bool(controller.move(max_width, speed_m_s))
 
 def close_gripper(controller):
     return None
