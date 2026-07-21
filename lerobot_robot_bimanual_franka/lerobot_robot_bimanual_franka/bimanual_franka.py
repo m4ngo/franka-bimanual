@@ -36,8 +36,8 @@ _KD_GAIN_BASE = 1.0
 OSC_BASE_KP = 5.0
 _GRIP_ACCUM_SPEED = 0.5
 
-_EE_TRANSLATION_FUDGE_FACTOR = 1.2
-_EE_ROTATION_FUDGE_FACTOR = 0.9
+_EE_TRANSLATION_FUDGE_FACTOR = 1.2 # 1.5
+_EE_ROTATION_FUDGE_FACTOR = 0.9 # 0.8
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
