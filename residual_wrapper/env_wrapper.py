@@ -50,6 +50,50 @@ _DEPTH_FLAT_SIZE = _DEPTH_POINT_COUNT * 3
 _SIM_CONV_ROT = Rotation.from_rotvec([0.0, 0.0, -0.785891])  # fk(flange) -> hand-body
 _SIM_CONV_POS_TOOL = np.array([0.0, 0.0, -0.0069])           # fk(TCP) -> grip site, tool frame (m)
 
+# --- Sim-WORLD alignment (F5, sim-trained policies) --------------------------
+# The real world frame (chessboard calibration) is yawed 224.3 deg vs the
+# robot base with its origin ON the table plane; sim's world has the base at
+# (-0.6, 0, 0.912), identity yaw, table top at z=0.905. The 2026-07-19 obs
+# audit measured real proprio z fully OUTSIDE training support (~0.9 m low) —
+# the load-bearing part of F5, since train-time z-rotation augmentation makes
+# the student yaw-equivariant but never moves z. This constant SE(3) maps
+# real-world quantities into sim's world convention: rotation = the
+# calibration's world_in_robot yaw (config_single_arm_franka.py), translation
+# xy anchors the robot base to sim's base, z anchors the TABLE PLANE to sim's
+# (0.905 vs ~0.005 measured; table-anchoring centers task heights in the
+# training bulk — the rigs' base-to-table geometry differs by ~13 cm, so
+# base-anchoring would sit at the p99 edge). Applied to proprio pose, twist,
+# and cloud together so the modalities stay mutually consistent. Pinned by
+# multi-fast scripts/sysid/test_controller_parity.py.
+_SIM_WORLD_ROT = Rotation.from_quat([0.0, 0.0, 0.926393, -0.376557])  # real-world -> sim-world yaw
+_SIM_WORLD_T = np.array([0.069, 0.003, 0.900])
+
+
+def to_sim_world_pose(ee_pose_world: np.ndarray) -> np.ndarray:
+    """Map [x,y,z,qx,qy,qz,qw,...] from the real world frame to sim's world
+    convention (constants above). Trailing entries pass through."""
+    out = ee_pose_world.copy()
+    out[:3] = (_SIM_WORLD_ROT.apply(ee_pose_world[:3].astype(np.float64))
+               + _SIM_WORLD_T).astype(np.float32)
+    q = _SIM_WORLD_ROT * Rotation.from_quat(ee_pose_world[3:7].astype(np.float64))
+    out[3:7] = q.as_quat().astype(np.float32)
+    return out
+
+
+def to_sim_world_points(points: np.ndarray) -> np.ndarray:
+    """Map (N, 3) real-world points into sim's world convention."""
+    return (_SIM_WORLD_ROT.apply(points.astype(np.float64))
+            + _SIM_WORLD_T).astype(np.float32)
+
+
+def to_sim_world_twist(twist: np.ndarray) -> np.ndarray:
+    """Rotate a [lin(3), ang(3)] twist into sim's world convention
+    (velocities rotate with the frame; the translation doesn't apply)."""
+    t = np.asarray(twist, dtype=np.float64)
+    return np.concatenate([
+        _SIM_WORLD_ROT.apply(t[:3]), _SIM_WORLD_ROT.apply(t[3:])
+    ]).astype(np.float32)
+
 
 def current_ee_pose(obs: dict, sim_convention: bool = True) -> np.ndarray:
     """Return [x, y, z, qx, qy, qz, qw, gripper] for the right arm via FK.

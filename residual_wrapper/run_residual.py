@@ -20,6 +20,9 @@ from viz import EpisodeRecorder, save_episode_html, save_rollout_html, save_poli
 from viz import _propagate_pose_traj
 from env_wrapper import (
     ee_pose_to_world,
+    to_sim_world_points,
+    to_sim_world_pose,
+    to_sim_world_twist,
     _ACTION_KEYS,
     _CHUNK_EXEC,
     _RESIDUAL_HORIZON,
@@ -241,6 +244,14 @@ def _run_episode(
                             controller._r_robot_in_world,
                             controller._t_robot_in_world,
                         )
+                        # F5: express all world-frame quantities in sim's world
+                        # convention (table z + yaw; see env_wrapper). Applied
+                        # to pose, twist, and cloud together so the modalities
+                        # stay mutually consistent. --raw-proprio disables.
+                        if sim_proprio_convention:
+                            proprio_pose = to_sim_world_pose(proprio_pose)
+                            vel = to_sim_world_twist(vel)
+                            point_cloud = to_sim_world_points(point_cloud)
                     else:
                         proprio_pose = ee_pose
                     # base_chunk = np.repeat(base_chunk, 2, axis=0)

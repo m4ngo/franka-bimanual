@@ -102,9 +102,19 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
   (compare against numerical diff of consecutive measured poses during
   motion). sysid.py recordings still log the firmware d-variant — separate
   contract, unchanged.
-- **F5 — world-frame origin**: verify real calibrated world origin/axes match
-  robosuite's world (table height!). Absolute eef_pos enters every token.
-  Check training-data eef_pos range vs real (Tier 2 catches this).
+- **F5 — world-frame origin** — MEASURED + FIXED 2026-07-19: the Tier-2 audit
+  found real proprio z fully outside training support (real world origin sits
+  ON the table, yawed 224.3° vs the base; sim world: base at (-0.6, 0, 0.912),
+  identity yaw, table at z=0.905 → ~0.9 m z offset, the load-bearing part
+  since train-time z-rotation augmentation gives yaw-equivariance but never
+  moves z). Fix: constant SE(3) `to_sim_world_{pose,twist,points}` in
+  env_wrapper (yaw from the calibration quat; xy anchors base→sim base; z
+  anchors TABLE→sim table, chosen over base-anchoring because the rigs'
+  base-to-table geometry differs ~13 cm and table-anchoring centers task
+  heights in the training bulk). Applied to proprio pose + twist + cloud
+  together in run_residual's world path; `--raw-proprio` disables. Offline
+  prediction on the 2026-07-19 dumps: all proprio FLAGs clear (z median
+  1.024 vs train [0.449..1.179]). Verify by re-dump + Tier-2 re-audit.
 - **F6 — `center_on_eef` hardcoded** — FIXED 2026-07-19: `ResidualPolicy` now
   reads center_on_eef, num_points, use_rgb, crop_half_extent from
   `ckpt["data_kwargs"]` and enforces them in `_prepare_pcd` (crop -> resample
@@ -131,8 +141,11 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
   ±residual_mag (0.2); real clips grip to ±`_RESIDUAL_MAG` (1.0)
   (`policy_wrapper.py:206` / `env_wrapper.py:18`). Fix: `_RESIDUAL_MAG = 0.2`.
 
-Status: F1-F4, F6, F7 fixed 2026-07-19; F5, F8 OPEN (measurement questions —
-Tier 2 audit); F9 OPEN (one-line fix). Update this list as fixes land.
+Status: F1-F7 fixed 2026-07-19 (F5 pending re-dump verification); F8 fixed
+(box crop) + Tier-2 audit shows clouds within training scene-variation
+(real↔train chamfer 0.170 < train↔train baseline 0.200); F9 OPEN (one-line
+fix; Tier-1 found no |grip|>0.2 events in the 2026-07-19 dumps, so currently
+immaterial). Update this list as fixes land.
 
 ---
 
