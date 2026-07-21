@@ -86,6 +86,7 @@ class BimanualFranka(Robot):
                 self._depth_cam[s] = None
                 continue
             self._depth_cam[s] = _make_camera(cam)
+        # Half-extent of the world-axis-aligned box crop (sim collect convention).
         self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
 
         world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))

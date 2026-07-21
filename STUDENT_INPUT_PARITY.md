@@ -118,8 +118,13 @@ drx, dry, drz, grip]` — DAMPING FIRST** (SB3 `fast/utils.py:57-78`,
   already outside the envelope. Applied on the execution path and mirrored in
   the recorder's total-trajectory viz; gripper sum clipped to [-1, 1].
   Fuzz-tested: executed total == sim's clipped total over random b/r.
-- **F8 — crop geometry**: box (sim) vs sphere (real); per-camera quota vs
-  single-view sampling; no real analogue of wrist-view training clouds.
+- **F8 — crop geometry**: PARTIALLY FIXED 2026-07-19 — real capture now uses
+  sim's world-axis-aligned box (half-extent `depth_crop_radius_m`) via a
+  circumscribed-ball camera-frame prefilter + exact world L-inf test in
+  `framos.get_cropped_point_cloud` (verified: box-exact, corners captured,
+  brute-force reference match under rotated extrinsics). STILL OPEN: per-camera
+  quota vs sim's single-sampled-view, and no real wrist-view analogue —
+  quantify via the Tier 2 cloud block (chamfer + support stats) before acting.
 
 - **F9 — gripper residual clip mismatch** (found 2026-07-19 while speccing the
   parity scripts): sim eval clips channels 2:9 (pose AND grip) to

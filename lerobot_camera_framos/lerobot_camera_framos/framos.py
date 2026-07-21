@@ -244,20 +244,22 @@ class FramosCamera(Camera):
         num_points: int = 2048,
         stride: int = 2,
     ) -> np.ndarray:
-        """Project depth to world space, optionally crop to a sphere around `center`,
-        then randomly subsample to `num_points`. Cropping/downsampling happens here,
-        before the array crosses the thread-pool boundary, so far fewer points get
-        unprojected/copied than in the old full-cloud path.
+        """Project depth to world space, optionally crop to a world-axis-aligned
+        BOX of half-extent `radius_m` around `center` (matching the sim collect
+        crop; see STUDENT_INPUT_PARITY.md F8), then randomly subsample to
+        `num_points`. Cropping/downsampling happens here, before the array
+        crosses the thread-pool boundary.
 
-        Hot path in the control loop (~2 ms at 720p, stride 2):
+        Hot path in the control loop (~2-4 ms at 720p, stride 2):
         - The pixel grid is strided before deprojection; a 720p frame still leaves
           ~10x more crop candidates than num_points, so the sample distribution is
           unaffected while the crop test shrinks by stride^2.
         - Crop math runs in float32; depth is uint16 * scale so no isfinite pass
           is needed (the product is always finite).
-        - The num_points sample indices are drawn before the R/t matmul, so only
-          the winners get transformed to world frame. The crop is a Euclidean ball,
-          which rigid transforms preserve, so cropping in camera frame is exact.
+        - Two-stage crop: a camera-frame prefilter with the circumscribed ball
+          (radius sqrt(3)*radius_m — rotation-invariant, so valid before the R/t
+          transform), then the exact world-frame L-inf box test on the survivors.
+          Only ball survivors get the matmul.
         """
         depth_image = self._last_depth
         if depth_image is None:
@@ -279,20 +281,25 @@ class FramosCamera(Camera):
         y_cam = (yy.astype(np.float32) * stride - cy) * z / fy
 
         if center is not None and radius_m is not None:
+            center_w = np.asarray(center, dtype=np.float64)
             # center_cam = R^T @ (center_world - t)
-            center_cam = (
-                self._r_world_from_cam.T @ (np.asarray(center, dtype=np.float64) - self._t_world_from_cam)
-            ).astype(np.float32)
+            center_cam = (self._r_world_from_cam.T @ (center_w - self._t_world_from_cam)).astype(np.float32)
+            # Circumscribed-ball prefilter (camera frame), then exact box test (world).
             d2 = (x_cam - center_cam[0]) ** 2 + (y_cam - center_cam[1]) ** 2 + (z - center_cam[2]) ** 2
-            keep = np.flatnonzero(d2 <= np.float32(radius_m) ** 2)
-        else:
-            keep = np.arange(z.size)
-        if keep.size == 0:
-            return np.zeros((num_points, 3), dtype=np.float32)
+            keep = np.flatnonzero(d2 <= 3.0 * np.float32(radius_m) ** 2)
+            if keep.size == 0:
+                return np.zeros((num_points, 3), dtype=np.float32)
+            cam_points = np.stack((x_cam[keep], y_cam[keep], z[keep]), axis=1).astype(np.float64, copy=False)
+            world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+            world_points = world_points[np.max(np.abs(world_points - center_w), axis=1) <= radius_m]
+            if world_points.shape[0] == 0:
+                return np.zeros((num_points, 3), dtype=np.float32)
+            sel = self._rng.choice(world_points.shape[0], size=num_points,
+                                   replace=world_points.shape[0] < num_points)
+            return world_points[sel].astype(np.float32)
 
-        sel = self._rng.choice(keep.size, size=num_points, replace=keep.size < num_points)
-        k = keep[sel]
-        cam_points = np.stack((x_cam[k], y_cam[k], z[k]), axis=1).astype(np.float64, copy=False)
+        sel = self._rng.choice(z.size, size=num_points, replace=z.size < num_points)
+        cam_points = np.stack((x_cam[sel], y_cam[sel], z[sel]), axis=1).astype(np.float64, copy=False)
         world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
         return world_points.astype(np.float32)
 
