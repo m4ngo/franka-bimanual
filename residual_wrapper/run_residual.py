@@ -12,6 +12,7 @@ import tty
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -147,6 +148,29 @@ def _build_dataset(args, controller) -> LeRobotDataset:
 # Episode loop
 # ---------------------------------------------------------------------------
 
+def _write_video_frame(writers, video_dir, video_stem, fps, cam_name, img, step_idx):
+    """Lazily create one mp4 writer per camera and append an annotated frame.
+
+    Frame index == control-loop step index (first frame = first post-homing,
+    first-inference step), so base/residual runs at the same fps are
+    time-aligned by construction for side-by-side stitching.
+    """
+    w = writers.get(cam_name)
+    if w is None:
+        video_dir.mkdir(parents=True, exist_ok=True)
+        w = cv2.VideoWriter(str(video_dir / f"{video_stem}_{cam_name}.mp4"),
+                            cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                            (img.shape[1], img.shape[0]))
+        writers[cam_name] = w
+    frame = np.ascontiguousarray(img[:, :, ::-1])  # RGB->BGR; copy keeps the obs image pristine
+    label = f"{step_idx:05d} {step_idx / fps:6.2f}s"
+    cv2.putText(frame, label, (4, frame.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, label, (4, frame.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    w.write(frame)
+
+
 def _run_episode(
     controller,
     base_policy: BasePolicy,
@@ -160,6 +184,9 @@ def _run_episode(
     proprio_frame: str = "world",
     sim_proprio_convention: bool = True,
     dump_dir: "Path | None" = None,
+    video_dir: "Path | None" = None,
+    video_cams: "list[str] | None" = None,
+    video_stem: str = "episode",
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -184,6 +211,8 @@ def _run_episode(
     infer_idx = 0
     if dump_dir is not None:
         dump_dir.mkdir(parents=True, exist_ok=True)
+    video_writers: dict[str, "cv2.VideoWriter"] = {}
+    step_idx = 0
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -219,6 +248,14 @@ def _run_episode(
             # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
             # times.append(time.perf_counter())
+
+            if video_dir is not None:
+                for cam_name in (video_cams or sorted(controller.cameras.keys())):
+                    img = obs.get(cam_name)
+                    if isinstance(img, np.ndarray) and img.ndim == 3:
+                        _write_video_frame(video_writers, video_dir, video_stem,
+                                           fps, cam_name, img, step_idx)
+            step_idx += 1
 
             if chunk_used >= _CHUNK_EXEC:
                 base_chunk = base_policy.infer(obs_no_depth)
@@ -418,6 +455,10 @@ def _run_episode(
             if t_deadline < time.perf_counter():
                 t_deadline = time.perf_counter() + dt
     finally:
+        for w in video_writers.values():
+            w.release()
+        if video_writers:
+            logger.info("saved %d camera video(s) to %s", len(video_writers), video_dir)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
 
@@ -459,6 +500,11 @@ def main() -> None:
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
         help="Path to residual policy checkpoint (best.pt)",
     )
+    parser.add_argument("--save-videos", action="store_true",
+                        help="Write one time-aligned mp4 per camera into --viz-dir "
+                             "(frame index == control step; see stitch_videos.py)")
+    parser.add_argument("--video-cams", nargs="+", default=None,
+                        help="Camera obs keys to record (default: all connected cameras)")
     parser.add_argument("--dump-obs-dir", default=None,
                         help="Dump every residual_obs bundle (+ residual output) to npz under "
                              "this dir, one timestamped run subdir per invocation; feeds the "
@@ -516,6 +562,8 @@ def main() -> None:
 
     if args.repo_id and not args.output_dir:
         parser.error("--output-dir is required when --repo-id is set")
+    if args.save_videos and not args.viz_dir:
+        parser.error("--viz-dir is required when --save-videos is set")
     if args.repo_id and not args.task:
         parser.error("--task is required when --repo-id is set")
 
@@ -598,6 +646,8 @@ def main() -> None:
                     proprio_frame=args.proprio_frame,
                     sim_proprio_convention=not args.raw_proprio,
                     dump_dir=dump_root / "ep000" if dump_root else None,
+                    video_dir=Path(args.viz_dir) if args.save_videos else None,
+                    video_cams=args.video_cams,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -636,6 +686,9 @@ def main() -> None:
                         proprio_frame=args.proprio_frame,
                         sim_proprio_convention=not args.raw_proprio,
                         dump_dir=dump_root / f"ep{dataset.num_episodes:03d}" if dump_root else None,
+                        video_dir=Path(args.viz_dir) if args.save_videos else None,
+                        video_cams=args.video_cams,
+                        video_stem=f"episode_{ep_idx:03d}",
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:
