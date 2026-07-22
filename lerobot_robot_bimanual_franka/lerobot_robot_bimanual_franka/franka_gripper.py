@@ -18,13 +18,13 @@ RPYC_TIMEOUT_S = 10
 
 class FrankaGripper:
     GRIPPER_TRUE_MAX_MM = 80.0
-    _MOVE_SPEED_M_S = 1.0
+    _MOVE_SPEED_M_S = 0.5
     _INTERPOLATE_SPEED = 110
     _START_OFFSET_S = 0.6
     # _ASYNC_MOVE_SPEED_M_S = 0.20
     # Keep every meaningful width update so the latest command reaches the gripper.
     # _TARGET_CHANGE_THRESH_MM = 0.8
-    _DEFAULT_FORCE = 20.0
+    _DEFAULT_FORCE = 50.0
 
     def __init__(self, name: str = "", server_ip: str = "", robot_ip: str = "", port: int = 0, do_print: bool = False):
         self.name = name
@@ -85,14 +85,14 @@ def close_gripper(controller):
         return None
 
     def move(self, position_mm: float, speed: float = _MOVE_SPEED_M_S, blocking: bool = False) -> bool:
-        if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open and time.time() - self._last_send > 0.75:
+        if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = False
             self._position_mm = self.GRIPPER_TRUE_MAX_MM
             self._position_ts = time.monotonic()
             # store time
             self.grasp(0.0, speed, self._DEFAULT_FORCE)
             self._last_send = time.time()
-        elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open and time.time() - self._last_send > 0.75:
+        elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = True
             self._position_mm = 0
             self._position_ts = time.monotonic()
