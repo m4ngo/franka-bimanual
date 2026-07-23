@@ -80,6 +80,13 @@ class FramosCamera(Camera):
         self._output_width = int(config.width) if config.width is not None else int(config.color_width)
         self._output_height = int(config.height) if config.height is not None else int(config.color_height)
 
+        # Blob/outlier filter params (see _filter_lone_points). Exposed as
+        # attributes rather than config fields so existing configs keep working;
+        # override on the instance if a scene needs different tuning.
+        self._blob_filter_enabled: bool = True
+        self._blob_filter_min_neighbors: int = 20
+        self._blob_filter_radius_m: float = 0.01
+
     @property
     def is_connected(self) -> bool:
         return self._pipeline is not None and self._profile is not None
@@ -237,6 +244,38 @@ class FramosCamera(Camera):
         self._profile = None
         self._aligner = None
 
+    def _filter_lone_points(self, points: np.ndarray) -> np.ndarray:
+        """Remove isolated points ("blob detection" for point clouds).
+
+        A point survives only if it has at least `_blob_filter_min_neighbors`
+        other points within `_blob_filter_radius_m` metres of it (a radius
+        outlier removal, i.e. a spatial sliding-window density filter). Points
+        that don't clear that bar are treated as sensor noise / stray returns
+        and dropped before subsampling, so `num_points` is spent on points
+        that belong to real surface blobs rather than isolated noise.
+
+        No-ops (returns `points` unchanged) if filtering is disabled or if
+        there are too few points for a meaningful neighborhood test.
+        """
+        if not self._blob_filter_enabled or points.shape[0] < self._blob_filter_min_neighbors + 1:
+            return points
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64, copy=False))
+        try:
+            _, keep_idx = pcd.remove_radius_outlier(
+                nb_points=self._blob_filter_min_neighbors,
+                radius=self._blob_filter_radius_m,
+            )
+        except Exception:
+            logger.debug("Blob/outlier filter failed; falling back to unfiltered points", exc_info=True)
+            return points
+
+        keep_idx = np.asarray(keep_idx, dtype=np.int64)
+        if keep_idx.size == 0:
+            return points[:0]
+        return points[keep_idx]
+
     def get_cropped_point_cloud(
         self,
         center: np.ndarray | None = None,
@@ -246,11 +285,15 @@ class FramosCamera(Camera):
     ) -> np.ndarray:
         """Project depth to world space, optionally crop to a world-axis-aligned
         BOX of half-extent `radius_m` around `center` (matching the sim collect
-        crop; see STUDENT_INPUT_PARITY.md F8), then randomly subsample to
-        `num_points`. Cropping/downsampling happens here, before the array
-        crosses the thread-pool boundary.
+        crop; see STUDENT_INPUT_PARITY.md F8), filter out isolated/lone points
+        (points without enough nearby neighbors — a spatial density filter
+        analogous to blob detection, see `_filter_lone_points`), then randomly
+        subsample to `num_points`. Cropping/filtering/downsampling all happen
+        here, before the array crosses the thread-pool boundary.
 
-        Hot path in the control loop (~2-4 ms at 720p, stride 2):
+        Hot path in the control loop (~2-4 ms at 720p, stride 2, filter off;
+        add a few ms when the blob filter is enabled since it builds a KD-tree
+        over the cropped points):
         - The pixel grid is strided before deprojection; a 720p frame still leaves
           ~10x more crop candidates than num_points, so the sample distribution is
           unaffected while the crop test shrinks by stride^2.
@@ -260,6 +303,9 @@ class FramosCamera(Camera):
           (radius sqrt(3)*radius_m — rotation-invariant, so valid before the R/t
           transform), then the exact world-frame L-inf box test on the survivors.
           Only ball survivors get the matmul.
+        - Lone-point filtering runs on the (small) cropped/surviving set, not the
+          full frame, and happens before subsampling so `num_points` isn't wasted
+          on noise that would otherwise get filtered later.
         """
         depth_image = self._last_depth
         if depth_image is None:
@@ -292,16 +338,21 @@ class FramosCamera(Camera):
             cam_points = np.stack((x_cam[keep], y_cam[keep], z[keep]), axis=1).astype(np.float64, copy=False)
             world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
             world_points = world_points[np.max(np.abs(world_points - center_w), axis=1) <= radius_m]
+            world_points = self._filter_lone_points(world_points)
             if world_points.shape[0] == 0:
                 return np.zeros((num_points, 3), dtype=np.float32)
             sel = self._rng.choice(world_points.shape[0], size=num_points,
                                    replace=world_points.shape[0] < num_points)
             return world_points[sel].astype(np.float32)
 
-        sel = self._rng.choice(z.size, size=num_points, replace=z.size < num_points)
-        cam_points = np.stack((x_cam[sel], y_cam[sel], z[sel]), axis=1).astype(np.float64, copy=False)
+        cam_points = np.stack((x_cam, y_cam, z), axis=1).astype(np.float64, copy=False)
         world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
-        return world_points.astype(np.float32)
+        world_points = self._filter_lone_points(world_points)
+        if world_points.shape[0] == 0:
+            return np.zeros((num_points, 3), dtype=np.float32)
+        sel = self._rng.choice(world_points.shape[0], size=num_points,
+                               replace=world_points.shape[0] < num_points)
+        return world_points[sel].astype(np.float32)
 
     def get_full_point_cloud(self) -> np.ndarray:
         """Return ALL valid depth pixels projected to world space.
