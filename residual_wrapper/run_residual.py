@@ -28,6 +28,8 @@ from env_wrapper import (
     _CHUNK_EXEC,
     _RESIDUAL_HORIZON,
     _STATE_OBS_KEYS,
+    _RES_POS_GAIN,
+    _RES_ROT_GAIN,
     _POS_SCALE,
     _ROT_SCALE,
     build_action,
@@ -361,8 +363,8 @@ def _run_episode(
                 # clip the residual to the base's remaining headroom to match.
                 b_pos = base_chunk[chunk_used, :3].astype(np.float64) / _POS_SCALE
                 b_rot = Rotation.from_quat(base_chunk[chunk_used, 3:7]).as_rotvec() / _ROT_SCALE
-                dpos = (np.clip(b_pos + res[2:5], -1.0, 1.0) - b_pos) * _POS_SCALE
-                drot = (np.clip(b_rot + res[5:8], -1.0, 1.0) - b_rot) * _ROT_SCALE
+                dpos = (np.clip(b_pos + res[2:5], -1.0, 1.0) - b_pos) * _POS_SCALE * _RES_POS_GAIN
+                drot = (np.clip(b_rot + res[5:8], -1.0, 1.0) - b_rot) * _ROT_SCALE * _RES_ROT_GAIN
                 if replaying:
                     # residual is visualized only; base/trajectory gains drive execution
                     kp = float(base_chunk[chunk_used, 8])

@@ -11,6 +11,8 @@ from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 
+_RES_POS_GAIN = 1.0
+_RES_ROT_GAIN = 1.0
 _POS_SCALE = 0.05       # metres per normalised unit
 _ROT_SCALE = 0.5        # radians per normalised unit
 _CHUNK_EXEC = 5         # steps to execute per inference call (both base and residual)

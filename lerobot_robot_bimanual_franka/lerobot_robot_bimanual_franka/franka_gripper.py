@@ -24,7 +24,7 @@ class FrankaGripper:
     # _ASYNC_MOVE_SPEED_M_S = 0.20
     # Keep every meaningful width update so the latest command reaches the gripper.
     # _TARGET_CHANGE_THRESH_MM = 0.8
-    _DEFAULT_FORCE = 50.0
+    _DEFAULT_FORCE = 10.0
 
     def __init__(self, name: str = "", server_ip: str = "", robot_ip: str = "", port: int = 0, do_print: bool = False):
         self.name = name

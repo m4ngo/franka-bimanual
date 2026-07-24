@@ -1,4 +1,4 @@
-source /home/franka/.venv/bin/activate
+# source /home/franka/.venv/bin/activate
 
 # FRAMOS pyrealsense2 — NOT on PyPI; must be installed from the local FRAMOS SDK build.
 uv pip install --no-build-isolation ~/librealsense2/wrappers/python/

@@ -103,7 +103,7 @@ def main():
                          help="repo_id to push the filtered dataset to")
     parser.add_argument("--action-key", default="action",
                          help="Name of the action feature in the dataset (default: 'action')")
-    parser.add_argument("--translation-threshold", type=float, default=0.001,
+    parser.add_argument("--translation-threshold", type=float, default=0.0005,
                          help="Minimum translation-delta norm to keep a frame (dataset's native length unit)")
     parser.add_argument("--rotation-threshold", type=float, default=0.01,
                          help="Minimum rotation-delta angle (radians) to keep a frame")
