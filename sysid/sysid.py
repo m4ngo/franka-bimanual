@@ -98,7 +98,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
         from lerobot_robot_bimanual_franka import (
             bimanual_franka as bf,
             franka_process as fp,
-            osc_velocity_controller as osc,
+            osc_torque_controller as osc,
             safety as sf,
         )
     except ImportError:
@@ -110,8 +110,9 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
     )
     return _ROBOT_STACK
 
-# Action kp/kd in [-1, 1]; send_action maps them via kp_gain = 10**kp.
-# Default 0.0 → kp_gain = 1.0 (minimum, safest for an open-loop sysid replay).
+# Action kp/kd in [-1, 1]; send_action maps them the way the sim wrapper does:
+# kp = 150 * 10**kp, damping_ratio = 1 * 10**kd. Default 0.0 → the robosuite
+# defaults (kp 150, critically damped), which is what the policies were trained on.
 _DEFAULT_KP = 0.0
 _DEFAULT_KD = 0.0
 
@@ -612,12 +613,13 @@ def save_sysid_hdf5(recorded: dict[str, np.ndarray], path: str, attrs: dict | No
 _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
     "bf": (
         "_EE_TRANSLATION_FUDGE_FACTOR", "_EE_ROTATION_FUDGE_FACTOR",
-        "OSC_BASE_KP", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
-        "EE_PD_KP", "EE_PD_KD", "JOINT_PD_KP", "JOINT_PD_KD",
+        "OSC_BASE_KP", "OSC_BASE_DAMPING_RATIO", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
+        "JOINT_IMPEDANCE_KP", "HOME_IMPEDANCE_KP", "HOME_MAX_QDOT",
     ),
     "osc": (
-        "DEFAULT_KP", "DEFAULT_DAMPING_RATIO", "DEFAULT_NULLSPACE_KP",
-        "DEFAULT_DLS_DAMPING", "DEFAULT_MAX_QDOT",
+        "DEFAULT_KP", "KP_LIMITS", "DEFAULT_DAMPING_RATIO", "DAMPING_RATIO_LIMITS",
+        "KP_EXP_SCALE", "DAMPING_EXP_SCALE", "DEFAULT_NULLSPACE_KP",
+        "DELTA_POS_MAX", "DELTA_ROT_MAX", "DEFAULT_JOINT_KP", "JOINT_TORQUE_LIMITS",
     ),
     "safety": (
         "JOINT_VELOCITY_MAX", "EE_LINEAR_VELOCITY_MAX", "EE_ANGULAR_VELOCITY_MAX",
@@ -625,13 +627,11 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
         "CUSTOM_END_EFFECTOR_Z_EXTENSION",
     ),
     "fp": (
-        "VELOCITY_COMMAND_DURATION_MS", "_JOINT_RELATIVE_DYNAMICS",
-        "_EE_DELTA_RELATIVE_DYNAMICS", "_JOINT_STIFFNESS",
-        "_TORQUE_THRESHOLD", "_FORCE_THRESHOLD",
+        "NUM_JOINTS", "RPYC_TIMEOUT_S", "FIRST_STATE_TIMEOUT_S",
     ),
 }
 _METADATA_MODULE_LABELS = {
-    "bf": "bimanual_franka", "osc": "osc_velocity_controller",
+    "bf": "bimanual_franka", "osc": "osc_torque_controller",
     "safety": "safety", "fp": "franka_process",
 }
 
@@ -670,9 +670,9 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
         "episodes_completed": [],
         "derived_gains": {
             "kp_gain": kp_gain,
-            "effective_velocity_kp": kp_gain * osc_base_kp if osc_base_kp is not None else None,
-            "kd_note": "kd action is inert on this stack (_KD_GAIN_BASE == 1.0; "
-                       "OSCVelocityController's law has no kd term)",
+            "effective_kp": kp_gain * osc_base_kp if osc_base_kp is not None else None,
+            "kd_note": "kd action is the OSC damping_ratio: ratio = 10**kd, "
+                       "kd = 2*sqrt(kp)*ratio (robosuite impedance_mode='variable')",
         },
         "constants": constants,
     }

@@ -25,9 +25,12 @@ Three machines, two arms, two grippers, six cameras:
 - Six GigE cameras (4× Basler ARV, 2× FRAMOS D415e) — IP/serial map in
   `BimanualFrankaConfig` and the README.
 
-Each NUC runs `./start_control.sh` which exposes the FR3 over RPyC; the
-workstation connects directly via `rpyc.classic.connect` (one connection per
-arm) and bypasses `net_franky.franky`'s singleton (IP,PORT) limitation.
+Each NUC runs `./run_server.sh`, which launches `pylibfranka_server.py` under
+`taskset` + `chrt -f 80`. That process owns a **1 kHz torque control loop per
+arm** (libfranka `readOnce`/`writeOnce`) and the OSC law feeding it; the
+workstation pushes goals at policy rate over RPyC. Deploy with
+`scripts/deploy_nuc_server.sh <mario|luigi>`. The franky/net_franky
+`start_control.sh` is superseded — franky has no torque interface.
 
 ## Package layout
 
@@ -69,30 +72,36 @@ The follower is composed of three subsystems, each isolated in its own module:
   it caches that snapshot so the immediate `send_action()` skips a redundant
   RPyC round-trip.
 - [franka_process.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_process.py)
-  — the RPyC bridge. **Read the docstring before editing.** A big `_SERVER_HELPERS`
-  string is `exec`'d on the NUC at connect time so each control-loop op is one
-  round-trip per arm. Two important wire-format constraints encoded there:
-  - **Tuples, not lists.** brine encodes immutable values; lists cross as
-    netrefs that cost a round-trip per element and spam `AttributeError` when
-    numpy probes `__array__`.
-  - **Read `cb_robot.state` directly under a `with` block.** The
-    `get_last_callback_data` accessor leaks `state_mutex` on `AttributeError`;
-    the helper recovers any lock left dangling by a crashed prior session.
-  - Recoverable Franka errors (`UDP receive: Timeout`,
-    `communication_constrains_violation`, `current mode ("Reflex")`,
-    `type of motion cannot change`) trigger `recover_from_errors()` on the
-    server side and a warning rather than an exception. Edit `_RECOVERABLE_ERRORS`
-    if you add another known-recoverable string.
-  - The 6×7 EE Jacobian is cached and recomputed only when joint angles drift
-    past `_JACOBIAN_CACHE_Q_THRESHOLD` (0.5 rad L∞). This matters when adding
-    code that needs fresh Jacobians.
+  — the RPyC client. Ships *goals*, not per-tick commands: `send_osc_goal`,
+  `send_joint_goal` and `send_joint_velocity` are non-blocking pushes, and
+  `get_kinematic_state` is a non-blocking read of whatever the server last
+  published. **Tuples, not lists** on the wire — brine encodes immutable values;
+  lists cross as netrefs that cost a round-trip per element and spam
+  `AttributeError` when numpy probes `__array__`.
+- [pylibfranka_server.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_server.py)
+  — runs **on the NUC**, not here. **Read the docstring before editing.** Owns the
+  `ActiveControlBase` and the RT thread, recomputing tau every tick from the held
+  goal. Constraints encoded there: libfranka matrices are column-major
+  (`order="F"`); `Model.zero_jacobian` returns all zeros on this build so the
+  analytic `franka_jacobian` is used instead; torque rate limiting against
+  `state.tau_J_d` is mandatory; the service **must** keep its `SlaveService` base
+  or `FrankaGripper`'s `rpyc.classic.connect` breaks; and recoverable errors
+  (reflex, `communication_constrains_violation`, UDP timeout) re-arm torque
+  control holding the pose the arm actually ended up in.
+- [osc_torque_controller.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/osc_torque_controller.py)
+  — robosuite's `OperationalSpaceController` ported 1:1 in
+  `impedance_mode="variable"`. Deployed to the NUC alongside the server, so it
+  stays numpy-only with no package-relative imports. Verify changes with
+  `scripts/check_osc_parity.py`, which diffs it against robosuite's real modules.
 - [safety.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/safety.py)
-  — `ActionSafetyScreen` applies pre-dispatch shaping to either joint-velocity
-  or EE-twist commands:
-  - **Worktable brake**: caps downward velocity by `sqrt(2·MAX_DECEL·clearance)`
-    so the EE can stop before reaching `WORKTABLE_HEIGHT + DISTANCE_MIN`. EE
-    mode mutates only `vz`; joint mode uniformly scales the whole velocity
-    vector to preserve direction.
+  — `ActionSafetyScreen` applies pre-dispatch shaping to goal poses (torque
+  paths) or velocity commands (the remaining velocity callers):
+  - **Worktable brake**: caps downward motion by `sqrt(2·MAX_DECEL·clearance)`
+    so the EE can stop before reaching `WORKTABLE_HEIGHT + DISTANCE_MIN`.
+    `shape_goal` / `shape_joint_goal` express that envelope as a bound on the
+    downward position error (the impedance loop settles at `v = (kp/kd)·error`)
+    plus a hard floor the goal can never cross; `shape_ee` / `shape_joint` keep
+    the velocity-domain form.
   - L2-norm clamps on joint velocity (2.0 rad/s) and EE linear/angular
     velocity (0.30 m/s, 1.20 rad/s).
   - Bimanual arm-repel is **not yet implemented** (noted in the module
@@ -108,15 +117,20 @@ The follower is composed of three subsystems, each isolated in its own module:
 
 ### Robot action schema
 
-`BimanualFranka` has two modes selected by `use_ee_pos`:
+`BimanualFranka` has three modes selected by `control_mode`. All land on torque;
+`send_action` is robosuite's `set_goal` half, the NUC runs `run_controller`.
 
-- **Joint mode** (`use_ee_pos=False`): action keys `l_joint_1…l_joint_7,
-  l_gripper, r_joint_1…r_joint_7, r_gripper`. Internally converted to
-  joint-velocity commands with `JOINT_PD_KP=2.0`, `JOINT_PD_KD=0.1`.
-- **EE mode** (`use_ee_pos=True`): action keys `l_{x,y,z,qx,qy,qz,qw,gripper}`
-  and `r_*`. Internally converted to Cartesian twists with `EE_PD_KP=2.0`,
-  `EE_PD_KD=0.1`. Quaternion error uses a Hamilton-product formulation with
-  hemisphere selection (`q_err[3] < 0` → negate).
+- **`JOINT_POS`**: keys `l_joint_1…l_joint_7, l_gripper, r_joint_1…`. Dispatched
+  as a joint-impedance goal at `JOINT_IMPEDANCE_KP`.
+- **`EE_POS`**: keys `l_{x,y,z,qx,qy,qz,qw,gripper}` and `r_*`, an absolute pose
+  used directly as the OSC goal.
+- **`EE_DELTA`**: same keys as a delta. `goal = ee_pos + delta`, rebuilt from the
+  *current* pose every policy step (never accumulated onto the previous goal),
+  delta clipped to osc_pose.json's ±0.05 m / ±0.5 rad envelope.
+
+The `kp`/`kd` action entries use the sim's exponential remap, matching
+`multi-fast/utils/envs/libero.py`: `kp = 150·10^a_kp` clipped to [0, 1500],
+`damping_ratio = 1·10^a_kd` clipped to [0, 10], `kd = 2√kp·ratio`.
 
 Gripper values are normalised to `[0, 1]` against
 `WSG.GRIPPER_TRUE_MAX_MM = 110.0` mm.
@@ -183,15 +197,17 @@ constants for this exact rig. All scripts assume the venv is active.
 
 | Script | What it does | Mode |
 |---|---|---|
-| `teleop.sh` | Bimanual GELLO joint-mode teleop | `use_ee_pos=false` |
-| `gello_ee_teleop.sh` | Bimanual GELLO EE-mode teleop (FR3 FK on leader) | `use_ee_pos=true` |
-| `spacemouse_teleop.sh` | Bimanual SpaceMouse EE-mode teleop | `use_ee_pos=true` |
+| `teleop.sh` | Bimanual GELLO joint-mode teleop | `JOINT_POS` |
+| `gello_ee_teleop.sh` | Bimanual GELLO EE-mode teleop (FR3 FK on leader) | `EE_POS` |
+| `spacemouse_teleop.sh` | Bimanual SpaceMouse EE-mode teleop | `EE_POS` |
 | `record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO joint teleop dataset → HuggingFace | joint |
 | `ee_record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO EE teleop dataset | EE |
 | `replay.sh <repo_id> <episode>` | Replay one episode of a recorded dataset | joint |
 | `train.sh <repo_id> <policy_repo> <bs> <steps> <policy_type> <resume> <config>` | Train a policy with wandb logging, upload to HF | — |
 | `rollout_policy.sh <repo_id> <n_eps> <policy_repo> <out_dir>` | Roll out a policy in EE mode and log trajectories | EE |
 | `openpi_client_franka.py` | Single-arm (right) OpenPI inference client; sends DROID-style joint-velocity observations to a remote websocket policy | joint |
+| `deploy_nuc_server.sh <mario\|luigi>` | Copy the torque server + controller to a NUC and restart it under `chrt -f 80` | — |
+| `check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all five packages | — |
 
 USB ports: **left GELLO `/dev/ttyUSB1`, right GELLO `/dev/ttyUSB0`**. SpaceMice
@@ -203,6 +219,11 @@ defaults of `/dev/hidraw4` / `/dev/hidraw5`).
 ## Conventions worth following
 
 - **Tuples over lists at the RPyC boundary.** See `franka_process.py`.
+- **The control law runs on the NUC; the goal is set here.** Anything that must
+  respond faster than a policy period (damping, Coriolis, torque limiting) belongs
+  in `pylibfranka_server.py`; anything at policy rate (goal composition, safety
+  shaping, gains) belongs in `bimanual_franka.py`. Re-deploy the NUC side after
+  touching it — the workstation copy is not what runs.
 - **Pure (action, state) → action transforms in `safety.py`.** Don't push
   side effects into `ActionSafetyScreen`; it is intended to be a pre-dispatch
   shaping layer.
@@ -232,8 +253,11 @@ For code-level debugging:
   (`logger.debug` in `_fetch_frame` reports how many it drained per call).
 - Stale teleop input → SpaceMouse: check the HID drain loop; GELLO async:
   check the read thread is alive.
-- "Robot already connected on this (ip, port)" — net_franky's singleton
-  caching; the direct-RPyC path in `franka_process.py` is the workaround,
-  not the cause. Don't reintroduce `franky.Robot(ip)` calls on the workstation.
+- Arm limp or not tracking → the server holds the current pose if no goal
+  arrives for `_STALE_GOAL_TIMEOUT_S` (0.5 s). Check the policy loop rate and
+  `~/pylibfranka_server.log` on the NUC.
+- `communication_constrains_violation` → the RT loop missed its 1 kHz deadline.
+  Check the server is running under `chrt -f 80` and that nothing else is
+  saturating cores 2-7.
 - Gripper FAST STOP latched after a crash → re-`connect()` clears it via
   `ack_fast_stop()` in `WSG.__init__`.

@@ -1,8 +1,17 @@
-"""Direct-RPyC Franka driver for the bimanual plugin.
+"""Direct-RPyC pylibfranka driver for the bimanual plugin.
 
-Bypasses net_franky.franky (singleton (IP,PORT)) by calling rpyc.classic.connect
-once per arm. Motion construction and state packing run server-side via helpers
-installed at connect time, so each per-loop op is one RPyC round-trip per arm.
+Replaces the franky/net_franky driver. franky has no torque interface, so the
+OSC law could only be approximated in the velocity domain; the NUC now runs
+``pylibfranka_server.py``, which owns a 1 kHz torque loop per arm.
+
+Consequence for this file: it no longer ships *commands* per tick, it ships
+*goals*. The control law runs server-side (see that module's docstring for why),
+so every method here is a cheap non-blocking push or a non-blocking read of the
+latest published state -- nothing in the per-tick path blocks on the robot.
+
+brine encodes immutable values only: tuples of native floats cross by value,
+lists cross as netrefs costing a round-trip per element and spamming
+AttributeError when numpy probes ``__array__``. Everything on the wire is a tuple.
 """
 
 import logging
@@ -15,177 +24,137 @@ from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-VELOCITY_COMMAND_DURATION_MS = 100
 NUM_JOINTS = 7
 EE_DELTA_DIMS = 6
 
 DEFAULT_REQUEST_TIMEOUT_S = 5.0
 RPYC_TIMEOUT_S = 10
+FIRST_STATE_TIMEOUT_S = 5.0
 
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
-_JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_TORQUE_THRESHOLD = 100.0  # Nm
-_FORCE_THRESHOLD = 200.0   # N
-_JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
-
-_RECOVERABLE_ERRORS = (
-    "UDP receive: Timeout",
-    "communication_constrains_violation",
-    'current mode ("Reflex")',
-    "type of motion cannot change",
-    "singular"
-)
+# Server-side control modes (pylibfranka_server.MODE_*).
+MODE_FLOAT = "float"
+MODE_HOLD = "hold"
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)
 KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
 
 
-# All motion construction lives here so each loop op is one RPyC round-trip.
-# brine encodes immutable types only — tuples of native floats are brineable,
-# but lists are NOT (they cross the wire as netrefs, costing one round-trip
-# per element access and spamming AttributeError into the server log when
-# numpy probes them for __array__). Always exchange data as tuples.
-# CBRobot.get_last_callback_data leaks state_mutex on AttributeError, so we
-# read cb_robot.state directly under a `with` block and recover any mutex left
-# locked by a previously crashed session.
-_SERVER_HELPERS = f"""
-import threading, numpy as _np
-import franky as _fr
-import net_franky.cb_robot as _cbm
-
-if not _cbm.state_mutex.acquire(blocking=False):
-    _cbm.state_mutex = threading.Lock()
-    _cbm.state = None
-else:
-    _cbm.state_mutex.release()
-
-_DUR = _fr.Duration({VELOCITY_COMMAND_DURATION_MS})
-_EE_DYN = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
-_ZERO3 = _np.zeros(3)
-_ZERO_J = _np.zeros({NUM_JOINTS})
-
-def init_robot(ip, ee):
-    r = _cbm.CBRobot(ip)
-    r.recover_from_errors()
-    if ee:
-        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_EE_DELTA_RELATIVE_DYNAMICS!r})
-    else:
-        r.relative_dynamics_factor = _fr.RelativeDynamicsFactor(*{_JOINT_RELATIVE_DYNAMICS!r})
-    r.set_collision_behavior({_TORQUE_THRESHOLD}, {_FORCE_THRESHOLD})
-    r.set_joint_impedance({_JOINT_STIFFNESS!r})
-    return r
-
-def get_state(robot):
-    with _cbm.state_mutex:
-        s = _cbm.state
-    s = s.robot_state if s is not None else robot.state
-    return (
-        tuple(float(x) for x in s.q),
-        tuple(float(x) for x in s.dq),
-        tuple(float(x) for x in s.O_T_EE.translation),
-        tuple(float(x) for x in s.O_T_EE.quaternion),
-        tuple(float(x) for x in s.O_dP_EE_d.linear) + tuple(float(x) for x in s.O_dP_EE_d.angular),
+def _unpack(bundle: tuple) -> tuple[KinematicSnapshot, int]:
+    q, dq, J_flat, ee_pos, ee_quat_xyzw, ee_twist, recovery_count = bundle
+    snap: KinematicSnapshot = (
+        np.array(q),
+        np.array(dq),
+        np.array(J_flat).reshape(6, NUM_JOINTS),
+        np.array(ee_pos),
+        np.array(ee_quat_xyzw),
+        np.array(ee_twist),
     )
-
-def get_jacobian(robot):
-    j = _np.asarray(robot.model.zero_jacobian(_fr.Frame.EndEffector, robot.state))
-    return tuple(float(x) for x in j.flat)
-
-def send_jv(robot, vel):
-    robot.move(_fr.JointVelocityMotion(_np.asarray(vel, dtype=_np.float64), _DUR), asynchronous=True)
-
-def send_ee(robot, twist):
-    t = _np.asarray(twist, dtype=_np.float64)
-    robot.move(_fr.CartesianVelocityMotion(_fr.Twist(t[:3], t[3:]), _DUR, _EE_DYN), asynchronous=True)
-
-def stop(robot, use_ee):
-    if use_ee:
-        m = _fr.CartesianVelocityMotion(_fr.Twist(_ZERO3, _ZERO3), _DUR, _EE_DYN)
-    else:
-        m = _fr.JointVelocityMotion(_ZERO_J, _DUR)
-    robot.move(m, asynchronous=False)
-"""
+    return snap, int(recovery_count)
 
 
 class RobotDriver:
-    """One arm: one RPyC connection, one robot handle, one set of helpers.
+    """One arm: one RPyC connection to that arm's torque-server session.
 
     Single-threaded per-instance; the wrapper executor owns serialization.
     """
 
     def __init__(self, server_ip: str, robot_ip: str, port: int, use_ee_delta: bool = False):
+        # Retained for call-site compatibility with the franky driver. Torque
+        # control has no separate EE transport mode -- BimanualFranka picks the
+        # server-side control law instead.
         self.use_ee_delta = use_ee_delta
-        # Cumulative count of recoverable-error recoveries (reflexes etc.) —
-        # lets recording scripts flag ticks where tracking was interrupted.
+        self.robot_ip = robot_ip
+        # Cumulative recoverable-error recoveries (reflexes etc.), mirrored from
+        # the server on every state read so recording scripts can flag ticks
+        # where tracking was interrupted.
         self.recovery_count = 0
-        self._jac: NDArray | None = None
-        self._jac_q: NDArray | None = None
+        self._last_snap: KinematicSnapshot | None = None
 
-        self._conn = rpyc.classic.connect(server_ip, port)
-        self._conn._config["sync_request_timeout"] = RPYC_TIMEOUT_S
-        self._conn.execute(_SERVER_HELPERS)
-        ns = self._conn.namespace
-        self._rpc_state = ns["get_state"]
-        self._rpc_jacobian = ns["get_jacobian"]
-        self._rpc_send_jv = ns["send_jv"]
-        self._rpc_send_ee = ns["send_ee"]
-        self._rpc_stop = ns["stop"]
-        self.robot = ns["init_robot"](robot_ip, use_ee_delta)
+        self._conn = rpyc.connect(
+            server_ip,
+            port,
+            config={"sync_request_timeout": RPYC_TIMEOUT_S, "allow_pickle": True},
+        )
+        root = self._conn.root
+        root.init_robot(robot_ip, True)
+        root.start_control(robot_ip)
+        self._root = root
 
     @property
     def is_alive(self) -> bool:
         return not self._conn.closed
 
     def get_kinematic_state(self) -> KinematicSnapshot:
-        q_l, dq_l, p_l, r_l, v_l = self._rpc_state(self.robot)
-        q = np.array(q_l)
-        if self._jac is None or float(np.max(np.abs(q - self._jac_q))) > _JACOBIAN_CACHE_Q_THRESHOLD:
-            self._jac = np.array(self._rpc_jacobian(self.robot)).reshape(6, 7)
-            self._jac_q = q.copy()
-        return q, np.array(dq_l), self._jac, np.array(p_l), np.array(r_l), np.array(v_l)
+        """Latest state published by the RT loop. Non-blocking once running."""
+        bundle, err, _ = self._root.get_state(self.robot_ip)
+        if bundle is None:
+            bundle, err, _, ok = self._root.wait_next(self.robot_ip, -1, FIRST_STATE_TIMEOUT_S)
+            if not ok or bundle is None:
+                raise ConnectionError(
+                    f"no state from {self.robot_ip} after {FIRST_STATE_TIMEOUT_S}s: {err}"
+                )
+        if err is not None:
+            logger.warning("RobotDriver(%s): %s", self.robot_ip, err)
+        snap, self.recovery_count = _unpack(bundle)
+        self._last_snap = snap
+        return snap
 
-    def send_joint_velocity(self, vel: list[float]) -> None:
-        """Joint-space velocity RPC (joint-mode teleop and `home()` when not in EE mode)."""
-        # tuple() so brine encodes by value (lists go over as netrefs).
-        try:
-            self._rpc_send_jv(self.robot, tuple(vel))
-        except Exception as e:
-            if any(t in str(e) for t in _RECOVERABLE_ERRORS):
-                self.recovery_count += 1
-                try:
-                    self.robot.recover_from_errors()
-                except Exception:
-                    pass
-            logger.warning("send_joint_velocity: %s", e)
+    def send_osc_goal(
+        self,
+        goal_pos: np.ndarray,
+        goal_quat_xyzw: np.ndarray,
+        kp: np.ndarray,
+        kd: np.ndarray,
+        nullspace_q: np.ndarray | None = None,
+    ) -> None:
+        self._push(
+            self._root.set_osc_goal,
+            _t(goal_pos),
+            _t(goal_quat_xyzw),
+            _t(kp),
+            _t(kd),
+            None if nullspace_q is None else _t(nullspace_q),
+        )
 
-    def send_velocity(self, vel: list[float]) -> None:
-        """Cartesian twist when `use_ee_delta`, else joint velocity (normal teleop)."""
-        # tuple() so brine encodes by value (lists go over as netrefs).
-        rpc = self._rpc_send_ee if self.use_ee_delta else self._rpc_send_jv
+    def send_joint_goal(
+        self, goal_q: np.ndarray, kp: float | None = None, damping_ratio: float | None = None
+    ) -> None:
+        self._push(self._root.set_joint_goal, _t(goal_q), kp, damping_ratio)
+
+    def send_joint_velocity(self, vel: list[float], kd_scale: float = 1.0) -> None:
+        """Joint-velocity setpoint, tracked by a server-side impedance law."""
+        self._push(self._root.set_joint_velocity_goal, _t(vel), float(kd_scale))
+
+    def set_mode(self, mode: str) -> None:
+        self._push(self._root.set_mode, mode)
+
+    def set_tuning(self, joint_damping_kv: float | None = None) -> None:
+        """Live server-side tuning; 0.0 joint damping restores exact osc.py behaviour."""
+        self._push(self._root.set_tuning, joint_damping_kv)
+
+    def _push(self, rpc, *args) -> None:
         try:
-            rpc(self.robot, tuple(vel))
+            rpc(self.robot_ip, *args)
         except Exception as e:
-            if any(t in str(e) for t in _RECOVERABLE_ERRORS):
-                self.recovery_count += 1
-                try:
-                    self.robot.recover_from_errors()
-                except Exception:
-                    pass
-            logger.warning("send_velocity: %s", e)
+            logger.warning("%s(%s): %s", getattr(rpc, "__name__", "push"), self.robot_ip, e)
 
     def stop(self) -> None:
-        self._rpc_stop(self.robot, self.use_ee_delta)
+        """Park in a joint hold at the current pose; the arm stays where it is."""
+        self.set_mode(MODE_HOLD)
 
     def shutdown(self) -> None:
         try:
-            self.stop()
+            self._root.stop(self.robot_ip)
         except Exception:
             pass
         try:
             self._conn.close()
         except Exception:
             pass
+
+
+def _t(v) -> tuple:
+    return tuple(float(x) for x in np.asarray(v, dtype=np.float64).ravel())
 
 
 class MultiRobotWrapper:
@@ -205,7 +174,7 @@ class MultiRobotWrapper:
         return sum(1 for d in self.drivers.values() if d.is_alive)
 
     def recovery_counts(self) -> dict[str, int]:
-        """Cumulative recoverable-error recoveries per arm (see RobotDriver.recovery_count)."""
+        """Cumulative recoverable-error recoveries per arm, as of the last state read."""
         return {n: d.recovery_count for n, d in self.drivers.items()}
 
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
@@ -215,14 +184,27 @@ class MultiRobotWrapper:
     def current_kinematic_state(self, name: str, timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> KinematicSnapshot:
         return self.drivers[name].get_kinematic_state()
 
-    def current_kinematic_state_batch(self, names: list[str], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S) -> dict[str, KinematicSnapshot]:
+    def current_kinematic_state_batch(
+        self, names: list[str], timeout_s: float = DEFAULT_REQUEST_TIMEOUT_S
+    ) -> dict[str, KinematicSnapshot]:
         return self._gather(lambda n: self.drivers[n].get_kinematic_state(), names, timeout_s)
+
+    def move_osc_goal_batch(self, goals: dict[str, tuple]) -> None:
+        """goals[arm] = (goal_pos(3), goal_quat_xyzw(4), kp(6), kd(6), nullspace_q(7) | None)."""
+        self._gather(lambda n: self.drivers[n].send_osc_goal(*goals[n]), list(goals))
+
+    def move_joint_goal_batch(self, goals: dict[str, tuple]) -> None:
+        """goals[arm] = (goal_q(7), kp | None, damping_ratio | None)."""
+        self._gather(lambda n: self.drivers[n].send_joint_goal(*goals[n]), list(goals))
 
     def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True) -> None:
         self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n]), list(vels))
 
-    def move_ee_delta_batch(self, twists: dict[str, list], asynchronous: bool = True) -> None:
-        self._gather(lambda n: self.drivers[n].send_velocity(twists[n]), list(twists))
+    def set_mode_all(self, mode: str) -> None:
+        self._gather(lambda n: self.drivers[n].set_mode(mode), list(self.drivers))
+
+    def set_tuning_all(self, joint_damping_kv: float | None = None) -> None:
+        self._gather(lambda n: self.drivers[n].set_tuning(joint_damping_kv), list(self.drivers))
 
     def stop_all_motion(self) -> None:
         self._gather(lambda n: self.drivers[n].stop(), [n for n, d in self.drivers.items() if d.is_alive])

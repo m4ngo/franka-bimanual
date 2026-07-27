@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 
 # Single-arm teleop for the right-arm-only Franka wrapper.
+#
+# Scales map full stick deflection onto osc_pose.json's output_max envelope
+# (0.05 m, 0.5 rad), which is also what clip_delta enforces. The old 0.1/0.2
+# saturated translation at half deflection while leaving rotation at 40% of its
+# range at full deflection -- fast translation, stiff rotation.
 
 PORT=/dev/ttyUSB0
 
@@ -17,6 +22,6 @@ lerobot-teleoperate \
     --teleop.hidraw_path="/dev/hidraw3" \
     --teleop.prefix="r_" \
     --teleop.use_delta=true \
-    --teleop.translation_scale=0.1 \
-    --teleop.rotation_scale=0.2 \
+    --teleop.translation_scale=0.05 \
+    --teleop.rotation_scale=0.5 \
     --fps=20

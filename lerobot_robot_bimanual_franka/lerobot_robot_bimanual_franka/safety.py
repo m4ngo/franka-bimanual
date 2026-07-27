@@ -2,6 +2,14 @@
 
 All checks are pure (action, kin_state) → action transforms applied before dispatch.
 Currently implements a worktable brake; bimanual arm-repel is not yet implemented.
+
+Under torque control the dispatched quantity is a *goal pose*, not a velocity, so
+``shape_goal`` / ``shape_joint_goal`` are the live screens; ``shape_ee`` and
+``shape_joint`` remain for the velocity-domain callers (openpi client, the
+joint-velocity diagnostic path). The braking envelope is identical in all four --
+what differs is how it is expressed. For a goal, the OSC closed loop settles at
+``v = (kp/kd) * error``, so capping the descent speed at ``v_envelope`` means
+capping the downward position error at ``v_envelope * kd/kp``.
 """
 
 import numpy as np
@@ -45,6 +53,64 @@ class ActionSafetyScreen:
         if end_effector_z_extension < 0.0:
             raise ValueError("end_effector_z_extension must be non-negative.")
         self.end_effector_z_extension = float(end_effector_z_extension)
+
+    def _descent_envelope(self, snap: KinematicSnapshot) -> float:
+        """Max downward EE speed (m/s) that still allows stopping above the table."""
+        contact_z = float(np.asarray(snap[3])[2]) - self.end_effector_z_extension
+        safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
+        return 0.0 if safe_dist <= 0.0 else float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
+
+    @property
+    def goal_z_floor(self) -> float:
+        """Lowest EE-frame z that may ever be commanded as a goal."""
+        return WORKTABLE_HEIGHT + WORKTABLE_DISTANCE_MIN + self.end_effector_z_extension
+
+    def shape_goal(
+        self,
+        goals_by_arm: dict[str, tuple[np.ndarray, np.ndarray]],
+        kin_state: dict[str, KinematicSnapshot],
+        kp: np.ndarray,
+        kd: np.ndarray,
+    ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Clamp EE goal positions: hard floor above the table, plus a cap on how
+        far below the current EE the goal may sit (the descent-speed envelope
+        re-expressed as a position error). Orientation goals pass through."""
+        kp_z, kd_z = float(np.asarray(kp)[2]), float(np.asarray(kd)[2])
+        out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        for arm, (goal_pos, goal_quat) in goals_by_arm.items():
+            goal_pos = np.asarray(goal_pos, dtype=np.float64).copy()
+            ee_z = float(np.asarray(kin_state[arm][3])[2])
+            max_down = self._descent_envelope(kin_state[arm]) * (kd_z / kp_z) if kp_z > 0.0 else 0.0
+            goal_pos[2] = max(goal_pos[2], ee_z - max_down, self.goal_z_floor)
+            out[arm] = (goal_pos, goal_quat)
+        return out
+
+    def shape_joint_goal(
+        self,
+        goals_by_arm: dict[str, np.ndarray],
+        kin_state: dict[str, KinematicSnapshot],
+        kp: float,
+        damping_ratio: float = 1.0,
+    ) -> dict[str, np.ndarray]:
+        """Scale a joint-position goal's delta so the EE descent it implies stays
+        inside the braking envelope. Uniform scale keeps the joint-space
+        direction, matching shape_joint."""
+        kd = 2.0 * np.sqrt(kp) * damping_ratio
+        max_descent_error = (kd / kp) if kp > 0.0 else 0.0
+        out: dict[str, np.ndarray] = {}
+        for arm, goal_q in goals_by_arm.items():
+            goal_q = np.asarray(goal_q, dtype=np.float64)
+            q, _, jacobian, _, _, _ = kin_state[arm]
+            delta = goal_q - np.asarray(q, dtype=np.float64)
+            # J[2] @ delta_q is the EE z error the goal implies; the impedance
+            # loop turns that into (kp/kd) * error of descent speed.
+            descent_z = float(np.asarray(jacobian, dtype=np.float64)[2, :] @ delta)
+            limit = self._descent_envelope(kin_state[arm]) * max_descent_error
+            if descent_z >= -WORKTABLE_VELOCITY_EPS or -descent_z <= limit:
+                out[arm] = goal_q
+                continue
+            out[arm] = np.asarray(q, dtype=np.float64) + delta * (limit / -descent_z)
+        return out
 
     def shape_ee(
         self,
