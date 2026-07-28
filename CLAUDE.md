@@ -25,12 +25,28 @@ Three machines, two arms, two grippers, six cameras:
 - Six GigE cameras (4× Basler ARV, 2× FRAMOS D415e) — IP/serial map in
   `BimanualFrankaConfig` and the README.
 
-Each NUC runs `./run_server.sh`, which launches `pylibfranka_server.py` under
-`taskset` + `chrt -f 80`. That process owns a **1 kHz torque control loop per
-arm** (libfranka `readOnce`/`writeOnce`) and the OSC law feeding it; the
+Each NUC runs `./run_server.sh`, which launches `pylibfranka_server.py` pinned
+to **CPUs 0-1**. The server is only an RPyC ↔ shared-memory proxy; it spawns one
+`pylibfranka_control.py` child per arm under `chrt -f 80`, pinned to whichever
+core takes the fewest device interrupts. That child owns the **1 kHz torque
+control loop** (libfranka `readOnce`/`writeOnce`) and the OSC law; the
 workstation pushes goals at policy rate over RPyC. Deploy with
 `scripts/deploy_nuc_server.sh <mario|luigi>`. The franky/net_franky
 `start_control.sh` is superseded — franky has no torque interface.
+
+**Three placement rules keep the loop real-time**, all found the hard way by
+watching `control_command_success_rate`. Breaking any one of them brings back
+`communication_constraints_violation` aborts, which latch a stiff joint hold
+mid-trajectory and read as a jerk:
+
+- Nothing else may share the loop's core. The RPyC server and the gripper server
+  are pinned to 0-1 for this reason — `SCHED_FIFO` wins the CPU but does not
+  stop their socket work from landing NET_RX softirqs on the loop's core.
+- The loop's core is chosen at spawn from `/proc/interrupts`. Both the arm's UDP
+  and the workstation's RPyC ride one NIC here whose MSI-X queues sit on most of
+  2-7; steering the IRQs away instead would need root.
+- The loop writes before it computes. See `pylibfranka_control.py`'s docstring —
+  the robot grades response latency, not tick duration.
 
 ## Package layout
 
@@ -79,15 +95,26 @@ The follower is composed of three subsystems, each isolated in its own module:
   lists cross as netrefs that cost a round-trip per element and spam
   `AttributeError` when numpy probes `__array__`.
 - [pylibfranka_server.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_server.py)
-  — runs **on the NUC**, not here. **Read the docstring before editing.** Owns the
-  `ActiveControlBase` and the RT thread, recomputing tau every tick from the held
-  goal. Constraints encoded there: libfranka matrices are column-major
-  (`order="F"`); `Model.zero_jacobian` returns all zeros on this build so the
-  analytic `franka_jacobian` is used instead; torque rate limiting against
-  `state.tau_J_d` is mandatory; the service **must** keep its `SlaveService` base
-  or `FrankaGripper`'s `rpyc.classic.connect` breaks; and recoverable errors
-  (reflex, `communication_constrains_violation`, UDP timeout) re-arm torque
-  control holding the pose the arm actually ended up in.
+  — runs **on the NUC**, not here. The RPyC face of the stack: it owns no robot
+  connection, only the shm channel and the control child's lifetime. The service
+  **must** keep its `SlaveService` base or `FrankaGripper`'s
+  `rpyc.classic.connect` breaks.
+- [pylibfranka_control.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_control.py)
+  — runs **on the NUC**, one process per arm. **Read the docstring before
+  editing.** Owns the `ActiveControlBase` and the RT loop, recomputing tau from
+  the held goal. Constraints encoded there: libfranka matrices are column-major
+  (`order="F"`); `Model.zero_jacobian` returns all zeros on this build (re-checked
+  under pylibfranka, still zero) so the analytic `franka_jacobian` is used
+  instead; torque rate limiting against `state.tau_J_d` is mandatory; the law runs
+  at **500 Hz, not 1 kHz**, because that is robosuite's substep rate; the write
+  precedes the compute; and recoverable errors (reflex,
+  `communication_constraints_violation`, UDP timeout) re-arm torque control
+  holding the pose the arm actually ended up in.
+- [pylibfranka_shm.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_shm.py)
+  — the goal/state block the two share, with a seqlock so neither ever blocks the
+  other. Only the creator may unlink it: Python's `resource_tracker` otherwise
+  destroys the segment when *any* attached process exits, so a restarting control
+  child would take the server's channel down with it.
 - [osc_torque_controller.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/osc_torque_controller.py)
   — robosuite's `OperationalSpaceController` ported 1:1 in
   `impedance_mode="variable"`. Deployed to the NUC alongside the server, so it
@@ -224,7 +251,7 @@ defaults of `/dev/hidraw4` / `/dev/hidraw5`).
 - **Tuples over lists at the RPyC boundary.** See `franka_process.py`.
 - **The control law runs on the NUC; the goal is set here.** Anything that must
   respond faster than a policy period (damping, Coriolis, torque limiting) belongs
-  in `pylibfranka_server.py`; anything at policy rate (goal composition, safety
+  in `pylibfranka_control.py`; anything at policy rate (goal composition, safety
   shaping, gains) belongs in `bimanual_franka.py`. Re-deploy the NUC side after
   touching it — the workstation copy is not what runs.
 - **Pure (action, state) → action transforms in `safety.py`.** Don't push
@@ -255,7 +282,7 @@ python tests/test_spacemouse_action.py # stick deflection → tau vs the sim pol
 ```
 
 Run both after touching `osc_torque_controller.py`, `bimanual_franka.py`,
-`pylibfranka_server.py` or the SpaceMouse. They cover the gain remap, the delta
+`pylibfranka_control.py` or the SpaceMouse. They cover the gain remap, the delta
 envelope, the goal-orientation hold rule, both `uncouple_pos_ori` settings, the
 nullspace reference, the torque clamp/rate limiter, and that every
 hardware-bridging knob is a no-op at its default.

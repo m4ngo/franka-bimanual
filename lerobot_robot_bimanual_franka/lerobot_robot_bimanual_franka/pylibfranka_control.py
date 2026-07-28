@@ -14,6 +14,23 @@ decimated block of numpy stores into shared memory, cheap enough to keep inline
 rather than pay a second thread's wakeup. BLAS is pinned to one thread above --
 at 7x7 its pool costs more in barrier sync than the arithmetic it splits.
 
+The loop is PIPELINED, and that ordering is load-bearing. What the robot grades
+is not how long a tick takes but how soon the command follows the state: with
+the law computed before the write, response ran ~400 us on the ticks that
+recomputed and libfranka dropped them, pinning control_command_success_rate at
+0.47-0.72 no matter how much total slack the tick had. So each tick writes the
+torque prepared during the previous tick's slack -- only the speed guard, the
+rate limiter and the write itself sit in the response path (~92 us mean, 207 us
+worst) -- and then spends the remaining ~600 us computing the next one. Measured
+1.000 success rate holding and 0.99-1.00 tracking, zero aborts either way.
+
+The cost is that tau is one tick (1 ms) older than the state it is applied
+against. That is strictly better than the alternative it replaced: a dropped
+command leaves the robot on its *previous* command anyway, for an unbounded and
+nondeterministic staleness rather than a fixed 1 ms. The guard and the rate
+limiter are deliberately left in the response path so both still see the fresh
+state -- they bound what actually reaches the joints.
+
 Launched as a child of pylibfranka_server.py:
     python pylibfranka_control.py --robot-ip <ip> --shm <name>
 """
@@ -54,6 +71,18 @@ NUM_JOINTS = 7
 _TORQUE_THRESHOLD, _FORCE_THRESHOLD = 100.0, 200.0
 _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 
+# Recompute the control law every Nth tick and hold tau in between. This is not
+# an approximation of the sim -- it IS the sim: robosuite steps mujoco at
+# macros.SIMULATION_TIMESTEP = 2 ms and calls run_controller() once per substep
+# (robots/single_arm.py: set_goal only on policy_step, run_controller always), so
+# the law runs at 500 Hz there while the goal changes at 20 Hz. Running it at the
+# full 1 kHz was the less faithful choice, and it cost ~150 us/tick we did not
+# have -- compute ran 355 us against a 1000 us budget with read taking 640, so
+# over half the ticks landed late and libfranka aborted on
+# communication_constraints_violation. The guard and the rate limiter still run
+# every tick: both are bounds on what actually reaches the joints.
+_CONTROL_DECIMATION = 2
+
 _TAU_SAFETY_FACTOR = 0.8
 _TAU_LIMIT = np.asarray(JOINT_TORQUE_LIMITS, dtype=np.float64) * _TAU_SAFETY_FACTOR
 _MAX_TORQUE_RATE = 1000.0
@@ -79,9 +108,12 @@ _ARM_ATTEMPTS, _ARM_BACKOFF_S = 6, 0.3
 class ControlLoop:
     # Per-section worst-case us, reset at each health log. Class-level so an
     # instance built with object.__new__ (the tests) still has one.
-    _PROF_KEYS = dict.fromkeys(("read", "goal", "model", "ctrl", "compute", "write"), 0.0)
+    _PROF_KEYS = dict.fromkeys(("read", "resp", "law"), 0.0)
     _prof = dict(_PROF_KEYS)
+    _prof_sum = dict(_PROF_KEYS)
+    _prof_n = dict(_PROF_KEYS)
     _prev_t3 = 0.0
+    _raw_tau = None
 
     def __init__(self, robot_ip: str, channel: shm.ShmChannel):
         self.robot_ip = robot_ip
@@ -100,6 +132,7 @@ class ControlLoop:
         self.recovery_count = 0
         self.guard_trips = 0
         self._last_tau = np.zeros(NUM_JOINTS)
+        self._raw_tau = None
         self._last_J = None
         self._last_J_q = None
         self._last_mode = None
@@ -108,6 +141,8 @@ class ControlLoop:
         self._guard_ts = 0.0
 
         self._prof = dict(self._PROF_KEYS)
+        self._prof_sum = dict(self._PROF_KEYS)
+        self._prof_n = dict(self._PROF_KEYS)
         self._prev_t3 = 0.0
 
     # ---- arming -----------------------------------------------------------
@@ -167,10 +202,8 @@ class ControlLoop:
     def _compute_tau(self, state, goal):
         q = np.asarray(state.q, dtype=np.float64)
         dq = np.asarray(state.dq, dtype=np.float64)
-        _t = time.perf_counter()
         M = np.asarray(self.model.mass(state), dtype=np.float64).reshape(7, 7, order="F")
         coriolis = np.asarray(self.model.coriolis(state), dtype=np.float64)
-        self._prof["model"] = max(self._prof["model"], (time.perf_counter() - _t) * 1e6)
 
         mode = goal[shm.G_MODE]
         cmd_seq = goal[shm.G_CMD_SEQ]
@@ -203,12 +236,10 @@ class ControlLoop:
             T = np.asarray(state.O_T_EE, dtype=np.float64).reshape(4, 4, order="F")
             J = self._jacobian(q, T[:3, 3])
             tw = J @ dq
-            _t = time.perf_counter()
             tau = self.osc.run_controller(
                 ee_pos=T[:3, 3], ee_ori_mat=T[:3, :3], ee_pos_vel=tw[:3], ee_ori_vel=tw[3:],
                 J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis,
                 joint_damping_kv=float(goal[shm.G_JOINT_DAMPING_KV]))
-            self._prof["ctrl"] = max(self._prof["ctrl"], (time.perf_counter() - _t) * 1e6)
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
@@ -216,6 +247,16 @@ class ControlLoop:
         if kc:
             tau = tau + kc * _FRICTION_COULOMB * np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
         return tau, q, dq, None
+
+    def _goal(self):
+        goal = self.ch.read_goal()
+        return self.ch.goal.copy() if goal is None else goal   # torn read -> hold
+
+    def _acc(self, key: str, us: float) -> None:
+        if us > self._prof[key]:
+            self._prof[key] = us
+        self._prof_sum[key] += us
+        self._prof_n[key] += 1
 
     def _publish(self, state, q, dq):
         T = np.asarray(state.O_T_EE, dtype=np.float64).reshape(4, 4, order="F")
@@ -249,28 +290,34 @@ class ControlLoop:
             try:
                 if self.control is None:
                     self._last_mode = None
+                    self._raw_tau = None
                     self.arm()
                 state, duration = self.control.readOnce()
                 _t0 = time.perf_counter()
-                goal = self.ch.read_goal()
-                if goal is None:                       # torn read; reuse nothing, hold
-                    goal = self.ch.goal.copy()
-                _t1 = time.perf_counter()
-                self._prof["goal"] = max(self._prof["goal"], (_t1 - _t0) * 1e6)
-                tau, q, dq, _ = self._compute_tau(state, goal)
-                tau = self._speed_guard(tau, dq)
+                q = np.asarray(state.q, dtype=np.float64)
+                dq = np.asarray(state.dq, dtype=np.float64)
+                if self._raw_tau is None:               # first tick, or just re-armed
+                    self._raw_tau = self._compute_tau(state, self._goal())[0]
+                # Shape and send FIRST, from the torque prepared last tick. Only
+                # the guard, the rate limiter and the write sit between the state
+                # arriving and the command leaving.
+                tau = self._speed_guard(self._raw_tau, dq)
                 tau = self._limit(tau, np.asarray(state.tau_J_d, dtype=np.float64), duration)
                 self._last_tau = tau
-                _t2 = time.perf_counter()
                 self.control.writeOnce(pylibfranka.Torques([float(x) for x in tau]))
-                _t3 = time.perf_counter()
-                self._prof["compute"] = max(self._prof["compute"], (_t2 - _t1) * 1e6)
-                self._prof["write"] = max(self._prof["write"], (_t3 - _t2) * 1e6)
-                self._prof["read"] = max(self._prof["read"], (_t0 - self._prev_t3) * 1e6
-                                         if self._prev_t3 else 0.0)
-                self._prev_t3 = _t3
+                _t1 = time.perf_counter()
+                self._acc("resp", (_t1 - _t0) * 1e6)
 
-                worst_us = max(worst_us, (time.perf_counter() - _t0) * 1e6)
+                # Everything below runs in the slack before the next state.
+                if tick % _CONTROL_DECIMATION == 0:
+                    self._raw_tau = self._compute_tau(state, self._goal())[0]
+                _t2 = time.perf_counter()
+                self._acc("law", (_t2 - _t1) * 1e6)
+                if self._prev_t3:
+                    self._acc("read", (_t0 - self._prev_t3) * 1e6)
+                self._prev_t3 = _t2
+
+                worst_us = max(worst_us, (_t1 - _t0) * 1e6)
                 tick += 1
                 if tick % _PUBLISH_DECIMATION == 0:
                     self._publish(state, q, dq)
@@ -279,14 +326,16 @@ class ControlLoop:
                         health_ts = now
                         rate = float(getattr(state, "control_command_success_rate", 1.0))
                         log = logger.warning if rate < 0.95 else logger.info
-                        log("success rate %.3f, worst compute %.0f us, recoveries %d, "
-                            "guard trips %d%s  [worst us: %s]", rate, worst_us,
+                        log("success rate %.3f, worst response %.0f us, recoveries %d, "
+                            "guard trips %d%s  [us mean/max: %s]", rate, worst_us,
                             self.recovery_count, self.guard_trips,
                             "  <- MISSING DEADLINES" if rate < 0.95 else "",
-                            " ".join(f"{k}={v:.0f}" for k, v in self._prof.items()))
+                            " ".join(
+                                f"{k}={self._prof_sum[k] / max(self._prof_n[k], 1):.0f}/{v:.0f}"
+                                for k, v in self._prof.items()))
                         worst_us = 0.0
                         for k in self._prof:
-                            self._prof[k] = 0.0
+                            self._prof[k] = self._prof_sum[k] = self._prof_n[k] = 0.0
             except Exception as e:  # noqa: BLE001
                 msg = str(e)
                 if any(t in msg.lower() for t in _RECOVERABLE):

@@ -731,6 +731,19 @@ def test_nullspace_reference_is_the_home_configuration():
     assert np.allclose(ns, case["q"])
 
 
+def test_control_decimation_matches_robosuite_substep_rate():
+    """The law must run at the sim's rate, not the robot's.
+
+    robosuite calls run_controller() once per mujoco substep -- 500 Hz at
+    macros.SIMULATION_TIMESTEP = 2 ms -- while set_goal fires at the 20 Hz
+    policy rate. Our RT loop ticks at 1 kHz, so it must recompute every 2nd
+    tick to land on the same 500 Hz. Running it every tick is both less
+    faithful and ~150 us/tick we do not have.
+    """
+    assert srv._CONTROL_DECIMATION == 2
+    assert 1000.0 / srv._CONTROL_DECIMATION == 1.0 / 0.002
+
+
 def test_impedance_mode_is_variable_not_fixed():
     """Gains must come from the action every step.
 
