@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
-
 # Single-arm teleop for the right-arm-only Franka wrapper.
 #
-# Scales map full stick deflection onto osc_pose.json's output_max envelope
-# (0.05 m, 0.5 rad), which is also what clip_delta enforces. The old 0.1/0.2
-# saturated translation at half deflection while leaving rotation at 40% of its
-# range at full deflection -- fast translation, stiff rotation.
-
+# Scales are the SpaceMouseConfig defaults now (0.05 m / 0.5 rad = robosuite
+# osc_pose.json's output_max), so full stick deflection is exactly a normalized
+# +/-1 policy action -- teleop and policy rollouts drive the controller through
+# identical units.
+#
+# uncouple_pos_ori stays at its default of TRUE, matching osc_pose.json. Setting
+# it false raises commanded torque ~13x, which combined with kp_ori_scale
+# saturated the joint torque clamp and produced dangerous motion. Rotation
+# authority comes from kp_ori_scale / friction_kc instead.
 PORT=/dev/ttyUSB0
 
 lerobot-teleoperate \
@@ -16,12 +19,11 @@ lerobot-teleoperate \
     --robot.r_gripper_ip=192.168.201.10 \
     --robot.r_port=18812 \
     --robot.control_mode=EE_DELTA \
+    --robot.uncouple_pos_ori=true \
     --robot.active_arms=[r] \
     --teleop.type=spacemouse \
     --teleop.id=${MODE}_r_teleop \
     --teleop.hidraw_path="/dev/hidraw3" \
     --teleop.prefix="r_" \
     --teleop.use_delta=true \
-    --teleop.translation_scale=0.05 \
-    --teleop.rotation_scale=0.5 \
     --fps=20

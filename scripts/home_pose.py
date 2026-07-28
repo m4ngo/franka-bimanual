@@ -41,7 +41,11 @@ import numpy as np
 
 from lerobot.robots import make_robot_from_config
 
-from lerobot_robot_bimanual_franka import BimanualFranka, BimanualFrankaConfig
+from lerobot_robot_bimanual_franka import (
+    BimanualFranka,
+    BimanualFrankaConfig,
+    SingleArmFrankaConfig,
+)
 
 POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
 
@@ -53,8 +57,28 @@ _RIG = dict(
 )
 
 
-def _make_robot() -> BimanualFranka:
-    cfg = BimanualFrankaConfig(**_RIG, control_mode="JOINT_POS")
+def _make_robot(arm: str = "both") -> BimanualFranka:
+    """arm="r" builds the right-arm-only wrapper.
+
+    The bimanual config opens both WSG grippers, so it fails outright when the
+    left one is unreachable -- which it is whenever luigi is down. Single-arm
+    mode also drops the cameras and drives the gripper over the arm's own RPyC
+    connection (r_gripper_ip == r_robot_ip), the same path the teleop and
+    residual scripts use, so nothing beyond the torque server has to be up.
+    """
+    if arm == "r":
+        cfg = SingleArmFrankaConfig(
+            r_server_ip=_RIG["r_server_ip"],
+            r_robot_ip=_RIG["r_robot_ip"],
+            r_gripper_ip=_RIG["r_robot_ip"],
+            r_port=_RIG["r_port"],
+            control_mode="JOINT_POS",
+            cameras={},
+            depth=False,
+            depth_cam={},
+        )
+    else:
+        cfg = BimanualFrankaConfig(**_RIG, control_mode="JOINT_POS")
     return make_robot_from_config(cfg)
 
 
@@ -64,13 +88,15 @@ def _path_for(name: str) -> Path:
 
 def cmd_save(args: argparse.Namespace) -> None:
     path = _path_for(args.name)
-    robot = _make_robot()
+    robot = _make_robot(args.arm)
     robot.connect()
     try:
         kin = robot.robot_manager.current_kinematic_state_batch(list(robot.active_arms))
+        prev = json.loads(path.read_text()) if path.exists() else {}
         pose = {
-            "l_q": [float(x) for x in kin["l"][0]],
-            "r_q": [float(x) for x in kin["r"][0]],
+            # Keep the other arm's saved value when only one arm is connected.
+            "l_q": [float(x) for x in kin["l"][0]] if "l" in kin else prev.get("l_q"),
+            "r_q": [float(x) for x in kin["r"][0]] if "r" in kin else prev.get("r_q"),
             "gripper": float(args.gripper),
         }
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -84,11 +110,12 @@ def cmd_save(args: argparse.Namespace) -> None:
 def cmd_apply(args: argparse.Namespace) -> None:
     path = _path_for(args.name)
     pose = json.loads(path.read_text())
-    robot = _make_robot()
+    robot = _make_robot(args.arm)
     robot.connect()
     try:
+        left = pose.get("l_q") if "l" in robot.active_arms else None
         ok = robot.home(
-            home_q_left=np.asarray(pose["l_q"], dtype=np.float64),
+            home_q_left=None if left is None else np.asarray(left, dtype=np.float64),
             home_q_right=np.asarray(pose["r_q"], dtype=np.float64),
             gripper_norm=float(pose.get("gripper", 1.0)),
             max_time_s=args.max_time_s,
@@ -119,12 +146,16 @@ def main() -> None:
 
     sp_save = sub.add_parser("save", help="Read and save the current joint pose")
     sp_save.add_argument("name", help="Pose name (stored as home_poses/NAME.json)")
+    sp_save.add_argument("--arm", choices=("both", "r"), default="both",
+                         help="'r' skips the left arm and its gripper (use when luigi is down)")
     sp_save.add_argument("--gripper", type=float, default=1.0,
                          help="Normalized gripper target to record (0=closed, 1=open). Default 1.0.")
     sp_save.set_defaults(func=cmd_save)
 
     sp_apply = sub.add_parser("apply", help="Drive the arms to a saved pose")
     sp_apply.add_argument("name", help="Pose name")
+    sp_apply.add_argument("--arm", choices=("both", "r"), default="both",
+                         help="'r' skips the left arm and its gripper (use when luigi is down)")
     sp_apply.add_argument("--max-time-s", type=float, default=5.0)
     sp_apply.add_argument("--tol-rad", type=float, default=0.05)
     sp_apply.set_defaults(func=cmd_apply)

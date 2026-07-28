@@ -20,11 +20,19 @@ class SpaceMouseLeaderFields:
     # Path to the hidraw node. Two SpaceMice appear as separate /dev/hidrawN.
     hidraw_path: str = "/dev/hidraw4"
 
-    # Position increment (metres) per control tick at full axis deflection.
-    # pyspacemouse normalises axis values to [-1, 1].
+    # Metres / radians per control tick at full axis deflection. These are
+    # robosuite osc_pose.json's output_max, so full deflection is exactly a
+    # normalized +/-1 policy action -- teleop and policy drive the controller
+    # through identical units. Downstream clip_delta enforces the same bound, so
+    # raising these past 0.05/0.5 only saturates earlier, it does not go faster.
     translation_scale: float = 0.05
-    # Rotation increment (radians) per control tick at full axis deflection.
     rotation_scale: float = 0.5
+
+    # Fraction of full deflection treated as zero, with the remainder rescaled
+    # so full deflection still reaches 1.0. The puck cross-talks: twisting to yaw
+    # drives the linear axes to ~0.23, which is ~1.2 cm/tick of translation the
+    # operator never commanded.
+    deadzone: float = 0.08
 
     prefix: str = ""
     use_delta: bool = False
@@ -38,10 +46,12 @@ class SpaceMouseLeaderFields:
     # Initial EE orientation as a unit quaternion [qx, qy, qz, qw].
     initial_rot: tuple[float, float, float, float] = field(default_factory=lambda: (1.0, 0.0, 0.0, 0.0))
 
-    # Per-axis sign multipliers (+1 or -1) to match the robot's base frame.
-    # Order: (x, y, z) for translation and (roll, pitch, yaw) for rotation.
-    translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, -1, 1))
-    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
+    # Per-axis sign trims in BASE frame (x, y, z), applied after
+    # spacemouse.DEVICE_TO_BASE. The device mounting lives in that matrix, not
+    # here -- these exist only to flip an axis without editing it. Defaults are
+    # identity because the matrix already encodes this rig's mounting.
+    translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, 1))
+    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, 1))
 
     # Gripper travel limits (mm). Right button → open, left button → close.
     gripper_min_mm: float = -1.0

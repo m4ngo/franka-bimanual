@@ -208,6 +208,9 @@ constants for this exact rig. All scripts assume the venv is active.
 | `openpi_client_franka.py` | Single-arm (right) OpenPI inference client; sends DROID-style joint-velocity observations to a remote websocket policy | joint |
 | `deploy_nuc_server.sh <mario\|luigi>` | Copy the torque server + controller to a NUC and restart it under `chrt -f 80` | — |
 | `check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
+| `check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
+| `check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
+| `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all five packages | — |
 
 USB ports: **left GELLO `/dev/ttyUSB1`, right GELLO `/dev/ttyUSB0`**. SpaceMice
@@ -239,6 +242,42 @@ defaults of `/dev/hidraw4` / `/dev/hidraw5`).
 - **Data outside the repo.** Datasets, eval rollouts, and trained policies
   live under `~/franka_data/`. The only thing the repo tracks is code +
   reference frames.
+
+## Tests
+
+`tests/` holds full-stack equivalence tests against robosuite's **actual**
+`OperationalSpaceController` class (mujoco and pylibfranka are stubbed; the real
+controller and the real `_ArmSession._compute_tau` run). No pytest needed:
+
+```
+python tests/test_osc_stack.py        # send_action → goal → tau vs robosuite
+python tests/test_spacemouse_action.py # stick deflection → tau vs the sim policy
+```
+
+Run both after touching `osc_torque_controller.py`, `bimanual_franka.py`,
+`pylibfranka_server.py` or the SpaceMouse. They cover the gain remap, the delta
+envelope, the goal-orientation hold rule, both `uncouple_pos_ori` settings, the
+nullspace reference, the torque clamp/rate limiter, and that every
+hardware-bridging knob is a no-op at its default.
+
+Coverage worth knowing about:
+- **Per axis**, both signs and several magnitudes: translation matches to ~1e-14,
+  rotation to ~1e-8 (robosuite's `quat2mat` rounds through float32).
+- **Trajectories over all 3^6 = 729 combinations** of translation/rotation axis
+  signs, stepped with the arm state evolving between steps. Single-step tests
+  cannot catch a `goal_ori` divergence, because the disagreement only compounds
+  once it is carried across steps.
+- **Device axis -> base axis** for the SpaceMouse, asserted rather than assumed:
+  `x->lin Y-  y->lin X+  z->lin Z+  roll->ang Y-  pitch->ang X+  yaw->ang Z+`.
+
+`orientation_error` is robosuite's sin-based `0.5*sum(rc_i x rd_i)`, so a
+t-radian error reports `sin(t)` -- a 4% shortfall at the 0.5 rad envelope bound.
+That is pinned by a test; do not "fix" it into a true axis-angle error or the
+controller stops matching the policies' training dynamics.
+
+`ActionSafetyScreen` is bypassed in the parity tests (robosuite has no
+equivalent) and tested separately — if a parity test starts failing on a
+downward-z action, suspect the worktable brake before the controller.
 
 ## When something breaks
 

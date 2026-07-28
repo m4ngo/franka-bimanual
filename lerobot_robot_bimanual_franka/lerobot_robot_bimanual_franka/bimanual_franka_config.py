@@ -27,7 +27,38 @@ class BimanualFrankaConfig(RobotConfig):
     r_gripper_ip: str
     r_port: int
     control_mode: ControlMode
+    # Gripper RPyC port -- a DIFFERENT process from the torque server. pylibfranka's
+    # Gripper bindings do not release the GIL across blocking calls, so a gripper
+    # command issued in the torque server's process stalls the 1 kHz RT thread
+    # (measured: 100 ms for a mere read_once) and libfranka aborts the motion with
+    # communication_constraints_violation. Set equal to the arm port to go back to
+    # sharing one process.
+    l_gripper_port: int = 18822
+    r_gripper_port: int = 18823
     active_arms: tuple[str, ...] = _VALID_ARMS
+    # Coulomb friction feedforward applied server-side, in [0, 1]. 0.0 is exact
+    # robosuite; raise it when low-inertia task directions (notably EE rotation,
+    # where the operational-space inertia is ~0.002 kg m^2) command torques below
+    # the joints' breakaway friction. Measure with scripts/check_osc_axes.py.
+    friction_kc: float = 0.0
+    # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
+    # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
+    ee_translation_fudge: float = 1.0
+    ee_rotation_fudge: float = 1.0
+    # Multiplies the OSC orientation gains only, per base axis (rx, ry, rz). Rotational operational-space
+    # inertia here is ~0.002 kg m^2 vs 1-16 kg translational, so the shared
+    # sim kp that translates smoothly leaves wrist torque under breakaway.
+    # 1.0 is exact sim behaviour; raising translation gains instead makes the
+    # arm violent. Measure with scripts/check_osc_axes.py.
+    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # osc_pose.json sets uncouple_pos_ori=true, which applies Lambda_pos/Lambda_ori
+    # to the two halves of the wrench separately. That leaves the arm's own
+    # translation<->rotation inertia coupling in the loop AND scales the moment by
+    # the ~0.002 kg m^2 wrist inertia, so orientation commands land under breakaway
+    # friction. False applies Lambda_full to the whole wrench: response is exactly
+    # the commanded acceleration, cross-coupling is zero, and every axis gets more
+    # torque at the same gains. True is sim parity; False is what this arm needs.
+    uncouple_pos_ori: bool = True
     use_noise: bool = False
     noise_pos_scale: float = 0.005   # metres, added to position output each step
     noise_rot_scale: float = 0.01   # radians (axis-angle), added to rotation output each step

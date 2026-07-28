@@ -30,6 +30,21 @@ from __future__ import annotations
 
 import numpy as np
 
+# This stack always runs osc.py's impedance_mode="variable": kp and the damping
+# ratio come from the action every step (resolve_gains), never from a fixed
+# constant. Stated explicitly because the two modes are NOT interchangeable --
+# under "fixed" robosuite ignores gain actions entirely, so a gain sweep changes
+# the real arm and leaves the sim reference untouched.
+#
+# NOTE the sysid sim reference in ~/sysid/sim_rotation_only/data.hdf5 was
+# generated under "fixed" (LIBERO's unmodified osc_pose.json, kp_limits [0,300]).
+# That is numerically identical to variable at action kp=kd=0 -- both give
+# kp=150, ratio=1 -- so it is a valid reference for a kp=0 run and only for that.
+# To sweep gains against sim, regenerate it with
+#   sysid.controller_overrides: {impedance_mode: variable, kp_limits: [0, 1500]}
+# and an action carrying the gain channels.
+IMPEDANCE_MODE = "variable"
+
 # Sim-parity gain schedule (cfg/fast_default.yaml controller block).
 DEFAULT_KP = 150.0
 KP_LIMITS = (0.0, 1500.0)
@@ -50,22 +65,43 @@ DEFAULT_NULLSPACE_KP = 10.0
 # FR3/Panda datasheet continuous joint torque limits (Nm).
 JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 
-# Joint-space impedance gains for JOINT_POS / home() / hold, which have no sim
-# counterpart to match -- robosuite JointPositionController-shaped computed torque.
-DEFAULT_JOINT_KP = 60.0
+# Joint-space impedance for JOINT_POS / home() / hold. Per-joint stiffness, NOT
+# a scalar through the mass matrix: tau = M @ (kp*e) collapses on the wrist,
+# where M is ~0.01, so a 0.5 rad error asks for ~0.3 Nm -- under breakaway, which
+# is why home() could not rotate the wrist joints. These are libfranka's
+# joint_impedance_example values, in Nm/rad and Nms/rad.
+DEFAULT_JOINT_KP = np.array([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
+DEFAULT_JOINT_KD = np.array([50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0])
 DEFAULT_JOINT_DAMPING_RATIO = 1.0
 
 
-def resolve_gains(kp_action: float, kd_action: float) -> tuple[np.ndarray, np.ndarray]:
+def resolve_gains(
+    kp_action: float, kd_action: float, kp_ori_scale: float = 1.0
+) -> tuple[np.ndarray, np.ndarray]:
     """Map action kp/kd in [-1, 1] to robosuite (kp, kd) 6-vectors.
 
     Reproduces LIBEROObservationWrapper.step's exponential rescale followed by
     OperationalSpaceController.set_goal's clip, for impedance_mode="variable":
     kp = 150 * 10**a_kp, damping_ratio = 1 * 10**a_kd, kd = 2*sqrt(kp)*ratio.
+
+    kp_ori_scale multiplies the three orientation entries only; scalar or (3,)
+    for per-axis control. osc.py's kp is
+    already a 6-vector (nums2array(kp, 6)) and variable mode reads all six from
+    the action, so a non-uniform kp is inside the controller's own action space,
+    not a modification of it -- the sim wrapper simply happens to broadcast one
+    scalar. It exists because operational-space *rotational* inertia on this arm
+    is ~0.002 kg m^2 against ~1-16 kg translational, so a shared kp that moves
+    the EE smoothly leaves wrist torques below breakaway friction. 1.0 is exact
+    sim behaviour.
     """
     kp = DEFAULT_KP * KP_EXP_SCALE ** float(np.clip(kp_action, -1.0, 1.0))
     ratio = DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** float(np.clip(kd_action, -1.0, 1.0))
-    kp6 = np.full(6, float(np.clip(kp, *KP_LIMITS)))
+    kp6 = np.full(6, float(kp))
+    # Scalar or (3,): yaw is typically the weakest orientation direction (it is
+    # rotation about the tool axis, the smallest operational-space rotational
+    # inertia), so a single scalar over-drives roll and pitch to fix it.
+    kp6[3:] *= np.asarray(kp_ori_scale, dtype=np.float64)
+    kp6 = np.clip(kp6, *KP_LIMITS)
     kd6 = 2.0 * np.sqrt(kp6) * float(np.clip(ratio, *DAMPING_RATIO_LIMITS))
     return kp6, kd6
 
@@ -232,7 +268,15 @@ class OSCTorqueController:
         mass_matrix: np.ndarray,
         coriolis: np.ndarray,
         use_nullspace: bool = True,
+        joint_damping_kv: float = 0.0,
     ) -> np.ndarray:
+        """joint_damping_kv adds extra joint-space damping *projected into the
+        nullspace*; 0.0 (the default) is exact osc.py. It must be projected: an
+        unprojected -kv*dq opposes commanded task motion, and does so ~10x more
+        for rotation than translation, because the wrist has to spin fast to
+        produce a given EE angular velocity. Note osc.py's nullspace_torques
+        already damps the redundant DoF at kv = 2*sqrt(10), so this is only for
+        adding more on top."""
         position_error = self.goal_pos - ee_pos
         vel_pos_error = -ee_pos_vel
         desired_force = position_error * self.kp[0:3] + vel_pos_error * self.kd[0:3]
@@ -265,6 +309,8 @@ class OSCTorqueController:
                 dq,
                 joint_kp=self.nullspace_kp,
             )
+        if joint_damping_kv:
+            torques = torques - joint_damping_kv * (nullspace_matrix.T @ dq)
         return torques
 
 
@@ -279,8 +325,8 @@ class JointImpedanceController:
         self.num_joints = int(num_joints)
         self.goal_q = np.zeros(self.num_joints)
         self.goal_dq = np.zeros(self.num_joints)
-        self.kp = float(DEFAULT_JOINT_KP)
-        self.kd = 2.0 * np.sqrt(self.kp) * DEFAULT_JOINT_DAMPING_RATIO
+        self.kp = DEFAULT_JOINT_KP.copy()
+        self.kd = DEFAULT_JOINT_KD.copy()
 
     def set_goal(
         self,
@@ -295,11 +341,12 @@ class JointImpedanceController:
             self.goal_dq = np.asarray(goal_dq, dtype=np.float64)
         else:
             self.goal_dq = np.zeros(self.num_joints)
+        # kp is a SCALE on the per-joint stiffness vector, not an absolute gain.
         if kp is not None:
-            self.kp = float(kp)
+            self.kp = DEFAULT_JOINT_KP * float(kp)
         if kp is not None or damping_ratio is not None:
             ratio = DEFAULT_JOINT_DAMPING_RATIO if damping_ratio is None else float(damping_ratio)
-            self.kd = 2.0 * np.sqrt(self.kp) * ratio
+            self.kd = DEFAULT_JOINT_KD * np.sqrt(np.max(self.kp) / np.max(DEFAULT_JOINT_KP)) * ratio
 
     def run_controller(
         self,
@@ -309,8 +356,7 @@ class JointImpedanceController:
         coriolis: np.ndarray,
         position_hold: bool = True,
     ) -> np.ndarray:
+        # Direct joint impedance, no mass-matrix weighting -- see DEFAULT_JOINT_KP.
         if position_hold:
-            accel = self.kp * (self.goal_q - q) - self.kd * dq
-        else:
-            accel = self.kd * (self.goal_dq - dq)
-        return mass_matrix @ accel + coriolis
+            return self.kp * (self.goal_q - q) - self.kd * dq + coriolis
+        return self.kd * (self.goal_dq - dq) + coriolis

@@ -22,6 +22,7 @@ from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 from .osc_torque_controller import (
+    DEFAULT_JOINT_KD,
     DEFAULT_JOINT_KP,
     DEFAULT_KP,
     KP_EXP_SCALE,
@@ -48,6 +49,7 @@ OSC_BASE_DAMPING_RATIO = 1.0
 # Joint-space impedance, used by JOINT_POS and home(); no sim counterpart to match.
 JOINT_IMPEDANCE_KP = DEFAULT_JOINT_KP
 HOME_IMPEDANCE_KP = DEFAULT_JOINT_KP
+HOME_IMPEDANCE_KD = DEFAULT_JOINT_KD
 HOME_MAX_QDOT = 0.6  # rad/s, ramp rate of the commanded home goal
 
 _GRIP_ACCUM_SPEED = 1.0
@@ -128,6 +130,12 @@ class BimanualFranka(Robot):
         # makes the EE keep its orientation while translating. Reset by
         # _reset_osc_goal_ori(), robosuite's reset_goal().
         self._osc_goal_ori: dict[str, Rotation] = {}
+        self._kp_ori_scale = np.asarray(getattr(config, "kp_ori_scale", 1.0), dtype=np.float64)
+        # Sim-to-real delta scaling, settable live so a sweep can search them.
+        # Applied to the axis-angle rotation delta, NOT the quaternion: scaling
+        # all four quaternion components uniformly is undone by normalisation.
+        self._trans_fudge = float(getattr(config, "ee_translation_fudge", _EE_TRANSLATION_FUDGE_FACTOR))
+        self._rot_fudge = float(getattr(config, "ee_rotation_fudge", _EE_ROTATION_FUDGE_FACTOR))
 
 
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
@@ -137,7 +145,8 @@ class BimanualFranka(Robot):
                 name=arm,
                 server_ip=getattr(self.config, f"{arm}_server_ip"),
                 robot_ip=getattr(self.config, f"{arm}_robot_ip"),
-                port=getattr(self.config, f"{arm}_port"),
+                port=getattr(self.config, f"{arm}_gripper_port",
+                             getattr(self.config, f"{arm}_port")),
                 do_print=False,
             )
         return WSG(name=arm, TCP_IP=gripper_ip, do_print=False)
@@ -214,6 +223,15 @@ class BimanualFranka(Robot):
                 # robosuite's Controller.__init__ captures initial_joint.
                 self._home_q[arm] = np.asarray(snap[0], dtype=np.float64).copy()
                 self._osc_goal_ori[arm] = Rotation.from_quat(np.asarray(snap[4], dtype=np.float64))
+            # ALWAYS push, even at defaults. Server sessions are keyed by robot_ip
+            # and outlive the client, so tuning set by an earlier script (a probe
+            # run with --friction-kc, say) otherwise silently persists into the
+            # next run. The config must be the single source of truth or a sysid
+            # sweep can measure a controller nobody configured.
+            self.robot_manager.set_tuning_all(
+                friction_kc=float(getattr(self.config, "friction_kc", 0.0)),
+                uncouple_pos_ori=bool(getattr(self.config, "uncouple_pos_ori", True)),
+            )
             for arm in self.active_arms:
                 self.grippers[arm].home()
         except Exception:
@@ -406,22 +424,17 @@ class BimanualFranka(Robot):
             goals = self.safety.shape_joint_goal(
                 {arm: self._joint_goal(action, arm) for arm in self.active_arms},
                 kin,
-                JOINT_IMPEDANCE_KP * self.kp_gain,
+                float(np.max(JOINT_IMPEDANCE_KP)) * self.kp_gain,
                 self.kd_gain,
             )
             self.robot_manager.move_joint_goal_batch(
-                {a: (g, JOINT_IMPEDANCE_KP * self.kp_gain, self.kd_gain) for a, g in goals.items()}
+                {a: (g, self.kp_gain, self.kd_gain) for a, g in goals.items()}
             )
             return action
 
-        kp, kd = resolve_gains(action["kp"], action["kd"])
+        kp, kd = resolve_gains(action["kp"], action["kd"], self._kp_ori_scale)
 
         if self.control_mode == ControlMode.EE_DELTA:
-            for arm in self.active_arms:
-                for ax in ("x", "y", "z"):
-                    action[f"{arm}_{ax}"] *= _EE_TRANSLATION_FUDGE_FACTOR
-                for ax in ("qx", "qy", "qz", "qw"):
-                    action[f"{arm}_{ax}"] *= _EE_ROTATION_FUDGE_FACTOR
             goals = {
                 arm: self._osc_goal_delta(
                     arm, action, kin[arm], self.delta_pos, self.delta_rot,
@@ -489,8 +502,9 @@ class BimanualFranka(Robot):
         deadline = time.perf_counter() + max_time_s
         names = list(targets_q)
         # Joint impedance settles at v = (kp/kd) * error, so this lead caps speed.
-        kd = 2.0 * np.sqrt(HOME_IMPEDANCE_KP)
-        max_lead = HOME_MAX_QDOT * kd / HOME_IMPEDANCE_KP
+        # Joint impedance settles at v = (kp/kd)*error per joint, so the fastest
+        # joint sets the lead that keeps every joint under HOME_MAX_QDOT.
+        max_lead = HOME_MAX_QDOT / float(np.max(HOME_IMPEDANCE_KP / HOME_IMPEDANCE_KD))
 
         while True:
             tick_start = time.perf_counter()
@@ -500,9 +514,9 @@ class BimanualFranka(Robot):
                 arm: kin[arm][0] + np.clip(targets_q[arm] - kin[arm][0], -max_lead, max_lead)
                 for arm in names
             }
-            goals = self.safety.shape_joint_goal(commanded, kin, HOME_IMPEDANCE_KP)
+            goals = self.safety.shape_joint_goal(commanded, kin, float(np.max(HOME_IMPEDANCE_KP)))
             self.robot_manager.move_joint_goal_batch(
-                {a: (g, HOME_IMPEDANCE_KP, 1.0) for a, g in goals.items()}
+                {a: (g, 1.0, 1.0) for a, g in goals.items()}
             )
 
             max_err = max(float(np.max(np.abs(targets_q[arm] - kin[arm][0]))) for arm in names)
@@ -579,7 +593,13 @@ class BimanualFranka(Robot):
                 "xyz", np.random.normal(0.0, noise_rot_scale, 3)
             ).as_rotvec()
 
+        # Clip to the envelope a policy could have emitted, THEN apply the
+        # hardware fudge. The other order lets clip_delta eat the fudge -- at
+        # tf=3 a 0.05 m delta became 0.15 m and was clipped straight back to
+        # 0.05, so any fudge above 1.0 (2.0 for rotation) was a silent no-op.
         dpos, drot = clip_delta(dpos, drot)
+        dpos = dpos * self._trans_fudge
+        drot = drot * self._rot_fudge
 
         # osc.py updates goal_ori ONLY when the rotation delta is nonzero, and
         # tests it with math.isclose(elem, 0.0) -- exact zero. Re-anchoring it

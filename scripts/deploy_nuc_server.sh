@@ -15,15 +15,16 @@ RESTART=1
 [[ "${2:-}" == "--no-restart" ]] && RESTART=0
 
 case "$TARGET" in
-  mario) HOST=mario@192.168.3.10; PORT=18812 ;;
-  luigi) HOST=luigi@192.168.3.11; PORT=18813 ;;
+  mario) HOST=mario@192.168.3.10; PORT=18812; GRIPPER_PORT=18822 ;;
+  luigi) HOST=luigi@192.168.3.11; PORT=18813; GRIPPER_PORT=18823 ;;
   *) echo "unknown target '$TARGET' (expected mario or luigi)" >&2; exit 1 ;;
 esac
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka"
 
 echo "==> copying server to $HOST"
-scp -q "$SRC/pylibfranka_server.py" "$SRC/osc_torque_controller.py" "$SRC/franka_jacobian.py" "$HOST:~/"
+scp -q "$SRC/pylibfranka_server.py" "$SRC/pylibfranka_control.py" "$SRC/pylibfranka_shm.py" \
+    "$SRC/osc_torque_controller.py" "$SRC/franka_jacobian.py" "$HOST:~/"
 
 echo "==> writing run_server.sh"
 ssh "$HOST" "cat > ~/run_server.sh" <<EOF
@@ -38,19 +39,34 @@ ssh "$HOST" "cat > ~/run_server.sh" <<EOF
 # Unlike the old net_franky launcher this runs our own module rather than the
 # generic rpyc_classic entrypoint: the torque loop has to live inside the
 # process that holds the ActiveControlBase.
+#
+# The gripper runs in a SEPARATE process on its own port. pylibfranka's Gripper
+# bindings hold the GIL across blocking calls -- measured 100 ms of stall for a
+# single read_once -- which inside this process would freeze the 1 kHz RT thread
+# and abort the motion with communication_constraints_violation. A separate
+# process means a separate GIL. It is left at normal priority on CPU 0-1 so it
+# cannot compete with the realtime thread either.
 source ~/pylibfranka_env/bin/activate
-exec taskset -c 2-7 chrt -f 80 python ~/pylibfranka_server.py --port $PORT --host 0.0.0.0
+taskset -c 0-1 rpyc_classic -p $GRIPPER_PORT --host 0.0.0.0 >~/gripper_server.log 2>&1 &
+# The server is a shared-memory proxy with no control loop in it, so it runs at
+# normal priority -- but it must still be kept OFF cores 2-7. SCHED_FIFO 80 only
+# beats it for CPU; it does not stop RPyC's socket work from evicting the RT
+# loop's cache or piling NET_RX softirqs onto the loop's cores. Measured: with
+# the server free to roam 0-7, 30 Hz of get_state drove the loop's own compute
+# from 345 us to 765 us and started a cascade of communication_constraints_
+# violation aborts. Same reason the gripper is pinned here.
+exec taskset -c 0-1 python ~/pylibfranka_server.py --port $PORT --host 0.0.0.0
 EOF
 ssh "$HOST" "chmod +x ~/run_server.sh"
 
 echo "==> import check"
 ssh "$HOST" "source ~/pylibfranka_env/bin/activate && python -c '
 import ast, sys
-for f in (\"pylibfranka_server.py\", \"osc_torque_controller.py\", \"franka_jacobian.py\"):
+for f in (\"pylibfranka_server.py\", \"pylibfranka_control.py\", \"pylibfranka_shm.py\", \"osc_torque_controller.py\", \"franka_jacobian.py\"):
     ast.parse(open(f).read())
 import pylibfranka, rpyc, numpy
 print(\"pylibfranka\", pylibfranka.__version__ if hasattr(pylibfranka, \"__version__\") else \"ok\", \"rpyc\", rpyc.__version__)
-import osc_torque_controller, franka_jacobian
+import osc_torque_controller, franka_jacobian, pylibfranka_shm
 print(\"osc_torque_controller ok\")
 '"
 
@@ -59,7 +75,7 @@ if [[ "$RESTART" == "1" ]]; then
   # 'rpyc_classic -p 18812' appears verbatim in that shell's own argv, so an
   # unbracketed -f pattern makes pkill kill itself before it kills the server.
   echo "==> stopping anything on port $PORT"
-  ssh "$HOST" "pkill -f '[r]pyc_classic -p $PORT' || true; pkill -f '[p]ylibfranka_server.py --port $PORT' || true; sleep 1"
+  ssh "$HOST" "pkill -f '[r]pyc_classic -p $PORT' || true; pkill -f '[r]pyc_classic -p $GRIPPER_PORT' || true; pkill -f '[p]ylibfranka_server.py --port $PORT' || true; pkill -f '[p]ylibfranka_control.py' || true; sleep 1"
   # The redirect binds to the subshell, not to run_server.sh: bash forks a
   # subshell for the backgrounded compound, and that subshell inheriting ssh's
   # stdout keeps the channel open, so ssh never returns even though the daemon
@@ -68,6 +84,7 @@ if [[ "$RESTART" == "1" ]]; then
   ssh -n "$HOST" "(cd ~ && setsid ./run_server.sh) </dev/null >~/pylibfranka_server.log 2>&1 &"
   sleep 3
   ssh -n "$HOST" "tail -5 ~/pylibfranka_server.log; pgrep -af '[p]ylibfranka_server.py' || { echo 'SERVER NOT RUNNING' >&2; exit 1; }"
+  ssh -n "$HOST" "pgrep -af '[r]pyc_classic -p $GRIPPER_PORT' || { echo 'GRIPPER SERVER NOT RUNNING' >&2; exit 1; }"
 fi
 
 echo "==> done ($TARGET)"

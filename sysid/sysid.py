@@ -46,7 +46,14 @@ Fields recorded in the output HDF5 (both modes):
     qpos          (T, 7) – actual joint angles
     qvel          (T, 7) – actual joint velocities
     t_sim         (T, 1) – wall-clock time since episode start
-    tau_cmd       (T, 7) – zeros (not accessible via current RPC interface)
+    tau_cmd       (T, 7) – joint torque the controller actually wrote, post
+                           clamp and rate limit (matches sim's tau_cmd)
+    tau_measured  (T, 7) – link-side measured joint torque (state.tau_J)
+    tau_ext       (T, 7) – libfranka's estimated external torque, i.e. what the
+                           dynamic model cannot account for. Commanded high but
+                           measured low with the joint stationary means the
+                           command is being absorbed mechanically, not a
+                           controller fault -- the distinction sim cannot show.
 
 Episodes are flushed incrementally (atomic tmp+rename, --flush-every steps)
 so a crash or Ctrl-C mid-episode keeps the data collected so far.
@@ -428,6 +435,7 @@ def _run_episode(
         "action", "action_norm", "eef_goal_pos", "eef_goal_quat",
         "eef_ang_vel", "eef_lin_vel", "eef_pos",
         "eef_quat", "fault_count", "qpos", "qvel", "t_sim", "tau_cmd",
+        "tau_measured", "tau_ext",
     )}
 
     record_video = video_dir is not None and bool(controller.cameras)
@@ -537,7 +545,12 @@ def _run_episode(
             buf["qpos"].append(np.asarray(q, dtype=np.float32))
             buf["qvel"].append(np.asarray(dq, dtype=np.float32))
             buf["t_sim"].append(np.array([t_now], dtype=np.float32))
-            buf["tau_cmd"].append(np.zeros(7, dtype=np.float32))
+            # Torques come from the same state read as q/dq above, so they are
+            # from one tick, not stitched across two.
+            tau_cmd, tau_meas, tau_ext = controller.robot_manager.torque_snapshot("r")
+            buf["tau_cmd"].append(np.asarray(tau_cmd, dtype=np.float32))
+            buf["tau_measured"].append(np.asarray(tau_meas, dtype=np.float32))
+            buf["tau_ext"].append(np.asarray(tau_ext, dtype=np.float32))
 
             # --- incremental flush (atomic tmp + rename) ----------------------
             if flush_path is not None and (step + 1) % flush_every == 0:
@@ -617,6 +630,7 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
         "JOINT_IMPEDANCE_KP", "HOME_IMPEDANCE_KP", "HOME_MAX_QDOT",
     ),
     "osc": (
+        "IMPEDANCE_MODE",
         "DEFAULT_KP", "KP_LIMITS", "DEFAULT_DAMPING_RATIO", "DAMPING_RATIO_LIMITS",
         "KP_EXP_SCALE", "DAMPING_EXP_SCALE", "DEFAULT_NULLSPACE_KP",
         "DELTA_POS_MAX", "DELTA_ROT_MAX", "DEFAULT_JOINT_KP", "JOINT_TORQUE_LIMITS",

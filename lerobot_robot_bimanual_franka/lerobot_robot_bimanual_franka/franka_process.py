@@ -22,6 +22,8 @@ import numpy as np
 import rpyc
 from numpy.typing import NDArray
 
+from .franka_jacobian import zero_jacobian
+
 logger = logging.getLogger(__name__)
 
 NUM_JOINTS = 7
@@ -39,17 +41,21 @@ MODE_HOLD = "hold"
 KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
 
 
-def _unpack(bundle: tuple) -> tuple[KinematicSnapshot, int]:
-    q, dq, J_flat, ee_pos, ee_quat_xyzw, ee_twist, recovery_count = bundle
+# (tau_commanded, tau_measured, tau_external_estimate), each (7,)
+TorqueSnapshot = tuple[NDArray, NDArray, NDArray]
+
+_ZERO_TAU = (np.zeros(NUM_JOINTS), np.zeros(NUM_JOINTS), np.zeros(NUM_JOINTS))
+
+
+def _unpack(bundle: tuple) -> tuple[KinematicSnapshot, int, TorqueSnapshot]:
+    """Flat 49-float bundle: q(7) dq(7) pos(3) quat(4) twist(6) rec(1) tau x3(21)."""
+    b = np.asarray(bundle, dtype=np.float64)
+    q, pos = b[0:7], b[14:17]
+    # J is not on the wire; rebuild it from the same q/ee_pos the server used.
     snap: KinematicSnapshot = (
-        np.array(q),
-        np.array(dq),
-        np.array(J_flat).reshape(6, NUM_JOINTS),
-        np.array(ee_pos),
-        np.array(ee_quat_xyzw),
-        np.array(ee_twist),
+        q, b[7:14], zero_jacobian(q, ee_pos_base=pos), pos, b[17:21], b[21:27],
     )
-    return snap, int(recovery_count)
+    return snap, int(b[27]), (b[28:35], b[35:42], b[42:49])
 
 
 class RobotDriver:
@@ -69,6 +75,8 @@ class RobotDriver:
         # where tracking was interrupted.
         self.recovery_count = 0
         self._last_snap: KinematicSnapshot | None = None
+        # Refreshed on every state read; see TorqueSnapshot.
+        self.last_torques: TorqueSnapshot = _ZERO_TAU
 
         self._conn = rpyc.connect(
             server_ip,
@@ -86,16 +94,19 @@ class RobotDriver:
 
     def get_kinematic_state(self) -> KinematicSnapshot:
         """Latest state published by the RT loop. Non-blocking once running."""
-        bundle, err, _ = self._root.get_state(self.robot_ip)
+        bundle, err, seq = self._root.get_state(self.robot_ip)
         if bundle is None:
-            bundle, err, _, ok = self._root.wait_next(self.robot_ip, -1, FIRST_STATE_TIMEOUT_S)
+            # Wait past the seq we just read, not past -1: the counter starts at
+            # 0, so `_seq > -1` is already true and wait_next would return the
+            # empty bundle immediately instead of blocking for the first publish.
+            bundle, err, _, ok = self._root.wait_next(self.robot_ip, seq, FIRST_STATE_TIMEOUT_S)
             if not ok or bundle is None:
                 raise ConnectionError(
                     f"no state from {self.robot_ip} after {FIRST_STATE_TIMEOUT_S}s: {err}"
                 )
         if err is not None:
             logger.warning("RobotDriver(%s): %s", self.robot_ip, err)
-        snap, self.recovery_count = _unpack(bundle)
+        snap, self.recovery_count, self.last_torques = _unpack(bundle)
         self._last_snap = snap
         return snap
 
@@ -107,14 +118,15 @@ class RobotDriver:
         kd: np.ndarray,
         nullspace_q: np.ndarray | None = None,
     ) -> None:
-        self._push(
-            self._root.set_osc_goal,
-            _t(goal_pos),
-            _t(goal_quat_xyzw),
-            _t(kp),
-            _t(kd),
-            None if nullspace_q is None else _t(nullspace_q),
-        )
+        ns = np.zeros(NUM_JOINTS) if nullspace_q is None else np.asarray(nullspace_q, dtype=np.float64)
+        packed = np.concatenate([
+            np.asarray(goal_pos, dtype=np.float64).ravel(),
+            np.asarray(goal_quat_xyzw, dtype=np.float64).ravel(),
+            np.asarray(kp, dtype=np.float64).ravel(),
+            np.asarray(kd, dtype=np.float64).ravel(),
+            ns.ravel(),
+        ])
+        self._push(self._root.set_osc_goal_flat, tuple(float(x) for x in packed))
 
     def send_joint_goal(
         self, goal_q: np.ndarray, kp: float | None = None, damping_ratio: float | None = None
@@ -128,9 +140,15 @@ class RobotDriver:
     def set_mode(self, mode: str) -> None:
         self._push(self._root.set_mode, mode)
 
-    def set_tuning(self, joint_damping_kv: float | None = None) -> None:
-        """Live server-side tuning; 0.0 joint damping restores exact osc.py behaviour."""
-        self._push(self._root.set_tuning, joint_damping_kv)
+    def set_tuning(
+        self,
+        joint_damping_kv: float | None = None,
+        uncouple_pos_ori: bool | None = None,
+        friction_kc: float | None = None,
+    ) -> None:
+        """Live server-side tuning. joint_damping_kv=0, uncouple_pos_ori=True and
+        friction_kc=0 together restore exact osc.py behaviour."""
+        self._push(self._root.set_tuning, joint_damping_kv, uncouple_pos_ori, friction_kc)
 
     def _push(self, rpc, *args) -> None:
         try:
@@ -177,6 +195,17 @@ class MultiRobotWrapper:
         """Cumulative recoverable-error recoveries per arm, as of the last state read."""
         return {n: d.recovery_count for n, d in self.drivers.items()}
 
+    def torque_snapshot(self, name: str) -> TorqueSnapshot:
+        """(commanded, measured, external estimate) from that arm's last state read.
+
+        commanded is post clamp and rate limit -- what was actually written to
+        libfranka, not what the control law produced before limiting.
+        """
+        return self.drivers[name].last_torques
+
+    def torque_snapshot_batch(self, names: list[str]) -> dict[str, TorqueSnapshot]:
+        return {n: self.drivers[n].last_torques for n in names}
+
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
         futs = [(n, self._pool.submit(fn, n)) for n in names]
         return {n: f.result(timeout=timeout_s) for n, f in futs}
@@ -203,8 +232,16 @@ class MultiRobotWrapper:
     def set_mode_all(self, mode: str) -> None:
         self._gather(lambda n: self.drivers[n].set_mode(mode), list(self.drivers))
 
-    def set_tuning_all(self, joint_damping_kv: float | None = None) -> None:
-        self._gather(lambda n: self.drivers[n].set_tuning(joint_damping_kv), list(self.drivers))
+    def set_tuning_all(
+        self,
+        joint_damping_kv: float | None = None,
+        uncouple_pos_ori: bool | None = None,
+        friction_kc: float | None = None,
+    ) -> None:
+        self._gather(
+            lambda n: self.drivers[n].set_tuning(joint_damping_kv, uncouple_pos_ori, friction_kc),
+            list(self.drivers),
+        )
 
     def stop_all_motion(self) -> None:
         self._gather(lambda n: self.drivers[n].stop(), [n for n, d in self.drivers.items() if d.is_alive])
