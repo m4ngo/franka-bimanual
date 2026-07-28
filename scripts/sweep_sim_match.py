@@ -19,7 +19,7 @@ Gains come from the reference file's own controller_cfg, so the real run always
 uses the kp/damping the sim was generated with rather than whatever was typed.
 
     python scripts/sweep_sim_match.py --yes
-    python scripts/sweep_sim_match.py --ref sysid/kp_actn0.50_damp_actn0.50/data.hdf5
+    python scripts/sweep_sim_match.py --ref ~/sysid/<run>/data.hdf5
     python scripts/sweep_sim_match.py --mode grid --yes      # full grid, slower
 
 Every trial re-homes to the reference's own init_qpos and verifies it got there;
@@ -44,8 +44,11 @@ from lerobot_robot_bimanual_franka.osc_torque_controller import DELTA_POS_MAX, D
 
 ARM = "r"
 
-# Above this, uncouple_pos_ori=false saturates the per-joint torque clamp.
-MAX_SAFE_ORI_SCALE_UNCOUPLED = 2.0
+# uncouple_pos_ori is pinned true throughout (sim's setting, and what this sweep
+# exists to match). It is also what keeps commanded torque ~13x lower: with it
+# false, ori_scale=12 once demanded ~110 Nm against a 69.6 Nm clamp, and a
+# saturated clamp is maximum-force motion. Do not make it selectable again
+# without restoring a refusal on the high-ori_scale combination.
 RIG = dict(r_server_ip="192.168.3.10", r_robot_ip="192.168.201.10",
            r_gripper_ip="192.168.201.10", r_port=18812)
 
@@ -53,7 +56,7 @@ RIG = dict(r_server_ip="192.168.3.10", r_robot_ip="192.168.201.10",
 # ----------------------------------------------------------------- reference
 
 def load_reference(path: str, index: int) -> dict:
-    with h5py.File(path, "r") as f:
+    with h5py.File(Path(path).expanduser(), "r") as f:
         cfg = json.loads(f.attrs["controller_cfg"])
         names = sorted(f["data"].keys())
         name = names[index]
@@ -131,10 +134,17 @@ def score(real_pos, real_quat, ref_pos, ref_quat) -> dict:
 
 # ----------------------------------------------------------------- hardware
 
-def home_reliably(robot, target_q, tol_rad=0.02, attempts=3, max_time_s=20.0) -> bool:
+def home_reliably(robot, target_q, tol_rad=0.005, attempts=3, max_time_s=20.0) -> bool:
     """Home and VERIFY. home() returning True is not enough on its own -- it can
     time out and, before the per-joint impedance fix, could leave the wrist
-    short. A trial started from the wrong pose is worse than a skipped one."""
+    short. A trial started from the wrong pose is worse than a skipped one.
+
+    tol_rad is tight on purpose: at the old 0.02 rad (1.1 deg/joint) the start
+    pose varied enough between trials to change the arm's inertia, and repeats
+    of one config spread by 0.40 total_err -- an order of magnitude more than
+    the 0.04 that separated the sweep's "best" from a frozen arm. Every knob
+    choice that sweep made was noise.
+    """
     for k in range(attempts):
         robot.home(home_q_left=None, home_q_right=target_q,
                    max_time_s=max_time_s, tol_rad=tol_rad, fps=30)
@@ -176,6 +186,23 @@ def replay(robot, ref, kp_action, kd_action, fps) -> tuple[np.ndarray, np.ndarra
     return pos, quat, faults
 
 
+def run_repeats(robot, ref, kc, tf, rf, oscale, fps, repeats) -> dict | None:
+    """Median of `repeats` trials, with the spread kept so noise stays visible."""
+    got = []
+    for _ in range(repeats):
+        r = run_trial(robot, ref, kc, tf, rf, oscale, fps)
+        if r:
+            got.append(r)
+    if not got:
+        return None
+    got.sort(key=lambda r: r["total_err"])
+    med = got[len(got) // 2]
+    med["n_trials"] = len(got)
+    med["err_spread"] = got[-1]["total_err"] - got[0]["total_err"]
+    med["_traj"] = got[len(got) // 2].get("_traj")
+    return med
+
+
 def run_trial(robot, ref, kc, tf, rf, oscale, fps, uncouple=True) -> dict | None:
     if not home_reliably(robot, ref["init_qpos"]):
         print("      HOMING FAILED - skipping trial")
@@ -197,12 +224,14 @@ def fmt(r: dict) -> str:
             f"| ERR {r['total_err']:7.3f}  posRMS {1000*r['pos_rms_m']:6.1f}mm  "
             f"rotRMS {np.degrees(r['rot_rms_rad']):5.2f}deg "
             f"| amp r/s {r['rot_amp_ratio'][dom]:5.2f}  corr {r['rot_corr'][dom]:+.2f}"
-            f"  faults {r['faults']}")
+            f"  faults {r['faults']}"
+            + (f"  spread {r['err_spread']:.3f} (n={r['n_trials']})" if "err_spread" in r else ""))
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ref", default="sysid/kp_actn0.50_damp_actn0.50/data.hdf5")
+    ap.add_argument("--ref",
+                    default="~/sysid/sim_gain_grid_3x3_rotation/kp_actn0.50_damp_actn0.50/data.hdf5")
     ap.add_argument("--traj-index", type=int, default=0)
     ap.add_argument("--fps", type=float, default=20.0)
     ap.add_argument("--mode", choices=("coord", "grid"), default="coord")
@@ -214,34 +243,22 @@ def main() -> None:
                          "enters the moment through the sin-based orientation_error and so saturates "
                          "at Lambda_ori*kp (~0.09 Nm here, under breakaway). This scales kp itself.")
     ap.add_argument("--passes", type=int, default=2, help="coordinate-descent passes")
+    ap.add_argument("--repeats", type=int, default=3,
+                    help="trials per config; configs are ranked by MEDIAN total_err. "
+                         "1 is not enough -- repeat spread was 0.40 while the whole "
+                         "signal between os=1 configs was 0.04.")
     ap.add_argument("--out", default="~/sysid/outputs/sweep_sim_match.json")
     # uncouple_pos_ori is pinned true: sim used true, and matching sim is the
     # entire point of this sweep. It is also the setting that keeps commanded
     # torque ~13x lower, so pinning it removes the combination that produced
     # dangerous motion.
-    ap.add_argument("--i-understand-this-is-dangerous", dest="force", action="store_true",
-                    help="permit uncouple_pos_ori=false together with kp_ori_scale > "
-                         "MAX_SAFE_ORI_SCALE_UNCOUPLED")
     ap.add_argument("--yes", action="store_true")
     args = ap.parse_args()
-
-    # uncouple_pos_ori=false raises commanded torque ~13x on its own (measured:
-    # roll 0.7 -> 9.1 Nm at ori_scale=1) and kp_ori_scale multiplies again. At
-    # ori_scale=12 that demanded ~110 Nm against a 69.6 Nm clamp -- a saturated
-    # clamp is maximum-force motion, which is how a sweep produced dangerous
-    # behaviour. The server speed guard is the real backstop; this stops the
-    # combination being requested in the first place.
-    if False:
-        raise SystemExit(
-            f"REFUSING: uncouple_pos_ori=false with kp_ori_scale up to {max(args.oscale)}.\n"
-            f"  Torque scales ~13x from uncoupling and again with ori_scale; past "
-            f"{MAX_SAFE_ORI_SCALE_UNCOUPLED} this saturates the per-joint clamp.\n"
-            f"  Either keep --uncouple true (sim's setting anyway) or cap --os at "
-            f"{MAX_SAFE_ORI_SCALE_UNCOUPLED}.")
 
     ref = load_reference(args.ref, args.traj_index)
     n_trials = (len(args.kc) * len(args.tf) * len(args.rf) * len(args.oscale) if args.mode == "grid"
                 else args.passes * (len(args.kc) + len(args.tf) + len(args.rf) + len(args.oscale)))
+    n_trials *= args.repeats
     secs = n_trials * (len(ref["action"]) / args.fps + 12)
     print(f"reference : {args.ref}  traj[{args.traj_index}] = {ref['name']}")
     print(f"            {len(ref['action'])} steps, sim kp={ref['cfg']['kp']:.2f} "
@@ -265,7 +282,7 @@ def main() -> None:
             combos = list(itertools.product(args.kc, args.tf, args.rf, args.oscale))
             for i, (kc, tf, rf, oc) in enumerate(combos):
                 print(f"  [{i+1}/{len(combos)}] ", end="", flush=True)
-                r = run_trial(robot, ref, kc, tf, rf, oc, args.fps, True)
+                r = run_repeats(robot, ref, kc, tf, rf, oc, args.fps, args.repeats)
                 if r:
                     results.append(r); print(fmt(r))
         else:
@@ -280,9 +297,9 @@ def main() -> None:
                     for v in values:
                         cand = dict(best); cand[knob] = v
                         print("    ", end="", flush=True)
-                        r = run_trial(robot, ref, cand["friction_kc"], cand["trans_fudge"],
-                                      cand["rot_fudge"], cand["ori_scale"], args.fps,
-                                      True)
+                        r = run_repeats(robot, ref, cand["friction_kc"], cand["trans_fudge"],
+                                        cand["rot_fudge"], cand["ori_scale"], args.fps,
+                                        args.repeats)
                         if r:
                             trials.append(r); results.append(r); print(fmt(r))
                     if trials:
