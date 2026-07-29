@@ -103,7 +103,7 @@ from lerobot_robot_bimanual_franka import pylibfranka_control as srv  # noqa: E4
 from lerobot_robot_bimanual_franka import pylibfranka_shm as _shm  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_jacobian import fk_chain, zero_jacobian  # noqa: E402
 from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
-    DELTA_POS_MAX, DELTA_ROT_MAX, OSCTorqueController, resolve_gains,
+    DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, OSCTorqueController, resolve_gains,
 )
 
 RNG = np.random.default_rng(20260727)
@@ -179,7 +179,7 @@ class _CapturingManager:
     def move_joint_goal_batch(self, goals):
         self.joint_goals.append(goals)
 
-    def move_joint_velocity_batch(self, vels):
+    def move_joint_velocity_batch(self, vels, kd_scale=1.0):
         pass
 
     def set_tuning_all(self, **kw):
@@ -225,6 +225,9 @@ class _PassThroughSafety:
 
 def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     bfmod.BimanualFranka._make_gripper = lambda self, arm: _FakeGripper()
+    # Pin sim gains: inheriting the tuned config would rewrite what parity means.
+    cfg_kw.setdefault("kp_ori_scale", (1.0, 1.0, 1.0))
+    cfg_kw.setdefault("kp_pos_scale", (1.0, 1.0, 1.0))
     cfg = SingleArmFrankaConfig(
         r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
         control_mode=mode, cameras={}, depth=False, depth_cam={}, **cfg_kw,
@@ -770,13 +773,25 @@ def test_impedance_mode_is_variable_not_fixed():
 
 
 def test_defaults_are_exact_parity():
-    """friction_kc, joint_damping_kv, kp_ori_scale must all be no-ops by default."""
+    """Every knob that alters the CONTROL LAW must be a no-op by default.
+
+    friction_kc is not one: it cancels a plant term the sim lacks. It still
+    defaults to 0 server-side, so an unconfigured client gets the raw law.
+    """
     cfg = SingleArmFrankaConfig(r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
                                 control_mode=ControlMode.EE_DELTA, cameras={}, depth=False,
                                 depth_cam={})
-    assert cfg.friction_kc == 0.0
-    assert tuple(cfg.kp_ori_scale) == (1.0, 1.0, 1.0)
     assert cfg.uncouple_pos_ori is True
+    assert cfg.ee_translation_fudge == 1.0 and cfg.ee_rotation_fudge == 1.0
+    assert 0.0 <= cfg.friction_kc <= 1.0
+    # Tuning is allowed, but only inside osc.py's action space.
+    kp_tuned, kd_tuned = resolve_gains(0.0, 0.0, cfg.kp_ori_scale,
+                                       kp_pos_scale=cfg.kp_pos_scale)
+    assert np.all(kp_tuned <= KP_LIMITS[1] + 1e-9)
+    # The invariant that keeps a stiffness tune from becoming a speed tune.
+    kp_sim, kd_sim = resolve_gains(0.0, 0.0)
+    assert np.allclose(kp_tuned / kd_tuned, kp_sim / kd_sim), (
+        "a per-axis gain scale changed the slew rate, not just the stiffness")
     from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
     assert _srv._FRICTION_KC == 0.0
     assert _srv._JOINT_DAMPING_KV == 0.0
@@ -839,6 +854,86 @@ def test_speed_guard_cuts_back_then_brakes():
     out = srv.ControlLoop._speed_guard(s2, tau.copy(), dq_ee)
     assert not np.allclose(out, tau), "EE-speed term did not trip"
     assert np.all(np.abs(out) <= srv._TAU_LIMIT + 1e-9)
+
+
+def test_speed_guard_clears_the_sim_action_envelope():
+    """The guard must sit OUTSIDE the motion a +/-1 sim action asks for.
+
+    Inside it, the guard rescales the control law instead of bounding a runaway.
+    """
+    kp, kd = resolve_gains(0.0, 0.0)
+    v_lin = (kp[0] / kd[0]) * DELTA_POS_MAX
+    v_ang = (kp[3] / kd[3]) * DELTA_ROT_MAX
+    worst = 0.0
+    for seed in range(24):
+        case = make_case(np.random.default_rng(seed))
+        s = make_session(case)
+        s._last_J = case["J"]
+        J_pinv = np.linalg.pinv(case["J"])
+        for axis in range(6):
+            twist = np.zeros(6)
+            twist[axis] = v_lin if axis < 3 else v_ang
+            dq = J_pinv @ twist
+            if np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS) > 0.98:
+                continue          # the arm's own rated velocity, not our envelope
+            tau = np.full(7, 5.0)
+            out = srv.ControlLoop._speed_guard(s, tau.copy(), dq)
+            assert np.allclose(out, tau), (
+                f"guard fired inside the sim envelope (seed {seed}, axis {axis}, "
+                f"max dq/limit {np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS):.2f})")
+            worst = max(worst, float(np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS)))
+    return f"sim-parity peak joint speed {worst:.2f} of rated, guard trips at {srv._JOINT_VELOCITY_TRIP}"
+
+
+def test_friction_feedforward_cannot_drive_an_idle_arm():
+    """Zero commanded torque must mean zero assist -- the anti-walking invariant.
+
+    EE_DELTA re-anchors goal_pos on the measured pose, so residual friction is
+    the only thing holding the arm at zero command; a dq-signed assist cancels it
+    and the arm walks.
+    """
+    kc = 0.9
+    coriolis = np.full(7, 0.4)
+    assert np.allclose(srv._friction_feedforward(kc, coriolis.copy(), coriolis), 0.0), (
+        "assist is nonzero with no control torque -- the arm can drive itself")
+
+    # Direction follows the command, and it saturates so it can only ever assist.
+    for sign in (+1.0, -1.0):
+        ff = srv._friction_feedforward(kc, coriolis + sign * 3.0, coriolis)
+        assert np.all(sign * ff > 0.0), "assist did not follow the commanded torque"
+        assert np.all(np.abs(ff) <= kc * srv._FRICTION_COULOMB + 1e-12)
+
+    # Enough authority to matter: a command at the friction floor must clear it.
+    cmd = 0.3 * srv._FRICTION_COULOMB
+    total = cmd + srv._friction_feedforward(kc, coriolis + cmd, coriolis)
+    assert np.all(total > srv._FRICTION_COULOMB * 0.9), "assist too weak to break away"
+
+    assert np.allclose(srv._friction_feedforward(0.0, coriolis + 3.0, coriolis), 0.0)
+
+
+def test_friction_assist_is_osc_only():
+    """Joint impedance relies on friction to stay quiet; assisting there buzzes."""
+    case = make_case(np.random.default_rng(11))
+    case["dq"] = np.zeros(7)
+    session = make_session(case, friction_kc=0.9)
+    state = FakeState(case["q"], case["dq"], case["ee_pos"], case["R"])
+
+    g = np.zeros(_shm.GOAL_SIZE)
+    g[_shm.G_CMD_SEQ] = 1.0
+    g[_shm.G_FRICTION_KC] = 0.9
+    g[_shm.G_JOINT_Q] = case["q"] + 0.05      # a standing hold error
+    g[_shm.G_JOINT_KP], g[_shm.G_JOINT_RATIO] = 1.0, 1.0
+    for mode in (_shm.MODE_JOINT, _shm.MODE_HOLD):
+        session._last_cmd_seq = -1.0
+        session._last_mode = None
+        g[_shm.G_MODE] = mode
+        tau = session._compute_tau(state, g.copy())[0]
+        session._last_cmd_seq = -1.0
+        session._last_mode = None
+        g[_shm.G_FRICTION_KC] = 0.0
+        plain = session._compute_tau(state, g.copy())[0]
+        g[_shm.G_FRICTION_KC] = 0.9
+        assert np.allclose(tau, plain), f"friction assist leaked into mode {mode}"
 
 
 def test_speed_guard_is_not_reachable_from_the_client():

@@ -86,16 +86,20 @@ def test_each_channel_uses_its_own_device_to_base_rotation():
     map from the linear one swaps roll and pitch at the robot. Confirmed on
     hardware -- see the note on the constants.
     """
+    cfg = SpaceMouseConfig(prefix="r_", use_delta=True)
+    t_signs = np.asarray(cfg.translation_signs, dtype=np.float64)
+    r_signs = np.asarray(cfg.rotation_signs, dtype=np.float64)
+
     for i, axis in enumerate("xyz"):
         lin = make_teleop(_FakeState(**{axis: 1.0}), deadzone=0.0)
         dp, _ = action_vec(lin.get_action())
-        expect = LINEAR_DEVICE_TO_BASE @ np.eye(3)[i]
+        expect = (LINEAR_DEVICE_TO_BASE @ np.eye(3)[i]) * t_signs
         assert np.allclose(dp / np.linalg.norm(dp), expect, atol=1e-9), f"linear {axis}"
 
     for i, axis in enumerate(("roll", "pitch", "yaw")):
         ang = make_teleop(_FakeState(**{axis: 1.0}), deadzone=0.0)
         _, dr = action_vec(ang.get_action())
-        expect = ANGULAR_DEVICE_TO_BASE @ np.eye(3)[i]
+        expect = (ANGULAR_DEVICE_TO_BASE @ np.eye(3)[i]) * r_signs
         assert np.allclose(dr / np.linalg.norm(dr), expect, atol=1e-9), f"angular {axis}"
 
 
@@ -260,12 +264,16 @@ def test_each_device_axis_drives_the_same_torque_as_robosuite():
 
 
 def test_each_device_axis_lands_on_the_expected_base_axis():
-    """Which robot axis each device axis drives, with sign. This is the mapping
-    a mis-mounted puck would break, and the one the hardware probe checks."""
+    """Which robot axis each device axis drives, with sign.
+
+    The sign trims are part of the convention: this puck reports yaw inverted.
+    """
+    cfg = SpaceMouseConfig(prefix="r_", use_delta=True)
     expected = {}
     for i, axis in enumerate(DEVICE_AXES):
         m = LINEAR_DEVICE_TO_BASE if i < 3 else ANGULAR_DEVICE_TO_BASE
-        vec = m @ np.eye(3)[i % 3]
+        signs = cfg.translation_signs if i < 3 else cfg.rotation_signs
+        vec = (m @ np.eye(3)[i % 3]) * np.asarray(signs, dtype=np.float64)
         expected[axis] = (int(np.argmax(np.abs(vec))), float(np.sign(vec[np.argmax(np.abs(vec))])))
 
     rows = []
@@ -303,8 +311,11 @@ def test_absolute_mode_integrates_the_same_deltas():
     tel.seed_state(np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
     pos = np.zeros(3)
     rot = Rotation.identity()
-    step_p = LINEAR_DEVICE_TO_BASE @ np.array([0.0, 0.5, 0.0]) * DELTA_POS_MAX
-    step_r = Rotation.from_rotvec(ANGULAR_DEVICE_TO_BASE @ np.array([0.0, 0.0, 0.4]) * DELTA_ROT_MAX)
+    t_signs = np.asarray(cfg.translation_signs, dtype=np.float64)
+    r_signs = np.asarray(cfg.rotation_signs, dtype=np.float64)
+    step_p = (LINEAR_DEVICE_TO_BASE @ np.array([0.0, 0.5, 0.0])) * t_signs * DELTA_POS_MAX
+    step_r = Rotation.from_rotvec(
+        (ANGULAR_DEVICE_TO_BASE @ np.array([0.0, 0.0, 0.4])) * r_signs * DELTA_ROT_MAX)
     for _ in range(4):
         act = tel.get_action()
         pos = pos + step_p

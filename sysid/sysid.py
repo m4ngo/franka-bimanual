@@ -102,6 +102,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
     try:
         from env_wrapper import start_controller
         from lerobot_robot_bimanual_franka import SingleArmFranka  # noqa: F401
+        from lerobot_robot_bimanual_franka import SingleArmFrankaConfig as cfg
         from lerobot_robot_bimanual_franka import (
             bimanual_franka as bf,
             franka_process as fp,
@@ -113,7 +114,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
             return None
         raise
     _ROBOT_STACK = SimpleNamespace(
-        start_controller=start_controller, bf=bf, fp=fp, osc=osc, safety=sf,
+        start_controller=start_controller, bf=bf, fp=fp, osc=osc, safety=sf, cfg=cfg,
     )
     return _ROBOT_STACK
 
@@ -307,6 +308,9 @@ class _MockController:
 
             def recovery_counts(self):
                 return {"r": 0}
+
+            def torque_snapshot(self, name):
+                return (np.zeros(7), np.zeros(7), np.zeros(7))
 
         self.robot_manager = _RM()
 
@@ -643,11 +647,36 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
     "fp": (
         "NUM_JOINTS", "RPYC_TIMEOUT_S", "FIRST_STATE_TIMEOUT_S",
     ),
+    # env_wrapper passes no overrides, so these class defaults ARE the plant;
+    # runs recorded under different ones are not comparable.
+    "cfg": (
+        "friction_kc", "uncouple_pos_ori", "kp_ori_scale", "kp_pos_scale",
+        "ee_translation_fudge", "ee_rotation_fudge",
+    ),
 }
 _METADATA_MODULE_LABELS = {
     "bf": "bimanual_franka", "osc": "osc_torque_controller",
-    "safety": "safety", "fp": "franka_process",
+    "safety": "safety", "fp": "franka_process", "cfg": "single_arm_franka_config",
 }
+
+# The NUC-side law cannot be imported here (no pylibfranka), so pin the run to a
+# controller revision by hashing the files the deploy script ships.
+_CONTROL_STACK_FILES = ("pylibfranka_control.py", "osc_torque_controller.py",
+                        "franka_jacobian.py")
+
+
+def _control_stack_hashes(stack: SimpleNamespace | None) -> dict:
+    osc_mod = getattr(stack, "osc", None)
+    if osc_mod is None or not getattr(osc_mod, "__file__", None):
+        return {}
+    pkg = Path(osc_mod.__file__).resolve().parent
+    out = {}
+    for name in _CONTROL_STACK_FILES:
+        try:
+            out[name] = _sha256(str(pkg / name))
+        except OSError:
+            out[name] = None
+    return out
 
 
 def _sha256(path: str) -> str:
@@ -689,6 +718,7 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
                        "kd = 2*sqrt(kp)*ratio (robosuite impedance_mode='variable')",
         },
         "constants": constants,
+        "control_stack_sha256": _control_stack_hashes(stack),
     }
 
 

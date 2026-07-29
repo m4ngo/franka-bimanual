@@ -107,7 +107,10 @@ The follower is composed of three subsystems, each isolated in its own module:
   under pylibfranka, still zero) so the analytic `franka_jacobian` is used
   instead; torque rate limiting against `state.tau_J_d` is mandatory; the law runs
   at **500 Hz, not 1 kHz**, because that is robosuite's substep rate; the write
-  precedes the compute; and recoverable errors (reflex,
+  precedes the compute; the speed guard's envelope must stay **outside** the one
+  a ±1 sim action produces (`v = (kp/kd)·delta` = 0.31 m/s / 3.06 rad/s at the
+  default kp, and 3.06 rad/s runs the wrist at ~0.9 of rated) or it silently
+  rescales the control law; and recoverable errors (reflex,
   `communication_constraints_violation`, UDP timeout) re-arm torque control
   holding the pose the arm actually ended up in.
 - [pylibfranka_shm.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_shm.py)
@@ -130,7 +133,8 @@ The follower is composed of three subsystems, each isolated in its own module:
     plus a hard floor the goal can never cross; `shape_ee` / `shape_joint` keep
     the velocity-domain form.
   - L2-norm clamps on joint velocity (2.0 rad/s) and EE linear/angular
-    velocity (0.30 m/s, 1.20 rad/s).
+    velocity (1.0 m/s, 2.0 rad/s). These bound the *velocity-domain* callers
+    only; the torque paths are bounded by the NUC's speed guard instead.
   - Bimanual arm-repel is **not yet implemented** (noted in the module
     docstring).
 - [wsg.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/wsg.py)
@@ -238,6 +242,7 @@ constants for this exact rig. All scripts assume the venv is active.
 | `check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
+| `measure_joint_friction.py` | Per-joint Coulomb/viscous friction from constant-velocity torque; sets `friction_kc`'s constants | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all five packages | — |
 
 USB ports: **left GELLO `/dev/ttyUSB1`, right GELLO `/dev/ttyUSB0`**. SpaceMice

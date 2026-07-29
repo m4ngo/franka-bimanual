@@ -51,6 +51,8 @@ JOINT_IMPEDANCE_KP = DEFAULT_JOINT_KP
 HOME_IMPEDANCE_KP = DEFAULT_JOINT_KP
 HOME_IMPEDANCE_KD = DEFAULT_JOINT_KD
 HOME_MAX_QDOT = 0.6  # rad/s, ramp rate of the commanded home goal
+HOME_SETTLE_QDOT = 0.05  # rad/s, home() is not done until the arm is this still
+HOME_LEAD_MARGIN = 1.5   # headroom so the stall clamp stays off the ramp
 
 _GRIP_ACCUM_SPEED = 1.0
 
@@ -131,6 +133,7 @@ class BimanualFranka(Robot):
         # _reset_osc_goal_ori(), robosuite's reset_goal().
         self._osc_goal_ori: dict[str, Rotation] = {}
         self._kp_ori_scale = np.asarray(getattr(config, "kp_ori_scale", 1.0), dtype=np.float64)
+        self._kp_pos_scale = np.asarray(getattr(config, "kp_pos_scale", 1.0), dtype=np.float64)
         # Sim-to-real delta scaling, settable live so a sweep can search them.
         # Applied to the axis-angle rotation delta, NOT the quaternion: scaling
         # all four quaternion components uniformly is undone by normalisation.
@@ -391,8 +394,9 @@ class BimanualFranka(Robot):
         measured EE position. Originally a workaround for franky's all-zero
         zero_jacobian; kept under pylibfranka because this is the convention the
         downstream proprio/twist consumers (residual_wrapper) were validated
-        against. The server-side OSC law uses libfranka's own Jacobian, which is
-        self-consistent with the O_T_EE it forms the pose error from."""
+        against. pylibfranka's Model.zero_jacobian is all-zero on this build too,
+        so the server-side OSC law computes this same analytic Jacobian from the
+        same q and measured EE point."""
         q, dq, J, ee_pos, ee_quat_xyzw, ee_twist = snap
         q = np.asarray(q, dtype=np.float64)
         ee_pos = np.asarray(ee_pos, dtype=np.float64)
@@ -432,7 +436,8 @@ class BimanualFranka(Robot):
             )
             return action
 
-        kp, kd = resolve_gains(action["kp"], action["kd"], self._kp_ori_scale)
+        kp, kd = resolve_gains(action["kp"], action["kd"], self._kp_ori_scale,
+                               kp_pos_scale=self._kp_pos_scale)
 
         if self.control_mode == ControlMode.EE_DELTA:
             goals = {
@@ -504,23 +509,37 @@ class BimanualFranka(Robot):
         # Joint impedance settles at v = (kp/kd) * error, so this lead caps speed.
         # Joint impedance settles at v = (kp/kd)*error per joint, so the fastest
         # joint sets the lead that keeps every joint under HOME_MAX_QDOT.
-        max_lead = HOME_MAX_QDOT / float(np.max(HOME_IMPEDANCE_KP / HOME_IMPEDANCE_KD))
+        # RAMP the goal; re-deriving it from the measured q each tick sawtooths
+        # the error by v/rate, a 25% torque ripple felt as vibration.
+        step = HOME_MAX_QDOT / rate_hz
+        # Stall guard, not the speed limit (the ramp is). Sustaining HOME_MAX_QDOT
+        # needs exactly HOME_MAX_QDOT/(kp/kd) of lead, so this must sit above it
+        # with margin or it binds every tick and the sawtooth comes back.
+        max_lead = HOME_LEAD_MARGIN * HOME_MAX_QDOT / float(
+            np.max(HOME_IMPEDANCE_KP / HOME_IMPEDANCE_KD))
+        ramp = {arm: np.asarray(snap[0], dtype=np.float64).copy()
+                for arm, snap in self.robot_manager.current_kinematic_state_batch(names).items()}
 
         while True:
             tick_start = time.perf_counter()
             kin = self.robot_manager.current_kinematic_state_batch(names)
 
-            commanded = {
-                arm: kin[arm][0] + np.clip(targets_q[arm] - kin[arm][0], -max_lead, max_lead)
-                for arm in names
-            }
+            commanded = {}
+            for arm in names:
+                lead = ramp[arm] + np.clip(targets_q[arm] - ramp[arm], -step, step)
+                # Re-anchors only once the arm has fallen behind.
+                ramp[arm] = kin[arm][0] + np.clip(lead - kin[arm][0], -max_lead, max_lead)
+                commanded[arm] = ramp[arm]
             goals = self.safety.shape_joint_goal(commanded, kin, float(np.max(HOME_IMPEDANCE_KP)))
             self.robot_manager.move_joint_goal_batch(
                 {a: (g, 1.0, 1.0) for a, g in goals.items()}
             )
 
             max_err = max(float(np.max(np.abs(targets_q[arm] - kin[arm][0]))) for arm in names)
-            if max_err < tol_rad:
+            # Exit at rest, not merely in position: returning mid-motion leaves
+            # the arm coasting into whatever the caller does next.
+            max_qdot = max(float(np.max(np.abs(kin[arm][1]))) for arm in names)
+            if max_err < tol_rad and max_qdot < HOME_SETTLE_QDOT:
                 self._cached_kin_state = None
                 for arm in names:
                     self._home_q[arm] = targets_q[arm].copy()

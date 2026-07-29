@@ -226,8 +226,9 @@ class MultiRobotWrapper:
         """goals[arm] = (goal_q(7), kp | None, damping_ratio | None)."""
         self._gather(lambda n: self.drivers[n].send_joint_goal(*goals[n]), list(goals))
 
-    def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True) -> None:
-        self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n]), list(vels))
+    def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True,
+                                  kd_scale: float = 1.0) -> None:
+        self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n], kd_scale), list(vels))
 
     def set_mode_all(self, mode: str) -> None:
         self._gather(lambda n: self.drivers[n].set_mode(mode), list(self.drivers))

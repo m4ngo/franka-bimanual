@@ -87,22 +87,38 @@ _TAU_SAFETY_FACTOR = 0.8
 _TAU_LIMIT = np.asarray(JOINT_TORQUE_LIMITS, dtype=np.float64) * _TAU_SAFETY_FACTOR
 _MAX_TORQUE_RATE = 1000.0
 
-# Speed guard -- see pylibfranka_server's history: every client-settable knob
-# multiplies commanded torque and several compose, so bound the RESULT.
+# Speed guard on the RESULT: every client-settable knob multiplies commanded
+# torque and several compose. Must stay OUTSIDE the envelope a sim-parity action
+# produces (0.31 m/s, 3.06 rad/s -- the latter is ~0.9 of rated wrist velocity)
+# or it rescales the control law instead of bounding a runaway.
 _JOINT_VELOCITY_LIMITS = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])
-_JOINT_VELOCITY_TRIP = 0.30
-_EE_LINEAR_TRIP, _EE_ANGULAR_TRIP = 0.60, 2.50
+_JOINT_VELOCITY_TRIP = 0.95
+_EE_LINEAR_TRIP, _EE_ANGULAR_TRIP = 1.20, 6.00
 _GUARD_HARD_STOP = 1.5
 _BRAKE_KD = np.array([40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0])
 
-_FRICTION_COULOMB = np.array([0.55, 0.87, 0.64, 1.17, 0.42, 0.42, 0.53])
-_FRICTION_TAU_EPS = 0.05 * _FRICTION_COULOMB
+# Zero-speed intercepts measured on THIS arm (scripts/measure_joint_friction.py);
+# the torque at the sweep speed carries ~1.0 Nms/rad of viscous that must not be
+# fed back as a speed-independent term. Joints 5-6 are poorly resolved, low side.
+_FRICTION_COULOMB = np.array([1.02, 1.04, 0.67, 1.04, 0.15, 0.25, 0.41])
+_FRICTION_TAU_EPS = 0.20 * _FRICTION_COULOMB   # stiction band; sharper limit-cycles
+_FRICTION_DQ_EPS = 0.02   # rad/s below which a joint counts as stuck
 
 _STALE_GOAL_TIMEOUT_S = 0.5
 _PUBLISH_DECIMATION = 10
 _RECOVERABLE = ("communication_constraint", "communication_constrains", "reflex",
                 "udp receive: timeout", "command not possible in the current mode")
 _ARM_ATTEMPTS, _ARM_BACKOFF_S = 6, 0.3
+
+
+def _friction_feedforward(kc, tau, coriolis):
+    """Assist the commanded torque past breakaway; zero command, zero assist.
+
+    Never sign this by dq. EE_DELTA re-anchors its goal on the measured pose, so
+    residual friction is the only thing holding the arm at zero command -- cancel
+    it and a nudge makes the arm walk.
+    """
+    return kc * _FRICTION_COULOMB * np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
 
 
 class ControlLoop:
@@ -131,6 +147,9 @@ class ControlLoop:
         self.control = None
         self.recovery_count = 0
         self.guard_trips = 0
+        # Ticks the law asked past the clamp: beyond it the arm is under maximum
+        # force, not under the OSC law. Signals a gain out of range for the pose.
+        self.clamp_trips = 0
         self._last_tau = np.zeros(NUM_JOINTS)
         self._raw_tau = None
         self._last_J = None
@@ -217,6 +236,10 @@ class ControlLoop:
             elif mode == shm.MODE_JOINT:
                 self.joint.set_goal(goal_q=goal[shm.G_JOINT_Q], kp=goal[shm.G_JOINT_KP],
                                     damping_ratio=goal[shm.G_JOINT_RATIO])
+            elif mode == shm.MODE_JOINT_VEL:
+                # The velocity setpoint rides G_JOINT_Q.
+                self.joint.set_goal(goal_dq=goal[shm.G_JOINT_Q],
+                                    damping_ratio=goal[shm.G_JOINT_RATIO])
             self.osc.uncoupling = bool(goal[shm.G_UNCOUPLE])
 
         if mode != shm.MODE_FLOAT and getattr(self, "_goal_ts", 0.0):
@@ -243,9 +266,11 @@ class ControlLoop:
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
+        # OSC only: home/hold have no sim counterpart and friction is what keeps
+        # them quiet -- assisting there buzzes on the hold's own standing torque.
         kc = float(goal[shm.G_FRICTION_KC])
-        if kc:
-            tau = tau + kc * _FRICTION_COULOMB * np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
+        if kc and mode == shm.MODE_OSC:
+            tau = tau + _friction_feedforward(kc, tau, coriolis)
         return tau, q, dq, None
 
     def _goal(self):
@@ -304,11 +329,13 @@ class ControlLoop:
                 tau = self._speed_guard(self._raw_tau, dq)
                 tau = self._limit(tau, np.asarray(state.tau_J_d, dtype=np.float64), duration)
                 self._last_tau = tau
-                self.control.writeOnce(pylibfranka.Torques([float(x) for x in tau]))
+                self.control.writeOnce(pylibfranka.Torques(tau.tolist()))
                 _t1 = time.perf_counter()
                 self._acc("resp", (_t1 - _t0) * 1e6)
 
                 # Everything below runs in the slack before the next state.
+                if np.any(np.abs(self._raw_tau) > _TAU_LIMIT):
+                    self.clamp_trips += 1
                 if tick % _CONTROL_DECIMATION == 0:
                     self._raw_tau = self._compute_tau(state, self._goal())[0]
                 _t2 = time.perf_counter()
@@ -318,7 +345,8 @@ class ControlLoop:
                 self._prev_t3 = _t2
 
                 worst_us = max(worst_us, (_t1 - _t0) * 1e6)
-                tick += 1
+                # Incremented last so publish lands on a law tick and _publish's
+                # Jacobian hits the cache instead of always missing it.
                 if tick % _PUBLISH_DECIMATION == 0:
                     self._publish(state, q, dq)
                     now = time.monotonic()
@@ -327,8 +355,8 @@ class ControlLoop:
                         rate = float(getattr(state, "control_command_success_rate", 1.0))
                         log = logger.warning if rate < 0.95 else logger.info
                         log("success rate %.3f, worst response %.0f us, recoveries %d, "
-                            "guard trips %d%s  [us mean/max: %s]", rate, worst_us,
-                            self.recovery_count, self.guard_trips,
+                            "guard trips %d, clamp trips %d%s  [us mean/max: %s]", rate, worst_us,
+                            self.recovery_count, self.guard_trips, self.clamp_trips,
                             "  <- MISSING DEADLINES" if rate < 0.95 else "",
                             " ".join(
                                 f"{k}={self._prof_sum[k] / max(self._prof_n[k], 1):.0f}/{v:.0f}"
@@ -336,6 +364,7 @@ class ControlLoop:
                         worst_us = 0.0
                         for k in self._prof:
                             self._prof[k] = self._prof_sum[k] = self._prof_n[k] = 0.0
+                tick += 1
             except Exception as e:  # noqa: BLE001
                 msg = str(e)
                 if any(t in msg.lower() for t in _RECOVERABLE):

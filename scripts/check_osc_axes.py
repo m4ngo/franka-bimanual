@@ -24,6 +24,7 @@ import time
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from lerobot_robot_bimanual_franka import SingleArmFrankaConfig
 from lerobot_robot_bimanual_franka.franka_process import MultiRobotWrapper
 from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains
 
@@ -61,13 +62,20 @@ def main() -> None:
     ap.add_argument("--uncouple", choices=("true", "false"), default=None,
                     help="osc.py's uncouple_pos_ori. false applies Lambda_full to the whole "
                          "wrench: zero cross-coupling and far more torque per axis")
-    ap.add_argument("--kp-ori-scale", type=float, default=1.0,
-                    help="multiply the orientation gains only; leaves translation at the "
-                         "sim default so the arm stays gentle")
-    ap.add_argument("--friction-kc", type=float, default=None,
-                    help="set the server's Coulomb friction feedforward before probing (0..1); "
-                         "omit to leave it as-is. Sweep this to find the smallest value that "
-                         "un-stalls the rotation axes.")
+    ap.add_argument("--kp-ori-scale", type=float, nargs="+",
+                    default=list(SingleArmFrankaConfig.kp_ori_scale),
+                    help="multiply the orientation gains only (scalar or rx ry rz); leaves "
+                         "translation at the sim default so the arm stays gentle. Capped at "
+                         "10x by KP_LIMITS -- yaw needs its own value, roll/pitch saturate "
+                         "the wrist torque clamp long before it does")
+    ap.add_argument("--kp-pos-scale", type=float, nargs="+",
+                    default=list(SingleArmFrankaConfig.kp_pos_scale),
+                    help="same for the translation gains (scalar or x y z). X is the weak "
+                         "one here: lambda_pos is ~0.85 kg along it against 6.3 along Z")
+    ap.add_argument("--friction-kc", type=float, default=SingleArmFrankaConfig.friction_kc,
+                    help="server-side Coulomb friction feedforward (0..1); defaults to the "
+                         "robot config's value so a probe measures what teleop flies. Sweep it "
+                         "to find the smallest value that un-stalls the rotation axes.")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
 
@@ -80,11 +88,16 @@ def main() -> None:
 
     mgr = MultiRobotWrapper()
     mgr.add_robot(ARM, args.server_ip, args.robot_ip, args.port, use_ee_delta=True)
-    kp, kd = resolve_gains(args.kp, args.kd, args.kp_ori_scale)
-    if args.friction_kc is not None or args.uncouple is not None:
-        unc = None if args.uncouple is None else (args.uncouple == "true")
-        mgr.set_tuning_all(friction_kc=args.friction_kc, uncouple_pos_ori=unc)
-        print(f"friction_kc={args.friction_kc}  uncouple_pos_ori={unc}")
+    def _scale3(v):
+        a = np.asarray(v, dtype=np.float64)
+        return np.full(3, a[0]) if a.size == 1 else a
+
+    ori_scale, pos_scale = _scale3(args.kp_ori_scale), _scale3(args.kp_pos_scale)
+    kp, kd = resolve_gains(args.kp, args.kd, ori_scale, kp_pos_scale=pos_scale)
+    # ALWAYS push: server sessions outlive their clients.
+    unc = SingleArmFrankaConfig.uncouple_pos_ori if args.uncouple is None else (args.uncouple == "true")
+    mgr.set_tuning_all(friction_kc=args.friction_kc, uncouple_pos_ori=unc)
+    print(f"friction_kc={args.friction_kc}  uncouple_pos_ori={unc}")
     try:
         q0, _, _, _, _, _ = mgr.current_kinematic_state(ARM)
         ns_q = np.asarray(q0, dtype=np.float64)

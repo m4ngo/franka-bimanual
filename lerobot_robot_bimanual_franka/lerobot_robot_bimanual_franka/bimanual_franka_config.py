@@ -36,21 +36,17 @@ class BimanualFrankaConfig(RobotConfig):
     l_gripper_port: int = 18822
     r_gripper_port: int = 18823
     active_arms: tuple[str, ...] = _VALID_ARMS
-    # Coulomb friction feedforward applied server-side, in [0, 1]. 0.0 is exact
-    # robosuite; raise it when low-inertia task directions (notably EE rotation,
-    # where the operational-space inertia is ~0.002 kg m^2) command torques below
-    # the joints' breakaway friction. Measure with scripts/check_osc_axes.py.
-    friction_kc: float = 0.0
+    # Coulomb friction feedforward, in [0, 1]. Cancels a plant term the sim does
+    # not have, so non-zero is CLOSER to osc.py's motion. 0.9 clears the
+    # measurement's ~10% spread; 1.0 overshoots (pitch overshot to 126%).
+    friction_kc: float = 0.9
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = 1.0
     ee_rotation_fudge: float = 1.0
-    # Multiplies the OSC orientation gains only, per base axis (rx, ry, rz). Rotational operational-space
-    # inertia here is ~0.002 kg m^2 vs 1-16 kg translational, so the shared
-    # sim kp that translates smoothly leaves wrist torque under breakaway.
-    # 1.0 is exact sim behaviour; raising translation gains instead makes the
-    # arm violent. Measure with scripts/check_osc_axes.py.
-    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # See SingleArmFrankaConfig. Measured on the right arm only.
+    kp_ori_scale: tuple[float, float, float] = (5.0, 5.0, 10.0)
+    kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # osc_pose.json sets uncouple_pos_ori=true, which applies Lambda_pos/Lambda_ori
     # to the two halves of the wrench separately. That leaves the arm's own
     # translation<->rotation inertia coupling in the loop AND scales the moment by

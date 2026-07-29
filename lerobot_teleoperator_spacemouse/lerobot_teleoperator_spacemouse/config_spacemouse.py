@@ -51,7 +51,8 @@ class SpaceMouseLeaderFields:
     # here -- these exist only to flip an axis without editing it. Defaults are
     # identity because the matrix already encodes this rig's mounting.
     translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, 1))
-    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, 1))
+    # Yaw is inverted on this puck; the controller itself is correctly signed.
+    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
 
     # Gripper travel limits (mm). Right button → open, left button → close.
     gripper_min_mm: float = -1.0

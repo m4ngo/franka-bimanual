@@ -74,9 +74,18 @@ DEFAULT_JOINT_KP = np.array([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
 DEFAULT_JOINT_KD = np.array([50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0])
 DEFAULT_JOINT_DAMPING_RATIO = 1.0
 
+# Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix so the pole is
+# this on every joint; DEFAULT_JOINT_KD as a velocity gain puts the wrist at
+# kd/M = 600-7900 rad/s and chatters against the 500 Hz law.
+DEFAULT_JOINT_VEL_KV = 25.0
+
 
 def resolve_gains(
-    kp_action: float, kd_action: float, kp_ori_scale: float = 1.0
+    kp_action: float,
+    kd_action: float,
+    kp_ori_scale: np.ndarray | float = 1.0,
+    kd_ori_scale: np.ndarray | float | None = None,
+    kp_pos_scale: np.ndarray | float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map action kp/kd in [-1, 1] to robosuite (kp, kd) 6-vectors.
 
@@ -84,25 +93,27 @@ def resolve_gains(
     OperationalSpaceController.set_goal's clip, for impedance_mode="variable":
     kp = 150 * 10**a_kp, damping_ratio = 1 * 10**a_kd, kd = 2*sqrt(kp)*ratio.
 
-    kp_ori_scale multiplies the three orientation entries only; scalar or (3,)
-    for per-axis control. osc.py's kp is
-    already a 6-vector (nums2array(kp, 6)) and variable mode reads all six from
-    the action, so a non-uniform kp is inside the controller's own action space,
-    not a modification of it -- the sim wrapper simply happens to broadcast one
-    scalar. It exists because operational-space *rotational* inertia on this arm
-    is ~0.002 kg m^2 against ~1-16 kg translational, so a shared kp that moves
-    the EE smoothly leaves wrist torques below breakaway friction. 1.0 is exact
-    sim behaviour.
+    kp_ori_scale / kp_pos_scale multiply their block's entries; scalar or (3,).
+    Non-uniform kp is inside osc.py's own action space -- kp is a 6-vector there
+    and variable mode reads all six. See the configs for what each is set from.
+
+    The damping ratio is ALWAYS derived per axis as sqrt(scale), so a scale buys
+    friction rejection and not speed: the loop settles at v = (sqrt(kp)/2*zeta)*
+    delta, so raising kp alone would speed that axis up by sqrt(scale).
+
+    kd_ori_scale overrides the derived orientation ratio; leave it None.
     """
     kp = DEFAULT_KP * KP_EXP_SCALE ** float(np.clip(kp_action, -1.0, 1.0))
     ratio = DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** float(np.clip(kd_action, -1.0, 1.0))
     kp6 = np.full(6, float(kp))
-    # Scalar or (3,): yaw is typically the weakest orientation direction (it is
-    # rotation about the tool axis, the smallest operational-space rotational
-    # inertia), so a single scalar over-drives roll and pitch to fix it.
+    kp6[:3] *= np.asarray(kp_pos_scale, dtype=np.float64)
     kp6[3:] *= np.asarray(kp_ori_scale, dtype=np.float64)
     kp6 = np.clip(kp6, *KP_LIMITS)
-    kd6 = 2.0 * np.sqrt(kp6) * float(np.clip(ratio, *DAMPING_RATIO_LIMITS))
+    # From the CLIPPED kp, so the slew rate holds even where KP_LIMITS bit.
+    ratio6 = float(ratio) * np.sqrt(kp6 / max(float(kp), 1e-12))
+    if kd_ori_scale is not None:
+        ratio6[3:] = float(ratio) * np.asarray(kd_ori_scale, dtype=np.float64)
+    kd6 = 2.0 * np.sqrt(kp6) * np.clip(ratio6, *DAMPING_RATIO_LIMITS)
     return kp6, kd6
 
 
@@ -327,6 +338,7 @@ class JointImpedanceController:
         self.goal_dq = np.zeros(self.num_joints)
         self.kp = DEFAULT_JOINT_KP.copy()
         self.kd = DEFAULT_JOINT_KD.copy()
+        self.kv = DEFAULT_JOINT_VEL_KV
 
     def set_goal(
         self,
@@ -347,6 +359,7 @@ class JointImpedanceController:
         if kp is not None or damping_ratio is not None:
             ratio = DEFAULT_JOINT_DAMPING_RATIO if damping_ratio is None else float(damping_ratio)
             self.kd = DEFAULT_JOINT_KD * np.sqrt(np.max(self.kp) / np.max(DEFAULT_JOINT_KP)) * ratio
+            self.kv = DEFAULT_JOINT_VEL_KV * ratio
 
     def run_controller(
         self,
@@ -359,4 +372,5 @@ class JointImpedanceController:
         # Direct joint impedance, no mass-matrix weighting -- see DEFAULT_JOINT_KP.
         if position_hold:
             return self.kp * (self.goal_q - q) - self.kd * dq + coriolis
-        return self.kd * (self.goal_dq - dq) + coriolis
+        # Velocity mode weights by M -- see DEFAULT_JOINT_VEL_KV.
+        return mass_matrix @ (self.kv * (self.goal_dq - dq)) + coriolis

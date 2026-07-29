@@ -25,17 +25,22 @@ class SingleArmFrankaConfig(RobotConfig):
     r_gripper_port: int = 18822
     active_arms: tuple[str, ...] = ("r",)
     # See BimanualFrankaConfig.friction_kc.
-    friction_kc: float = 0.0
+    friction_kc: float = 0.9
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = 1.0
     ee_rotation_fudge: float = 1.0
-    # Multiplies the OSC orientation gains only, per base axis (rx, ry, rz). Rotational operational-space
-    # inertia here is ~0.002 kg m^2 vs 1-16 kg translational, so the shared
-    # sim kp that translates smoothly leaves wrist torque under breakaway.
-    # 1.0 is exact sim behaviour; raising translation gains instead makes the
-    # arm violent. Measure with scripts/check_osc_axes.py.
-    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
+    # damping ratio is derived as sqrt(scale), so these buy friction rejection
+    # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
+    # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
+    # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
+    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 2.5)
+    # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
+    # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
+    # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
+    # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
+    kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # osc_pose.json sets uncouple_pos_ori=true, which applies Lambda_pos/Lambda_ori
     # to the two halves of the wrench separately. That leaves the arm's own
     # translation<->rotation inertia coupling in the loop AND scales the moment by
@@ -75,7 +80,7 @@ class SingleArmFrankaConfig(RobotConfig):
     )
     world_in_robot_translation_m: tuple[float, float, float] = (0.669, 0.003, 0.120)
     world_in_robot_quat_wxyz: tuple[float, float, float, float] = (-0.376557, 0.0, 0.0, 0.926393)
-    depth_crop_radius_m: float = 0.2
+    depth_crop_radius_m: float = 0.3
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: {
             "cam_3_wrist": ArvCameraConfig(name="gripper_bfs_23595719", ip="192.168.1.138", fps=30, width=224, height=224),
