@@ -55,13 +55,15 @@ import pylibfranka
 try:
     from .franka_jacobian import zero_jacobian
     from .osc_torque_controller import (
-        JOINT_TORQUE_LIMITS, JointImpedanceController, OSCTorqueController, mat_to_quat_xyzw,
+        JOINT_TORQUE_LIMITS, LAMBDA_DLS_MU, JointImpedanceController, OSCTorqueController,
+        mat_to_quat_xyzw,
     )
     from . import pylibfranka_shm as shm
 except ImportError:
     from franka_jacobian import zero_jacobian  # type: ignore[no-redef]
     from osc_torque_controller import (  # type: ignore[no-redef]
-        JOINT_TORQUE_LIMITS, JointImpedanceController, OSCTorqueController, mat_to_quat_xyzw,
+        JOINT_TORQUE_LIMITS, LAMBDA_DLS_MU, JointImpedanceController, OSCTorqueController,
+        mat_to_quat_xyzw,
     )
     import pylibfranka_shm as shm  # type: ignore[no-redef]
 
@@ -97,10 +99,11 @@ _EE_LINEAR_TRIP, _EE_ANGULAR_TRIP = 1.20, 6.00
 _GUARD_HARD_STOP = 1.5
 _BRAKE_KD = np.array([40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0])
 
-# Zero-speed intercepts measured on THIS arm (scripts/measure_joint_friction.py);
-# the torque at the sweep speed carries ~1.0 Nms/rad of viscous that must not be
-# fed back as a speed-independent term. Joints 5-6 are poorly resolved, low side.
-_FRICTION_COULOMB = np.array([1.02, 1.04, 0.67, 1.04, 0.15, 0.25, 0.41])
+# Measured on THIS arm (scripts/measure_joint_friction.py) at 0.10-0.20 rad/s.
+# What this assist must clear is BREAKAWAY, i.e. static friction, which is >= the
+# kinetic curve; extrapolating to the zero-speed intercept instead under-assists
+# (it cost X 80% -> 39% of command). Joints 5-6 remain poorly resolved.
+_FRICTION_COULOMB = np.array([1.19, 1.20, 0.83, 1.19, 0.26, 0.44, 0.41])
 _FRICTION_TAU_EPS = 0.20 * _FRICTION_COULOMB   # stiction band; sharper limit-cycles
 _FRICTION_DQ_EPS = 0.02   # rad/s below which a joint counts as stuck
 
@@ -144,6 +147,8 @@ class ControlLoop:
 
         self.osc = OSCTorqueController(num_joints=NUM_JOINTS)
         self.joint = JointImpedanceController(num_joints=NUM_JOINTS)
+        self.dls_mu = LAMBDA_DLS_MU
+        self.ori_force_coupling = False
         self.control = None
         self.recovery_count = 0
         self.guard_trips = 0
@@ -262,7 +267,10 @@ class ControlLoop:
             tau = self.osc.run_controller(
                 ee_pos=T[:3, 3], ee_ori_mat=T[:3, :3], ee_pos_vel=tw[:3], ee_ori_vel=tw[3:],
                 J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis,
-                joint_damping_kv=float(goal[shm.G_JOINT_DAMPING_KV]))
+                joint_damping_kv=float(goal[shm.G_JOINT_DAMPING_KV]),
+                # Only the coupled path inverts the 6x6 that goes singular.
+                dls_mu=0.0 if self.osc.uncoupling else self.dls_mu,
+                ori_force_coupling=self.ori_force_coupling)
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))

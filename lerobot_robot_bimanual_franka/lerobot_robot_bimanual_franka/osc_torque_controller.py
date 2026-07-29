@@ -62,6 +62,13 @@ DELTA_ROT_MAX = 0.5
 # control_utils.nullspace_torques default.
 DEFAULT_NULLSPACE_KP = 10.0
 
+# Damped-least-squares regularisation on lambda_full, in the units of J M^-1 J^T.
+# Only used when uncouple_pos_ori=False, which inverts the coupled 6x6 and so
+# blows up near a singularity. 0.05 bounds commanded torque at 24 Nm against the
+# 69.6 Nm clamp across the reach, at <=14 deg of direction error at the worst
+# pose and ~0 where the arm is well conditioned.
+LAMBDA_DLS_MU = 0.05
+
 # FR3/Panda datasheet continuous joint torque limits (Nm).
 JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 
@@ -180,13 +187,26 @@ def _lambda_inverse(lambda_inv: np.ndarray) -> np.ndarray:
 
 
 def opspace_matrices(
-    mass_matrix: np.ndarray, J_full: np.ndarray, J_pos: np.ndarray, J_ori: np.ndarray
+    mass_matrix: np.ndarray, J_full: np.ndarray, J_pos: np.ndarray, J_ori: np.ndarray,
+    dls_mu: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """control_utils.opspace_matrices (see _lambda_inverse on the pinv/inv path)."""
+    """control_utils.opspace_matrices (see _lambda_inverse on the pinv/inv path).
+
+    dls_mu damps lambda_full ONLY, which is the one that blows up near a
+    singularity: measured 156 Nm of commanded joint torque against a 69.6 Nm
+    clamp at sigma_min(J)=0.0045, where lambda_pos and lambda_ori stay bounded.
+    lambda_pos/lambda_ori are left exact so uncouple_pos_ori=True remains
+    bit-identical to robosuite. The nullspace projector is built from the damped
+    lambda_full and so leaks O(mu^2); at mu=0.05 that is far below the 0.03 Nm
+    the nullspace term itself produces.
+    """
     mass_matrix_inv = np.linalg.inv(mass_matrix)
     Mi_Jt = mass_matrix_inv @ J_full.T
 
-    lambda_full = _lambda_inverse(J_full @ Mi_Jt)
+    A = J_full @ Mi_Jt
+    if dls_mu:
+        A = A + (dls_mu * dls_mu) * np.eye(A.shape[0])
+    lambda_full = _lambda_inverse(A)
     lambda_pos = _lambda_inverse(J_pos @ mass_matrix_inv @ J_pos.T)
     lambda_ori = _lambda_inverse(J_ori @ mass_matrix_inv @ J_ori.T)
 
@@ -280,6 +300,8 @@ class OSCTorqueController:
         coriolis: np.ndarray,
         use_nullspace: bool = True,
         joint_damping_kv: float = 0.0,
+        dls_mu: float = 0.0,
+        ori_force_coupling: bool = True,
     ) -> np.ndarray:
         """joint_damping_kv adds extra joint-space damping *projected into the
         nullspace*; 0.0 (the default) is exact osc.py. It must be projected: an
@@ -298,7 +320,7 @@ class OSCTorqueController:
 
         J_pos, J_ori = J_full[:3, :], J_full[3:, :]
         lambda_full, lambda_pos, lambda_ori, nullspace_matrix = opspace_matrices(
-            mass_matrix, J_full, J_pos, J_ori
+            mass_matrix, J_full, J_pos, J_ori, dls_mu=dls_mu
         )
 
         if self.uncoupling:
@@ -306,7 +328,16 @@ class OSCTorqueController:
                 [lambda_pos @ desired_force, lambda_ori @ desired_torque]
             )
         else:
-            decoupled_wrench = lambda_full @ np.concatenate([desired_force, desired_torque])
+            # ori_force_coupling=False drops lambda_full's orientation->FORCE block.
+            # It is what makes the coupled form usable on this arm: the block turns
+            # an orientation error the wrist cannot clear into a standing
+            # translational push (26.8 Nm-driven newtons at 0.15 rad), measured as
+            # 215 mm of post-release walk. The blocks that matter are kept.
+            force = lambda_full[:3, :3] @ desired_force
+            if ori_force_coupling:
+                force = force + lambda_full[:3, 3:] @ desired_torque
+            moment = lambda_full[3:, :3] @ desired_force + lambda_full[3:, 3:] @ desired_torque
+            decoupled_wrench = np.concatenate([force, moment])
 
         # +coriolis, not +qfrc_bias: libfranka already compensates gravity.
         torques = J_full.T @ decoupled_wrench + coriolis

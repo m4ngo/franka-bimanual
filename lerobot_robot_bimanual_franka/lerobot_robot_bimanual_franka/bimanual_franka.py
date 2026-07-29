@@ -25,6 +25,7 @@ from .osc_torque_controller import (
     DEFAULT_JOINT_KD,
     DEFAULT_JOINT_KP,
     DEFAULT_KP,
+    JOINT_TORQUE_LIMITS,
     KP_EXP_SCALE,
     DAMPING_EXP_SCALE,
     clip_delta,
@@ -53,6 +54,11 @@ HOME_IMPEDANCE_KD = DEFAULT_JOINT_KD
 HOME_MAX_QDOT = 0.6  # rad/s, ramp rate of the commanded home goal
 HOME_SETTLE_QDOT = 0.05  # rad/s, home() is not done until the arm is this still
 HOME_LEAD_MARGIN = 1.5   # headroom so the stall clamp stays off the ramp
+# Fraction of each joint's torque clamp that homing may spend on kp*lead + kd*qdot
+# together. Both terms scale with the speed, so this caps the speed per joint:
+# the wrist (kd 30 against a 12 Nm clamp) cannot be damped at HOME_MAX_QDOT at
+# all, and a saturated joint stops tracking the ramp and never converges.
+HOME_TAU_FRACTION = 0.7
 
 _GRIP_ACCUM_SPEED = 1.0
 
@@ -511,12 +517,16 @@ class BimanualFranka(Robot):
         # joint sets the lead that keeps every joint under HOME_MAX_QDOT.
         # RAMP the goal; re-deriving it from the measured q each tick sawtooths
         # the error by v/rate, a 25% torque ripple felt as vibration.
-        step = HOME_MAX_QDOT / rate_hz
+        # kp*lead + kd*qdot = qdot*kd*(1 + margin), so the budget fixes the speed.
+        qdot_max = np.minimum(
+            HOME_MAX_QDOT,
+            HOME_TAU_FRACTION * np.asarray(JOINT_TORQUE_LIMITS)
+            / (HOME_IMPEDANCE_KD * (1.0 + HOME_LEAD_MARGIN)))
+        step = qdot_max / rate_hz
         # Stall guard, not the speed limit (the ramp is). Sustaining HOME_MAX_QDOT
         # needs exactly HOME_MAX_QDOT/(kp/kd) of lead, so this must sit above it
         # with margin or it binds every tick and the sawtooth comes back.
-        max_lead = HOME_LEAD_MARGIN * HOME_MAX_QDOT / float(
-            np.max(HOME_IMPEDANCE_KP / HOME_IMPEDANCE_KD))
+        max_lead = HOME_LEAD_MARGIN * qdot_max * HOME_IMPEDANCE_KD / HOME_IMPEDANCE_KP
         ramp = {arm: np.asarray(snap[0], dtype=np.float64).copy()
                 for arm, snap in self.robot_manager.current_kinematic_state_batch(names).items()}
 

@@ -19,7 +19,7 @@ lerobot-teleoperate \
     --robot.r_gripper_ip=192.168.201.10 \
     --robot.r_port=18812 \
     --robot.control_mode=EE_DELTA \
-    --robot.uncouple_pos_ori=true \
+    --robot.uncouple_pos_ori=false \
     --robot.active_arms=[r] \
     --teleop.type=spacemouse \
     --teleop.id=${MODE}_r_teleop \

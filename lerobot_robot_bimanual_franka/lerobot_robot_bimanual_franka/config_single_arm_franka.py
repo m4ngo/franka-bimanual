@@ -35,20 +35,23 @@ class SingleArmFrankaConfig(RobotConfig):
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
     # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
     # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
-    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 2.5)
+    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
     # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
     kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    # osc_pose.json sets uncouple_pos_ori=true, which applies Lambda_pos/Lambda_ori
-    # to the two halves of the wrench separately. That leaves the arm's own
-    # translation<->rotation inertia coupling in the loop AND scales the moment by
-    # the ~0.002 kg m^2 wrist inertia, so orientation commands land under breakaway
-    # friction. False applies Lambda_full to the whole wrench: response is exactly
-    # the commanded acceleration, cross-coupling is zero, and every axis gets more
-    # torque at the same gains. True is sim parity; False is what this arm needs.
-    uncouple_pos_ori: bool = True
+    # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
+    # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
+    # translation force as if rotation were free, then fights the rotation that
+    # push causes. On this arm that leaves joint 4 at 0.25x breakaway on +X.
+    # False applies Lambda_full to the whole wrench -- the exact operational-space
+    # form -- which is what lets X move: 43-71% -> ~100% of command, and
+    # pose-independent. Requires two guards, both on by default in the control
+    # loop: LAMBDA_DLS_MU (the coupled 6x6 goes singular) and the dropped
+    # orientation->force block (that term turns an orientation error the wrist
+    # cannot clear into a standing translational push -- 215 mm of walk measured).
+    uncouple_pos_ori: bool = False
     use_noise: bool = False
     noise_pos_scale: float = 0.01   # metres, added to position output each step
     noise_rot_scale: float = 0.075    # radians (axis-angle), added to rotation output each step

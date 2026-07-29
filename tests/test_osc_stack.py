@@ -108,6 +108,20 @@ from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
 
 RNG = np.random.default_rng(20260727)
 
+# Measured on the right arm via libfranka Model.mass at the q below, so tests that
+# care about conditioning use a real mass matrix rather than a synthetic SPD one.
+REAL_Q = np.array([-0.064549, -0.010316, -0.206631, -2.232503, 0.296601, 2.048460, -0.124818])
+REAL_M = np.array([
+    [1.426654, 0.097576, 1.399142, -0.015600, -0.039852, -0.046474, 0.002390],
+    [0.097576, 2.030185, 0.092572, -0.983097, -0.009118, -0.118825, -0.001640],
+    [1.399142, 0.092572, 1.404409, -0.013515, -0.040171, -0.046279, 0.002405],
+    [-0.015600, -0.983097, -0.013515, 1.121601, 0.010825, 0.141208, 0.000126],
+    [-0.039852, -0.009118, -0.040171, 0.010825, 0.024808, 0.002881, 0.000871],
+    [-0.046474, -0.118825, -0.046279, 0.141208, 0.002881, 0.041403, 0.000133],
+    [0.002390, -0.001640, 0.002405, 0.000126, 0.000871, 0.000133, 0.001934],
+])
+
+
 
 # --------------------------------------------------------------------------
 # Robot-state fixtures: self-consistent q / M / J / pose
@@ -263,7 +277,12 @@ def make_session(case, uncouple=True, friction_kc=0.0, joint_damping_kv=0.0):
     s._last_tau = np.zeros(7)
     s._guard_ts = 0.0
     s.guard_trips = 0
+    s.clamp_trips = 0
     s.recovery_count = 0
+    # Parity is against robosuite's exact lambda_full; the DLS guard is a
+    # deliberate deviation and has its own test.
+    s.dls_mu = 0.0
+    s.ori_force_coupling = True   # robosuite's exact lambda_full
     # Tuning reaches the loop through the goal block, so stash it for _goal_block.
     s._test_tuning = dict(uncouple=uncouple, friction_kc=friction_kc,
                           joint_damping_kv=joint_damping_kv)
@@ -773,16 +792,22 @@ def test_impedance_mode_is_variable_not_fixed():
 
 
 def test_defaults_are_exact_parity():
-    """Every knob that alters the CONTROL LAW must be a no-op by default.
+    """Pin the deliberate deviations from osc.py, and their preconditions.
 
-    friction_kc is not one: it cancels a plant term the sim lacks. It still
-    defaults to 0 server-side, so an unconfigured client gets the raw law.
+    friction_kc cancels a plant term the sim lacks. uncouple_pos_ori=False uses
+    the exact operational-space form instead of osc.py's decoupled approximation,
+    which the sim's frictionless plant can afford and this arm cannot. It is only
+    safe with the DLS guard, so that pairing is asserted rather than assumed.
     """
     cfg = SingleArmFrankaConfig(r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
                                 control_mode=ControlMode.EE_DELTA, cameras={}, depth=False,
                                 depth_cam={})
-    assert cfg.uncouple_pos_ori is True
     assert cfg.ee_translation_fudge == 1.0 and cfg.ee_rotation_fudge == 1.0
+    # The coupled path inverts a 6x6 that goes singular; without damping it
+    # commanded 709 Nm against a 69.6 Nm clamp in test_dls_bounds_lambda_full.
+    from lerobot_robot_bimanual_franka.osc_torque_controller import LAMBDA_DLS_MU
+    if not cfg.uncouple_pos_ori:
+        assert LAMBDA_DLS_MU > 0.0, "uncouple_pos_ori=False needs the DLS guard"
     assert 0.0 <= cfg.friction_kc <= 1.0
     # Tuning is allowed, but only inside osc.py's action space.
     kp_tuned, kd_tuned = resolve_gains(0.0, 0.0, cfg.kp_ori_scale,
@@ -934,6 +959,36 @@ def test_friction_assist_is_osc_only():
         plain = session._compute_tau(state, g.copy())[0]
         g[_shm.G_FRICTION_KC] = 0.9
         assert np.allclose(tau, plain), f"friction assist leaked into mode {mode}"
+
+
+def test_dls_bounds_lambda_full_near_a_singularity():
+    """uncouple_pos_ori=False inverts the coupled 6x6, which blows up as J loses
+    rank; the guard must bound it there and be near-exact where it does not."""
+    from lerobot_robot_bimanual_franka.osc_torque_controller import (
+        LAMBDA_DLS_MU, opspace_matrices)
+    M = REAL_M
+    cmd = np.concatenate([np.full(3, 7.5), np.zeros(3)])
+
+    exact, damped, worst_rel = [], [], 0.0
+    for q4 in (-2.4, -1.6, -1.2, -0.8, -0.5, -0.3):
+        q = REAL_Q.copy(); q[3] = q4
+        Jx = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
+        lf_e = opspace_matrices(M, Jx, Jx[:3], Jx[3:])[0]
+        lf_d = opspace_matrices(M, Jx, Jx[:3], Jx[3:], dls_mu=LAMBDA_DLS_MU)[0]
+        exact.append(np.max(np.abs(Jx.T @ (lf_e @ cmd))))
+        damped.append(np.max(np.abs(Jx.T @ (lf_d @ cmd))))
+        cond = np.linalg.cond(Jx @ np.linalg.inv(M) @ Jx.T)
+        if cond < 1e3:            # well conditioned: the guard must barely bite
+            worst_rel = max(worst_rel, _rel(lf_d @ cmd, lf_e @ cmd))
+
+    # Absolute Nm depends on the mass matrix, which make_case synthesises; what
+    # must hold for any M is that the worst pose is bounded well below the exact
+    # blow-up while the well-conditioned poses are barely touched.
+    assert max(damped) < 0.5 * max(exact), (
+        f"DLS only cut the worst torque {max(exact):.0f} -> {max(damped):.0f} Nm")
+    assert worst_rel < 0.15, f"DLS distorts a well-conditioned pose by {worst_rel:.2%}"
+    return (f"peak tau {max(exact):.0f} -> {max(damped):.0f} Nm, "
+            f"well-conditioned distortion {worst_rel:.1%}")
 
 
 def test_speed_guard_is_not_reachable_from_the_client():

@@ -44,11 +44,10 @@ from lerobot_robot_bimanual_franka.osc_torque_controller import DELTA_POS_MAX, D
 
 ARM = "r"
 
-# uncouple_pos_ori is pinned true throughout (sim's setting, and what this sweep
-# exists to match). It is also what keeps commanded torque ~13x lower: with it
-# false, ori_scale=12 once demanded ~110 Nm against a 69.6 Nm clamp, and a
-# saturated clamp is maximum-force motion. Do not make it selectable again
-# without restoring a refusal on the high-ori_scale combination.
+# uncouple_pos_ori follows the robot config so the sweep measures the controller
+# we actually fly, not sim's setting. False raises commanded torque a lot; that is
+# bounded by LAMBDA_DLS_MU now, but a high ori_scale on top can still saturate the
+# clamp, which is maximum-force motion -- watch clamp_trips in the server log.
 RIG = dict(r_server_ip="192.168.3.10", r_robot_ip="192.168.201.10",
            r_gripper_ip="192.168.201.10", r_port=18812)
 
@@ -203,7 +202,8 @@ def run_repeats(robot, ref, kc, tf, rf, oscale, fps, repeats) -> dict | None:
     return med
 
 
-def run_trial(robot, ref, kc, tf, rf, oscale, fps, uncouple=True) -> dict | None:
+def run_trial(robot, ref, kc, tf, rf, oscale, fps,
+              uncouple=SingleArmFrankaConfig.uncouple_pos_ori) -> dict | None:
     if not home_reliably(robot, ref["init_qpos"]):
         print("      HOMING FAILED - skipping trial")
         return None
@@ -248,10 +248,7 @@ def main() -> None:
                          "1 is not enough -- repeat spread was 0.40 while the whole "
                          "signal between os=1 configs was 0.04.")
     ap.add_argument("--out", default="~/sysid/outputs/sweep_sim_match.json")
-    # uncouple_pos_ori is pinned true: sim used true, and matching sim is the
-    # entire point of this sweep. It is also the setting that keeps commanded
-    # torque ~13x lower, so pinning it removes the combination that produced
-    # dangerous motion.
+    # uncouple_pos_ori follows the robot config; see the module note.
     ap.add_argument("--yes", action="store_true")
     args = ap.parse_args()
 
