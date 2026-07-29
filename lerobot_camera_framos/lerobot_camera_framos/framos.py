@@ -16,7 +16,6 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 from numpy.typing import NDArray
-import open3d as o3d
 
 from lerobot.cameras.camera import Camera
 
@@ -247,12 +246,17 @@ class FramosCamera(Camera):
     def _filter_lone_points(self, points: np.ndarray) -> np.ndarray:
         """Remove isolated points ("blob detection" for point clouds).
 
-        A point survives only if it has at least `_blob_filter_min_neighbors`
-        other points within `_blob_filter_radius_m` metres of it (a radius
-        outlier removal, i.e. a spatial sliding-window density filter). Points
-        that don't clear that bar are treated as sensor noise / stray returns
-        and dropped before subsampling, so `num_points` is spent on points
-        that belong to real surface blobs rather than isolated noise.
+        A point survives only if at least `_blob_filter_min_neighbors` other
+        points fall in the 3x3x3 block of `_blob_filter_radius_m` voxels
+        centred on its own voxel (a spatial density filter). Points that don't
+        clear that bar are treated as sensor noise / stray returns and dropped
+        before subsampling, so `num_points` is spent on points that belong to
+        real surface blobs rather than isolated noise.
+
+        Bucket counting is O(N) and stays in numpy, unlike the KD-tree radius
+        query it replaces; the 3-voxel block circumscribes the ball of radius
+        `_blob_filter_radius_m`, so the count is an upper bound on the true
+        in-radius neighbour count and dense surfaces survive at any range.
 
         No-ops (returns `points` unchanged) if filtering is disabled or if
         there are too few points for a meaningful neighborhood test.
@@ -260,21 +264,28 @@ class FramosCamera(Camera):
         if not self._blob_filter_enabled or points.shape[0] < self._blob_filter_min_neighbors + 1:
             return points
 
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(points.astype(np.float64, copy=False))
-        try:
-            _, keep_idx = pcd.remove_radius_outlier(
-                nb_points=self._blob_filter_min_neighbors,
-                radius=self._blob_filter_radius_m,
-            )
-        except Exception:
-            logger.debug("Blob/outlier filter failed; falling back to unfiltered points", exc_info=True)
+        side = float(self._blob_filter_radius_m)
+        if side <= 0.0:
             return points
 
-        keep_idx = np.asarray(keep_idx, dtype=np.int64)
-        if keep_idx.size == 0:
-            return points[:0]
-        return points[keep_idx]
+        # Voxel index per point, shifted by 1 so the +/-1 shifts below stay in range.
+        q = np.floor(points / side).astype(np.int64)
+        q -= q.min(axis=0) - 1
+        span = q.max(axis=0) + 2
+        key = (q[:, 0] * span[1] + q[:, 1]) * span[2] + q[:, 2]
+
+        uniq, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+        totals = np.zeros(uniq.size, dtype=np.int64)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    shifted = uniq + (dx * span[1] + dy) * span[2] + dz
+                    pos = np.searchsorted(uniq, shifted)
+                    np.clip(pos, 0, uniq.size - 1, out=pos)
+                    totals += np.where(uniq[pos] == shifted, cnt[pos], 0)
+
+        # totals counts the point itself, so require min_neighbors + 1.
+        return points[totals[inv] > self._blob_filter_min_neighbors]
 
     def get_cropped_point_cloud(
         self,
