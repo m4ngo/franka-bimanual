@@ -25,11 +25,11 @@ class SingleArmFrankaConfig(RobotConfig):
     r_gripper_port: int = 18822
     active_arms: tuple[str, ...] = ("r",)
     # See BimanualFrankaConfig.friction_kc.
-    friction_kc: float = 0.9
+    friction_kc: float = 1.0
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = 1.0
-    ee_rotation_fudge: float = 1.0
+    ee_rotation_fudge: float = 0.35
     # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
     # damping ratio is derived as sqrt(scale), so these buy friction rejection
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
