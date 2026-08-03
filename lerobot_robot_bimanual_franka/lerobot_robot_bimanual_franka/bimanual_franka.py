@@ -140,6 +140,8 @@ class BimanualFranka(Robot):
         self._osc_goal_ori: dict[str, Rotation] = {}
         self._kp_ori_scale = np.asarray(getattr(config, "kp_ori_scale", 1.0), dtype=np.float64)
         self._kp_pos_scale = np.asarray(getattr(config, "kp_pos_scale", 1.0), dtype=np.float64)
+        self._kd_ori_scale = np.asarray(getattr(config, "kd_ori_scale", 1.0), dtype=np.float64)
+        self._kd_pos_scale = np.asarray(getattr(config, "kd_pos_scale", 1.0), dtype=np.float64)
         # Sim-to-real delta scaling, settable live so a sweep can search them.
         # Applied to the axis-angle rotation delta, NOT the quaternion: scaling
         # all four quaternion components uniformly is undone by normalisation.
@@ -442,8 +444,10 @@ class BimanualFranka(Robot):
             )
             return action
 
-        kp, kd = resolve_gains(action["kp"], action["kd"], self._kp_ori_scale,
-                               kp_pos_scale=self._kp_pos_scale)
+        kp, kd = resolve_gains(action["kp"], action["kd"],
+                               self._kp_ori_scale, self._kd_ori_scale,
+                               kp_pos_scale=self._kp_pos_scale,
+                               kd_pos_scale=self._kd_pos_scale)
 
         if self.control_mode == ControlMode.EE_DELTA:
             goals = {

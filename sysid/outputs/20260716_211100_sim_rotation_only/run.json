@@ -49,8 +49,8 @@
   },
   "constants": {
     "bimanual_franka": {
-      "_EE_TRANSLATION_FUDGE_FACTOR": 1.2,
-      "_EE_ROTATION_FUDGE_FACTOR": 0.9,
+      "_EE_TRANSLATION_FUDGE_FACTOR": 1.0,
+      "_EE_ROTATION_FUDGE_FACTOR": 1.0,
       "OSC_BASE_KP": 5.0,
       "_KP_GAIN_BASE": 10.0,
       "_KD_GAIN_BASE": 1.0,

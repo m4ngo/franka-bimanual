@@ -104,7 +104,10 @@ _BRAKE_KD = np.array([40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0])
 # kinetic curve; extrapolating to the zero-speed intercept instead under-assists
 # (it cost X 80% -> 39% of command). Joints 5-6 remain poorly resolved.
 _FRICTION_COULOMB = np.array([1.19, 1.20, 0.83, 1.19, 0.26, 0.44, 0.41])
-_FRICTION_TAU_EPS = 0.20 * _FRICTION_COULOMB   # stiction band; sharper limit-cycles
+# Band width sets the assist's incremental gain, 1 + kc/frac -- 6x here, and tau
+# carries the measured dq, so the assist re-injects encoder noise at that gain.
+# Widen the band to reduce it; do NOT filter the assist. See _friction_feedforward.
+_FRICTION_TAU_EPS = 0.20 * _FRICTION_COULOMB
 _FRICTION_DQ_EPS = 0.02   # rad/s below which a joint counts as stuck
 
 _STALE_GOAL_TIMEOUT_S = 0.5
@@ -120,6 +123,14 @@ def _friction_feedforward(kc, tau, coriolis):
     Never sign this by dq. EE_DELTA re-anchors its goal on the measured pose, so
     residual friction is the only thing holding the arm at zero command -- cancel
     it and a nudge makes the arm walk.
+
+    Keep it MEMORYLESS. The tanh band gives this a large incremental gain
+    (1 + kc/band, 6x at the defaults) and tau carries the measured dq, so it does
+    amplify encoder noise -- but low-passing the assist to fix that is a trap:
+    a first-order lag inside a gain-(1+g) path is a lag network, pole before
+    zero, and a 25 Hz corner cost 39 deg of phase at 52 Hz. Tried on hardware,
+    it made the shake worse. The only safe lever is the gain itself
+    (_FRICTION_TAU_EPS), or kc, which set_tuning can sweep live.
     """
     return kc * _FRICTION_COULOMB * np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
 

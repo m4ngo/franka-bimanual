@@ -14,7 +14,7 @@ rather than queued behind the worker.
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import logging
 import time
 import threading
@@ -79,7 +79,10 @@ def close_gripper(controller):
         self._is_open = True
         self._position_ts: float | None = None
         self._last_send: float = time.time()
-        self._inflight: Future | None = None
+        # Worker handoff: at most one command in flight, at most one queued.
+        self._lock = threading.Lock()
+        self._pending: tuple | None = None
+        self._running = False
 
     @staticmethod
     def _clamp_mm(position_mm: float) -> float:
@@ -101,17 +104,11 @@ def close_gripper(controller):
     def move(self, position_mm: float, speed: float = _MOVE_SPEED_M_S, blocking: bool = False) -> bool:
         if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = False
-            self._position_mm = self.GRIPPER_TRUE_MAX_MM
-            self._position_ts = time.monotonic()
-            # store time
-            self.grasp(0.0, speed, self._DEFAULT_FORCE)
+            self.grasp(0.0, speed, self._DEFAULT_FORCE, from_mm=self.GRIPPER_TRUE_MAX_MM)
             self._last_send = time.time()
         elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = True
-            self._position_mm = 0
-            self._position_ts = time.monotonic()
-            # store time
-            self.open(speed)
+            self.open(speed, from_mm=0.0)
             self._last_send = time.time()
         return True
 
@@ -129,19 +126,43 @@ def close_gripper(controller):
     def grip(self, force_n: float, speed: float, blocking: bool = True):
         return self.grasp(10.0, speed, force_n)
 
-    def grasp(self, width: float, speed: float, force_n: float):
-        self._submit(self._rpc_grasp, self._controller, width, speed, force_n)
+    def grasp(self, width: float, speed: float, force_n: float, from_mm: float | None = None):
+        self._submit(self._rpc_grasp, (self._controller, width, speed, force_n), from_mm)
 
-    def open(self, speed: float):
-        self._submit(self._rpc_open, self._controller, speed)
+    def open(self, speed: float, from_mm: float | None = None):
+        self._submit(self._rpc_open, (self._controller, speed), from_mm)
 
-    def _submit(self, rpc, *args) -> None:
-        """Fire-and-forget on the worker thread, dropping the command if the
-        previous one is still running. pylibfranka's grasp/move block for the
-        whole motion, so queueing would let stale commands replay seconds late."""
-        if self._inflight is not None and not self._inflight.done():
-            return
-        self._inflight = self._executor.submit(self._call, rpc, *args)
+    def _submit(self, rpc, args: tuple, from_mm: float | None = None) -> None:
+        """Coalesce onto the worker, latest command wins.
+
+        pylibfranka's grasp/move block for the whole motion, so queueing every
+        command would replay stale ones seconds late. But DROPPING one desyncs
+        `_is_open`, which move() has already committed: the open issued while a
+        grasp was still running vanished, `_is_open` said open, and the elif
+        never fired again -- the gripper stayed shut until reconnect.
+        """
+        with self._lock:
+            self._pending = (rpc, args, from_mm)
+            if self._running:
+                return
+            self._running = True
+        self._executor.submit(self._drain)
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                job, self._pending = self._pending, None
+                if job is None:
+                    self._running = False
+                    return
+            rpc, args, from_mm = job
+            if from_mm is not None:
+                # Stamp when the motion starts, not when it was queued: position
+                # is dead-reckoned from here and a queued command can sit behind
+                # a blocking grasp for most of a second.
+                self._position_mm = from_mm
+                self._position_ts = time.monotonic()
+            self._call(rpc, *args)
 
     @staticmethod
     def _call(rpc, *args) -> None:

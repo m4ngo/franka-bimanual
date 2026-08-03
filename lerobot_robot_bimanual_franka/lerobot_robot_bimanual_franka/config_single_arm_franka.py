@@ -29,7 +29,7 @@ class SingleArmFrankaConfig(RobotConfig):
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = 1.0
-    ee_rotation_fudge: float = 0.35
+    ee_rotation_fudge: float = 1.0
     # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
     # damping ratio is derived as sqrt(scale), so these buy friction rejection
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
@@ -41,6 +41,12 @@ class SingleArmFrankaConfig(RobotConfig):
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
     kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    # Damping-only trim, per block. kp_*_scale holds kp/kd fixed by construction,
+    # so it cannot calm an axis that oscillates -- it stiffens it. These multiply
+    # the damping ratio instead, which is the only knob that lowers kp/kd, i.e.
+    # slows and damps the axis. Raise these when an axis vibrates; 1.0 is sim.
+    kd_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    kd_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
     # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
     # translation force as if rotation were free, then fights the rotation that
@@ -53,8 +59,8 @@ class SingleArmFrankaConfig(RobotConfig):
     # cannot clear into a standing translational push -- 215 mm of walk measured).
     uncouple_pos_ori: bool = False
     use_noise: bool = False
-    noise_pos_scale: float = 0.01   # metres, added to position output each step
-    noise_rot_scale: float = 0.075    # radians (axis-angle), added to rotation output each step
+    noise_pos_scale: float = 0.0025   # metres, added to position output each step
+    noise_rot_scale: float = 0.02    # radians (axis-angle), added to rotation output each step
     depth: bool = True
     depth_cam: dict[str, CameraConfig] = field(
         default_factory=lambda: {

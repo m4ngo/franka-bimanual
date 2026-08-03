@@ -23,8 +23,32 @@ _fk_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fk_mod)
 franka_fk_chain = _fk_mod.franka_fk_chain
 
-# Offset subtracted from world-frame eef_pos to recover robot base frame.
+# Fallback offset subtracted from world-frame eef_pos to recover robot base
+# frame, used only when the reference carries no qpos. Prefer
+# resolve_world_frame_offset(), which measures it per dataset.
 WORLD_FRAME_OFFSET = np.array([-0.66, 0.0, 0.912])
+
+
+def resolve_world_frame_offset(ref: dict[str, np.ndarray]) -> np.ndarray:
+    """Sim-world -> robot-base translation, measured from the reference itself.
+
+    The sim's base sits at a different world position per suite/task/mount:
+    -0.659 on the libero_goal set this constant was read off, but -0.560 on the
+    probe sets and -0.600 on sim_rotation_only. Hardcoding it displaces every
+    reference position by the difference -- 100 mm on the current probe data --
+    which shows up as the reference EE path floating away from the reference
+    skeleton, and lands in compute_trajectory_errors as well as the plot.
+
+    eef_pos and qpos are recorded from the same sim step, so their difference is
+    the base offset plus a fixed TCP discrepancy; the median over the trajectory
+    is robust and exact for any mount.
+    """
+    qpos, eef = ref.get("qpos"), ref.get("eef_pos")
+    if qpos is None or eef is None or len(qpos) == 0 or len(eef) == 0:
+        return WORLD_FRAME_OFFSET
+    n = min(len(qpos), len(eef))
+    fk = np.array([franka_fk_chain(q)[7][:3, 3] for q in np.asarray(qpos)[:n]])
+    return np.median(np.asarray(eef)[:n] - fk, axis=0)
 
 # --- EE orientation triad settings (mirrors residual wrapper's viz) ---------
 _FORECAST_AXIS_LENGTH = 0.038
@@ -182,7 +206,7 @@ def compute_trajectory_errors(
                              `saturation_level` of the safety clamp (those steps identify the
                              safety screen, not the controller)
     """
-    ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET  # robot frame
+    ref_pos = ref["eef_pos"] - resolve_world_frame_offset(ref)  # robot frame
     rep_pos = recorded["eef_pos"]
     T_min = min(len(ref_pos), len(rep_pos))
 
@@ -356,7 +380,7 @@ def save_aggregate_html(
                "#a6d854", "#ffd92f", "#e5c494", "#b3b3b3", "#1b9e77", "#d95f02"]
 
     for idx, (name, ref, recorded) in enumerate(items):
-        ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET
+        ref_pos = ref["eef_pos"] - resolve_world_frame_offset(ref)
         rep_pos = recorded["eef_pos"]
         fig.add_trace(go.Scatter3d(
             x=ref_pos[:, 0], y=ref_pos[:, 1], z=ref_pos[:, 2],
@@ -436,7 +460,8 @@ def save_comparison_html(
                      row 3  per-axis position error (x/y/z) + L2 norm
                      row 4  per-joint qpos (ref dashed, replayed solid; 7 joints each)
     """
-    ref_pos = ref["eef_pos"] - WORLD_FRAME_OFFSET      # (T_ref, 3) — robot frame
+    world_offset = resolve_world_frame_offset(ref)
+    ref_pos = ref["eef_pos"] - world_offset             # (T_ref, 3) — robot frame
     rep_pos = recorded["eef_pos"]                       # (T_rep, 3)
     T_rep = len(rep_pos)
     T_ref = len(ref_pos)
@@ -455,7 +480,7 @@ def save_comparison_html(
     rep_quat  = recorded.get("eef_quat")
     goal_quat = ref.get("eef_goal_quat")
     goal_pos  = ref.get("eef_goal_pos")
-    goal_pos  = goal_pos - WORLD_FRAME_OFFSET if goal_pos is not None else None
+    goal_pos  = goal_pos - world_offset if goal_pos is not None else None
 
     have_rot = ref_quat is not None and rep_quat is not None
     rot_ref = rot_rep = rot_goal = None

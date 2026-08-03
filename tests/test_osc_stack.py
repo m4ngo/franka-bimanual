@@ -103,7 +103,8 @@ from lerobot_robot_bimanual_franka import pylibfranka_control as srv  # noqa: E4
 from lerobot_robot_bimanual_franka import pylibfranka_shm as _shm  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_jacobian import fk_chain, zero_jacobian  # noqa: E402
 from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
-    DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, OSCTorqueController, resolve_gains,
+    DAMPING_RATIO_LIMITS, DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, OSCTorqueController,
+    resolve_gains,
 )
 
 RNG = np.random.default_rng(20260727)
@@ -237,11 +238,38 @@ class _PassThroughSafety:
         return goals
 
 
+# Every config field that reaches the control path, at its sim value. Parity is
+# DEFINED at these, so anything tuned on the rig must be pinned here or the suite
+# silently starts asserting "the rig matches the rig" -- which is how
+# ee_rotation_fudge=0.35 turned 8 of these tests red with the stack untouched.
+# test_every_hardware_knob_is_pinned checks this list is still complete.
+_SIM_PARITY_KNOBS = {
+    "kp_ori_scale": (1.0, 1.0, 1.0),
+    "kp_pos_scale": (1.0, 1.0, 1.0),
+    "kd_ori_scale": (1.0, 1.0, 1.0),
+    "kd_pos_scale": (1.0, 1.0, 1.0),
+    "ee_translation_fudge": 1.0,
+    "ee_rotation_fudge": 1.0,
+    "use_noise": False,
+}
+
+# Reach the control loop through make_session, not the robot config.
+_SESSION_KNOBS = {"friction_kc", "uncouple_pos_ori"}
+
+# Transport, framing and perception: cannot reach the torque path. noise_*_scale
+# is control-path but gated by use_noise, which is pinned above.
+_INERT_FIELDS = {
+    "active_arms", "calibration_dir", "cameras", "control_mode", "depth",
+    "depth_cam", "depth_crop_radius_m", "id", "noise_pos_scale", "noise_rot_scale",
+    "r_gripper_ip", "r_gripper_port", "r_port", "r_robot_ip", "r_server_ip",
+    "world_in_robot_quat_wxyz", "world_in_robot_translation_m",
+}
+
+
 def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     bfmod.BimanualFranka._make_gripper = lambda self, arm: _FakeGripper()
-    # Pin sim gains: inheriting the tuned config would rewrite what parity means.
-    cfg_kw.setdefault("kp_ori_scale", (1.0, 1.0, 1.0))
-    cfg_kw.setdefault("kp_pos_scale", (1.0, 1.0, 1.0))
+    for knob, value in _SIM_PARITY_KNOBS.items():
+        cfg_kw.setdefault(knob, value)
     cfg = SingleArmFrankaConfig(
         r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
         control_mode=mode, cameras={}, depth=False, depth_cam={}, **cfg_kw,
@@ -397,6 +425,111 @@ def test_gains_match_the_sim_wrapper():
         ref_ratio = np.clip(1.0 * 10.0 ** a_kd, 0, 10)
         assert np.allclose(kp, ref_kp), (a_kp, kp, ref_kp)
         assert np.allclose(kd, 2 * np.sqrt(ref_kp) * ref_ratio), (a_kd, kd)
+
+
+def test_gain_constants_match_the_sim_controller_config():
+    """The remap's constants come from the sim's own controller block.
+
+    resolve_gains hardcodes kp=150, kp_limits=[0,1500], damping=1,
+    damping_limits=[0,10] and derives exp_scale = limit_max / default the way
+    libero.py's wrapper does. Those numbers live in cfg/fast_default.yaml, not
+    osc_pose.json (whose "fixed" / kp_limits [0,300] are overridden), so read
+    them back rather than trusting the comment.
+    """
+    import re
+    cfg = _REPO / "multi-fast" / "cfg" / "fast_default.yaml"
+    if not cfg.exists():
+        return "skipped: multi-fast not checked out"
+    block = re.search(r"^controller:\n((?:[ \t]+.*\n|\n)+)", cfg.read_text(), re.M)
+    assert block, "no controller: block in fast_default.yaml"
+    text = block.group(1)
+
+    def num(key):
+        m = re.search(rf"^\s+{key}:\s*(\[.*?\]|[-\d.eE+]+)", text, re.M)
+        assert m, f"{key} missing from the controller block"
+        return eval(m.group(1))  # noqa: S307 -- a float or a 2-list of floats
+
+    kp, kp_lim = num("kp"), num("kp_limits")
+    damping, damping_lim = num("damping"), num("damping_limits")
+
+    from lerobot_robot_bimanual_franka.osc_torque_controller import (
+        DAMPING_EXP_SCALE, DAMPING_RATIO_LIMITS, DEFAULT_DAMPING_RATIO, DEFAULT_KP, KP_EXP_SCALE,
+    )
+    assert DEFAULT_KP == kp, f"kp {DEFAULT_KP} vs sim {kp}"
+    assert tuple(KP_LIMITS) == tuple(kp_lim), f"kp_limits {KP_LIMITS} vs sim {kp_lim}"
+    assert DEFAULT_DAMPING_RATIO == damping, f"damping {DEFAULT_DAMPING_RATIO} vs sim {damping}"
+    assert tuple(DAMPING_RATIO_LIMITS) == tuple(damping_lim)
+    # libero.py: exp_scale = limits[1] / default, applied as scale ** action.
+    assert np.isclose(KP_EXP_SCALE, kp_lim[1] / kp)
+    assert np.isclose(DAMPING_EXP_SCALE, damping_lim[1] / damping)
+    return f"kp={kp} {kp_lim}, damping={damping} {damping_lim}, exp_scale={KP_EXP_SCALE:g}"
+
+
+def test_gain_channels_sweep_against_robosuite():
+    """kp and kd actions, swept in isolation against robosuite's real set_goal.
+
+    The other tests randomise the gains alongside the delta; this pins the gain
+    channel on its own -- both ends of the action range, both channels, at a
+    fixed pose error -- so a remap error cannot hide behind a small delta.
+    """
+    rng = np.random.default_rng(77)
+    case = make_case(rng)
+    dpos, drot = np.array([0.6, -0.4, 0.3]), np.array([0.2, 0.5, -0.3])
+    worst = 0.0
+    for a_kp in (-1.0, -0.5, -0.2, 0.0, 0.2, 0.5, 1.0):
+        for a_kd in (-1.0, -0.4, 0.0, 0.4, 1.0):
+            ours = our_torque(make_robot(case), make_session(case),
+                              ee_delta_action(dpos, drot, a_kp, a_kd), case)
+            ref = ref_torque(case, dpos, drot, a_kp, a_kd)
+            err = _rel(ours, ref)
+            assert err < 1e-5, f"a_kp={a_kp} a_kd={a_kd}: rel err {err:.2e}"
+            worst = max(worst, err)
+
+    # The endpoints land exactly on the sim's clip limits, so a policy that
+    # saturates its gain channel gets the same stiffness the sim would give.
+    kp_hi, kd_hi = resolve_gains(1.0, 1.0)
+    kp_lo, _ = resolve_gains(-1.0, 0.0)
+    assert np.allclose(kp_hi, KP_LIMITS[1]), f"a_kp=+1 gave {kp_hi[0]}, not {KP_LIMITS[1]}"
+    assert np.allclose(kp_lo, 150.0 / 10.0)
+    assert np.allclose(kd_hi, 2 * np.sqrt(KP_LIMITS[1]) * 10.0)
+    return f"35 (a_kp, a_kd) pairs, worst rel err {worst:.2e}"
+
+
+def test_kd_scales_damp_without_stiffening():
+    """kd_*_scale is the knob for an axis that oscillates; kp_*_scale is not.
+
+    The settling speed is v = (kp/kd)*delta. kp_*_scale re-derives the ratio as
+    sqrt(kp6/kp), so kp/kd is invariant and raising it only stiffens an already
+    lively axis. kd_*_scale multiplies the damping ratio, which is the only path
+    that lowers kp/kd.
+    """
+    kp0, kd0 = resolve_gains(0.0, 0.0)
+
+    # A kd scale: damping up by exactly the factor, stiffness untouched.
+    for s in (1.5, 2.0, 4.0):
+        kp, kd = resolve_gains(0.0, 0.0, kd_pos_scale=s)
+        assert np.allclose(kp, kp0), "kd_pos_scale moved the stiffness"
+        assert np.allclose(kd[:3], kd0[:3] * s), f"kd_pos_scale={s} did not scale kd"
+        assert np.allclose(kd[3:], kd0[3:]), "kd_pos_scale leaked into orientation"
+        assert np.allclose((kp[:3] / kd[:3]) * s, kp0[:3] / kd0[:3]), "slew rate wrong"
+
+    kp, kd = resolve_gains(0.0, 0.0, kd_ori_scale=3.0)
+    assert np.allclose(kd[3:], kd0[3:] * 3.0) and np.allclose(kd[:3], kd0[:3])
+    assert np.allclose(kp, kp0), "kd_ori_scale moved the stiffness"
+
+    # By contrast a kp scale cannot calm anything: kp/kd is unchanged.
+    kp, kd = resolve_gains(0.0, 0.0, kp_pos_scale=4.0)
+    assert np.allclose(kp[:3] / kd[:3], kp0[:3] / kd0[:3]), (
+        "kp_pos_scale changed the slew rate; it is a stiffness knob only")
+    assert np.all(kp[:3] > kp0[:3])
+
+    # Per-axis, and still inside osc.py's damping_ratio_limits at the extreme.
+    kp, kd = resolve_gains(0.0, 0.0, kd_pos_scale=(1.0, 2.0, 3.0))
+    assert np.allclose(kd[:3] / kd0[:3], [1.0, 2.0, 3.0])
+    _, kd_max = resolve_gains(0.0, 1.0, kd_pos_scale=100.0)   # ratio already at the cap
+    assert np.allclose(kd_max[:3], 2 * np.sqrt(150.0) * DAMPING_RATIO_LIMITS[1]), (
+        "a kd scale escaped the sim's damping_ratio_limits")
+    return "damping-only, per axis, clipped at the sim's damping_ratio_limits"
 
 
 def test_delta_scaling_matches_scale_action():
@@ -791,6 +924,27 @@ def test_impedance_mode_is_variable_not_fixed():
     assert np.isclose(kp_hi[0] / kp_lo[0], 10.0), "exponential remap is not 10**a"
 
 
+def test_every_hardware_knob_is_pinned():
+    """Every config field is classified, and the pinned ones actually land.
+
+    Without this, adding a tuning knob quietly redefines parity as "the rig
+    agrees with the rig": the harness inherits the rig's value, feeds it to both
+    sides, and the comparison passes while the arm and the sim disagree.
+    """
+    import dataclasses
+    fields = {f.name for f in dataclasses.fields(SingleArmFrankaConfig)}
+    unclassified = fields - set(_SIM_PARITY_KNOBS) - _SESSION_KNOBS - _INERT_FIELDS
+    assert not unclassified, (
+        f"unclassified config fields: {sorted(unclassified)} -- add each to "
+        "_SIM_PARITY_KNOBS (pinned at its sim value), _SESSION_KNOBS or _INERT_FIELDS")
+
+    # And the pinning reaches the state send_action reads, not just the config.
+    robot = make_robot(make_case(np.random.default_rng(0)))
+    assert robot._trans_fudge == 1.0 and robot._rot_fudge == 1.0
+    assert np.allclose(robot._kp_ori_scale, 1.0) and np.allclose(robot._kp_pos_scale, 1.0)
+    assert robot.config.use_noise is False
+
+
 def test_defaults_are_exact_parity():
     """Pin the deliberate deviations from osc.py, and their preconditions.
 
@@ -802,21 +956,37 @@ def test_defaults_are_exact_parity():
     cfg = SingleArmFrankaConfig(r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
                                 control_mode=ControlMode.EE_DELTA, cameras={}, depth=False,
                                 depth_cam={})
-    assert cfg.ee_translation_fudge == 1.0 and cfg.ee_rotation_fudge == 1.0
+    assert cfg.ee_translation_fudge == 1.0 and cfg.ee_rotation_fudge == 1.0, (
+        f"delta fudge deviates from sim: translation={cfg.ee_translation_fudge} "
+        f"rotation={cfg.ee_rotation_fudge}. The policy's own delta is being "
+        "rescaled before it reaches the OSC goal, so the arm tracks a different "
+        "command than the sim it was trained in.")
     # The coupled path inverts a 6x6 that goes singular; without damping it
     # commanded 709 Nm against a 69.6 Nm clamp in test_dls_bounds_lambda_full.
     from lerobot_robot_bimanual_franka.osc_torque_controller import LAMBDA_DLS_MU
     if not cfg.uncouple_pos_ori:
         assert LAMBDA_DLS_MU > 0.0, "uncouple_pos_ori=False needs the DLS guard"
-    assert 0.0 <= cfg.friction_kc <= 1.0
+    # Above 1.0 the assist injects more than the friction it cancels, so the net
+    # plant friction goes negative, and the band's incremental gain (1 + kc/0.20)
+    # multiplies the OSC law -- and the measured dq inside it -- by that much.
+    assert 0.0 <= cfg.friction_kc <= 1.0, (
+        f"friction_kc={cfg.friction_kc} over-compensates: assist saturates at "
+        f"{cfg.friction_kc:.1f}x breakaway against ~0.7x kinetic while sliding, and the "
+        f"assist's incremental gain is {1.0 + cfg.friction_kc / 0.20:.0f}x "
+        f"(vs {1.0 + 1.0 / 0.20:.0f}x at 1.0, {1.0:.0f}x at exact osc.py)")
     # Tuning is allowed, but only inside osc.py's action space.
-    kp_tuned, kd_tuned = resolve_gains(0.0, 0.0, cfg.kp_ori_scale,
-                                       kp_pos_scale=cfg.kp_pos_scale)
+    kp_tuned, kd_tuned = resolve_gains(0.0, 0.0, cfg.kp_ori_scale, cfg.kd_ori_scale,
+                                       kp_pos_scale=cfg.kp_pos_scale,
+                                       kd_pos_scale=cfg.kd_pos_scale)
     assert np.all(kp_tuned <= KP_LIMITS[1] + 1e-9)
-    # The invariant that keeps a stiffness tune from becoming a speed tune.
+    # The invariant that keeps a STIFFNESS tune from becoming a speed tune: the
+    # kp scales must leave kp/kd alone, and the kd scales must move it by exactly
+    # their own factor and nothing more.
     kp_sim, kd_sim = resolve_gains(0.0, 0.0)
-    assert np.allclose(kp_tuned / kd_tuned, kp_sim / kd_sim), (
-        "a per-axis gain scale changed the slew rate, not just the stiffness")
+    kd_scale6 = np.concatenate([np.broadcast_to(cfg.kd_pos_scale, 3),
+                                np.broadcast_to(cfg.kd_ori_scale, 3)])
+    assert np.allclose((kp_tuned / kd_tuned) * kd_scale6, kp_sim / kd_sim), (
+        "a gain scale changed the slew rate by something other than kd_*_scale")
     from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
     assert _srv._FRICTION_KC == 0.0
     assert _srv._JOINT_DAMPING_KV == 0.0
@@ -934,6 +1104,125 @@ def test_friction_feedforward_cannot_drive_an_idle_arm():
     assert np.all(total > srv._FRICTION_COULOMB * 0.9), "assist too weak to break away"
 
     assert np.allclose(srv._friction_feedforward(0.0, coriolis + 3.0, coriolis), 0.0)
+
+
+def test_joint_damping_pole_is_inside_the_law_rate():
+    """JOINT_POS / home() / hold damping must stay representable at 500 Hz.
+
+    kp is deliberately not weighted by M (the wrist could not break away
+    otherwise), but kd inherited that: at M_jj ~ 0.01-0.05 the raw kd puts the
+    velocity pole at 600-1500 rad/s, so -kd*dq alternates sign tick to tick and
+    the wrist bang-bangs its torque clamp. That is the homing vibration.
+    """
+    from lerobot_robot_bimanual_franka.osc_torque_controller import (
+        DEFAULT_JOINT_KD, DEFAULT_JOINT_KP, JOINT_KD_POLE_MAX, JointImpedanceController,
+    )
+    # Representative FR3 inertia diagonal: heavy proximal joints, light wrist.
+    M = np.diag([2.0, 2.0, 0.8, 0.6, 0.05, 0.02, 0.01])
+    t_eff = srv._CONTROL_DECIMATION * 1e-3 + 1.5e-3     # law period + write-first delay
+
+    ctrl = JointImpedanceController(num_joints=7)
+    ctrl.set_goal(goal_q=np.zeros(7), kp=1.0, damping_ratio=1.0)
+    dq = np.ones(7)
+    tau = ctrl.run_controller(np.zeros(7), dq, M, np.zeros(7), position_hold=True)
+    kd_eff = -tau                                        # zero error, zero coriolis
+
+    crit = kd_eff * t_eff / np.diag(M)
+    assert np.all(crit < 1.0), f"velocity loop not stable at 500 Hz: kd*T/M = {crit}"
+
+    # Damping only. The stiffness must stay un-weighted or the wrist stalls.
+    tau_e = ctrl.run_controller(np.full(7, 0.1), np.zeros(7), M, np.zeros(7),
+                                position_hold=True)
+    assert np.allclose(tau_e, DEFAULT_JOINT_KP * -0.1), "the cap touched the stiffness"
+
+    # A cap, never a boost, and the heavy joints keep their tuned damping.
+    assert np.all(kd_eff <= DEFAULT_JOINT_KD + 1e-9), "the cap raised a joint's damping"
+    assert np.allclose(kd_eff[:4], DEFAULT_JOINT_KD[:4]), (
+        f"cap bit a joint it should not have: {kd_eff[:4]}")
+
+    zeta = kd_eff / (2.0 * np.sqrt(DEFAULT_JOINT_KP * np.diag(M)))
+    assert np.all(zeta > 0.4), f"capped damping left a joint underdamped: {zeta}"
+
+    # DEFAULT_JOINT_KD is now sized to sit just inside the cap at nominal
+    # inertia, so the cap is a pose-varying safety net rather than the mechanism.
+    # Keep it under test by handing it an inertia well below nominal.
+    light = np.diag([2.0, 2.0, 0.8, 0.6, 0.005, 0.002, 0.001])
+    tau_l = ctrl.run_controller(np.zeros(7), dq, light, np.zeros(7), position_hold=True)
+    assert np.all(-tau_l[4:] < DEFAULT_JOINT_KD[4:]), "the cap did not bite on a light wrist"
+    assert np.all(-tau_l * t_eff / np.diag(light) < 1.0), "still unstable at low inertia"
+    return (f"kd {np.round(kd_eff, 2)}, zeta {np.round(zeta, 2)}, "
+            f"worst kd*T/M {crit.max():.2f} (cap {JOINT_KD_POLE_MAX:.0f} rad/s)")
+
+
+def test_homing_speed_budget_reaches_every_joint():
+    """home()'s ramp must be able to drive every joint at a usable speed.
+
+    The budget is qdot_max = frac*tau_limit/(kd*(1+margin)) -- it falls out of
+    kd, so a kd sized for the proximal joints throttles the wrist. At kd=25 that
+    was 0.13 rad/s on joint 6, and a 1 rad wrist move could not finish inside the
+    5 s default max_time_s: homing reported 'failed to converge' while looking
+    converged, because it genuinely had not arrived.
+    """
+    from lerobot_robot_bimanual_franka.osc_torque_controller import (
+        DEFAULT_JOINT_KD, DEFAULT_JOINT_KP, JOINT_TORQUE_LIMITS,
+    )
+    qdot_max = np.minimum(
+        bfmod.HOME_MAX_QDOT,
+        bfmod.HOME_TAU_FRACTION * np.asarray(JOINT_TORQUE_LIMITS)
+        / (bfmod.HOME_IMPEDANCE_KD * (1.0 + bfmod.HOME_LEAD_MARGIN)))
+
+    assert np.all(qdot_max >= 0.4 * bfmod.HOME_MAX_QDOT), (
+        f"a joint is throttled to {np.round(qdot_max, 3)} rad/s; the wrist cannot home")
+
+    # The ramp's lead has to clear breakaway friction, or the joint never starts.
+    max_lead = bfmod.HOME_LEAD_MARGIN * qdot_max * DEFAULT_JOINT_KD / DEFAULT_JOINT_KP
+    tau_at_lead = DEFAULT_JOINT_KP * max_lead
+    assert np.all(tau_at_lead > srv._FRICTION_COULOMB), (
+        f"stall lead is under breakaway: {np.round(tau_at_lead, 2)} Nm "
+        f"vs {srv._FRICTION_COULOMB} Nm")
+    # ...without asking for more torque than the joint has.
+    assert np.all(tau_at_lead <= np.asarray(JOINT_TORQUE_LIMITS) * bfmod.HOME_TAU_FRACTION + 1e-9)
+
+    # And a full-scale move fits inside the default timeout with margin.
+    slowest = float(np.min(qdot_max))
+    assert 1.0 / slowest < 0.6 * 5.0, (
+        f"a 1 rad move takes {1.0 / slowest:.1f}s against the 5 s default max_time_s")
+    return (f"qdot_max {np.round(qdot_max, 3)} rad/s, "
+            f"1 rad worst case {1.0 / slowest:.1f}s")
+
+
+def test_friction_assist_is_memoryless():
+    """The assist must stay a pure function of (kc, tau, coriolis).
+
+    Its incremental gain is 1 + kc/band -- 6x at the defaults -- so it multiplies
+    the whole OSC law near the Coriolis level, and tau carries the measured dq.
+    That genuinely does amplify encoder noise. The fix is NOT to filter it: a
+    first-order lag inside a gain-(1+g) path is a lag network, pole at wc and
+    zero at wc(1+g), and a 25 Hz corner costs 39 deg of phase at 52 Hz. Deployed
+    to hardware that made the shake worse, not better. Reduce the gain instead
+    (_FRICTION_TAU_EPS), or kc, which set_tuning can sweep live.
+    """
+    kc, coriolis = 0.9, np.zeros(7)
+    hi = 3.0 * srv._FRICTION_COULOMB
+    lo = -3.0 * srv._FRICTION_COULOMB
+
+    # Same input, same output, whatever came before it.
+    first = srv._friction_feedforward(kc, hi, coriolis)
+    for _ in range(50):
+        srv._friction_feedforward(kc, lo, coriolis)
+    assert np.allclose(srv._friction_feedforward(kc, hi, coriolis), first), (
+        "the assist carries state across calls -- it must add no phase")
+
+    # A reversal completes in one call rather than being approached over several.
+    assert np.allclose(srv._friction_feedforward(kc, lo, coriolis), -first), (
+        "reversal is not instantaneous")
+
+    # And the loop holds no assist state of its own.
+    assert not hasattr(srv.ControlLoop, "_assist"), (
+        "ControlLoop regained assist state; see _friction_feedforward")
+
+    band = srv._FRICTION_TAU_EPS[0] / srv._FRICTION_COULOMB[0]
+    return f"pure map, band {band:.2f}*Fc -> {1.0 + kc / band:.1f}x incremental gain"
 
 
 def test_friction_assist_is_osc_only():

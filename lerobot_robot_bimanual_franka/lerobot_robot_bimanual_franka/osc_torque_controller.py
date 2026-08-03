@@ -78,8 +78,23 @@ JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
 # is why home() could not rotate the wrist joints. These are libfranka's
 # joint_impedance_example values, in Nm/rad and Nms/rad.
 DEFAULT_JOINT_KP = np.array([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
-DEFAULT_JOINT_KD = np.array([50.0, 50.0, 50.0, 50.0, 30.0, 25.0, 15.0])
+# kd is sized per joint as 2*zeta*sqrt(kp*M) at zeta~0.7, NOT copied from
+# libfranka's example: those values assume the proximal joints' inertia, and on
+# the wrist (M ~ 0.01-0.05) they are both discretely unstable (kd/M above the
+# 500 Hz law's Nyquist) and self-throttling -- home()'s torque budget is
+# frac*tau_limit/(kd*(1+margin)), so kd=25 capped joint 6 at 0.13 rad/s and a
+# 1 rad wrist move could not finish inside the 5 s default max_time_s.
+DEFAULT_JOINT_KD = np.array([50.0, 50.0, 50.0, 50.0, 5.0, 2.5, 1.0])
 DEFAULT_JOINT_DAMPING_RATIO = 1.0
+
+# Cap on each joint's velocity-loop pole kd/M (rad/s). The STIFFNESS must stay
+# un-weighted or the wrist cannot break away (see DEFAULT_JOINT_KP), but the
+# DAMPING then inherits the same tiny inertia: kd/M is 600-1500 rad/s on joints
+# 5-7, so -kd*dq alternates sign against the 500 Hz law and the wrist bang-bangs
+# its +/-12 Nm clamp -- the homing vibration. This is the failure the velocity
+# path already avoids by weighting through M (DEFAULT_JOINT_VEL_KV). 100 rad/s
+# leaves joints 1-4 untouched and lands 5-7 at damping ratio 0.58-0.71.
+JOINT_KD_POLE_MAX = 100.0
 
 # Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix so the pole is
 # this on every joint; DEFAULT_JOINT_KD as a velocity gain puts the wrist at
@@ -91,24 +106,34 @@ def resolve_gains(
     kp_action: float,
     kd_action: float,
     kp_ori_scale: np.ndarray | float = 1.0,
-    kd_ori_scale: np.ndarray | float | None = None,
+    kd_ori_scale: np.ndarray | float = 1.0,
     kp_pos_scale: np.ndarray | float = 1.0,
+    kd_pos_scale: np.ndarray | float = 1.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Map action kp/kd in [-1, 1] to robosuite (kp, kd) 6-vectors.
 
     Reproduces LIBEROObservationWrapper.step's exponential rescale followed by
     OperationalSpaceController.set_goal's clip, for impedance_mode="variable":
     kp = 150 * 10**a_kp, damping_ratio = 1 * 10**a_kd, kd = 2*sqrt(kp)*ratio.
+    All four scales at 1.0 is exactly that; every one of them is a deliberate
+    hardware deviation from it.
 
-    kp_ori_scale / kp_pos_scale multiply their block's entries; scalar or (3,).
-    Non-uniform kp is inside osc.py's own action space -- kp is a 6-vector there
-    and variable mode reads all six. See the configs for what each is set from.
+    The two families do different things, and which one you want depends on
+    whether the axis is too weak or too lively:
 
-    The damping ratio is ALWAYS derived per axis as sqrt(scale), so a scale buys
-    friction rejection and not speed: the loop settles at v = (sqrt(kp)/2*zeta)*
-    delta, so raising kp alone would speed that axis up by sqrt(scale).
+    - kp_*_scale multiplies its block's stiffness. The ratio is then re-derived
+      as sqrt(kp6/kp), which holds kp/kd -- and therefore the settling speed
+      v = (kp/kd)*delta -- FIXED. So a kp scale buys friction rejection, not
+      speed.
+    - kd_*_scale multiplies its block's damping ratio directly, which is the one
+      knob that does change kp/kd. Raising it slows and damps the axis without
+      stiffening it: the antidote to an axis that oscillates, where more kp only
+      makes it worse.
 
-    kd_ori_scale overrides the derived orientation ratio; leave it None.
+    Each is a scalar or (3,). Non-uniform gains are inside osc.py's own action
+    space (kp is a 6-vector there and variable mode reads all six), and the
+    scaled ratio still passes through DAMPING_RATIO_LIMITS, so no combination
+    can leave the envelope the sim can represent.
     """
     kp = DEFAULT_KP * KP_EXP_SCALE ** float(np.clip(kp_action, -1.0, 1.0))
     ratio = DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** float(np.clip(kd_action, -1.0, 1.0))
@@ -118,8 +143,8 @@ def resolve_gains(
     kp6 = np.clip(kp6, *KP_LIMITS)
     # From the CLIPPED kp, so the slew rate holds even where KP_LIMITS bit.
     ratio6 = float(ratio) * np.sqrt(kp6 / max(float(kp), 1e-12))
-    if kd_ori_scale is not None:
-        ratio6[3:] = float(ratio) * np.asarray(kd_ori_scale, dtype=np.float64)
+    ratio6[:3] *= np.asarray(kd_pos_scale, dtype=np.float64)
+    ratio6[3:] *= np.asarray(kd_ori_scale, dtype=np.float64)
     kd6 = 2.0 * np.sqrt(kp6) * np.clip(ratio6, *DAMPING_RATIO_LIMITS)
     return kp6, kd6
 
@@ -402,6 +427,8 @@ class JointImpedanceController:
     ) -> np.ndarray:
         # Direct joint impedance, no mass-matrix weighting -- see DEFAULT_JOINT_KP.
         if position_hold:
-            return self.kp * (self.goal_q - q) - self.kd * dq + coriolis
+            # Damping alone is capped against the live inertia; see JOINT_KD_POLE_MAX.
+            kd = np.minimum(self.kd, JOINT_KD_POLE_MAX * np.diag(mass_matrix))
+            return self.kp * (self.goal_q - q) - kd * dq + coriolis
         # Velocity mode weights by M -- see DEFAULT_JOINT_VEL_KV.
         return mass_matrix @ (self.kv * (self.goal_dq - dq)) + coriolis

@@ -241,6 +241,8 @@ constants for this exact rig. All scripts assume the venv is active.
 | `check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
 | `check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
+| `sweep_sim_match.py` | Search `friction_kc` + the delta fudges against a sim reference | EE |
+| `../sysid/sweep_gains.py` | Search the OSC gain scales (per axis) against one sim trajectory; rejects trials that saturate the torque clamp | EE |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction from constant-velocity torque; sets `friction_kc`'s constants | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all five packages | — |
@@ -284,13 +286,23 @@ controller and the real `_ArmSession._compute_tau` run). No pytest needed:
 ```
 python tests/test_osc_stack.py        # send_action → goal → tau vs robosuite
 python tests/test_spacemouse_action.py # stick deflection → tau vs the sim policy
+python tests/test_wsg_gripper.py      # WSG MOVE coalescing + fault recovery (loopback fake)
 ```
 
-Run both after touching `osc_torque_controller.py`, `bimanual_franka.py`,
-`pylibfranka_control.py` or the SpaceMouse. They cover the gain remap, the delta
-envelope, the goal-orientation hold rule, both `uncouple_pos_ori` settings, the
-nullspace reference, the torque clamp/rate limiter, and that every
+Run these after touching `osc_torque_controller.py`, `bimanual_franka.py`,
+`pylibfranka_control.py`, `wsg.py` or the SpaceMouse. They cover the gain remap,
+the delta envelope, the goal-orientation hold rule, both `uncouple_pos_ori`
+settings, the nullspace reference, the torque clamp/rate limiter, and that every
 hardware-bridging knob is a no-op at its default.
+
+**A tuning knob must be pinned in the parity harness or it silently disables the
+suite.** `make_robot` builds the robot from `SingleArmFrankaConfig`, so any field
+it does not override is inherited from the rig and fed to *both* sides of the
+comparison — the test then asserts the rig agrees with itself and passes. This
+happened: `ee_rotation_fudge=0.35` turned 8 tests red with the control stack
+untouched. `_SIM_PARITY_KNOBS` lists what is pinned, and
+`test_every_hardware_knob_is_pinned` fails on any config field not classified as
+pinned, session-side or inert.
 
 Coverage worth knowing about:
 - **Per axis**, both signs and several magnitudes: translation matches to ~1e-14,
@@ -330,5 +342,10 @@ For code-level debugging:
 - `communication_constrains_violation` → the RT loop missed its 1 kHz deadline.
   Check the server is running under `chrt -f 80` and that nothing else is
   saturating cores 2-7.
+- Gripper closes then refuses to open → a MOVE that ends with the axis blocked
+  (i.e. any grasp) faults the WSG, which then rejects the next MOVE. `move()` is
+  fire-and-forget, so the reader thread is the only place that error is visible;
+  it now logs at warning level and the sender emits `STOP()` ahead of the next
+  MOVE to clear the axis. Grep the run log for `[WSG] ERR`.
 - Gripper FAST STOP latched after a crash → re-`connect()` clears it via
   `ack_fast_stop()` in `WSG.__init__`.
