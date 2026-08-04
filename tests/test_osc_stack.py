@@ -254,7 +254,8 @@ _SIM_PARITY_KNOBS = {
 }
 
 # Reach the control loop through make_session, not the robot config.
-_SESSION_KNOBS = {"friction_kc", "uncouple_pos_ori"}
+_SESSION_KNOBS = {"friction_kc", "friction_kc_joint", "uncouple_pos_ori",
+                  "lambda_dls_mu"}
 
 # Transport, framing and perception: cannot reach the torque path. noise_*_scale
 # is control-path but gated by use_noise, which is pinned above.

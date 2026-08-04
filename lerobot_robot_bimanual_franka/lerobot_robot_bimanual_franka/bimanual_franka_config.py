@@ -40,6 +40,8 @@ class BimanualFrankaConfig(RobotConfig):
     # not have, so non-zero is CLOSER to osc.py's motion. 0.9 clears the
     # measurement's ~10% spread; 1.0 overshoots (pitch overshot to 126%).
     friction_kc: float = 1.0
+    # Per-joint multiplier on friction_kc; see SingleArmFrankaConfig.
+    friction_kc_joint: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = 1.0
@@ -60,7 +62,13 @@ class BimanualFrankaConfig(RobotConfig):
     # friction. False applies Lambda_full to the whole wrench: response is exactly
     # the commanded acceleration, cross-coupling is zero, and every axis gets more
     # torque at the same gains. True is sim parity; False is what this arm needs.
-    uncouple_pos_ori: bool = False
+    uncouple_pos_ori: bool = True
+    # Damped-least-squares floor on lambda_full, active only when
+    # uncouple_pos_ori is False. Caps lambda_full at 1/mu^2: cond(J) rises
+    # 9->58 as the arm raises and an undamped lambda_full took joint 4 past
+    # its 69.6 Nm clamp, which shakes. Costs ~24% of the commanded torque at
+    # well-conditioned poses, so lower it if translation goes weak.
+    lambda_dls_mu: float = 0.025
     use_noise: bool = False
     noise_pos_scale: float = 0.005   # metres, added to position output each step
     noise_rot_scale: float = 0.01   # radians (axis-angle), added to rotation output each step

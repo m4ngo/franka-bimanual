@@ -280,15 +280,15 @@ class ControlLoop:
                 J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis,
                 joint_damping_kv=float(goal[shm.G_JOINT_DAMPING_KV]),
                 # Only the coupled path inverts the 6x6 that goes singular.
-                dls_mu=0.0 if self.osc.uncoupling else self.dls_mu,
+                dls_mu=0.0 if self.osc.uncoupling else float(goal[shm.G_DLS_MU]),
                 ori_force_coupling=self.ori_force_coupling)
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
         # OSC only: home/hold have no sim counterpart and friction is what keeps
         # them quiet -- assisting there buzzes on the hold's own standing torque.
-        kc = float(goal[shm.G_FRICTION_KC])
-        if kc and mode == shm.MODE_OSC:
+        kc = goal[shm.G_FRICTION_KC]
+        if mode == shm.MODE_OSC and np.any(kc):
             tau = tau + _friction_feedforward(kc, tau, coriolis)
         return tau, q, dq, None
 

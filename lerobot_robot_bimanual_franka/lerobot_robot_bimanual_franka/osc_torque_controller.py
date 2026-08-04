@@ -67,24 +67,27 @@ DEFAULT_NULLSPACE_KP = 10.0
 # blows up near a singularity. 0.05 bounds commanded torque at 24 Nm against the
 # 69.6 Nm clamp across the reach, at <=14 deg of direction error at the worst
 # pose and ~0 where the arm is well conditioned.
-LAMBDA_DLS_MU = 0.05
+# Caps lambda_full at 1/mu^2. 0.05 caps at 400 against a healthy 11, so it never
+# engaged before the torque clamp did: cond(J) 9->58 as the arm raises took joint 4
+# to 99 Nm against its 69.6 Nm clamp, which is the shaking. 0.15 caps at 44.
+LAMBDA_DLS_MU = 0.10
 
 # FR3/Panda datasheet continuous joint torque limits (Nm).
-JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 12.0, 12.0, 12.0)
+JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 25.0, 25.0, 25.0)
 
 # Joint-space impedance for JOINT_POS / home() / hold. Per-joint stiffness, NOT
 # a scalar through the mass matrix: tau = M @ (kp*e) collapses on the wrist,
 # where M is ~0.01, so a 0.5 rad error asks for ~0.3 Nm -- under breakaway, which
 # is why home() could not rotate the wrist joints. These are libfranka's
 # joint_impedance_example values, in Nm/rad and Nms/rad.
-DEFAULT_JOINT_KP = np.array([600.0, 600.0, 600.0, 600.0, 250.0, 150.0, 50.0])
+DEFAULT_JOINT_KP = np.array([300.0, 300.0, 300.0, 300.0, 500.0, 150.0, 150.0])
 # kd is sized per joint as 2*zeta*sqrt(kp*M) at zeta~0.7, NOT copied from
 # libfranka's example: those values assume the proximal joints' inertia, and on
 # the wrist (M ~ 0.01-0.05) they are both discretely unstable (kd/M above the
 # 500 Hz law's Nyquist) and self-throttling -- home()'s torque budget is
 # frac*tau_limit/(kd*(1+margin)), so kd=25 capped joint 6 at 0.13 rad/s and a
 # 1 rad wrist move could not finish inside the 5 s default max_time_s.
-DEFAULT_JOINT_KD = np.array([50.0, 50.0, 50.0, 50.0, 5.0, 2.5, 1.0])
+DEFAULT_JOINT_KD = np.array([35.0, 35.0, 35.0, 35.0, 15.0, 20.0, 20.0])
 DEFAULT_JOINT_DAMPING_RATIO = 1.0
 
 # Cap on each joint's velocity-loop pole kd/M (rad/s). The STIFFNESS must stay
@@ -263,8 +266,8 @@ def clip_delta(delta_pos: np.ndarray, delta_rotvec: np.ndarray) -> tuple[np.ndar
     output bound -- scaling again here would double-apply it.
     """
     return (
-        np.clip(delta_pos, -DELTA_POS_MAX, DELTA_POS_MAX),
-        np.clip(delta_rotvec, -DELTA_ROT_MAX, DELTA_ROT_MAX),
+        delta_pos, # np.clip(delta_pos, -DELTA_POS_MAX, DELTA_POS_MAX),
+        delta_rotvec # np.clip(delta_rotvec, -DELTA_ROT_MAX, DELTA_ROT_MAX),
     )
 
 

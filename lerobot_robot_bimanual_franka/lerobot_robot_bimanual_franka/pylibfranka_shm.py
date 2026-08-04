@@ -42,11 +42,12 @@ G_NULLSPACE = slice(22, 29)
 G_JOINT_Q = slice(29, 36)
 G_JOINT_KP = 36
 G_JOINT_RATIO = 37
-G_FRICTION_KC = 38
-G_JOINT_DAMPING_KV = 39
-G_UNCOUPLE = 40
-G_RUNNING = 41       # server -> control: 0 asks the loop to stop
-GOAL_SIZE = 48
+G_FRICTION_KC = slice(38, 45)   # per joint: friction is a per-joint property
+G_JOINT_DAMPING_KV = 45
+G_UNCOUPLE = 46
+G_RUNNING = 47       # server -> control: 0 asks the loop to stop
+G_DLS_MU = 48
+GOAL_SIZE = 56
 
 # ---- state block (written by the control process, read by the server) ----
 S_SEQ = 0

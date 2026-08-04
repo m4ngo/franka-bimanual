@@ -144,11 +144,16 @@ class RobotDriver:
         self,
         joint_damping_kv: float | None = None,
         uncouple_pos_ori: bool | None = None,
-        friction_kc: float | None = None,
+        friction_kc: float | np.ndarray | tuple | None = None,
+        dls_mu: float | None = None,
     ) -> None:
         """Live server-side tuning. joint_damping_kv=0, uncouple_pos_ori=True and
-        friction_kc=0 together restore exact osc.py behaviour."""
-        self._push(self._root.set_tuning, joint_damping_kv, uncouple_pos_ori, friction_kc)
+        friction_kc=0 together restore exact osc.py behaviour. friction_kc is a
+        scalar or a per-joint 7-vector."""
+        if friction_kc is not None and np.ndim(friction_kc) > 0:
+            friction_kc = _t(friction_kc)
+        self._push(self._root.set_tuning, joint_damping_kv, uncouple_pos_ori, friction_kc,
+                   dls_mu)
 
     def _push(self, rpc, *args) -> None:
         try:
@@ -238,9 +243,11 @@ class MultiRobotWrapper:
         joint_damping_kv: float | None = None,
         uncouple_pos_ori: bool | None = None,
         friction_kc: float | None = None,
+        dls_mu: float | None = None,
     ) -> None:
         self._gather(
-            lambda n: self.drivers[n].set_tuning(joint_damping_kv, uncouple_pos_ori, friction_kc),
+            lambda n: self.drivers[n].set_tuning(joint_damping_kv, uncouple_pos_ori,
+                                                 friction_kc, dls_mu),
             list(self.drivers),
         )
 

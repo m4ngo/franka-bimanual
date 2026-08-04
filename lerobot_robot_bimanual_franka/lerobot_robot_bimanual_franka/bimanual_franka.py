@@ -241,8 +241,9 @@ class BimanualFranka(Robot):
             # next run. The config must be the single source of truth or a sysid
             # sweep can measure a controller nobody configured.
             self.robot_manager.set_tuning_all(
-                friction_kc=float(getattr(self.config, "friction_kc", 0.0)),
+                friction_kc=self.friction_kc,
                 uncouple_pos_ori=bool(getattr(self.config, "uncouple_pos_ori", True)),
+                dls_mu=float(getattr(self.config, "lambda_dls_mu", 0.15)),
             )
             for arm in self.active_arms:
                 self.grippers[arm].home()
@@ -386,6 +387,17 @@ class BimanualFranka(Robot):
             dtype=np.float64,
         )
     
+    @property
+    def friction_kc(self) -> np.ndarray:
+        """Per-joint Coulomb assist scale: the scalar times the per-joint trim."""
+        return float(getattr(self.config, "friction_kc", 0.0)) * np.asarray(
+            getattr(self.config, "friction_kc_joint", (1.0,) * NUM_JOINTS), dtype=np.float64)
+
+    def set_friction_kc(self, kc) -> None:
+        """Push a new per-joint assist scale to the running control loops."""
+        self.robot_manager.set_tuning_all(
+            friction_kc=np.broadcast_to(np.asarray(kc, dtype=np.float64), (NUM_JOINTS,)))
+
     @property
     def kp_gain(self) -> float:
         return self._kp_gain

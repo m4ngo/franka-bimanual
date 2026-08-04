@@ -89,6 +89,7 @@ _FRICTION_KC = 0.0
 # rather than measured on this arm. Over-compensation shows up as buzzing; the
 # control process's speed guard bounds it either way.
 _FRICTION_KC_MAX = 3.0
+_LAMBDA_DLS_MU = 0.10
 
 
 # The control loop is in another process now, so handler latency here cannot
@@ -173,6 +174,7 @@ class _ArmSession:
         self._lock = threading.Lock()
         # Sensible defaults so a client that never calls set_tuning gets sim parity.
         self.ch.goal[shm.G_UNCOUPLE] = 1.0
+        self.ch.goal[shm.G_DLS_MU] = _LAMBDA_DLS_MU
         self.ch.goal[shm.G_MODE] = shm.MODE_HOLD
         logger.info("shm channel %s created for %s", self.ch.name, robot_ip)
 
@@ -248,20 +250,26 @@ class _ArmSession:
     def set_mode(self, mode: str) -> None:
         self.ch.write_goal(G_MODE=shm.MODE_NAMES.get(mode, shm.MODE_HOLD))
 
-    def set_tuning(self, joint_damping_kv=None, uncouple_pos_ori=None, friction_kc=None) -> None:
+    def set_tuning(self, joint_damping_kv=None, uncouple_pos_ori=None, friction_kc=None,
+                   dls_mu=None) -> None:
         fields = {}
         if joint_damping_kv is not None:
             fields["G_JOINT_DAMPING_KV"] = float(joint_damping_kv)
         if uncouple_pos_ori is not None:
             fields["G_UNCOUPLE"] = 1.0 if uncouple_pos_ori else 0.0
+        if dls_mu is not None:
+            fields["G_DLS_MU"] = float(np.clip(dls_mu, 0.0, 1.0))
         if friction_kc is not None:
-            fields["G_FRICTION_KC"] = float(np.clip(friction_kc, 0.0, _FRICTION_KC_MAX))
+            # Scalar broadcasts; a 7-vector sets each joint's own factor.
+            kc = np.broadcast_to(np.asarray(friction_kc, dtype=np.float64), (NUM_JOINTS,))
+            fields["G_FRICTION_KC"] = np.clip(kc, 0.0, _FRICTION_KC_MAX)
         if fields:
             self.ch.write_goal(**fields)
         g = self.ch.goal
-        logger.info("%s: tuning -> uncouple=%s joint_damping_kv=%.3f friction_kc=%.3f",
+        logger.info("%s: tuning -> uncouple=%s joint_damping_kv=%.3f friction_kc=%s",
                     self.robot_ip, bool(g[shm.G_UNCOUPLE]),
-                    g[shm.G_JOINT_DAMPING_KV], g[shm.G_FRICTION_KC])
+                    g[shm.G_JOINT_DAMPING_KV],
+                    np.array2string(g[shm.G_FRICTION_KC], precision=2))
 
     # ---- state ----
 
@@ -350,8 +358,9 @@ class FrankaTorqueService(SlaveService):
         joint_damping_kv: float | None = None,
         uncouple_pos_ori: bool | None = None,
         friction_kc: float | None = None,
+        dls_mu: float | None = None,
     ) -> bool:
-        self._sessions[robot_ip].set_tuning(joint_damping_kv, uncouple_pos_ori, friction_kc)
+        self._sessions[robot_ip].set_tuning(joint_damping_kv, uncouple_pos_ori, friction_kc, dls_mu)
         return True
 
     def exposed_get_state(self, robot_ip: str) -> tuple:

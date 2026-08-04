@@ -25,28 +25,30 @@ class SingleArmFrankaConfig(RobotConfig):
     r_gripper_port: int = 18822
     active_arms: tuple[str, ...] = ("r",)
     # See BimanualFrankaConfig.friction_kc.
-    friction_kc: float = 1.0
+    friction_kc: float = 0.9
+    # Per-joint multiplier on friction_kc; see SingleArmFrankaConfig.
+    friction_kc_joint: tuple[float, ...] = (0.46, 0.26, 0.51, 0.41, 1.26, 0.52, 12.0)
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
-    ee_translation_fudge: float = 1.0
-    ee_rotation_fudge: float = 1.0
+    ee_translation_fudge: float = 1.15
+    ee_rotation_fudge: float = 1.3
     # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
     # damping ratio is derived as sqrt(scale), so these buy friction rejection
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
     # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
     # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
-    kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    kp_ori_scale: tuple[float, float, float] = (1.5, 1.5, 1.5)
     # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
     # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
-    kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    kp_pos_scale: tuple[float, float, float] = (1.4, 1.4, 1.4)
     # Damping-only trim, per block. kp_*_scale holds kp/kd fixed by construction,
     # so it cannot calm an axis that oscillates -- it stiffens it. These multiply
     # the damping ratio instead, which is the only knob that lowers kp/kd, i.e.
     # slows and damps the axis. Raise these when an axis vibrates; 1.0 is sim.
     kd_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    kd_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    kd_pos_scale: tuple[float, float, float] = (0.7, 0.7, 0.7)
     # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
     # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
     # translation force as if rotation were free, then fights the rotation that
@@ -58,6 +60,12 @@ class SingleArmFrankaConfig(RobotConfig):
     # orientation->force block (that term turns an orientation error the wrist
     # cannot clear into a standing translational push -- 215 mm of walk measured).
     uncouple_pos_ori: bool = False
+    # Damped-least-squares floor on lambda_full, active only when
+    # uncouple_pos_ori is False. Caps lambda_full at 1/mu^2: cond(J) rises
+    # 9->58 as the arm raises and an undamped lambda_full took joint 4 past
+    # its 69.6 Nm clamp, which shakes. Costs ~24% of the commanded torque at
+    # well-conditioned poses, so lower it if translation goes weak.
+    lambda_dls_mu: float = 0.025
     use_noise: bool = False
     noise_pos_scale: float = 0.0025   # metres, added to position output each step
     noise_rot_scale: float = 0.02    # radians (axis-angle), added to rotation output each step
