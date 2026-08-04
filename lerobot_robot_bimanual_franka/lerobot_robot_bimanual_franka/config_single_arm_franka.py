@@ -27,28 +27,28 @@ class SingleArmFrankaConfig(RobotConfig):
     # See BimanualFrankaConfig.friction_kc.
     friction_kc: float = 0.9
     # Per-joint multiplier on friction_kc; see SingleArmFrankaConfig.
-    friction_kc_joint: tuple[float, ...] = (0.46, 0.26, 0.51, 0.41, 1.26, 0.52, 12.0)
+    friction_kc_joint: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 12.0)
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
-    ee_translation_fudge: float = 1.15
-    ee_rotation_fudge: float = 1.3
+    ee_translation_fudge: float = 1.0
+    ee_rotation_fudge: float = 1.1
     # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
     # damping ratio is derived as sqrt(scale), so these buy friction rejection
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
     # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
     # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
-    kp_ori_scale: tuple[float, float, float] = (1.5, 1.5, 1.5)
+    kp_ori_scale: tuple[float, float, float] = (1.25, 1.25, 1.25)
     # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
     # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
-    kp_pos_scale: tuple[float, float, float] = (1.4, 1.4, 1.4)
+    kp_pos_scale: tuple[float, float, float] = (1.25, 1.25, 1.25)
     # Damping-only trim, per block. kp_*_scale holds kp/kd fixed by construction,
     # so it cannot calm an axis that oscillates -- it stiffens it. These multiply
     # the damping ratio instead, which is the only knob that lowers kp/kd, i.e.
     # slows and damps the axis. Raise these when an axis vibrates; 1.0 is sim.
-    kd_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    kd_pos_scale: tuple[float, float, float] = (0.7, 0.7, 0.7)
+    kd_ori_scale: tuple[float, float, float] = (0.8, 0.8, 0.8)
+    kd_pos_scale: tuple[float, float, float] = (0.8, 0.8, 0.8)
     # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
     # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
     # translation force as if rotation were free, then fights the rotation that

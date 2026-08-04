@@ -46,7 +46,7 @@ import numpy as np
 IMPEDANCE_MODE = "variable"
 
 # Sim-parity gain schedule (cfg/fast_default.yaml controller block).
-DEFAULT_KP = 150.0
+DEFAULT_KP = 175.0
 KP_LIMITS = (0.0, 1500.0)
 DEFAULT_DAMPING_RATIO = 1.0
 DAMPING_RATIO_LIMITS = (0.0, 10.0)
@@ -73,21 +73,21 @@ DEFAULT_NULLSPACE_KP = 10.0
 LAMBDA_DLS_MU = 0.10
 
 # FR3/Panda datasheet continuous joint torque limits (Nm).
-JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 25.0, 25.0, 25.0)
+JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 30.0, 25.0, 20.0)
 
 # Joint-space impedance for JOINT_POS / home() / hold. Per-joint stiffness, NOT
 # a scalar through the mass matrix: tau = M @ (kp*e) collapses on the wrist,
 # where M is ~0.01, so a 0.5 rad error asks for ~0.3 Nm -- under breakaway, which
 # is why home() could not rotate the wrist joints. These are libfranka's
 # joint_impedance_example values, in Nm/rad and Nms/rad.
-DEFAULT_JOINT_KP = np.array([300.0, 300.0, 300.0, 300.0, 500.0, 150.0, 150.0])
+DEFAULT_JOINT_KP = np.array([300.0, 300.0, 300.0, 300.0, 400.0, 150.0, 100.0])
 # kd is sized per joint as 2*zeta*sqrt(kp*M) at zeta~0.7, NOT copied from
 # libfranka's example: those values assume the proximal joints' inertia, and on
 # the wrist (M ~ 0.01-0.05) they are both discretely unstable (kd/M above the
 # 500 Hz law's Nyquist) and self-throttling -- home()'s torque budget is
 # frac*tau_limit/(kd*(1+margin)), so kd=25 capped joint 6 at 0.13 rad/s and a
 # 1 rad wrist move could not finish inside the 5 s default max_time_s.
-DEFAULT_JOINT_KD = np.array([35.0, 35.0, 35.0, 35.0, 15.0, 20.0, 20.0])
+DEFAULT_JOINT_KD = np.array([35.0, 35.0, 35.0, 35.0, 20.0, 10.0, 10.0])
 DEFAULT_JOINT_DAMPING_RATIO = 1.0
 
 # Cap on each joint's velocity-loop pole kd/M (rad/s). The STIFFNESS must stay
