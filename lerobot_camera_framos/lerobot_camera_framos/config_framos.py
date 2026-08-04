@@ -40,3 +40,7 @@ class FramosCameraConfig(CameraConfig):
         (0.41393851, -0.51973991, -0.74734553),
     )
     t_cam_in_world: tuple[float, float, float] = (0.47975414, 0.45897286, 0.94583442)
+
+    blob_filter: bool = False
+    blob_filter_min_neighbors: int = 20
+    blob_filter_radius_m: float = 0.01

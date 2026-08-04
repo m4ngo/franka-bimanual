@@ -38,6 +38,11 @@ _CAMERA_READ_TIMEOUT_MS: float = 5.0
 _CONNECT_TIMEOUT_S = 10.0
 _DEPTH_POINT_COUNT = 2048
 
+# Age past which get_observation()'s kin snapshot is re-read instead of reused.
+# EE_DELTA anchors its goal on the measured pose, so a stale anchor silently
+# subtracts whatever the arm travelled in between from the commanded delta.
+_KIN_CACHE_MAX_AGE_S = 0.005
+
 # Exponential action->gain remap, matching the sim wrapper the policies were
 # trained against (utils/envs/libero.py: exp_scale = limit_max / default).
 # kp_gain/kd_gain are the multipliers; OSC_BASE_KP/OSC_BASE_DAMPING_RATIO are
@@ -72,9 +77,6 @@ EE_AXIS_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw")
 
 _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraConfig: ArvCamera}
 
-_DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
-_DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
-
 logger = logging.getLogger(__name__)
 
 
@@ -102,6 +104,8 @@ class BimanualFranka(Robot):
         self.safety = ActionSafetyScreen()
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
+        self._cached_kin_ts: float = 0.0
+        self._kin_cache_stale = 0
         self._kp_gain = 0.0
         self._kd_gain = 0.0
         self._gripper_accum: dict[str, float] = {arm: 1.0 for arm in self.active_arms}
@@ -165,9 +169,6 @@ class BimanualFranka(Robot):
     def _arm_features(self, keys: tuple[str, ...]) -> dict[str, type]:
         return {f"{arm}_{key}": float for arm in self.active_arms for key in keys}
 
-    def _depth_features(self) -> dict[str, type]:
-        return {f"depth_{i}": float for i in range(_DEPTH_FLAT_SIZE)}
-
     @cached_property
     def _camera_features(self) -> dict[str, tuple[int, int, int]]:
         out: dict[str, tuple[int, int, int]] = {}
@@ -179,8 +180,8 @@ class BimanualFranka(Robot):
 
     @property
     def observation_features(self) -> dict[str, type | tuple[int, int, int]]:
-        if self._use_depth:
-            return {**self._arm_features(JOINT_FEATURE_KEYS), **self._camera_features, **self._depth_features()}
+        # The depth cloud is not in here: it is an array, reached through
+        # last_full_point_cloud, not 6144 scalar observation entries.
         return {**self._arm_features(JOINT_FEATURE_KEYS), **self._camera_features}
 
     @property
@@ -262,24 +263,40 @@ class BimanualFranka(Robot):
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
 
-        cam_futs = {
-            n: self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS)
-            for n, cam in self.cameras.items()
-        }
-
-        standalone_depth_cam = []
-        depth_color_fut = []
-        if self._use_depth:
-            for s, cam in self._depth_cam.items():
-                if cam is None:
-                    continue
-                standalone_depth_cam.append(cam)
-                depth_color_fut.append(self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS))
-
+        # Arm state FIRST: the depth crop needs ee_world at submit time, and that
+        # is what lets each camera's cloud compute chain onto its own frame
+        # instead of waiting for every camera in the rig to finish reading.
         kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         self._cached_kin_state = kin
+        self._cached_kin_ts = time.perf_counter()
         ee_world = self._ee_world_center(kin)
+
+        depth_cams: dict[str, Camera] = {}
+        if self._use_depth:
+            for name, cam in self._depth_cam.items():
+                c = self.cameras.get(name) if cam is None else cam
+                if c is None:
+                    raise KeyError(f"Depth camera {name!r} not found in cameras")
+                depth_cams[name] = c
+            if not depth_cams:
+                raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
+        cloud_points = _DEPTH_POINT_COUNT // max(len(depth_cams), 1)
+
+        def _read(cam: Camera, with_cloud: bool):
+            img = cam.async_read(_CAMERA_READ_TIMEOUT_MS)
+            if not with_cloud:
+                return img, None
+            return img, cam.get_cropped_point_cloud(
+                ee_world, self._depth_crop_radius_m, cloud_points
+            )
+
+        # A camera in both dicts is the same object, so it is read once and its
+        # cloud is derived from that same frame.
+        futs = {
+            name: self._camera_pool.submit(_read, cam, name in depth_cams)
+            for name, cam in {**self.cameras, **depth_cams}.items()
+        }
 
         obs: RobotObservation = {}
 
@@ -290,46 +307,31 @@ class BimanualFranka(Robot):
             max_mm = self.grippers[arm].GRIPPER_TRUE_MAX_MM
             obs[f"{arm}_gripper"] = (0 if pos is None else pos) / max_mm
 
-        for n, fut in cam_futs.items():
+        clouds: dict[str, np.ndarray] = {}
+        for name, fut in futs.items():
             try:
-                obs[n] = fut.result()
+                img, cloud = fut.result()
             except Exception as e:
-                logger.warning("Camera %s read failed: %s", n, e)
-                blank = getattr(self.cameras[n], "blank_frame", None)
-                obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
-
-        if len(standalone_depth_cam) > 0:
-            try:
-                for fut in depth_color_fut:
-                    fut.result()  # prime the buffer; result unused, not part of obs
-            except Exception as e:
-                logger.warning("Standalone depth camera color read failed: %s", e)
+                logger.warning("Camera %s read failed: %s", name, e)
+                img, cloud = None, None
+            if name in self.cameras:
+                if img is None:
+                    blank = getattr(self.cameras[name], "blank_frame", None)
+                    img = (blank() if callable(blank)
+                           else np.zeros(self._camera_features[name], dtype=np.uint8))
+                obs[name] = img
+            if name in depth_cams:
+                clouds[name] = (cloud if cloud is not None
+                                else np.zeros((cloud_points, 3), dtype=np.float32))
 
         if self._use_depth:
-            depth_cams = []
-            for s, cam in self._depth_cam.items():
-                if cam is None:
-                    depth_cams.append(self.cameras.get(s))
-                else:
-                    depth_cams.append(cam)
-            if len(depth_cams) <= 0:
-                raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
-
-            depth_futs = []
-            clouds: list[np.ndarray] = []
-            for c in depth_cams:
-                depth_futs.append(self._camera_pool.submit(
-                    c.get_cropped_point_cloud, ee_world, self._depth_crop_radius_m, _DEPTH_POINT_COUNT // len(depth_cams)
-                ))
-                
-            for fut in depth_futs:
-                clouds.append(fut.result())
-
-            self._last_full_point_cloud = np.concatenate(clouds,axis=0) # self._sample_depth_points(np.concatenate(clouds,axis=0), ee_world)
-            # print(self._last_full_point_cloud)
-            flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
-            # print(flat.shape)
-            obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
+            # Concatenated in _depth_cam order so the cloud's per-camera layout is
+            # stable across calls. Exposed as an array via last_full_point_cloud,
+            # never as scalar obs entries -- flattening it to 6144 float keys and
+            # rebuilding it cost ~1.1 ms/step for nothing.
+            self._last_full_point_cloud = np.concatenate(
+                [clouds[name] for name in depth_cams], axis=0
+            )
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
@@ -419,7 +421,12 @@ class BimanualFranka(Robot):
         modes land on torque -- EE_DELTA/EE_POS via OSC, JOINT_POS via joint
         impedance -- since pylibfranka exposes no Cartesian-velocity interface.
         """
-        kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+        kin = self._cached_kin_state
+        if kin is not None and time.perf_counter() - self._cached_kin_ts > _KIN_CACHE_MAX_AGE_S:
+            self._kin_cache_stale += 1
+            kin = None
+        if kin is None:
+            kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
         kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         self._kp_gain = _KP_GAIN_BASE ** float(np.clip(action["kp"], -1.0, 1.0))

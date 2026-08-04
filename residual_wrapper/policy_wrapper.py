@@ -23,6 +23,7 @@ Residual output     : (_CHUNK_EXEC, 9) chunk — [damping, stiffness, dx, dy, dz
                       indices 0–1, positional/rotational deltas at 2–7, gripper at 8.
 """
 
+import contextlib
 import logging
 from pathlib import Path
 
@@ -57,10 +58,26 @@ def _format_obs_for_policy(obs: dict) -> dict:
     return formatted
 
 
-class BasePolicy:
-    """Thin wrapper around a pretrained lerobot ACT / diffusion policy."""
+_AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "none": None}
 
-    def __init__(self, path: str, device: str = "cuda") -> None:
+
+class BasePolicy:
+    """Thin wrapper around a pretrained lerobot ACT / diffusion policy.
+
+    ``amp`` / ``compile_mode`` exist because this policy is what sets the control
+    loop's step budget, and its cost is GPU compute, not launch overhead: at
+    20 Hz the diffusion policy spends 33.0 ms of wall time against 32.9 ms of
+    measured GPU time, nearly all of it the 8 sequential UNet calls in the
+    denoising loop. Threads cannot touch that; arithmetic precision can. fp16
+    autocast plus a compiled UNet runs it in 21.8 ms, which is what lets the
+    chunk be inferred on the step that executes it (``--infer-lead 1``) instead
+    of being prefetched from a staler observation.
+    """
+
+    _amp_dtype = None
+
+    def __init__(self, path: str, device: str = "cuda",
+                 amp: str | None = None, compile_mode: str | None = None) -> None:
         self.device = torch.device(device)
         cfg = PreTrainedConfig.from_pretrained(path)
         cfg.pretrained_path = path
@@ -70,15 +87,51 @@ class BasePolicy:
         self.policy.eval()
         self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, pretrained_path=path)
 
+        self._amp_dtype = _AMP_DTYPES.get(str(amp or "none").lower())
+        if amp and self._amp_dtype is None and str(amp).lower() != "none":
+            raise ValueError(f"amp must be one of {sorted(_AMP_DTYPES)}, got {amp!r}")
+        if compile_mode and compile_mode.lower() != "none":
+            self._compile_unet(compile_mode)
+
+    def _compile_unet(self, mode: str) -> None:
+        """Compile the denoising UNet, the only module worth compiling here.
+
+        Falls back to eager on any failure: a slower loop is recoverable, an
+        episode that dies at the first inference is not.
+        """
+        unet = getattr(getattr(self.policy, "diffusion", None), "unet", None)
+        if unet is None:
+            logger.warning("compile_mode=%s ignored: %s has no diffusion.unet",
+                           mode, type(self.policy).__name__)
+            return
+        try:
+            self.policy.diffusion.unet = torch.compile(unet, mode=mode)
+            logger.info("compiled diffusion UNet (mode=%s); first inference pays the "
+                        "compile cost, so warmup() before the episode", mode)
+        except Exception:
+            logger.exception("torch.compile failed; running eager")
+
     def reset(self) -> None:
         self.policy.reset()
+
+    def warmup(self, obs: dict, n: int = 3) -> None:
+        """Pay compile/autotune and cuDNN algorithm selection before the loop starts.
+
+        Resets afterwards so the warmup observations do not enter the policy's
+        obs history.
+        """
+        for _ in range(n):
+            self.infer(obs)
+        self.reset()
 
     def infer(self, obs: dict) -> np.ndarray:
         obs_t = prepare_observation_for_inference(_format_obs_for_policy(obs), self.device)
         obs_t = self.preprocessor(obs_t)
         obs_only = {k: v for k, v in obs_t.items() if k.startswith("observation.")}
 
-        with torch.inference_mode():
+        amp = (torch.autocast(self.device.type, dtype=self._amp_dtype)
+               if self._amp_dtype is not None else contextlib.nullcontext())
+        with torch.inference_mode(), amp:
             if hasattr(self.policy, "_queues") and self.policy._queues is not None:
                 # Mirror what select_action does before calling predict_action_chunk (lerobot 0.5.1
                 # has no offline mode for predict_action_chunk — queues must be pre-populated).
@@ -91,7 +144,9 @@ class BasePolicy:
                 chunk = self.policy.predict_action_chunk(batch_for_queues)  # (1, T, action_dim)
             else:
                 chunk = self.policy.predict_action_chunk(obs_only)
-        chunk = chunk.squeeze(0)  # (T, action_dim)
+        # Back to fp32 before the postprocessor: under autocast the chunk comes
+        # out in the reduced dtype and the unnormalisation stats are fp32.
+        chunk = chunk.float().squeeze(0)  # (T, action_dim)
 
         # Unnormalise each step via the postprocessor.
         # For stateful postprocessors (e.g. relative actions), revisit this loop.
