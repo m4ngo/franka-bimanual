@@ -46,7 +46,7 @@ import numpy as np
 IMPEDANCE_MODE = "variable"
 
 # Sim-parity gain schedule (cfg/fast_default.yaml controller block).
-DEFAULT_KP = 175.0
+DEFAULT_KP = 150.0
 KP_LIMITS = (0.0, 1500.0)
 DEFAULT_DAMPING_RATIO = 1.0
 DAMPING_RATIO_LIMITS = (0.0, 10.0)
