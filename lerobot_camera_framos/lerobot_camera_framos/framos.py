@@ -493,6 +493,28 @@ class FramosCamera(Camera):
                 full_arr = cv2.cvtColor(full_arr, cv2.COLOR_BGR2RGB)
             self._last_color_full = full_arr
 
+            # Center-crop the color frame to the requested output aspect ratio
+            # before resizing. This avoids skewing when downsampling from a
+            # different source aspect ratio.
+            if arr.ndim == 3:
+                h, w = arr.shape[:2]
+                desired_w = int(self._output_width)
+                desired_h = int(self._output_height)
+                if desired_h > 0 and desired_w > 0:
+                    desired_ratio = float(desired_w) / float(desired_h)
+                    current_ratio = float(w) / float(h)
+                    if abs(current_ratio - desired_ratio) > 1e-6:
+                        if current_ratio > desired_ratio:
+                            # source is wider than desired -> crop width
+                            crop_w = int(round(h * desired_ratio))
+                            crop_x = (w - crop_w) // 2
+                            arr = arr[:, crop_x : crop_x + crop_w]
+                        else:
+                            # source is taller than desired -> crop height
+                            crop_h = int(round(w / desired_ratio))
+                            crop_y = (h - crop_h) // 2
+                            arr = arr[crop_y : crop_y + crop_h, :]
+
             if arr.ndim == 3 and (
                 arr.shape[0] != self._output_height or arr.shape[1] != self._output_width
             ):

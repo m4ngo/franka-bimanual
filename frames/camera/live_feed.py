@@ -10,15 +10,25 @@ from __future__ import annotations
 import sys
 
 import cv2
+import franka_config as fc
 import numpy as np
 import pyrealsense2 as rs
 
-# Set this to the serial number of the camera you want to use, e.g. "123456789012".
-# Leave as None to just grab the first device the context finds.
-TARGET_SERIAL: str | None = "6CD146030D71"
+# Camera to show, by id in config/cameras.yaml. Set TARGET_SERIAL to None to
+# just grab the first device the context finds.
+CAM_KEY = "cam_2"
+TARGET_SERIAL: str | None = fc.camera(CAM_KEY).serial_number
 
-COLOR_W, COLOR_H = 1280, 720
-FPS = 30  # native stream FPS requested from the camera
+_FRAMOS = fc.framos_defaults()
+COLOR_W, COLOR_H = _FRAMOS["color_width"], _FRAMOS["color_height"]
+# Display square size (crop left/right to make frames square)
+DISPLAY_SIZE = min(COLOR_W, COLOR_H)
+FPS = fc.camera_stream_fps()  # native stream FPS requested from the camera
+
+# Overlay reference image (path relative to workspace). Set to None to disable.
+OVERLAY_PATH: str | None = "frames/sim-ref.png"
+# Initial global overlay alpha in [0, 1]
+OVERLAY_ALPHA = 0.0
 
 WARMUP_FRAMES = 15
 FRAME_TIMEOUT_MS = 5000
@@ -37,9 +47,32 @@ def _make_display_backend():
         fig, ax = plt.subplots(num=WINDOW_NAME)
         ax.set_title(WINDOW_NAME)
         ax.axis("off")
-        image = ax.imshow(np.zeros((COLOR_H, COLOR_W, 3), dtype=np.uint8))
+        # Use a square display buffer so matplotlib window matches the
+        # center-cropped frames (left/right margins removed).
+        image = ax.imshow(np.zeros((DISPLAY_SIZE, DISPLAY_SIZE, 3), dtype=np.uint8))
         fig.show()
         return "matplotlib", (plt, fig, ax, image)
+
+
+def _load_overlay(path: str) -> np.ndarray | None:
+    try:
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+    except Exception:
+        return None
+    if img is None:
+        return None
+    # cv2 reads BGR(A) — convert to RGB(A)
+    if img.ndim == 3 and img.shape[2] >= 3:
+        img = img[..., :4] if img.shape[2] == 4 else img[..., :3]
+        if img.shape[2] == 3:
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        else:
+            # 4 channels: B G R A -> R G B A
+            bgr = img[..., :3]
+            a = img[..., 3:4]
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            img = np.concatenate([rgb, a], axis=2)
+    return img
 
 
 def pick_device(ctx: rs.context) -> rs.device | None:
@@ -104,6 +137,14 @@ def main() -> int:
 
     display_backend, display_state = _make_display_backend()
 
+    overlay_img = None
+    overlay_enabled = False
+    overlay_alpha = float(OVERLAY_ALPHA)
+    if OVERLAY_PATH is not None:
+        overlay_img = _load_overlay(OVERLAY_PATH)
+        if overlay_img is not None:
+            overlay_enabled = True
+
     try:
         # Warm up so auto-exposure etc. can settle before we display frames.
         for _ in range(WARMUP_FRAMES):
@@ -126,6 +167,40 @@ def main() -> int:
                 continue
 
             color_np = np.asanyarray(color.get_data())
+            # Center-crop horizontally to make the frame square (crop left/right)
+            h, w = color_np.shape[:2]
+            if w != h:
+                crop_w = min(w, h)
+                crop_x = (w - crop_w) // 2
+                color_np = color_np[:, crop_x:crop_x + crop_w]
+            # If overlay present and enabled, resize and alpha-blend.
+            if overlay_img is not None and overlay_enabled:
+                # Resize overlay to match frame
+                oh = overlay_img.shape[0]
+                ow = overlay_img.shape[1]
+                th, tw = color_np.shape[:2]
+                if (oh, ow) != (th, tw):
+                    # Use INTER_AREA for downsampling, INTER_LINEAR for up
+                    interp = cv2.INTER_AREA if (ow > tw or oh > th) else cv2.INTER_LINEAR
+                    overlay_resized = cv2.resize(overlay_img, (tw, th), interpolation=interp)
+                else:
+                    overlay_resized = overlay_img
+
+                if overlay_resized.ndim == 3 and overlay_resized.shape[2] == 4:
+                    rgb = overlay_resized[..., :3].astype(np.float32)
+                    a = overlay_resized[..., 3].astype(np.float32) / 255.0
+                    a = a * overlay_alpha
+                    a = a[..., None]
+                else:
+                    rgb = overlay_resized.astype(np.float32)
+                    a = overlay_alpha
+                    a = np.full((th, tw, 1), float(a), dtype=np.float32)
+
+                # color_np is uint8 RGB; blend in float then convert back
+                fg = rgb
+                bg = color_np.astype(np.float32)
+                blended = (a * fg) + ((1.0 - a) * bg)
+                color_np = np.clip(blended, 0, 255).astype(np.uint8)
             if display_backend == "opencv":
                 # Frames arrive as RGB; OpenCV expects BGR for display.
                 bgr = cv2.cvtColor(color_np, cv2.COLOR_RGB2BGR)
@@ -134,6 +209,13 @@ def main() -> int:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
+                # Toggle overlay with 'o', increase/decrease alpha with '+'/'-'
+                if key == ord('o'):
+                    overlay_enabled = not overlay_enabled
+                if key == ord('+') or key == ord('='):
+                    overlay_alpha = min(1.0, overlay_alpha + 0.05)
+                if key == ord('-'):
+                    overlay_alpha = max(0.0, overlay_alpha - 0.05)
             else:
                 plt, fig, ax, image = display_state
                 image.set_data(color_np)

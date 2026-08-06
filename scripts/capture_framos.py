@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Manually capture RGB frames from both FRAMOS D415e cameras.
+"""Manually capture RGB frames from the FRAMOS D415e cameras.
 
 Standalone — does not touch the FR3 control stack or LeRobot CLI. Talks
-straight to the cameras via `lerobot_camera_framos.FramosCamera`.
+straight to the cameras via `lerobot_camera_framos.FramosCamera`; IPs and
+serials come from config/cameras.yaml.
 
 Press Enter to capture one frame from each camera; `q` + Enter (or Ctrl+C)
 to quit. Frames are written to OUT as PNGs named `{ts}_{shot:04d}_{slot}.png`.
@@ -15,15 +16,14 @@ import time
 from pathlib import Path
 
 import cv2
+import franka_config as fc
 
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
 
-# IPs/serials mirror BimanualFrankaConfig.
-CAMERAS: tuple[tuple[str, str, str, str], ...] = (
-    ("cam_2", "workspace_framos_d71", "192.168.0.116", "6CD146030D71"),
-    ("cam_6", "workspace_framos_d63", "192.168.1.102", "6CD146030D63"),
-)
+def _framos_camera_keys() -> tuple[str, ...]:
+    """Every FRAMOS camera declared in config/cameras.yaml."""
+    return tuple(k for k in fc.camera_keys() if fc.camera(k).is_framos)
 
 
 def main() -> None:
@@ -34,9 +34,14 @@ def main() -> None:
         default=Path.home() / "franka_data" / "demo_images",
         help="Output directory for captured PNGs.",
     )
-    p.add_argument("--width", type=int, default=1280, help="Color frame width.")
-    p.add_argument("--height", type=int, default=720, help="Color frame height.")
-    p.add_argument("--fps", type=int, default=30, help="Streaming FPS (6/15/30/60/90).")
+    p.add_argument("--width", type=int, default=fc.framos_defaults()["color_width"],
+                   help="Color frame width.")
+    p.add_argument("--height", type=int, default=fc.framos_defaults()["color_height"],
+                   help="Color frame height.")
+    p.add_argument("--fps", type=int, default=fc.camera_stream_fps(),
+                   help="Streaming FPS (6/15/30/60/90).")
+    p.add_argument("--cameras", nargs="+", default=list(_framos_camera_keys()),
+                   help="Camera ids from config/cameras.yaml to capture from.")
     p.add_argument(
         "--warmup-frames",
         type=int,
@@ -49,11 +54,9 @@ def main() -> None:
 
     cams: list[tuple[str, FramosCamera]] = []
     try:
-        for slot, name, ip, sn in CAMERAS:
-            cfg = FramosCameraConfig(
-                name=name,
-                ip=ip,
-                serial_number=sn,
+        for slot in args.cameras:
+            cfg = FramosCameraConfig.for_camera(
+                slot,
                 fps=args.fps,
                 width=args.width,
                 height=args.height,

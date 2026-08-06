@@ -1,0 +1,26 @@
+# Normalization contract shared by sysid, residual_wrapper, and the trained
+# policies. Changing anything here invalidates previously trained checkpoints.
+
+version: 2
+
+residual:
+  pos_scale_m: 0.05        # metres per normalised unit
+  rot_scale_rad: 0.5       # radians per normalised unit
+  chunk_exec: 5            # steps executed per inference call
+  horizon: 10              # base-chunk steps forwarded to the residual policy
+  gains_mag: 0.5
+  residual_mag: 0.2
+  residual_trans_mag: 0.2
+  residual_rot_mag: 0.2
+  res_pos_gain: 1.0
+  res_rot_gain: 1.0
+
+gripper:
+  # robosuite gripper_qpos = [width/2, -width/2]; Panda finger range (m).
+  panda_finger_max_m: 0.04
+
+sysid:
+  # Action kp/kd channels in [-1, 1]; 0.0 -> kp_gain = 1.0.
+  default_kp: 0.0
+  default_kd: 0.0
+  camera_read_timeout_ms: 50.0

@@ -69,6 +69,7 @@ from datetime import datetime
 from pathlib import Path
 
 import cv2
+import franka_config as fc
 import h5py
 import numpy as np
 from tqdm import tqdm
@@ -112,12 +113,15 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
 
 # Action kp/kd in [-1, 1]; send_action maps them via kp_gain = 10**kp.
 # Default 0.0 → kp_gain = 1.0 (minimum, safest for an open-loop sysid replay).
-_DEFAULT_KP = 0.0
-_DEFAULT_KD = 0.0
+_DEFAULT_KP = fc.policy("sysid.default_kp")
+_DEFAULT_KD = fc.policy("sysid.default_kd")
+
+# Rig profile the sysid loop drives, and the arm key it exposes.
+_PROFILE = "single_arm_franka"
+_ARM_KEY = fc.profile(_PROFILE).depth_center_arm
 
 # Camera read timeout used when capturing frames inside the step loop.
-# 50 ms is generous for a buffered async_read at 20 Hz control rate.
-_CAM_TIMEOUT_MS = 50.0
+_CAM_TIMEOUT_MS = fc.policy("sysid.camera_read_timeout_ms")
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +302,7 @@ class _MockController:
                 return {a: snap for a in arms}
 
             def recovery_counts(self):
-                return {"r": 0}
+                return {_ARM_KEY: 0}
 
         self.robot_manager = _RM()
 
@@ -463,9 +467,9 @@ def _run_episode(
             # --- read kinematic state ----------------------------------------
             # Store in _cached_kin_state so send_action re-uses it, avoiding
             # a redundant RPyC round-trip.
-            kin = controller.robot_manager.current_kinematic_state_batch(["r"])
+            kin = controller.robot_manager.current_kinematic_state_batch([_ARM_KEY])
             controller._cached_kin_state = kin
-            q, dq, _jac, ee_pos, ee_quat, ee_vel = kin["r"]
+            q, dq, _jac, ee_pos, ee_quat, ee_vel = kin[_ARM_KEY]
             # ee_vel layout: [lin_x, lin_y, lin_z, ang_x, ang_y, ang_z]
             ee_pos64 = np.asarray(ee_pos, dtype=np.float64)
             ee_quat64 = np.asarray(ee_quat, dtype=np.float64)
@@ -528,7 +532,7 @@ def _run_episode(
             buf["eef_goal_quat"].append(gq.astype(np.float32))
             # Cumulative recoverable-error recoveries (reflexes etc.) so analysis
             # can flag ticks where tracking was interrupted. Local attribute read.
-            buf["fault_count"].append(np.int32(controller.robot_manager.recovery_counts().get("r", 0)))
+            buf["fault_count"].append(np.int32(controller.robot_manager.recovery_counts().get(_ARM_KEY, 0)))
             buf["eef_ang_vel"].append(np.asarray(ee_vel[3:], dtype=np.float32))
             buf["eef_lin_vel"].append(np.asarray(ee_vel[:3], dtype=np.float32))
             buf["eef_pos"].append(np.asarray(ee_pos, dtype=np.float32))
@@ -622,7 +626,7 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
     "safety": (
         "JOINT_VELOCITY_MAX", "EE_LINEAR_VELOCITY_MAX", "EE_ANGULAR_VELOCITY_MAX",
         "WORKTABLE_HEIGHT", "WORKTABLE_DISTANCE_MIN", "WORKTABLE_MAX_DECEL",
-        "CUSTOM_END_EFFECTOR_Z_EXTENSION",
+        "EE_SPHERE",
     ),
     "fp": (
         "VELOCITY_COMMAND_DURATION_MS", "_JOINT_RELATIVE_DYNAMICS",
@@ -675,6 +679,10 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
                        "OSCVelocityController's law has no kd term)",
         },
         "constants": constants,
+        # Full YAML config snapshot: the constants above are read live from the
+        # modules, but the modules now read from config/, so record the source.
+        "config": fc.all_sections(),
+        "config_dir": str(fc.config_dir()),
     }
 
 
@@ -709,7 +717,7 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true",
                         help="Run against a kinematic mock instead of the robot "
                              "(no hardware or lerobot/franky needed)")
-    parser.add_argument("--fps", type=float, default=20.0, help="Control rate in Hz")
+    parser.add_argument("--fps", type=float, default=float(fc.control_fps()), help="Control rate in Hz")
     parser.add_argument(
         "--kp", type=float, default=_DEFAULT_KP,
         help="EE PD kp in [-1, 1]; maps to gain 10**kp (default 0 → gain 1.0)",

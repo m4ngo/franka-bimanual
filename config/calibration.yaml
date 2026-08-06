@@ -1,0 +1,54 @@
+# ChArUco board spec and IO layout for frames/camera/camera_calibration.py.
+# Editing the board here is enough; the script reads it at startup and writes
+# results back into cameras.yaml via `--write-config`.
+
+version: 2
+
+board:
+  squares_x: 12              # total squares (black+white), horizontal
+  squares_y: 9               # total squares (black+white), vertical
+  square_length_m: 0.0645    # checkerboard square edge
+  marker_length_m: 0.047     # marker's black-bordered footprint
+  aruco_dict: null           # null -> autodetect from candidate_dicts
+  auto_detect_dict: true
+  candidate_dicts:
+    - DICT_4X4_50
+    - DICT_4X4_100
+    - DICT_4X4_250
+    - DICT_4X4_1000
+    - DICT_5X5_50
+    - DICT_5X5_100
+    - DICT_5X5_250
+    - DICT_5X5_1000
+    - DICT_6X6_50
+    - DICT_6X6_100
+    - DICT_6X6_250
+    - DICT_6X6_1000
+    - DICT_7X7_50
+    - DICT_7X7_100
+    - DICT_7X7_250
+    - DICT_7X7_1000
+
+world_axes:
+  # Axes only. The calibration frame's ORIGIN is always the board centre:
+  #   calib_pt = axis_remap(board_to_world) @ (board_pt - board_center)
+  #
+  # There is deliberately no origin offset here. Where the calibration frame
+  # sits relative to the world lives in exactly one place —
+  # world.yaml: calib_origin_in_world — and is applied at load time, so moving
+  # the world origin never requires recalibrating.
+  board_to_world: [X, Y, Z]
+
+fit:
+  reproj_error_threshold_px: 0.5
+  min_charuco_corners: 6
+  show_debug_images: true
+
+paths:
+  # Relative to the repo root; {cam} is substituted with the camera id.
+  root: frames/camera
+  intrinsics_glob: "{root}/{cam}/calibrate/*.png"
+  extrinsics_glob: "{root}/{cam}/extrinsics/*.png"
+  undistort_glob: "{root}/{cam}/chessboard.png"
+  undistort_out: "{root}/{cam}/calibresult.png"
+  matrices_out: "{root}/{cam}_matrices.txt"

@@ -1,0 +1,47 @@
+# Robot profiles: which arms, which cameras, which key prefixes.
+#
+# Each profile is what a `RobotConfig` subclass reads its defaults from.
+# `arms` maps the exposed action/observation key prefix -> physical arm in
+# arms.yaml. The single-arm profile deliberately exposes the LEFT FR3 under
+# the `r` key so previously recorded single-arm datasets stay readable.
+#
+# `teleop_device` names which physical leader (teleop.yaml devices) the operator
+# holds. It is INDEPENDENT of which arm the profile drives — deriving one from
+# the other silently grabs the wrong SpaceMouse/GELLO, which connects fine and
+# then does nothing.
+
+version: 2
+
+profiles:
+  bimanual_franka:
+    arms:
+      l: left
+      r: right
+    cameras: [cam_1, cam_2, cam_3, cam_4, cam_5, cam_6]
+    depth_cameras: [cam_2]
+    depth: true
+    # Arm whose EE centres the depth crop.
+    depth_center_arm: r
+    control_mode: JOINT_POS
+
+  single_arm_franka:
+    arms:
+      r: left
+    # The operator drives this rig with the RIGHT-hand GELLO / SpaceMouse even
+    # though it commands the left FR3.
+    teleop_device: right
+    cameras: [cam_1, cam_5, cam_2]
+    depth_cameras: [cam_2]
+    depth: true
+    depth_center_arm: r
+    control_mode: EE_DELTA
+
+  openpi_single_arm:
+    # scripts/openpi_client_franka.py — DROID-style joint-velocity client.
+    arms:
+      r: right
+    cameras: [cam_2, cam_3]
+    depth_cameras: []
+    depth: false
+    depth_center_arm: r
+    control_mode: JOINT_POS

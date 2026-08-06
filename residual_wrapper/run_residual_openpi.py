@@ -27,6 +27,7 @@ import sys
 import time
 from pathlib import Path
 
+import franka_config as fc
 import numpy as np
 
 import env_wrapper
@@ -38,7 +39,7 @@ from run_residual import (
     _save_viz,
     _str2bool,
     _wait_for_right_arrow,
-    _DEFAULT_HOME_Q,
+    _default_home_q,
     _POSES_DIR,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -94,21 +95,21 @@ def main() -> None:
     parser.add_argument("--raw-proprio", action="store_true",
                         help="A/B control: skip the sim-convention proprio correction")
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu) for the residual policy")
-    parser.add_argument("--home-pose-name", default="home_pose",
+    parser.add_argument("--home-pose-name", default=fc.default_home_pose_name(),
                         help=f"Name of a saved pose JSON in {_POSES_DIR} (overrides --home-q)")
-    parser.add_argument("--home-q", nargs=7, type=float, default=_DEFAULT_HOME_Q,
-                        help="7 joint angles (rad) for the right arm home pose")
-    parser.add_argument("--home-gripper", type=float, default=1.0)
-    parser.add_argument("--home-max-time-s", type=float, default=3.0)
-    parser.add_argument("--home-tol-rad", type=float, default=0.05)
-    parser.add_argument("--home-tol-m", type=float, default=0.025)
+    parser.add_argument("--home-q", nargs=7, type=float, default=None,
+                        help="7 joint angles (rad) overriding the saved home pose")
+    parser.add_argument("--home-gripper", type=float, default=fc.control("homing.gripper_norm"))
+    parser.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
+    parser.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
+    parser.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"))
 
     parser.add_argument("--repo-id", default=None)
     parser.add_argument("--output-dir", default=None)
     parser.add_argument("--task", default=None)
     parser.add_argument("--num-episodes", type=int, default=1)
     parser.add_argument("--episode-time-s", type=float, default=60.0)
-    parser.add_argument("--fps", type=int, default=20)
+    parser.add_argument("--fps", type=int, default=fc.control_fps())
     parser.add_argument("--push-to-hub", type=_str2bool, default=True)
     parser.add_argument("--resume", type=_str2bool, default=False)
     parser.add_argument("--viz-dir", default=None)
@@ -125,14 +126,13 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, force=True)
 
-    if args.home_pose_name:
-        import json
-        pose = json.loads((_POSES_DIR / f"{args.home_pose_name}.json").read_text())
-        home_q = np.asarray(pose["r_q"], dtype=np.float64)
-        home_gripper = float(pose.get("gripper", args.home_gripper))
-    else:
+    if args.home_q is not None:
         home_q = np.asarray(args.home_q, dtype=np.float64)
         home_gripper = args.home_gripper
+    else:
+        pose = fc.load_home_pose(args.home_pose_name)
+        home_q = _default_home_q(args.home_pose_name)
+        home_gripper = float(pose.get("gripper", args.home_gripper))
 
     print("attempting connection to robot...")
     controller = env_wrapper.start_controller()

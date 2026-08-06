@@ -18,13 +18,15 @@ from scipy.spatial.transform import Rotation
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from env_wrapper import DEFAULT_HOME_Q, measured_ee_twist_world, start_controller  # noqa: E402
+import franka_config as fc  # noqa: E402
+from env_wrapper import default_home_q, measured_ee_twist_world, start_controller  # noqa: E402
 
-_FPS = 20.0
+_FPS = float(fc.control_fps())
+_ARM_KEY = fc.profile("single_arm_franka").depth_center_arm
 
 
 def _sample(controller):
-    return time.perf_counter(), controller.robot_manager.current_kinematic_state_batch(["r"])["r"]
+    return time.perf_counter(), controller.robot_manager.current_kinematic_state_batch([_ARM_KEY])[_ARM_KEY]
 
 
 def _pose_fd(t0, s0, t1, s1):
@@ -52,8 +54,8 @@ def main() -> None:
     dt = 1.0 / _FPS
     try:
         if not args.no_home:
-            print("homing to DEFAULT_HOME_Q...")
-            if not controller.home(home_q_left=None, home_q_right=np.asarray(DEFAULT_HOME_Q)):
+            print("homing to the saved default home pose...")
+            if not controller.home(home_q_left=None, home_q_right=default_home_q()):
                 print("WARNING: homing did not converge; continuing from current pose")
 
         # Phase 1: rest — brake explicitly and let post-homing motion decay

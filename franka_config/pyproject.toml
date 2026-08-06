@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "franka_config"
+version = "0.0.0"
+description = "Centralized YAML-backed environment config for the TRI bimanual FR3 workspace"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pyyaml",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["franka_config*"]

@@ -22,9 +22,10 @@ import tty
 from pathlib import Path
 import time
 
+import franka_config as fc
 import numpy as np
 
-POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
+POSES_DIR = fc.home_poses_dir()
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.feature_utils import combine_feature_dicts
@@ -111,9 +112,14 @@ class _StdinKeyboardThread:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
 
 
-_R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.201.10", 18812
-_R_GELLO_PORT = "/dev/ttyUSB0"
-_R_SPACEMOUSE_PATH = "/dev/hidraw3"
+# Which physical arm the `r_` keys drive comes from config/rig.yaml. The leader
+# device is a SEPARATE question — which SpaceMouse/GELLO the operator holds —
+# so it comes from the profile's teleop_device, never from the arm. Both
+# SpaceMice enumerate as identical HID devices, so picking the wrong one
+# connects successfully and then does nothing.
+_PROFILE = "single_arm_franka"
+_ARM_KEY = fc.profile(_PROFILE).depth_center_arm
+_TELEOP_DEVICE = fc.profile(_PROFILE).teleop_device
 
 
 def _str2bool(v: str) -> bool:
@@ -122,31 +128,33 @@ def _str2bool(v: str) -> bool:
 
 def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = False) -> SingleArmFranka:
     cfg = SingleArmFrankaConfig(
-        r_server_ip=_R_SERVER_IP,
-        r_robot_ip=_R_ROBOT_IP,
-        r_gripper_ip=_R_GRIPPER_IP,
-        r_port=_R_PORT,
         control_mode=control_mode,
         depth=depth,
-        use_noise=noise
+        use_noise=noise,
     )
     return make_robot_from_config(cfg)
 
 
-def _build_teleop(mode: str, teleop_id: str):
+def _build_teleop(mode: str, teleop_id: str, device: str | None = None):
+    device = device or _TELEOP_DEVICE
+    if device is None:
+        raise ValueError(
+            f"rig profile {_PROFILE!r} has no teleop_device; set one in config/rig.yaml "
+            "or pass --teleop-device."
+        )
+    gello_port = fc.teleop(f"gello.devices.{device}.port")
+    spacemouse_path = fc.teleop(f"spacemouse.devices.{device}.hidraw_path")
     if mode == "gello":
-        cfg = GelloConfig(id=teleop_id, side="r", port=_R_GELLO_PORT, use_noise=True)
+        cfg = GelloConfig(id=teleop_id, side=_ARM_KEY, port=gello_port, use_noise=True)
     elif mode == "gello_ee":
-        cfg = GelloEEConfig(id=teleop_id, side="r", port=_R_GELLO_PORT, use_noise=True)
+        cfg = GelloEEConfig(id=teleop_id, side=_ARM_KEY, port=gello_port, use_noise=True)
     elif mode == "spacemouse":
+        # translation/rotation scale come from config/teleop.yaml defaults.
         cfg = SpaceMouseConfig(
             id=teleop_id,
-            hidraw_path=_R_SPACEMOUSE_PATH,
-            prefix="r_",
+            hidraw_path=spacemouse_path,
+            prefix=f"{_ARM_KEY}_",
             use_delta=True,
-            # use_noise=True,
-            translation_scale=0.05,
-            rotation_scale=0.5,
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
@@ -208,8 +216,8 @@ def main() -> None:
     p.add_argument("--num-episodes", type=int, required=True)
     p.add_argument("--task", required=True, help="single_task description")
     p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
-    p.add_argument("--control-mode", required=True, choices=("JOINT_POS", "EE_POS", "EE_DELTA"),
-                   help="Robot control mode")
+    p.add_argument("--control-mode", default=fc.profile(_PROFILE).control_mode,
+                   choices=("JOINT_POS", "EE_POS", "EE_DELTA"), help="Robot control mode")
     p.add_argument("--depth", type=_str2bool, default=True,
                    help="Enable depth point-cloud observations (default: true)")
     p.add_argument(
@@ -218,8 +226,11 @@ def main() -> None:
         choices=("gello", "gello_ee", "spacemouse"),
         help="Teleop type (ignored when --policy is set)",
     )
+    p.add_argument("--teleop-device", default=_TELEOP_DEVICE,
+                   help="Which physical leader the operator holds (teleop.yaml devices). "
+                        "Defaults to the rig profile's teleop_device.")
     p.add_argument("--teleop-id", default="homed_single_arm_teleop")
-    p.add_argument("--fps", type=int, default=20)
+    p.add_argument("--fps", type=int, default=fc.control_fps())
     p.add_argument("--episode-time-s", type=float, default=60.0)
     p.add_argument("--reset-time-s", type=float, default=5.0, help="Time between episodes for manual reset")
     p.add_argument("--resume", type=_str2bool, default=False)
@@ -228,39 +239,40 @@ def main() -> None:
 
     p.add_argument(
         "--home-pose-name",
-        default=None,
+        default=fc.default_home_pose_name(),
         help=f"Name of a saved pose in {POSES_DIR} (overrides --home-q-right and --home-gripper)",
     )
     p.add_argument(
         "--home-q-right",
         nargs=7,
         type=float,
-        default=[-0.28223089288736675, -0.5594522989991991, -0.4191884798561259, -1.82212661700904, 0.06416041394704838, 1.5246974433097138, -0.7569427650529224],
+        default=None,
+        help="7 joint angles (rad) overriding the saved home pose",
     )
     p.add_argument(
         "--home-gripper",
         type=float,
-        default=1.0,
+        default=fc.control("homing.gripper_norm"),
         help="Normalized gripper at home (0=closed, 1=open)",
     )
-    p.add_argument("--home-max-time-s", type=float, default=3.0)
+    p.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
     p.add_argument(
         "--home-tol-rad",
         type=float,
-        default=0.05,
+        default=fc.control("homing.tol_rad"),
         help="Joint homing: max per-joint error (rad). EE homing: default rot tolerance if --home-tol-rot-rad unset.",
     )
     p.add_argument(
         "--home-fps",
         type=int,
         default=None,
-        help="Homing control rate (Hz). Default: max(--fps, 60) in EE mode, else --fps.",
+        help="Homing control rate (Hz). Default: control.rates.home_fps in config/control.yaml.",
     )
-    p.add_argument("--home-tol-m", type=float, default=0.03, help="EE homing only: max position error (m)")
+    p.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"), help="EE homing only: max position error (m)")
     p.add_argument(
         "--home-tol-rot-rad",
         type=float,
-        default=None,
+        default=fc.control("homing.tol_rot_rad"),
         help="EE homing only: max axis-angle error (rad); defaults to --home-tol-rad",
     )
     p.add_argument("--noise", type=bool, default=False, help="Whether to add noise to actions or not")
@@ -274,7 +286,7 @@ def main() -> None:
         args._policy_cfg.pretrained_path = args.policy
 
     robot = _build_robot(control_mode=ControlMode(args.control_mode), depth=args.depth, noise=args.noise)
-    teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
+    teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id, args.teleop_device)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 
@@ -290,14 +302,14 @@ def main() -> None:
             preprocessor_overrides={"device_processor": {"device": args._policy_cfg.device}},
         )
 
-    if args.home_pose_name:
-        pose_path = POSES_DIR / f"{args.home_pose_name}.json"
-        pose = json.loads(pose_path.read_text())
-        home_q_r = np.asarray(pose["r_q"], dtype=np.float64)
-        args.home_gripper = float(pose.get("gripper", args.home_gripper))
-        logger.info("Loaded home pose %r from %s", args.home_pose_name, pose_path)
-    else:
+    if args.home_q_right is not None:
         home_q_r = np.asarray(args.home_q_right, dtype=np.float64)
+    else:
+        pose = fc.load_home_pose(args.home_pose_name)
+        home_q_r = fc.home_q(args.home_pose_name, key=_ARM_KEY)
+        args.home_gripper = float(pose.get("gripper", args.home_gripper))
+        logger.info("Loaded home pose %r from %s", args.home_pose_name,
+                    POSES_DIR / f"{args.home_pose_name}.json")
 
     robot.connect()
     if teleop is not None:

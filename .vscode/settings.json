@@ -1,4 +1,13 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:venv",
-    "python-envs.defaultPackageManager": "ms-python.python:pip"
+    "python-envs.defaultPackageManager": "ms-python.python:pip",
+    "python.analysis.extraPaths": [
+        "franka_config",
+        "lerobot_camera_arv",
+        "lerobot_camera_framos",
+        "lerobot_robot_bimanual_franka",
+        "lerobot_teleoperator_gello",
+        "lerobot_teleoperator_spacemouse",
+        "residual_wrapper"
+    ]
 }

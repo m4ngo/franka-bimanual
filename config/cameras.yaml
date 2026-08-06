@@ -1,0 +1,109 @@
+# The six GigE cameras. `cam_1` … `cam_6` are the canonical observation keys
+# everywhere in the codebase; `role` and `mount` are metadata, never part of
+# the key.
+#
+# Extrinsics are stored in the CALIBRATION frame — origin at the ChArUco board
+# CENTRE, on the table — verbatim as frames/camera/camera_calibration.py prints
+# them. The loader composes them with world.calib_origin_in_world to get
+# camera-in-world; that transform is the single place the board-to-world offset
+# lives, so moving the world origin never invalidates these numbers.
+#
+# ARV wrist cameras carry no extrinsics: they move with the arm, so their pose
+# is FK-derived, not calibrated.
+
+version: 2
+
+defaults:
+  width: 224
+  height: 224
+  fps: 30
+  framos:
+    color_width: 1280
+    color_height: 720
+    depth_width: 1280
+    depth_height: 720
+    align_to: color
+    color_format: rgb8
+    depth_format: z16
+    streaming_fps: 30
+  arv:
+    pixel_format: Mono8
+
+cameras:
+  cam_1:
+    type: arv
+    name: gripper_bfs_23595723
+    ip: 192.168.0.142
+    role: wrist
+    mount: left_arm
+
+  cam_2:
+    type: framos
+    name: workspace_framos_d71
+    ip: 192.168.0.116
+    serial_number: 6CD146030D71
+    role: scene
+    mount: world
+    depth: true
+    calibration:
+      source: frames/camera/cam_2_matrices.txt
+      # +0.10 m in x vs that printout: it was produced with the old
+      # WORLD_ORIGIN_OFFSET baked in, and these are board-centre relative.
+      rms_reprojection_px: 0.1285
+      intrinsic_matrix:
+        - [1.02582369e+03, 0.0, 6.50459995e+02]
+        - [0.0, 1.17476266e+03, 3.14406419e+02]
+        - [0.0, 0.0, 1.0]
+      distortion_coeffs: [4.68252213e-02, 7.03564390e-01, -2.44091099e-03,
+                          2.53549950e-03, -3.12505518e+00]
+      # camera -> calibration frame
+      r_cam_in_calib:
+        - [-0.00776813, 0.51825880, -0.85518856]
+        - [0.99996459, 0.00125894, -0.00832026]
+        - [-0.00323542, -0.85522292, -0.51825023]
+      t_cam_in_calib: [0.84175211, 0.04680689, 0.72598619]
+
+  cam_3:
+    type: arv
+    name: gripper_bfs_23595719
+    ip: 192.168.1.138
+    role: wrist
+    mount: right_arm
+
+  cam_4:
+    type: arv
+    name: gripper_bfs_23595720
+    ip: 192.168.1.139
+    role: wrist
+    mount: right_arm
+
+  cam_5:
+    type: arv
+    name: gripper_bfs_23595724
+    ip: 192.168.1.143
+    role: wrist
+    mount: left_arm
+
+  cam_6:
+    type: framos
+    name: workspace_framos_d63
+    ip: 192.168.1.102
+    serial_number: 6CD146030D63
+    role: scene
+    mount: world
+    depth: true
+    calibration:
+      source: frames/camera/cam_6_matrices.txt
+      # +0.10 m in x vs that printout: see the note on cam_2.
+      rms_reprojection_px: 0.1278
+      intrinsic_matrix:
+        - [896.16738407, 0.0, 623.03492019]
+        - [0.0, 887.37167772, 353.61930747]
+        - [0.0, 0.0, 1.0]
+      distortion_coeffs: [-3.49668586e-03, 1.29032071e+00, -1.50837926e-03,
+                          -9.31210944e-05, -5.63551716e+00]
+      r_cam_in_calib:
+        - [-0.84769453, 0.07912915, -0.52454986]
+        - [0.33176631, 0.85065211, -0.40782608]
+        - [0.41393851, -0.51973991, -0.74734553]
+      t_cam_in_calib: [0.57975414, 0.45897286, 0.90583442]

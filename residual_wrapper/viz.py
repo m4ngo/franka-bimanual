@@ -12,6 +12,8 @@ self-contained animated HTML containing:
       is inferred, stays fixed within a chunk execution window.
     - Total chunk forecast — base + residual projected trajectory (solid blue);
       shows what the residual-modified plan looks like over the whole chunk.
+    - World origin and depth-camera pose, each drawn as a static RGB axis triad
+      with an origin marker (legend-toggleable).
     - Time-series panels (right column): kp, kd, commanded gripper
 
 Terminology
@@ -24,12 +26,21 @@ base forecast      : ee_pos_at_inference + cumsum(commanded_delta × EE_PD_KP ×
 total forecast     : same, but residual position corrections are included for the
                      first _CHUNK_EXEC steps, using the residual policy's kp_gain.
 
+All geometry rendered by this module — skeleton, EE poses, and chunk
+forecasts — is expressed in WORLD frame. FK produces robot-frame geometry,
+which is transformed into world frame via the robot's base pose in world, read
+from config/world.yaml (robot_base_in_world): the robot base (skeleton joint 0)
+is placed at that translation, oriented per that quaternion. Point clouds
+recorded by EpisodeRecorder are assumed to already be in world frame and are
+used as-is.
+
 The HTML is self-contained via ``include_plotlyjs="cdn"`` and mirrors the
 animated-slider pattern from multi-fast/utils/distill/pcd_viz.py.
 """
 
 import os
 
+import franka_config as fc
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -37,9 +48,14 @@ from scipy.spatial.transform import Rotation
 
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
 
-# Default world→robot transform (matches BimanualFrankaConfig defaults).
-_DEFAULT_WORLD_IN_ROBOT_T = (0.669, 0.003, 0.120)
-_DEFAULT_WORLD_IN_ROBOT_Q_WXYZ = (-0.376557, 0.0, 0.0, 0.926393)
+_PROFILE = "single_arm_franka"
+_ARM = fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
+
+# Robot base pose expressed in world frame (translation + wxyz quaternion),
+# from config/world.yaml. Skeleton joint 0 (the robot origin) is placed here.
+_BASE_IN_WORLD = fc.robot_base_in_world(_ARM)
+_DEFAULT_ROBOT_IN_WORLD_T = tuple(float(v) for v in _BASE_IN_WORLD.translation)
+_DEFAULT_ROBOT_IN_WORLD_Q_WXYZ = _BASE_IN_WORLD.quat_wxyz
 _AXIS_COLORS = (
     "rgba(220, 40, 40, 0.92)",
     "rgba(40, 170, 80, 0.92)",
@@ -52,6 +68,12 @@ _BASE_AXIS_COLORS = (
     "rgba(95, 180, 70, 0.82)",
     "rgba(55, 120, 220, 0.82)",
 )
+# Depth-camera pose in world frame, from config/cameras.yaml (camera -> world).
+_DEPTH_CAM_KEY = fc.profile(_PROFILE).depth_cameras[0]
+_DEPTH_CAM_IN_WORLD = fc.camera(_DEPTH_CAM_KEY).calibration.cam_in_world
+_DEFAULT_CAM_IN_WORLD_R = tuple(tuple(float(v) for v in row) for row in _DEPTH_CAM_IN_WORLD.rotation)
+_DEFAULT_CAM_IN_WORLD_T = tuple(float(v) for v in _DEPTH_CAM_IN_WORLD.translation)
+_STATIC_AXIS_LENGTH = 0.12
 
 
 # ---------------------------------------------------------------------------
@@ -193,13 +215,16 @@ class EpisodeRecorder:
 # ---------------------------------------------------------------------------
 
 def _skeleton_pts(q: np.ndarray) -> np.ndarray:
-    """Return (9, 3) skeleton positions: robot base origin + 7 joint frames + EE."""
+    """Return (9, 3) skeleton positions in ROBOT frame: robot base origin + 7
+    joint frames + EE. Call _apply_robot_to_world on the result to get world
+    frame."""
     chain = franka_fk_chain(q)  # (8, 4, 4)
     return np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # (9, 3)
 
 
 def _fk_pose(q: np.ndarray) -> np.ndarray:
-    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q."""
+    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q, in
+    ROBOT frame. Call _apply_robot_to_world_pose to get world frame."""
     chain = franka_fk_chain(q)
     pose = np.empty(7, dtype=np.float32)
     pose[:3] = chain[7, :3, 3]
@@ -208,7 +233,7 @@ def _fk_pose(q: np.ndarray) -> np.ndarray:
 
 
 def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
-    """Return (T, 7) EE poses for a list of joint-angle vectors."""
+    """Return (T, 7) EE poses (robot frame) for a list of joint-angle vectors."""
     return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
 
 
@@ -312,6 +337,66 @@ def _select_poses(poses: np.ndarray, idxs: tuple[int, ...]) -> np.ndarray:
     return poses[sel]
 
 
+def _static_frame_traces(
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    name: str,
+    length: float,
+    marker_color: str,
+    marker_symbol: str = "diamond",
+) -> list[go.Scatter3d]:
+    """Origin marker + RGB axis triad for a fixed world-frame pose.
+
+    Static (never included in a go.Frame update), so append these after every
+    animated trace. `rotation` is a 3x3 matrix mapping frame-local vectors into
+    world frame; `translation` is the frame origin in world frame.
+    """
+    rotation = np.asarray(rotation, dtype=np.float64)
+    translation = np.asarray(translation, dtype=np.float64)
+    pose = np.empty((1, 7), dtype=np.float64)
+    pose[0, :3] = translation
+    pose[0, 3:] = Rotation.from_matrix(rotation).as_quat()
+    marker = go.Scatter3d(
+        x=[float(translation[0])], y=[float(translation[1])], z=[float(translation[2])],
+        mode="markers",
+        marker=dict(size=5, color=marker_color, symbol=marker_symbol),
+        name=name,
+        legendgroup=name,
+        showlegend=False,
+        hoverinfo="text",
+        text=[name],
+    )
+    return [marker] + _pose_axes_traces(
+        pose, name, length, width=5, opacity=0.9, legendgroup=name
+    )
+
+
+def _reference_frame_traces(
+    cam_in_world_rotation: np.ndarray | None,
+    cam_in_world_translation: np.ndarray | None,
+) -> list[go.Scatter3d]:
+    """World-origin triad plus the camera pose triad (skipped when unset)."""
+    traces = _static_frame_traces(
+        np.eye(3), (0.0, 0.0, 0.0), "world origin", _STATIC_AXIS_LENGTH, "black"
+    )
+    if cam_in_world_rotation is not None and cam_in_world_translation is not None:
+        traces += _static_frame_traces(
+            cam_in_world_rotation, cam_in_world_translation, "camera",
+            _STATIC_AXIS_LENGTH, "gold",
+        )
+    return traces
+
+
+def _reference_frame_points(
+    cam_in_world_translation: np.ndarray | None,
+) -> list[np.ndarray]:
+    """Frame origins to fold into the scene bbox so the triads stay in view."""
+    pts = [np.zeros((1, 3), dtype=np.float32)]
+    if cam_in_world_translation is not None:
+        pts.append(np.asarray(cam_in_world_translation, dtype=np.float32).reshape(1, 3))
+    return pts
+
+
 def _skeleton_trace(pts: np.ndarray) -> go.Scatter3d:
     return go.Scatter3d(
         x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
@@ -354,15 +439,19 @@ def _metric_trace(
     )
 
 
-def _build_world_to_robot(
+def _build_robot_to_world(
     translation: tuple[float, float, float],
     quat_wxyz: tuple[float, float, float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (R, t) for p_robot = R @ p_world + t.
+    """Return (R, t) for p_world = R @ p_robot + t.
+
+    This places the robot base (robot-frame origin) at `translation` in world
+    frame, oriented per `quat_wxyz`.
 
     Args:
-        translation:  (tx, ty, tz) in metres.
-        quat_wxyz:    Unit quaternion (w, x, y, z).
+        translation:  (tx, ty, tz) in metres — robot base position in world frame.
+        quat_wxyz:    Unit quaternion (w, x, y, z) — robot base orientation in
+                      world frame.
     """
     w, x, y, z = quat_wxyz
     R = Rotation.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
@@ -370,19 +459,41 @@ def _build_world_to_robot(
     return R, t
 
 
-def _apply_world_to_robot(
+def _apply_robot_to_world(
     pts: np.ndarray,
     R: np.ndarray,
     t: np.ndarray,
 ) -> np.ndarray:
     """Apply rigid transform to the xyz columns; pass any extra columns (e.g. RGB) through.
 
-    pts: (N, 3) or (N, 6) — xyz [+ rgb].  Returns same shape.
+    pts: (N, 3) or (N, 6) — xyz [+ rgb].  Returns same shape, in world frame.
     """
+    pts = np.asarray(pts)
+    if len(pts) == 0:
+        return pts.astype(np.float32)
     xyz_out = (R @ pts[:, :3].T).T + t
     if pts.shape[1] == 3:
-        return xyz_out
-    return np.concatenate([xyz_out, pts[:, 3:]], axis=1)
+        return xyz_out.astype(np.float32)
+    return np.concatenate([xyz_out, pts[:, 3:]], axis=1).astype(np.float32)
+
+
+def _apply_robot_to_world_pose(
+    poses: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Transform an array of [x,y,z,qx,qy,qz,qw] poses from robot frame to world frame.
+
+    poses: (N, 7). Returns (N, 7), or the same empty array if poses is empty.
+    """
+    poses = np.asarray(poses, dtype=np.float64)
+    if len(poses) == 0:
+        return poses.astype(np.float32)
+    R_rot = Rotation.from_matrix(R)
+    out = np.empty_like(poses, dtype=np.float64)
+    out[:, :3] = (R @ poses[:, :3].T).T + t
+    out[:, 3:] = (R_rot * Rotation.from_quat(poses[:, 3:7])).as_quat()
+    return out.astype(np.float32)
 
 
 def _pcd_marker(pts: np.ndarray) -> dict:
@@ -488,11 +599,18 @@ def save_episode_html(
     title: str = "Residual episode",
     frame_stride: int = 1,
     fps: float = 20.0,
-    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
     pcd_max_pts: int = 3000,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
+    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
 ) -> None:
     """Write a self-contained animated Plotly HTML from recorded episode data.
+
+    Everything is rendered in WORLD frame. The robot base (skeleton joint 0)
+    is placed at `robot_base_in_world_translation`, oriented per
+    `robot_base_in_world_quat_wxyz`. Point clouds recorded by the EpisodeRecorder
+    are assumed to already be in world frame and are plotted as-is.
 
     Layout:
         Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray,
@@ -524,14 +642,19 @@ def save_episode_html(
         frame_stride:              Emit every Nth step (default 1 = all).
                                    Use 2–4 to reduce file size for long episodes.
         fps:                       Playback speed in frames per second (default 20).
-        world_in_robot_translation: (tx, ty, tz) metres — translation part of the
-                                   world→robot rigid transform.  Defaults to
-                                   BimanualFrankaConfig values.
-        world_in_robot_quat_wxyz:  (w, x, y, z) unit quaternion — rotation part of
-                                   the world→robot rigid transform.  Defaults to
+        robot_base_in_world_translation: (tx, ty, tz) metres — robot base position in
+                                   world frame. Defaults to BimanualFrankaConfig
+                                   values.
+        robot_base_in_world_quat_wxyz:  (w, x, y, z) unit quaternion — robot base
+                                   orientation in world frame. Defaults to
                                    BimanualFrankaConfig values.
         pcd_max_pts:               Max points to render per frame (uniformly
                                    subsampled).  Reduces HTML size for dense clouds.
+        cam_in_world_rotation:     3x3 camera->world rotation; None hides the
+                                   camera frame. Defaults to the cam_2_scene
+                                   calibration in config_single_arm_franka.
+        cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
+                                   frame; None hides the camera frame.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -541,14 +664,14 @@ def save_episode_html(
 
     frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
 
+    # --- robot -> world rigid transform --------------------------------------
+    R_r2w, t_r2w = _build_robot_to_world(robot_base_in_world_translation, robot_base_in_world_quat_wxyz)
+
     # --- apply stride --------------------------------------------------------
     indices = list(range(0, T_full, max(1, frame_stride)))
     T = len(indices)
 
     joint_angles     = [recorder.joint_angles[i]      for i in indices]
-    actual_pos       = np.array([recorder.actual_ee_pos[i]     for i in indices])  # (T, 3)
-    total_des_pos    = np.array([recorder.total_desired_pos[i] for i in indices])  # (T, 3)
-    base_des_pos     = np.array([recorder.base_desired_pos[i]  for i in indices])  # (T, 3)
     kp_arr           = np.array([recorder.kp[i]      for i in indices])
     kd_arr           = np.array([recorder.kd[i]      for i in indices])
     grip_arr         = np.array([recorder.gripper[i] for i in indices])
@@ -559,41 +682,61 @@ def save_episode_html(
                         else np.zeros((T, 3), dtype=np.float32))  # (T, 3)
     ts               = np.array(indices, dtype=np.float32)
 
-    # --- point clouds: transform world→robot and subsample -------------------
-    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
+    # --- point clouds: already world frame; subsample only -------------------
     raw_pcds = [recorder.point_clouds[i] for i in indices]  # (T,) list of (N,3) or None
     has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
 
-    pcd_robot: list[np.ndarray] = []
+    pcd_world: list[np.ndarray] = []
     if has_pcd:
         empty = np.zeros((0, 3), dtype=np.float32)
         for pts in raw_pcds:
             if pts is None or len(pts) == 0:
-                pcd_robot.append(empty)
+                pcd_world.append(empty)
                 continue
-            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
-            # if len(transformed) > pcd_max_pts:
-            #     idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
-            #     transformed = transformed[idx]
-            pcd_robot.append(transformed)
+            pts = np.asarray(pts, dtype=np.float32)
+            # if len(pts) > pcd_max_pts:
+            #     idx = np.random.choice(len(pts), pcd_max_pts, replace=False)
+            #     pts = pts[idx]
+            pcd_world.append(pts)
 
-    # --- forward kinematics --------------------------------------------------
+    # --- forward kinematics (robot frame) -> transform to world frame --------
     fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
-    skeletons = [item[0] for item in fk_frames]  # T × (9, 3)
-    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)  # T × (7,)
+    skeletons = [_apply_robot_to_world(item[0], R_r2w, t_r2w) for item in fk_frames]  # T × (9, 3)
+    ee_poses = np.array(
+        [_apply_robot_to_world_pose(item[1][None, :], R_r2w, t_r2w)[0] for item in fk_frames],
+        dtype=np.float32,
+    )  # T × (7,)
+    actual_pos = np.array([pose[:3] for pose in ee_poses], dtype=np.float32)  # (T, 3), world frame
 
-    # --- chunk forecast events -----------------------------------------------
-    chunk_events = recorder.chunk_events  # sorted ascending by step
+    # --- chunk forecast events (robot frame) -> transform to world frame -----
+    chunk_events = [
+        {
+            "step": ev["step"],
+            "ee_pos": _apply_robot_to_world(ev["ee_pos"][None, :], R_r2w, t_r2w)[0],
+            "base_traj": _apply_robot_to_world(ev["base_traj"], R_r2w, t_r2w),
+            "total_traj": _apply_robot_to_world(ev["total_traj"], R_r2w, t_r2w),
+            "base_traj_pose": (
+                _apply_robot_to_world_pose(ev["base_traj_pose"], R_r2w, t_r2w)
+                if ev.get("base_traj_pose") is not None else None
+            ),
+            "total_traj_pose": (
+                _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
+                if ev.get("total_traj_pose") is not None else None
+            ),
+        }
+        for ev in recorder.chunk_events
+    ]  # sorted ascending by step (order preserved from recorder)
 
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
-    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
     chunk_pts = []
     for ev in chunk_events:
         chunk_pts.append(ev["base_traj"])
         chunk_pts.append(ev["total_traj"])
+    frame_pts = _reference_frame_points(cam_in_world_translation)
     all_xyz = np.concatenate(
-        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
-        else [actual_pos] + skeletons + pcd_for_bbox,
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -691,9 +834,9 @@ def save_episode_html(
     # Traces 21-22: dashed lookahead segments of the two chunk forecasts
     fig.add_trace(_init_total_look, row=1, col=1)
     fig.add_trace(_init_base_look, row=1, col=1)
-    # Trace 23 (optional): point cloud at step 0 in robot space
+    # Trace 23 (optional): point cloud at step 0 in world space
     if has_pcd:
-        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+        fig.add_trace(_pcd_trace(pcd_world[0] if len(pcd_world[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
     # Trace 23 (or 24 if pcd present): res_gripper, same panel as gripper
     fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
     # --- animation frames ----------------------------------------------------
@@ -782,7 +925,7 @@ def save_episode_html(
         frame_data.append(total_look_tr)
         frame_data.append(base_look_tr)
         if has_pcd:
-            pts = pcd_robot[t]
+            pts = pcd_world[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
             # 23: point cloud at step t
@@ -878,6 +1021,10 @@ def save_episode_html(
             row=_zl_row, col=2,
         )
 
+    # World origin + camera pose triads (static, appended after all animated traces).
+    for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
+        fig.add_trace(frame_trace, row=1, col=1)
+
     fig.write_html(path, include_plotlyjs="cdn")
 
 
@@ -887,9 +1034,11 @@ def save_rollout_html(
     title: str = "Base policy rollout",
     frame_stride: int = 1,
     fps: float = 20.0,
-    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
     pcd_max_pts: int = 3000,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
+    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
 ) -> None:
     """Write a self-contained animated Plotly HTML for a base-policy-only rollout.
 
@@ -897,6 +1046,11 @@ def save_rollout_html(
     gray) and the base chunk forecast (royalblue) — the base policy's full projected
     trajectory updated each time a new chunk is inferred.  Use this when there is no
     residual policy.
+
+    Everything is rendered in WORLD frame. The robot base (skeleton joint 0)
+    is placed at `robot_base_in_world_translation`, oriented per
+    `robot_base_in_world_quat_wxyz`. Point clouds recorded by the EpisodeRecorder
+    are assumed to already be in world frame and are plotted as-is.
 
     Layout:
         Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray) +
@@ -910,9 +1064,15 @@ def save_rollout_html(
         title:                     Figure title.
         frame_stride:              Emit every Nth step (default 1 = all).
         fps:                       Playback speed in frames per second.
-        world_in_robot_translation: (tx, ty, tz) metres — world→robot transform.
-        world_in_robot_quat_wxyz:  (w, x, y, z) — rotation part of world→robot.
+        robot_base_in_world_translation: (tx, ty, tz) metres — robot base position in
+                                   world frame.
+        robot_base_in_world_quat_wxyz:  (w, x, y, z) — robot base orientation in
+                                   world frame.
         pcd_max_pts:               Max points to render per frame.
+        cam_in_world_rotation:     3x3 camera->world rotation; None hides the
+                                   camera frame.
+        cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
+                                   frame; None hides the camera frame.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -922,46 +1082,66 @@ def save_rollout_html(
 
     frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
 
+    R_r2w, t_r2w = _build_robot_to_world(robot_base_in_world_translation, robot_base_in_world_quat_wxyz)
+
     indices = list(range(0, T_full, max(1, frame_stride)))
     T = len(indices)
 
     joint_angles   = [recorder.joint_angles[i]     for i in indices]
-    actual_pos     = np.array([recorder.actual_ee_pos[i]    for i in indices])  # (T, 3)
-    commanded_pos  = np.array([recorder.base_desired_pos[i] for i in indices])  # (T, 3)
     kp_arr         = np.array([recorder.kp[i]      for i in indices])
     kd_arr         = np.array([recorder.kd[i]      for i in indices])
     grip_arr       = np.array([recorder.gripper[i] for i in indices])
     res_grip_arr       = np.array([recorder.res_gripper[i] for i in indices])
     ts             = np.array(indices, dtype=np.float32)
 
-    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
     raw_pcds = [recorder.point_clouds[i] for i in indices]
     has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
 
-    pcd_robot: list[np.ndarray] = []
+    pcd_world: list[np.ndarray] = []
     if has_pcd:
         empty = np.zeros((0, 3), dtype=np.float32)
         for pts in raw_pcds:
             if pts is None or len(pts) == 0:
-                pcd_robot.append(empty)
+                pcd_world.append(empty)
                 continue
-            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
-            if len(transformed) > pcd_max_pts:
-                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
-                transformed = transformed[idx]
-            pcd_robot.append(transformed)
+            pts = np.asarray(pts, dtype=np.float32)
+            if len(pts) > pcd_max_pts:
+                idx = np.random.choice(len(pts), pcd_max_pts, replace=False)
+                pts = pts[idx]
+            pcd_world.append(pts)
 
     fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
-    skeletons = [item[0] for item in fk_frames]
-    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)
+    skeletons = [_apply_robot_to_world(item[0], R_r2w, t_r2w) for item in fk_frames]
+    ee_poses = np.array(
+        [_apply_robot_to_world_pose(item[1][None, :], R_r2w, t_r2w)[0] for item in fk_frames],
+        dtype=np.float32,
+    )
+    actual_pos = np.array([pose[:3] for pose in ee_poses], dtype=np.float32)  # (T, 3), world frame
 
-    chunk_events = recorder.chunk_events  # sorted ascending by step
+    chunk_events = [
+        {
+            "step": ev["step"],
+            "ee_pos": _apply_robot_to_world(ev["ee_pos"][None, :], R_r2w, t_r2w)[0],
+            "base_traj": _apply_robot_to_world(ev["base_traj"], R_r2w, t_r2w),
+            "total_traj": _apply_robot_to_world(ev["total_traj"], R_r2w, t_r2w),
+            "base_traj_pose": (
+                _apply_robot_to_world_pose(ev["base_traj_pose"], R_r2w, t_r2w)
+                if ev.get("base_traj_pose") is not None else None
+            ),
+            "total_traj_pose": (
+                _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
+                if ev.get("total_traj_pose") is not None else None
+            ),
+        }
+        for ev in recorder.chunk_events
+    ]  # sorted ascending by step (order preserved from recorder)
 
-    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
     chunk_pts = [ev["base_traj"] for ev in chunk_events]
+    frame_pts = _reference_frame_points(cam_in_world_translation)
     all_xyz = np.concatenate(
-        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
-        else [actual_pos] + skeletons + pcd_for_bbox,
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -1029,7 +1209,7 @@ def save_rollout_html(
     fig.add_trace(_metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"), row=3, col=2)
     # Trace 14 (optional): point cloud
     if has_pcd:
-        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+        fig.add_trace(_pcd_trace(pcd_world[0] if len(pcd_world[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
     fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
 
     animated_traces = list(range(14))
@@ -1084,7 +1264,7 @@ def save_rollout_html(
                        line=dict(color="darkorchid", width=2)),
         ])
         if has_pcd:
-            pts = pcd_robot[t]
+            pts = pcd_world[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
             frame_data.append(go.Scatter3d(
@@ -1168,6 +1348,10 @@ def save_rollout_html(
                    line=_zero_line, showlegend=False, hoverinfo="skip"),
         row=2, col=2,
     )
+
+    # World origin + camera pose triads (static, appended after all animated traces).
+    for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
+        fig.add_trace(frame_trace, row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")
 

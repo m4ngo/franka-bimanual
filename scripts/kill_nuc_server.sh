@@ -6,14 +6,20 @@
 #
 # Usage: kill_nuc_server.sh [mario|luigi]
 set -euo pipefail
+source "$(dirname "$0")/_config.sh"
 
 TARGET="${1:-mario}"
 
+# NUC hostnames map to arms in config/arms.yaml.
 case "$TARGET" in
-  mario) HOST=mario@192.168.3.10; PORT=18812; GRIPPER_PORT=18822 ;;
-  luigi) HOST=luigi@192.168.3.11; PORT=18813; GRIPPER_PORT=18823 ;;
-  *) echo "unknown target '$TARGET' (expected mario or luigi)" >&2; exit 1 ;;
+  mario) ARM=right ;;
+  luigi) ARM=left  ;;
+  left|right) ARM="$TARGET" ;;
+  *) echo "unknown target '$TARGET' (expected mario/luigi or left/right)" >&2; exit 1 ;;
 esac
+
+eval "$(cfg_arm "$ARM" --prefix NUC)"
+HOST="$NUC_SSH"; PORT="$NUC_PORT"; GRIPPER_PORT="$NUC_GRIPPER_PORT"
 
 # Bracketed first char so the pattern never matches the shell running pkill --
 # 'rpyc_classic -p 18812' appears verbatim in that shell's own argv, so an

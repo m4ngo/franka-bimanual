@@ -34,26 +34,27 @@ current law doesn't consume kd directly.
 
 from __future__ import annotations
 
+import franka_config as fc
 import numpy as np
 
 # Velocity-domain PD gains (not torque-domain), same order of magnitude as the
 # EE_PD_KP/EE_PD_KD already used elsewhere in bimanual_franka.py.
-DEFAULT_KP = 3.5
-DEFAULT_DAMPING_RATIO = 1.0
+DEFAULT_KP = fc.control("gains.osc.default_kp")
+DEFAULT_DAMPING_RATIO = fc.control("gains.osc.damping_ratio")
 
 # Nullspace joint-velocity gain (acts only through the projected nullspace,
 # so it never fights the commanded task-space motion).
-DEFAULT_NULLSPACE_KP = 1.0
+DEFAULT_NULLSPACE_KP = fc.control("gains.osc.nullspace_kp")
 
 # Damped-least-squares singularity damping term used in the Jacobian pinv.
 # Must stay well below the smallest singular value J normally has away from
 # true kinematic singularities, or it introduces steady-state tracking error
 # during ordinary motion (not just near singularities). 0.01 only meaningfully
 # engages when a singular value drops below ~0.01, which is a real singularity.
-DEFAULT_DLS_DAMPING = 0.01
+DEFAULT_DLS_DAMPING = fc.control("gains.osc.dls_damping")
 
 # Final safety clip on the resulting joint velocity command, rad/s.
-DEFAULT_MAX_QDOT = 2.5
+DEFAULT_MAX_QDOT = fc.control("gains.osc.max_qdot")
 
 
 def quat_xyzw_conjugate(q_xyzw: np.ndarray) -> np.ndarray:

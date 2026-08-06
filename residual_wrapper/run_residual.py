@@ -46,8 +46,10 @@ from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 
 logger = logging.getLogger(__name__)
 
-_POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
-from env_wrapper import DEFAULT_HOME_Q as _DEFAULT_HOME_Q  # noqa: E402
+import franka_config as fc  # noqa: E402
+from env_wrapper import default_home_q as _default_home_q  # noqa: E402
+
+_POSES_DIR = fc.home_poses_dir()
 
 
 def _stdin_key_pressed() -> bool:
@@ -525,17 +527,17 @@ def main() -> None:
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu)")
     parser.add_argument(
         "--home-pose-name",
-        default="home_pose",
+        default=fc.default_home_pose_name(),
         help=f"Name of a saved pose JSON in {_POSES_DIR} (overrides --home-q)",
     )
     parser.add_argument(
-        "--home-q", nargs=7, type=float, default=_DEFAULT_HOME_Q,
-        help="7 joint angles (rad) for the right arm home pose",
+        "--home-q", nargs=7, type=float, default=None,
+        help="7 joint angles (rad) overriding the saved home pose",
     )
-    parser.add_argument("--home-gripper", type=float, default=1.0)
-    parser.add_argument("--home-max-time-s", type=float, default=3.0)
-    parser.add_argument("--home-tol-rad", type=float, default=0.05)
-    parser.add_argument("--home-tol-m", type=float, default=0.025)
+    parser.add_argument("--home-gripper", type=float, default=fc.control("homing.gripper_norm"))
+    parser.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
+    parser.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
+    parser.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"))
 
     # Recording options (all optional; omitting --repo-id disables recording).
     parser.add_argument("--repo-id", default=None,
@@ -548,7 +550,7 @@ def main() -> None:
                         help="Number of episodes to record (only used when recording)")
     parser.add_argument("--episode-time-s", type=float, default=60.0,
                         help="Duration of each episode in seconds (only used when recording)")
-    parser.add_argument("--fps", type=int, default=20,
+    parser.add_argument("--fps", type=int, default=fc.control_fps(),
                         help="Dataset fps (only used when creating a new dataset)")
     parser.add_argument("--push-to-hub", type=_str2bool, default=True,
                         help="Push dataset to HuggingFace Hub after recording")
@@ -571,13 +573,13 @@ def main() -> None:
 
     logging.basicConfig(level=logging.INFO, force=True)
 
-    if args.home_pose_name:
-        pose = json.loads((_POSES_DIR / f"{args.home_pose_name}.json").read_text())
-        home_q = np.asarray(pose["r_q"], dtype=np.float64)
-        home_gripper = float(pose.get("gripper", args.home_gripper))
-    else:
+    if args.home_q is not None:
         home_q = np.asarray(args.home_q, dtype=np.float64)
         home_gripper = args.home_gripper
+    else:
+        pose = fc.load_home_pose(args.home_pose_name)
+        home_q = _default_home_q(args.home_pose_name)
+        home_gripper = float(pose.get("gripper", args.home_gripper))
 
     print("attempting connection to robot...")
     controller = env_wrapper.start_controller()

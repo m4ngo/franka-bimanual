@@ -1,0 +1,7 @@
+Metadata-Version: 2.4
+Name: franka_config
+Version: 0.0.0
+Summary: Centralized YAML-backed environment config for the TRI bimanual FR3 workspace
+Requires-Python: >=3.10
+Requires-Dist: numpy
+Requires-Dist: pyyaml

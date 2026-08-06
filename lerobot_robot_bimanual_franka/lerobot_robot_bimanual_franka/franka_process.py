@@ -9,25 +9,27 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import franka_config as fc
 import numpy as np
 import rpyc
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-VELOCITY_COMMAND_DURATION_MS = 100
-NUM_JOINTS = 7
-EE_DELTA_DIMS = 6
+# Wire-level constants, all from config/control.yaml (franka: section).
+VELOCITY_COMMAND_DURATION_MS = fc.control("franka.velocity_command_duration_ms")
+NUM_JOINTS = fc.num_joints()
+EE_DELTA_DIMS = fc.control("franka.ee_delta_dims")
 
-DEFAULT_REQUEST_TIMEOUT_S = 5.0
-RPYC_TIMEOUT_S = 10
+DEFAULT_REQUEST_TIMEOUT_S = fc.control("franka.request_timeout_s")
+RPYC_TIMEOUT_S = fc.control("franka.rpyc_timeout_s")
 
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
-_JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_TORQUE_THRESHOLD = 100.0  # Nm
-_FORCE_THRESHOLD = 200.0   # N
-_JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
+_JACOBIAN_CACHE_Q_THRESHOLD = fc.control("franka.jacobian_cache_q_threshold_rad")  # rad, L-inf
+_JOINT_RELATIVE_DYNAMICS = tuple(fc.control("franka.joint_relative_dynamics"))
+_EE_DELTA_RELATIVE_DYNAMICS = tuple(fc.control("franka.ee_delta_relative_dynamics"))
+_TORQUE_THRESHOLD = fc.control("franka.torque_threshold_nm")  # Nm
+_FORCE_THRESHOLD = fc.control("franka.force_threshold_n")     # N
+_JOINT_STIFFNESS = list(fc.control("franka.joint_stiffness"))
 
 _RECOVERABLE_ERRORS = (
     "UDP receive: Timeout",

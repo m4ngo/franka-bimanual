@@ -4,6 +4,7 @@ Constants and helpers that sit at the boundary between raw robot observations
 and the policy / recording layer.  No policy or dataset imports here.
 """
 
+import franka_config as fc
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -11,27 +12,33 @@ from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 
-_RES_POS_GAIN = 1.0
-_RES_ROT_GAIN = 1.0
-_POS_SCALE = 0.05       # metres per normalised unit
-_ROT_SCALE = 0.5        # radians per normalised unit
-_CHUNK_EXEC = 5         # steps to execute per inference call (both base and residual)
-_RESIDUAL_HORIZON = 10  # base-chunk steps forwarded to the residual policy as context
-_GAINS_MAG = 0.5        # gains magnitude for clipping
-_RESIDUAL_MAG = 0.2     # residual magnitude for clipping
-_RESIDUAL_TRANS_MAG = 0.2
-_RESIDUAL_ROT_MAG = 0.2
+_PROFILE = "single_arm_franka"
+_ARM_KEY = fc.profile(_PROFILE).depth_center_arm
 
-_EE_ACTION_KEYS = ("r_x", "r_y", "r_z", "r_qx", "r_qy", "r_qz", "r_qw", "r_gripper")
+_RES_POS_GAIN = fc.policy("residual.res_pos_gain")
+_RES_ROT_GAIN = fc.policy("residual.res_rot_gain")
+_POS_SCALE = fc.policy("residual.pos_scale_m")     # metres per normalised unit
+_ROT_SCALE = fc.policy("residual.rot_scale_rad")   # radians per normalised unit
+_CHUNK_EXEC = fc.policy("residual.chunk_exec")     # steps to execute per inference call
+_RESIDUAL_HORIZON = fc.policy("residual.horizon")  # base-chunk steps forwarded to the residual policy
+_GAINS_MAG = fc.policy("residual.gains_mag")       # gains magnitude for clipping
+_RESIDUAL_MAG = fc.policy("residual.residual_mag")  # residual magnitude for clipping
+_RESIDUAL_TRANS_MAG = fc.policy("residual.residual_trans_mag")
+_RESIDUAL_ROT_MAG = fc.policy("residual.residual_rot_mag")
+
+_NUM_JOINTS = fc.num_joints()
+_EE_ACTION_KEYS = tuple(
+    f"{_ARM_KEY}_{ax}" for ax in ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
+)
 _ACTION_KEYS = (*_EE_ACTION_KEYS, "kp", "kd")
 
 # Scalar obs keys that make up observation.state, in dataset recording order.
 _STATE_OBS_KEYS = (
-    "r_joint_1", "r_joint_2", "r_joint_3", "r_joint_4",
-    "r_joint_5", "r_joint_6", "r_joint_7", "r_gripper",
+    *(f"{_ARM_KEY}_joint_{i}" for i in range(1, _NUM_JOINTS + 1)),
+    f"{_ARM_KEY}_gripper",
 )
 
-_DEPTH_POINT_COUNT = 2048
+_DEPTH_POINT_COUNT = fc.control("observation.depth_point_count")
 _DEPTH_FLAT_SIZE = _DEPTH_POINT_COUNT * 3
 
 
@@ -43,32 +50,20 @@ _DEPTH_FLAT_SIZE = _DEPTH_POINT_COUNT * 3
 # franka_fk returns the Franka TCP position but the FLANGE orientation: its DH
 # tail carries the hand's 0.1034 m translation but not the hand's 45° mounting
 # rotation. Sim-trained students expect robosuite's obs convention instead:
-# grip-SITE position + hand-BODY orientation. Without the correction the
-# student sees quaternions rotated 45.03° from its training distribution and
-# positions offset 6.9 mm from the (world-calibrated) point cloud. Constants
-# measured at matched joint configs across postures, std 0.0 — see
-# SYSID_UPDATE.md in multi-fast (2026-07-18); pinned by multi-fast
-# scripts/sysid/test_controller_parity.py.
-_SIM_CONV_ROT = Rotation.from_rotvec([0.0, 0.0, -0.785891])  # fk(flange) -> hand-body
-_SIM_CONV_POS_TOOL = np.array([0.0, 0.0, -0.0069])           # fk(TCP) -> grip site, tool frame (m)
+# grip-SITE position + hand-BODY orientation. Constants measured at matched
+# joint configs across postures — see config/world.yaml sim_alignment.
+_sim_rotvec, _SIM_CONV_POS_TOOL = fc.sim_ee_convention()
+_SIM_CONV_ROT = Rotation.from_rotvec(_sim_rotvec)  # fk(flange) -> hand-body
 
-# --- Sim-WORLD alignment (F5, sim-trained policies) --------------------------
-# The real world frame (chessboard calibration) is yawed 224.3 deg vs the
-# robot base with its origin ON the table plane; sim's world has the base at
-# (-0.6, 0, 0.912), identity yaw, table top at z=0.905. The 2026-07-19 obs
-# audit measured real proprio z fully OUTSIDE training support (~0.9 m low) —
-# the load-bearing part of F5, since train-time z-rotation augmentation makes
-# the student yaw-equivariant but never moves z. This constant SE(3) maps
-# real-world quantities into sim's world convention: rotation = the
-# calibration's world_in_robot yaw (config_single_arm_franka.py), translation
-# xy anchors the robot base to sim's base, z anchors the TABLE PLANE to sim's
-# (0.905 vs ~0.005 measured; table-anchoring centers task heights in the
-# training bulk — the rigs' base-to-table geometry differs by ~13 cm, so
-# base-anchoring would sit at the p99 edge). Applied to proprio pose, twist,
-# and cloud together so the modalities stay mutually consistent. Pinned by
-# multi-fast scripts/sysid/test_controller_parity.py.
-_SIM_WORLD_ROT = Rotation.from_quat([0.0, 0.0, 0.926393, -0.376557])  # real-world -> sim-world yaw
-_SIM_WORLD_T = np.array([0.069, 0.003, 0.900])
+# --- Sim-WORLD alignment (sim-trained policies) ------------------------------
+# Maps real-world quantities into sim's world convention. The real world frame
+# (config/world.yaml) is already floor-origin with the base at z = 0.912, i.e.
+# the sim convention, so this is identity unless world.yaml says otherwise.
+# Applied to proprio pose, twist, and cloud together so the modalities stay
+# mutually consistent.
+_SIM_WORLD_POSE = fc.sim_world_alignment()
+_SIM_WORLD_ROT = Rotation.from_matrix(_SIM_WORLD_POSE.rotation)
+_SIM_WORLD_T = _SIM_WORLD_POSE.translation
 
 
 def to_sim_world_pose(ee_pose_world: np.ndarray) -> np.ndarray:
@@ -98,20 +93,20 @@ def to_sim_world_twist(twist: np.ndarray) -> np.ndarray:
 
 
 def current_ee_pose(obs: dict, sim_convention: bool = True) -> np.ndarray:
-    """Return [x, y, z, qx, qy, qz, qw, gripper] for the right arm via FK.
+    """Return [x, y, z, qx, qy, qz, qw, gripper] for the active arm via FK.
 
     sim_convention (default True): express the pose in the sim-training obs
     convention (grip-site position, hand-body orientation) so sim-trained
     policies see in-distribution proprio. False returns the raw franka_fk
     convention (TCP position, flange orientation) for legacy comparison runs.
     """
-    q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
+    q = np.array([obs[f"{_ARM_KEY}_joint_{i}"] for i in range(1, _NUM_JOINTS + 1)])
     pos, quat_xyzw = franka_fk(q)
     if sim_convention:
         r_fk = Rotation.from_quat(quat_xyzw)
         pos = pos + r_fk.apply(_SIM_CONV_POS_TOOL)
         quat_xyzw = (r_fk * _SIM_CONV_ROT).as_quat()
-    return np.concatenate([pos, quat_xyzw, [obs["r_gripper"]]]).astype(np.float32)
+    return np.concatenate([pos, quat_xyzw, [obs[f"{_ARM_KEY}_gripper"]]]).astype(np.float32)
 
 
 def ee_pose_to_world(
@@ -133,13 +128,16 @@ def ee_pose_to_world(
 
 
 # Panda finger-joint range (m); robosuite gripper_qpos = [width/2, -width/2].
-_PANDA_FINGER_MAX_M = 0.04
+_PANDA_FINGER_MAX_M = fc.policy("gripper.panda_finger_max_m")
 
-# Canonical right-arm home configuration (rad), shared by rollout/check scripts.
-DEFAULT_HOME_Q = [
-    -0.28223089288736675, -0.5594522989991991, -0.4191884798561259,
-    -1.82212661700904, 0.06416041394704838, 1.5246974433097138, -0.7569427650529224,
-]
+
+def default_home_q(name: str | None = None) -> np.ndarray:
+    """Home configuration (rad) for the active arm.
+
+    home_poses/*.json is the only source of home configurations; `name`
+    defaults to arms.home_poses.default in config/arms.yaml.
+    """
+    return fc.home_q(name, key=_ARM_KEY)
 
 
 def measured_ee_twist_world(snap, r_robot_in_world: np.ndarray) -> np.ndarray:
@@ -226,14 +224,12 @@ def build_action(chunk_step: np.ndarray, kp: float, kd: float) -> dict:
 
 def start_controller(with_cameras: bool = True) -> SingleArmFranka:
     """with_cameras=False skips the camera rig entirely (no GigE connects, no
-    per-tick reads) for kinematics-only consumers like sysid collection."""
+    per-tick reads) for kinematics-only consumers like sysid collection.
+
+    All hardware addressing comes from the `single_arm_franka` rig profile.
+    """
     config = SingleArmFrankaConfig(
-        r_server_ip="192.168.3.10",
-        r_robot_ip="192.168.201.10",
-        r_gripper_ip="192.168.201.10",
-        r_port=18812,
-        control_mode="EE_DELTA",
-        **({} if with_cameras else {"cameras": {}}),
+        **({} if with_cameras else {"cameras": {}, "depth_cam": {}, "depth": False}),
     )
     robot = SingleArmFranka(config)
     robot.connect()

@@ -14,6 +14,7 @@ import argparse
 import sys
 from pathlib import Path
 
+import franka_config as fc
 import h5py
 
 _HERE = Path(__file__).resolve().parent
@@ -31,7 +32,7 @@ def main() -> None:
     parser.add_argument("ref_file", help="Reference HDF5 (sim format)")
     parser.add_argument("run_dir", help="sysid.py run directory with *_record_*.hdf5 files")
     parser.add_argument("--output", default=None, help="Output HTML (default: <run_dir>/aggregate.html)")
-    parser.add_argument("--fps", type=float, default=20.0)
+    parser.add_argument("--fps", type=float, default=float(fc.control_fps()))
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir).expanduser()

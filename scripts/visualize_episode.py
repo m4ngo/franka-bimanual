@@ -14,6 +14,7 @@ import argparse
 import dataclasses
 from collections.abc import Sequence
 
+import franka_config as fc
 import numpy as np
 import rerun as rr
 import rerun.blueprint as rrb
@@ -25,11 +26,14 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot_robot_bimanual_franka import BimanualFrankaConfig
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
 
-_WORLD_IN_ROBOT_TRANSLATION_M = np.array((0.669, 0.003, 0.120), dtype=np.float64)
-_WORLD_IN_ROBOT_QUAT_WXYZ = np.array((-0.376557, 0.0, 0.0, 0.926393), dtype=np.float64)
-_WORLD_FROM_ROBOT_ROT = Rotation.from_quat(
-    (_WORLD_IN_ROBOT_QUAT_WXYZ[1], _WORLD_IN_ROBOT_QUAT_WXYZ[2], _WORLD_IN_ROBOT_QUAT_WXYZ[3], _WORLD_IN_ROBOT_QUAT_WXYZ[0])
-).inv()
+# Robot base expressed in world (config/world.yaml): p_world = R @ p_base + t.
+# Previously this module inverted the stored pose, which — with the pose being
+# base-in-world — put the rendered geometry in the wrong place.
+_PROFILE = "bimanual_franka"
+_BASE_IN_WORLD = fc.robot_base_in_world(
+    fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
+)
+_ROBOT_TO_WORLD_ROT = Rotation.from_matrix(_BASE_IN_WORLD.rotation)
 
 
 def _camera_names() -> dict[str, str]:
@@ -72,12 +76,12 @@ def _action_mode(action_names: Sequence[str]) -> str:
 
 
 def _robot_to_world_points(points: np.ndarray) -> np.ndarray:
-    return _WORLD_FROM_ROBOT_ROT.apply(np.asarray(points, dtype=np.float64) - _WORLD_IN_ROBOT_TRANSLATION_M)
+    return _BASE_IN_WORLD.apply(np.asarray(points, dtype=np.float64))
 
 
 def _robot_to_world_pose(translation: np.ndarray, rotation_xyzw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     world_translation = _robot_to_world_points(np.asarray(translation, dtype=np.float64))
-    world_rotation = _WORLD_FROM_ROBOT_ROT * Rotation.from_quat(np.asarray(rotation_xyzw, dtype=np.float64))
+    world_rotation = _ROBOT_TO_WORLD_ROT * Rotation.from_quat(np.asarray(rotation_xyzw, dtype=np.float64))
     return world_translation, world_rotation.as_quat()
 
 

@@ -49,39 +49,56 @@ Board specification (fill these in for YOUR physical board):
                             and pick whichever detects the most markers.
 """
 
-import numpy as np
-import cv2 as cv
+import argparse
 import glob
 import os
+import sys
+
+import cv2 as cv
+import franka_config as fc
+import numpy as np
 
 # ----------------------------------------------------------------------
-# Config
+# Config — every value below comes from config/calibration.yaml.
+# `CAM_NAME` selects which camera in config/cameras.yaml is being calibrated;
+# override it with `--cam cam_6` on the command line.
 # ----------------------------------------------------------------------
-SQUARES_X = 11          # total squares (black+white), horizontal
-SQUARES_Y = 11          # total squares (black+white), vertical
-SQUARE_LENGTH = 0.05     # meters, checkerboard square edge
-MARKER_LENGTH = 0.039    # meters, marker's black-bordered footprint (not outer white border)
+_BOARD = fc.calibration("board")
+_FIT = fc.calibration("fit")
+_PATHS = fc.calibration("paths")
+_WORLD_AXES = fc.calibration("world_axes")
+SQUARES_X = _BOARD["squares_x"]              # total squares (black+white), horizontal
+SQUARES_Y = _BOARD["squares_y"]              # total squares (black+white), vertical
+SQUARE_LENGTH = _BOARD["square_length_m"]    # meters, checkerboard square edge
+MARKER_LENGTH = _BOARD["marker_length_m"]    # meters, marker's black-bordered footprint
 
 # Set to a specific dict, e.g. cv.aruco.DICT_5X5_250, if you know it.
 # Otherwise leave as None and AUTO_DETECT_DICT will probe candidates.
-ARUCO_DICT = None
-AUTO_DETECT_DICT = True
-CANDIDATE_DICTS = [
-    "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
-    "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
-    "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
-    "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
-]
-CAM_NAME = 'cam_2'
+ARUCO_DICT = _BOARD["aruco_dict"]
+AUTO_DETECT_DICT = _BOARD["auto_detect_dict"]
+CANDIDATE_DICTS = list(_BOARD["candidate_dicts"])
 
-INTRINSICS_GLOB = os.path.expanduser(f'~/franka_ws/frames/camera/{CAM_NAME}/calibrate/*.png')
-EXTRINSICS_GLOB = os.path.expanduser(f'~/franka_ws/frames/camera/{CAM_NAME}/extrinsics/*.png')
-UNDISTORT_GLOB  = os.path.expanduser(f'~/franka_ws/frames/camera/{CAM_NAME}/chessboard.png')
-UNDISTORT_OUT   = f'/home/franka/franka_ws/frames/camera/{CAM_NAME}/calibresult.png'
+CAM_NAME = "cam_2"
 
-REPROJ_ERROR_THRESHOLD = 0.5   # px; frames worse than this are dropped from intrinsics
-SHOW_DEBUG_IMAGES = True       # set False to skip cv.imshow popups
-MIN_CHARUCO_CORNERS = 6        # minimum interpolated corners to accept a frame
+
+def _apply_cam(cam_name):
+    """Point the globs at one camera's frame directories."""
+    global CAM_NAME, INTRINSICS_GLOB, EXTRINSICS_GLOB, UNDISTORT_GLOB, UNDISTORT_OUT, MATRICES_OUT
+    CAM_NAME = cam_name
+    root = str(fc.repo_root() / _PATHS["root"])
+    fmt = dict(root=root, cam=cam_name)
+    INTRINSICS_GLOB = _PATHS["intrinsics_glob"].format(**fmt)
+    EXTRINSICS_GLOB = _PATHS["extrinsics_glob"].format(**fmt)
+    UNDISTORT_GLOB = _PATHS["undistort_glob"].format(**fmt)
+    UNDISTORT_OUT = _PATHS["undistort_out"].format(**fmt)
+    MATRICES_OUT = _PATHS["matrices_out"].format(**fmt)
+
+
+_apply_cam(CAM_NAME)
+
+REPROJ_ERROR_THRESHOLD = _FIT["reproj_error_threshold_px"]  # px; worse frames are dropped
+SHOW_DEBUG_IMAGES = _FIT["show_debug_images"]               # False skips cv.imshow popups
+MIN_CHARUCO_CORNERS = _FIT["min_charuco_corners"]           # min corners to accept a frame
 
 CRITERIA = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, 30, 0.001)
 
@@ -126,8 +143,8 @@ def axis_remap_matrix(world_x, world_y, world_z):
     mirror the frame instead of rotating it).
     """
     axis_map = {
-        'X': np.array([0.0, -1.0, 0.0]),
-        'Y': np.array([-1.0, 0.0, 0.0]),
+        'X': np.array([0.0, 1.0, 0.0]),
+        'Y': np.array([1.0, 0.0, 0.0]),
         'Z': np.array([0.0, 0.0, -1.0]),
     }
 
@@ -156,8 +173,25 @@ def axis_remap_matrix(world_x, world_y, world_z):
     return R
 
 
-# Edit this to match your physical world-frame setup:
-BOARD_TO_WORLD_R = axis_remap_matrix('X', 'Y', 'Z')  # default: no rotation, board axes as-is
+# From config/calibration.yaml (world_axes.board_to_world).
+BOARD_TO_WORLD_R = axis_remap_matrix(*_WORLD_AXES["board_to_world"])
+
+# This script emits extrinsics in the CALIBRATION frame, whose origin is always
+# the board CENTER:
+#
+#     calib_pt = BOARD_TO_WORLD_R @ (board_pt - board_center)
+#
+# It deliberately has no origin-offset knob. Where that frame sits in the world
+# lives in exactly one place, world.yaml: calib_origin_in_world, and is applied
+# at load time by franka_config — so moving the world origin never invalidates
+# a calibration. An origin_offset_m left in calibration.yaml is a leftover from
+# the old two-knob scheme and is rejected rather than silently ignored.
+if "origin_offset_m" in _WORLD_AXES:
+    raise SystemExit(
+        "config/calibration.yaml still has world_axes.origin_offset_m. That knob was "
+        "folded into world.yaml: calib_origin_in_world — delete it, and make sure its "
+        "value is reflected there (extrinsics are now board-centre relative)."
+    )
 
 
 def draw_world_axes(img, mtx, dist, rvec, tvec, length=0.1):
@@ -238,6 +272,14 @@ def resolve_dictionary():
     return cv.aruco.getPredefinedDictionary(dict_id)
 
 
+def normalize_charuco(corners, ids):
+    """OpenCV 5's detectBoard returns (N,2)/(N,); the aruco helpers need (N,1,2)/(N,1)."""
+    if corners is None or ids is None:
+        return corners, ids
+    return (np.asarray(corners, np.float32).reshape(-1, 1, 2),
+            np.asarray(ids, np.int32).reshape(-1, 1))
+
+
 # ----------------------------------------------------------------------
 # calibrateCameraCharuco replacement (removed in newer OpenCV; the
 # documented replacement is CharucoBoard.matchImagePoints + calibrateCamera)
@@ -281,6 +323,7 @@ def calibrate_intrinsics(detector, board):
         img_shape = gray.shape[::-1]
 
         charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(gray)
+        charuco_corners, charuco_ids = normalize_charuco(charuco_corners, charuco_ids)
 
         if charuco_corners is None or len(charuco_corners) < MIN_CHARUCO_CORNERS:
             n = 0 if charuco_corners is None else len(charuco_corners)
@@ -315,7 +358,12 @@ def calibrate_intrinsics(detector, board):
     for i in range(len(all_charuco_corners)):
         obj_pts = board_corners_3d[all_charuco_ids[i].flatten()]
         proj, _ = cv.projectPoints(obj_pts, rvecs[i], tvecs[i], mtx, dist)
-        err = cv.norm(all_charuco_corners[i], proj, cv.NORM_L2) / len(proj)
+        # reshape both to flat (N, 2) before cv.norm -- detected corners
+        # and projectPoints() output don't always come back with matching
+        # channel-count/dtype, which otherwise raises a type-mismatch error.
+        detected = all_charuco_corners[i].reshape(-1, 2)
+        proj2 = proj.reshape(-1, 2)
+        err = cv.norm(detected, proj2, cv.NORM_L2) / len(proj)
         per_image_error.append(err)
 
     print("[intrinsics] per-image reprojection error (px):")
@@ -336,7 +384,9 @@ def calibrate_intrinsics(detector, board):
         for i in range(len(corners_f)):
             obj_pts = board_corners_3d[ids_f[i].flatten()]
             proj, _ = cv.projectPoints(obj_pts, rvecs[i], tvecs[i], mtx, dist)
-            mean_error += cv.norm(corners_f[i], proj, cv.NORM_L2SQR) / len(proj)
+            detected = corners_f[i].reshape(-1, 2)
+            proj2 = proj.reshape(-1, 2)
+            mean_error += cv.norm(detected, proj2, cv.NORM_L2SQR) / len(proj)
         total_error = np.sqrt(mean_error / len(corners_f))
     else:
         if dropped > 0:
@@ -345,7 +395,9 @@ def calibrate_intrinsics(detector, board):
         for i in range(len(all_charuco_corners)):
             obj_pts = board_corners_3d[all_charuco_ids[i].flatten()]
             proj, _ = cv.projectPoints(obj_pts, rvecs[i], tvecs[i], mtx, dist)
-            mean_error += cv.norm(all_charuco_corners[i], proj, cv.NORM_L2SQR) / len(proj)
+            detected = all_charuco_corners[i].reshape(-1, 2)
+            proj2 = proj.reshape(-1, 2)
+            mean_error += cv.norm(detected, proj2, cv.NORM_L2SQR) / len(proj)
         total_error = np.sqrt(mean_error / len(all_charuco_corners))
 
     print(f"\n[intrinsics] final RMS reprojection error: {total_error:.4f} px  "
@@ -432,9 +484,10 @@ def calibrate_extrinsics(mtx, dist, detector, board):
     if len(images) == 0:
         raise RuntimeError(f"No extrinsics images found at {EXTRINSICS_GLOB}")
 
-    # Board corners are defined by the board itself in its own frame,
-    # with origin at one corner of the grid. Shift to board-CENTER origin,
-    # then rotate into the desired world axes (see BOARD_TO_WORLD_R above).
+    # Board corners are defined by the board itself in its own frame, with
+    # origin at one corner of the grid. Shift to board-CENTER origin and rotate
+    # into the calibration axes (see BOARD_TO_WORLD_R above). The origin stays
+    # the board centre — world placement is world.yaml's job.
     board_corners_3d = board.getChessboardCorners()
     center = board_corners_3d.mean(axis=0)
     board_corners_centered = board_corners_3d - center
@@ -447,6 +500,7 @@ def calibrate_extrinsics(mtx, dist, detector, board):
         gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
         charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(gray)
+        charuco_corners, charuco_ids = normalize_charuco(charuco_corners, charuco_ids)
 
         if charuco_corners is None or len(charuco_corners) < MIN_CHARUCO_CORNERS:
             n = 0 if charuco_corners is None else len(charuco_corners)
@@ -498,15 +552,17 @@ def calibrate_extrinsics(mtx, dist, detector, board):
 
     R_avg, _ = cv.Rodrigues(rvec_avg)
 
-    print("\n[extrinsics] R (world->camera):\n", R_avg)
-    print("[extrinsics] t (world->camera):\n", tvec_avg.flatten())
+    print("\n[extrinsics] R (calib->camera):\n", R_avg)
+    print("[extrinsics] t (calib->camera):\n", tvec_avg.flatten())
 
     R_cam_in_world = R_avg.T
     t_cam_in_world = -R_avg.T @ tvec_avg
 
-    print("\n[extrinsics] Camera pose in world coordinates (BOARD_TO_WORLD_R applied):")
-    print("R_cam_in_world:\n", R_cam_in_world)
-    print("t_cam_in_world (camera position, meters):\n", t_cam_in_world.flatten())
+    print("\n[extrinsics] Camera pose in the CALIBRATION frame, origin at the board")
+    print("centre (BOARD_TO_WORLD_R applied). world.yaml: calib_origin_in_world lifts")
+    print("this into world at load time.")
+    print("R_cam_in_calib:\n", R_cam_in_world)
+    print("t_cam_in_calib (camera position, meters):\n", t_cam_in_world.flatten())
 
     return R_avg, tvec_avg, R_cam_in_world, t_cam_in_world
 
@@ -528,7 +584,43 @@ def undistort_sample(mtx, dist):
         print(f"[undistort] wrote {UNDISTORT_OUT}")
 
 
+def emit_cameras_yaml(cam_name, mtx, dist, R_cw, t_cw):
+    """Print the config/cameras.yaml calibration block for this camera.
+
+    Extrinsics stay in the CALIBRATION frame (board centre on the table);
+    config/world.yaml lifts them into world via calib_origin_in_world, so no
+    z-offset is baked in here.
+    """
+    def rows(m):
+        return "\n".join(
+            "        - [" + ", ".join(f"{v:.8f}" for v in row) + "]" for row in m
+        )
+
+    print(f"\n# --- paste into config/cameras.yaml under cameras.{cam_name} ---")
+    print("    calibration:")
+    print(f"      source: {_PATHS['root']}/{cam_name}_matrices.txt")
+    print("      intrinsic_matrix:")
+    print(rows(np.asarray(mtx)))
+    print("      distortion_coeffs: [" + ", ".join(f"{v:.8e}" for v in np.asarray(dist).ravel()) + "]")
+    print("      r_cam_in_calib:")
+    print(rows(np.asarray(R_cw)))
+    print("      t_cam_in_calib: [" + ", ".join(f"{v:.8f}" for v in np.asarray(t_cw).ravel()) + "]")
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ChArUco intrinsics + extrinsics calibration")
+    parser.add_argument("--cam", default=CAM_NAME,
+                        help="camera id from config/cameras.yaml (default: %(default)s)")
+    parser.add_argument("--no-debug-images", action="store_true",
+                        help="skip cv.imshow popups regardless of config")
+    args = parser.parse_args()
+
+    if args.cam not in fc.camera_keys():
+        parser.error(f"unknown camera {args.cam!r}; known: {', '.join(fc.camera_keys())}")
+    _apply_cam(args.cam)
+    if args.no_debug_images:
+        SHOW_DEBUG_IMAGES = False
+
     dictionary = resolve_dictionary()
     board = build_board(dictionary)
     detector = make_detector(board)
@@ -536,3 +628,4 @@ if __name__ == "__main__":
     mtx, dist, img_shape = calibrate_intrinsics(detector, board)
     R_wc, t_wc, R_cw, t_cw = calibrate_extrinsics(mtx, dist, detector, board)
     undistort_sample(mtx, dist)
+    emit_cameras_yaml(args.cam, mtx, dist, R_cw, t_cw)

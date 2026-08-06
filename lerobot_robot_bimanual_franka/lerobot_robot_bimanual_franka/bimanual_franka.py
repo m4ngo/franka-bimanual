@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import cast, Optional
 
+import franka_config as fc
 import numpy as np
 
 from lerobot.cameras.camera import Camera
@@ -24,20 +25,21 @@ from .wsg import WSG
 from .osc_velocity_controller import OSCVelocityController
 from .franka_jacobian import zero_jacobian  # the new analytic module
 
-IMAGE_CHANNELS = 3
-_CAMERA_READ_TIMEOUT_MS: float = 5.0
-_CONNECT_TIMEOUT_S = 10.0
-_DEPTH_POINT_COUNT = 2048
+# Every constant below comes from config/control.yaml.
+IMAGE_CHANNELS = fc.control("observation.image_channels")
+_CAMERA_READ_TIMEOUT_MS: float = fc.control("observation.camera_read_timeout_ms")
+_CONNECT_TIMEOUT_S = fc.control("franka.connect_timeout_s")
+_DEPTH_POINT_COUNT = fc.control("observation.depth_point_count")
 
-JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
-EE_PD_KP, EE_PD_KD = 3.5, 0.2
-_KP_GAIN_BASE = 10.0
-_KD_GAIN_BASE = 1.0
-OSC_BASE_KP = 5.0
-_GRIP_ACCUM_SPEED = 1.0
+JOINT_PD_KP, JOINT_PD_KD = fc.control("gains.joint_pd.kp"), fc.control("gains.joint_pd.kd")
+EE_PD_KP, EE_PD_KD = fc.control("gains.ee_pd.kp"), fc.control("gains.ee_pd.kd")
+_KP_GAIN_BASE = fc.control("gains.action_scaling.kp_base")
+_KD_GAIN_BASE = fc.control("gains.action_scaling.kd_base")
+OSC_BASE_KP = fc.control("gains.osc.base_kp")
+_GRIP_ACCUM_SPEED = fc.control("gripper_accum_speed")
 
-_EE_TRANSLATION_FUDGE_FACTOR = 1.2 # 1.5
-_EE_ROTATION_FUDGE_FACTOR = 0.9 # 0.8
+_EE_TRANSLATION_FUDGE_FACTOR = fc.control("fudge.ee_translation")
+_EE_ROTATION_FUDGE_FACTOR = fc.control("fudge.ee_rotation")
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -72,7 +74,19 @@ class BimanualFranka(Robot):
         self.grippers: dict[str, WSG | FrankaGripper] = {
             arm: self._make_gripper(arm) for arm in self.active_arms
         }
-        self.safety = ActionSafetyScreen()
+        # Robot base expressed in world (config/world.yaml): p_world = R @ p_base + t.
+        # No inversion — the pose is already base-in-world, which is the direction
+        # every consumer (safety brake, depth crop, viz, sysid) needs.
+        self._base_in_world_by_arm = {
+            arm: config.base_in_world(arm) for arm in self.active_arms
+        }
+        # The worktable brake compares world-frame heights, so it needs each
+        # arm's base pose rather than one shared base-frame threshold, plus each
+        # arm's EE collision sphere (grippers differ in size between arms).
+        self._ee_sphere_by_arm = {
+            arm: fc.ee_sphere(config.arm_name(arm)) for arm in self.active_arms
+        }
+        self.safety = ActionSafetyScreen(self._base_in_world_by_arm, self._ee_sphere_by_arm)
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
         self._kp_gain = 0.0
@@ -89,13 +103,13 @@ class BimanualFranka(Robot):
         # Half-extent of the world-axis-aligned box crop (sim collect convention).
         self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
 
-        world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))
-        world_in_robot_translation = getattr(config, "world_in_robot_translation_m", (0.0, 0.0, 0.0))
-        r_w_in_r = self._quat_wxyz_to_rot(world_in_robot_quat)
-        t_w_in_r = np.asarray(world_in_robot_translation, dtype=np.float64)
-        # Invert world-in-robot pose to map robot-frame EE positions into world frame.
-        self._r_robot_in_world = r_w_in_r.T
-        self._t_robot_in_world = -self._r_robot_in_world @ t_w_in_r
+        depth_center = getattr(config, "depth_center_arm", self.active_arms[0])
+        # Fall back when the profile's depth-centre arm isn't among active_arms.
+        self._depth_center_arm = depth_center if depth_center in self.active_arms else self.active_arms[0]
+        base_pose = self._base_in_world_by_arm[self._depth_center_arm]
+        self._base_in_world = base_pose
+        self._r_robot_in_world = base_pose.rotation
+        self._t_robot_in_world = base_pose.translation
         # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
@@ -280,9 +294,13 @@ class BimanualFranka(Robot):
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
-        arm = "r" if "r" in self.active_arms else self.active_arms[0]
-        ee_robot = np.asarray(kin[arm][3], dtype=np.float64)
-        return self._r_robot_in_world @ ee_robot + self._t_robot_in_world
+        arm = self._depth_center_arm
+        return self._base_in_world.apply(np.asarray(kin[arm][3], dtype=np.float64))
+
+    @property
+    def base_in_world(self):
+        """`franka_config.Pose` mapping robot-base coordinates into world."""
+        return self._base_in_world
 
     def _sample_depth_points(self, verts: np.ndarray, center: np.ndarray) -> np.ndarray:
         points = np.asarray(verts, dtype=np.float64)
@@ -315,22 +333,6 @@ class BimanualFranka(Robot):
 
         return np.asarray(sampled, dtype=np.float32)
 
-    @staticmethod
-    def _quat_wxyz_to_rot(q: tuple[float, float, float, float]) -> np.ndarray:
-        w, x, y, z = q
-        n = float(np.sqrt(w * w + x * x + y * y + z * z))
-        if n < 1e-12:
-            return np.eye(3, dtype=np.float64)
-        w, x, y, z = w / n, x / n, y / n, z / n
-        return np.array(
-            [
-                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-            ],
-            dtype=np.float64,
-        )
-    
     @property
     def kp_gain(self) -> float:
         return self._kp_gain
@@ -406,14 +408,14 @@ class BimanualFranka(Robot):
         self,
         home_q_left: np.ndarray | None,
         home_q_right: np.ndarray | None,
-        gripper_norm: float = 1.0,
-        max_time_s: float = 5.0,
-        tol_rad: float = 0.05,
-        fps: int = 30,
+        gripper_norm: float = fc.control("homing.gripper_norm"),
+        max_time_s: float = fc.control("homing.max_time_s"),
+        tol_rad: float = fc.control("homing.tol_rad"),
+        fps: int = fc.control_fps(),
         *,
         home_fps: int | None = None,
-        tol_pos_m: float = 0.025,
-        tol_rot_rad: float | None = None,
+        tol_pos_m: float = fc.control("homing.tol_pos_m"),
+        tol_rot_rad: float | None = fc.control("homing.tol_rot_rad"),
     ) -> bool:
         """Drive both arms to a saved home configuration.
 
@@ -440,7 +442,7 @@ class BimanualFranka(Robot):
             self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
         use_ee_homing = False # self.control_mode != ControlMode.JOINT_POS
-        rate_hz = float(home_fps if home_fps is not None else (max(fps, 60) if use_ee_homing else fps))
+        rate_hz = float(home_fps if home_fps is not None else fc.home_fps())
         period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s
         names = list(targets_q)

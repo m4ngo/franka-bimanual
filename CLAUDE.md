@@ -19,31 +19,77 @@ Three machines, two arms, two grippers, six cameras:
     commit data into the repo.**
   - `~/franka_ws/` is this workspace.
 - **`mario@192.168.3.10`** NUC controls the **right** arm
-  (`192.168.201.10`, gripper `192.168.2.20`, RPyC port `18812`).
+  (`192.168.201.10`, Schunk WSG at `192.168.2.20`, RPyC port `18812`).
 - **`luigi@192.168.3.11`** NUC controls the **left** arm
-  (`192.168.200.2`, gripper `192.168.2.21`, RPyC port `18813`).
-- Six GigE cameras (4× Basler ARV, 2× FRAMOS D415e) — IP/serial map in
-  `BimanualFrankaConfig` and the README.
+  (`192.168.200.2`, native Franka Hand, RPyC port `18813`).
+- Six GigE cameras (4× Basler ARV, 2× FRAMOS D415e).
+
+These values are stated here for orientation only — `config/arms.yaml` and
+`config/cameras.yaml` are authoritative, and `python -m franka_config arm right`
+prints what the stack will actually use.
 
 Each NUC runs `./start_control.sh` which exposes the FR3 over RPyC; the
 workstation connects directly via `rpyc.classic.connect` (one connection per
 arm) and bypasses `net_franky.franky`'s singleton (IP,PORT) limitation.
 
+## Central configuration — read this first
+
+**`config/*.yaml` is the single source of truth for every environment constant**:
+world origin, per-arm base poses, arm IPs/ports, camera intrinsics/extrinsics,
+control gains, safety limits, fudge factors, and the control rate. Nothing
+outside `config/` should hardcode any of them. See
+[config/README.md](config/README.md) for the file-by-file breakdown.
+
+Read it through the `franka_config` package (never by parsing YAML yourself):
+
+```python
+import franka_config as fc
+fc.control_fps()                    # 20 — one rate for teleop/record/rollout/sysid
+fc.arm("right").robot_ip
+fc.robot_base_in_world("left")      # Pose: p_world = R @ p_base + t
+fc.camera("cam_2").calibration.cam_in_world
+fc.control("gains.ee_pd.kp")
+fc.home_q(key="r")                  # from home_poses/<default>.json
+```
+
+Shell scripts use the same loader via `scripts/_config.sh` (`cfg`, `cfg_arm`,
+`cfg_rig`, `cfg_cameras`) so the two can never drift.
+
+Hard rules:
+
+- **Quaternions in `config/` are wxyz (scalar first).** scipy is scalar-last;
+  `fc.quat_wxyz_to_xyzw` is the only conversion point. Confusing the two once
+  produced a silent 180° world rotation.
+- **Poses are `<child>_in_<parent>`**, meaning `p_parent = R @ p_child + t`.
+  `robot_base_in_world` maps base → world and is **never inverted** by consumers.
+- **World is floor-origin**: z=0 floor, table top `world.worktable.height_m`
+  (what the safety brake compares against), arm bases 0.912. Camera extrinsics
+  are stored in the calibration frame — origin at the board **centre** — and
+  lifted by `world.calib_origin_in_world`, which is the single place the
+  board-to-world offset lives. Never bake an offset into an extrinsic.
+- **Home configurations live only in `home_poses/*.json`.** No home `q` vector
+  belongs in Python.
+- Robot/teleop/camera dataclass fields get their defaults from YAML via
+  `default_factory`, so every existing `--robot.*` / `--teleop.*` CLI override
+  still works unchanged.
+
 ## Package layout
 
-The repo is **five editable LeRobot plugin packages** in a flat layout plus a
-`scripts/` directory:
+The repo is **six editable packages** in a flat layout plus a `scripts/`
+directory:
 
 ```
 franka_ws/
-├── lerobot_robot_bimanual_franka/    # follower: two FR3 arms + WSG grippers + 6 cameras
+├── config/                           # YAML: the environment's single source of truth
+├── franka_config/                    # loader + typed accessors for config/ (import this)
+├── lerobot_robot_bimanual_franka/    # follower: two FR3 arms + grippers + 6 cameras
 ├── lerobot_teleoperator_gello/       # leader: joint-mode and EE-mode GELLOs
 ├── lerobot_teleoperator_spacemouse/  # leader: 3Dconnexion SpaceMice (EE only)
 ├── lerobot_camera_arv/               # Aravis GigE cameras (Basler BFS)
 ├── lerobot_camera_framos/            # FRAMOS D415e via FRAMOS librealsense2
 ├── scripts/                          # bash wrappers around lerobot-* CLIs
-├── config/                           # calibration JSONs land here
-└── frames/                           # per-camera reference snapshots
+├── home_poses/                       # named home configurations (JSON)
+└── frames/                           # per-camera reference snapshots + calibration
 ```
 
 Each package self-registers with LeRobot's config registries via
@@ -53,8 +99,8 @@ Each package self-registers with LeRobot's config registries via
 CLI resolve to classes here.
 
 Setup commands live in [scripts/local_module_check.sh](scripts/local_module_check.sh)
-— it installs the five packages with `uv pip install --no-deps -e ... -C
-editable_mode=compat` plus the non-PyPI deps (`net_franky`, FRAMOS-built
+— it installs the six packages with `uv pip install --no-deps -e ... -C
+editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (`net_franky`, FRAMOS-built
 `pyrealsense2` from `~/librealsense2/wrappers/python/`, `PyGObject<3.52`,
 `pyspacemouse`, `dynamixel-sdk`).
 
@@ -86,15 +132,26 @@ The follower is composed of three subsystems, each isolated in its own module:
   - The 6×7 EE Jacobian is cached and recomputed only when joint angles drift
     past `_JACOBIAN_CACHE_Q_THRESHOLD` (0.5 rad L∞). This matters when adding
     code that needs fresh Jacobians.
+- [rig_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/rig_config.py)
+  — the bridge from `config/rig.yaml` profiles to concrete camera configs and
+  per-arm connection fields. Keeps `franka_config` free of LeRobot imports.
 - [safety.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/safety.py)
   — `ActionSafetyScreen` applies pre-dispatch shaping to either joint-velocity
-  or EE-twist commands:
+  or EE-twist commands (all thresholds from `config/control.yaml`):
   - **Worktable brake**: caps downward velocity by `sqrt(2·MAX_DECEL·clearance)`
-    so the EE can stop before reaching `WORKTABLE_HEIGHT + DISTANCE_MIN`. EE
-    mode mutates only `vz`; joint mode uniformly scales the whole velocity
-    vector to preserve direction.
-  - L2-norm clamps on joint velocity (2.0 rad/s) and EE linear/angular
-    velocity (0.30 m/s, 1.20 rad/s).
+    so the EE can stop before reaching `WORKTABLE_HEIGHT + DISTANCE_MIN`.
+    Heights and vertical velocities are evaluated in **world frame** — the
+    screen is constructed with each arm's `robot_base_in_world`, so one table
+    plane covers arms whose bases differ in height or yaw. The EE is a
+    **sphere**, not a point (`worktable_brake.ee_sphere`, per-arm overridable
+    in `arms.yaml`): its centre is a TOOL-frame offset that rotates with the
+    gripper, clearance is measured from the sphere's bottom, and the centre's
+    velocity carries the `ω × r` lever term — so a tilted or rotating gripper
+    can't graze the table while the TCP still reads clear. EE mode corrects the
+    twist along world-up only (horizontal and angular parts untouched); joint
+    mode uniformly scales the whole vector to preserve direction.
+  - L2-norm clamps on joint velocity and EE linear/angular velocity
+    (`limits.*` in `config/control.yaml`).
   - Bimanual arm-repel is **not yet implemented** (noted in the module
     docstring).
 - [wsg.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/wsg.py)
@@ -110,20 +167,27 @@ The follower is composed of three subsystems, each isolated in its own module:
 
 `BimanualFranka` has two modes selected by `use_ee_pos`:
 
-- **Joint mode** (`use_ee_pos=False`): action keys `l_joint_1…l_joint_7,
+- **Joint mode** (`JOINT_POS`): action keys `l_joint_1…l_joint_7,
   l_gripper, r_joint_1…r_joint_7, r_gripper`. Internally converted to
-  joint-velocity commands with `JOINT_PD_KP=2.0`, `JOINT_PD_KD=0.1`.
-- **EE mode** (`use_ee_pos=True`): action keys `l_{x,y,z,qx,qy,qz,qw,gripper}`
-  and `r_*`. Internally converted to Cartesian twists with `EE_PD_KP=2.0`,
-  `EE_PD_KD=0.1`. Quaternion error uses a Hamilton-product formulation with
-  hemisphere selection (`q_err[3] < 0` → negate).
+  joint-velocity commands with `gains.joint_pd` from `config/control.yaml`.
+- **EE mode** (`EE_POS` / `EE_DELTA`): action keys `l_{x,y,z,qx,qy,qz,qw,gripper}`
+  and `r_*`. Internally converted to Cartesian twists with `gains.ee_pd`.
+  Quaternion error uses a Hamilton-product formulation with hemisphere
+  selection (`q_err[3] < 0` → negate).
 
 Gripper values are normalised to `[0, 1]` against
-`WSG.GRIPPER_TRUE_MAX_MM = 110.0` mm.
+`gripper.wsg.true_max_mm` (110.0 mm).
 
-Camera frames are 224×224 RGB by default and exposed in the observation under
-`cam_1` … `cam_6`. Camera failures degrade to `blank_frame()` (last known
-image) rather than raising.
+Camera frames are `observation.image_width` × `observation.image_height` RGB
+and exposed in the observation under `cam_1` … `cam_6` — those are the
+canonical keys everywhere; `role`/`mount` in `config/cameras.yaml` are metadata
+and never part of the key. Camera failures degrade to `blank_frame()` (last
+known image) rather than raising.
+
+**Rig profiles.** `config/rig.yaml` maps each robot config to its arms and
+cameras. `single_arm_franka` exposes the **left** FR3 under the `r_` key prefix
+(deliberate: it keeps previously recorded `r_*` datasets readable), so the key
+prefix is not the physical arm — always resolve through the profile.
 
 ## Teleop stack
 
@@ -194,14 +258,19 @@ constants for this exact rig. All scripts assume the venv is active.
 | `openpi_client_franka.py` | Single-arm (right) OpenPI inference client; sends DROID-style joint-velocity observations to a remote websocket policy | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all five packages | — |
 
-USB ports: **left GELLO `/dev/ttyUSB1`, right GELLO `/dev/ttyUSB0`**. SpaceMice
-default to `/dev/hidraw2` / `/dev/hidraw3` (the script overrides the config
-defaults of `/dev/hidraw4` / `/dev/hidraw5`).
+Device paths (GELLO USB ports, SpaceMouse hidraw nodes) and motion scales come
+from `config/teleop.yaml`. **Which** device a single-arm rig uses is a separate
+setting — `teleop_device` on the rig profile in `config/rig.yaml` — because the
+leader the operator holds is independent of which follower arm it drives. Both
+SpaceMice enumerate as identical HID devices, so grabbing the wrong one
+connects cleanly and then does nothing.
 
 `scripts/old/` holds pre-LeRobot prototypes; don't depend on them.
 
 ## Conventions worth following
 
+- **Never hardcode an environment constant.** IPs, ports, gains, limits,
+  transforms, rates, device paths → `config/*.yaml`, read via `franka_config`.
 - **Tuples over lists at the RPyC boundary.** See `franka_process.py`.
 - **Pure (action, state) → action transforms in `safety.py`.** Don't push
   side effects into `ActionSafetyScreen`; it is intended to be a pre-dispatch
@@ -217,7 +286,7 @@ defaults of `/dev/hidraw4` / `/dev/hidraw5`).
   that style.
 - **Data outside the repo.** Datasets, eval rollouts, and trained policies
   live under `~/franka_data/`. The only thing the repo tracks is code +
-  reference frames.
+  reference frames + config.
 
 ## When something breaks
 
@@ -235,5 +304,11 @@ For code-level debugging:
 - "Robot already connected on this (ip, port)" — net_franky's singleton
   caching; the direct-RPyC path in `franka_process.py` is the workaround,
   not the cause. Don't reintroduce `franky.Robot(ip)` calls on the workstation.
+- Point cloud / EE geometry in the wrong place → check the frame convention
+  before touching math: `robot_base_in_world` maps base → world directly.
+  `python -m franka_config dump world` shows what the stack actually sees.
+- `ModuleNotFoundError: franka_config` → run
+  `uv pip install --no-deps -e ~/franka_ws/franka_config -C editable_mode=compat`,
+  or set `FRANKA_CONFIG_DIR`.
 - Gripper FAST STOP latched after a crash → re-`connect()` clears it via
   `ack_fast_stop()` in `WSG.__init__`.

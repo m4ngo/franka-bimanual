@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 
+import franka_config as fc
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -23,8 +24,14 @@ _fk_mod = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_fk_mod)
 franka_fk_chain = _fk_mod.franka_fk_chain
 
-# Offset subtracted from world-frame eef_pos to recover robot base frame.
-WORLD_FRAME_OFFSET = np.array([-0.66, 0.0, 0.912])
+# Robot base pose in world (config/world.yaml). Subtracting the translation
+# from a world-frame eef_pos recovers the robot base frame; the full pose is
+# exposed for the rotated case.
+_PROFILE = "single_arm_franka"
+BASE_IN_WORLD = fc.robot_base_in_world(
+    fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
+)
+WORLD_FRAME_OFFSET = BASE_IN_WORLD.translation
 
 # --- EE orientation triad settings (mirrors residual wrapper's viz) ---------
 _FORECAST_AXIS_LENGTH = 0.038

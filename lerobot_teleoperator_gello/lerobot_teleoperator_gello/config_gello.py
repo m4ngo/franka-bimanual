@@ -6,22 +6,37 @@ GelloConfig composes it with the standard TeleoperatorConfig metadata.
 """
 
 from dataclasses import dataclass, field
+
+import franka_config as fc
 from lerobot.teleoperators.config import TeleoperatorConfig
+
+
+def _gello(path: str):
+    return fc.teleop(f"gello.{path}")
 
 
 @dataclass
 class GelloLeaderFields:
-    """Hardware and calibration parameters for one GELLO leader arm."""
+    """Hardware and calibration parameters for one GELLO leader arm.
 
-    port: str = "/dev/ttyUSB0"
-    baudrate: int = 57_600
+    Defaults come from config/teleop.yaml; the right-hand device is the
+    single-arm default.
+    """
+
+    port: str = field(default_factory=lambda: _gello("devices.right.port"))
+    baudrate: int = field(default_factory=lambda: _gello("baudrate"))
     # Reference joint angles (rad) at the calibration home pose, one per motor in JOINT_NAMES order.
-    calibration_position: list[float] = field(default_factory=lambda: [0, 0, 0, -1.57, 0, 1.57, 0, 0])
-    joint_signs: list[int] = field(default_factory=lambda: [1, 1, 1, -1, 1, -1, 1, -1])
-    gripper_travel_counts: int = 575  # closed-to-open travel in encoder counts
-    smoothing: float = 0.99           # EMA alpha; 1.0 = no smoothing, 0.0 = max smoothing
-    use_async: bool = True            # read motor states in a background thread
-    use_noise: bool = False
+    calibration_position: list[float] = field(default_factory=lambda: list(_gello("calibration_position")))
+    joint_signs: list[int] = field(default_factory=lambda: list(_gello("joint_signs")))
+    gripper_travel_counts: int = field(default_factory=lambda: _gello("gripper_travel_counts"))
+    smoothing: float = field(default_factory=lambda: _gello("smoothing"))
+    use_async: bool = field(default_factory=lambda: _gello("use_async"))
+    use_noise: bool = field(default_factory=lambda: _gello("use_noise"))
+
+    @classmethod
+    def for_side(cls, side: str, **overrides) -> "GelloLeaderFields":
+        """Leader fields for the "left"/"right" GELLO out of config/teleop.yaml."""
+        return cls(port=_gello(f"devices.{side}.port"), **overrides)
 
 
 @TeleoperatorConfig.register_subclass("gello")
