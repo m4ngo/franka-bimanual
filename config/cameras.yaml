@@ -26,6 +26,13 @@ defaults:
     color_format: rgb8
     depth_format: z16
     streaming_fps: 30
+    # Density filter on the projected cloud: a point survives only if the 3x3x3
+    # block of `blob_filter_radius_m` voxels around it holds more than
+    # `blob_filter_min_neighbors` others. Off by default — it changes what the
+    # policy sees, so enabling it is a per-run decision.
+    blob_filter: false
+    blob_filter_min_neighbors: 20
+    blob_filter_radius_m: 0.01
   arv:
     pixel_format: Mono8
 

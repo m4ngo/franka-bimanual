@@ -47,8 +47,12 @@ class BimanualFrankaConfig(RobotConfig):
     friction_kc_joint: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
-    ee_translation_fudge: float = 1.0
-    ee_rotation_fudge: float = 1.0
+    ee_translation_fudge: float = field(
+        default_factory=lambda: fc.control("fudge.ee_translation")
+    )
+    ee_rotation_fudge: float = field(
+        default_factory=lambda: fc.control("fudge.ee_rotation")
+    )
     # See SingleArmFrankaConfig. Measured on the right arm only.
     kp_ori_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)
     kp_pos_scale: tuple[float, float, float] = (1.0, 1.0, 1.0)

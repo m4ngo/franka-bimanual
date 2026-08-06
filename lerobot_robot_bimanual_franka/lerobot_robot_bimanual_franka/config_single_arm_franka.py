@@ -48,8 +48,12 @@ class SingleArmFrankaConfig(RobotConfig):
     friction_kc_joint: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 12.0)
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
-    ee_translation_fudge: float = 1.0
-    ee_rotation_fudge: float = 1.0
+    ee_translation_fudge: float = field(
+        default_factory=lambda: fc.control("fudge.ee_translation")
+    )
+    ee_rotation_fudge: float = field(
+        default_factory=lambda: fc.control("fudge.ee_rotation")
+    )
     # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
     # damping ratio is derived as sqrt(scale), so these buy friction rejection
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.

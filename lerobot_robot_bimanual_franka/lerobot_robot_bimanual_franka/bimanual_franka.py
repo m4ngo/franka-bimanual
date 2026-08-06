@@ -23,64 +23,57 @@ from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
 from .osc_torque_controller import (
+    DAMPING_EXP_SCALE,
+    DEFAULT_DAMPING_RATIO,
     DEFAULT_JOINT_KD,
     DEFAULT_JOINT_KP,
     DEFAULT_KP,
     JOINT_TORQUE_LIMITS,
     KP_EXP_SCALE,
-    DAMPING_EXP_SCALE,
     clip_delta,
     resolve_gains,
 )
 from .franka_jacobian import zero_jacobian  # the new analytic module
 
-# Every constant below comes from config/control.yaml.
+# Every constant below comes from config/control.yaml — either read here, or
+# re-exported from osc_torque_controller, which resolves the same `torque:` block
+# (see torque_config.py, which is what also gets those values onto the NUC).
 IMAGE_CHANNELS = fc.control("observation.image_channels")
 _CAMERA_READ_TIMEOUT_MS: float = fc.control("observation.camera_read_timeout_ms")
 _CONNECT_TIMEOUT_S = fc.control("franka.connect_timeout_s")
 _DEPTH_POINT_COUNT = fc.control("observation.depth_point_count")
-
-JOINT_PD_KP, JOINT_PD_KD = fc.control("gains.joint_pd.kp"), fc.control("gains.joint_pd.kd")
-EE_PD_KP, EE_PD_KD = fc.control("gains.ee_pd.kp"), fc.control("gains.ee_pd.kd")
-_KP_GAIN_BASE = fc.control("gains.action_scaling.kp_base")
-_KD_GAIN_BASE = fc.control("gains.action_scaling.kd_base")
-OSC_BASE_KP = fc.control("gains.osc.base_kp")
 _GRIP_ACCUM_SPEED = fc.control("gripper_accum_speed")
-
-_EE_TRANSLATION_FUDGE_FACTOR = fc.control("fudge.ee_translation")
-_EE_ROTATION_FUDGE_FACTOR = fc.control("fudge.ee_rotation")
 # Age past which get_observation()'s kin snapshot is re-read instead of reused.
 # EE_DELTA anchors its goal on the measured pose, so a stale anchor silently
 # subtracts whatever the arm travelled in between from the commanded delta.
-_KIN_CACHE_MAX_AGE_S = 0.005
+_KIN_CACHE_MAX_AGE_S = fc.control("observation.kin_cache_max_age_s")
+
+# Parity knobs on the incoming delta action; 1.0 = exactly what the policy emits.
+_EE_TRANSLATION_FUDGE_FACTOR = fc.control("fudge.ee_translation")
+_EE_ROTATION_FUDGE_FACTOR = fc.control("fudge.ee_rotation")
 
 # Exponential action->gain remap, matching the sim wrapper the policies were
 # trained against (utils/envs/libero.py: exp_scale = limit_max / default).
 # kp_gain/kd_gain are the multipliers; OSC_BASE_KP/OSC_BASE_DAMPING_RATIO are
-# the robosuite defaults they multiply.
+# the robosuite defaults they multiply. All four are DERIVED from
+# torque.osc.{default_kp,kp_limits,default_damping_ratio,damping_ratio_limits}.
 _KP_GAIN_BASE = KP_EXP_SCALE
 _KD_GAIN_BASE = DAMPING_EXP_SCALE
 OSC_BASE_KP = DEFAULT_KP
-OSC_BASE_DAMPING_RATIO = 1.0
+OSC_BASE_DAMPING_RATIO = DEFAULT_DAMPING_RATIO
 
 # Joint-space impedance, used by JOINT_POS and home(); no sim counterpart to match.
 JOINT_IMPEDANCE_KP = DEFAULT_JOINT_KP
 HOME_IMPEDANCE_KP = DEFAULT_JOINT_KP
 HOME_IMPEDANCE_KD = DEFAULT_JOINT_KD
-HOME_MAX_QDOT = 0.6  # rad/s, ramp rate of the commanded home goal
-HOME_SETTLE_QDOT = 0.05  # rad/s, home() is not done until the arm is this still
-HOME_LEAD_MARGIN = 1.5   # headroom so the stall clamp stays off the ramp
+HOME_MAX_QDOT = fc.control("homing.max_qdot_rad_s")      # ramp rate of the commanded home goal
+HOME_SETTLE_QDOT = fc.control("homing.settle_qdot_rad_s")  # home() is not done until this still
+HOME_LEAD_MARGIN = fc.control("homing.lead_margin")      # keeps the stall clamp off the ramp
 # Fraction of each joint's torque clamp that homing may spend on kp*lead + kd*qdot
 # together. Both terms scale with the speed, so this caps the speed per joint:
 # the wrist (kd 30 against a 12 Nm clamp) cannot be damped at HOME_MAX_QDOT at
 # all, and a saturated joint stops tracking the ramp and never converges.
-HOME_TAU_FRACTION = 0.7
-
-_GRIP_ACCUM_SPEED = 1.0
-
-# Parity knobs on the incoming delta action; 1.0 = exactly what the policy emits.
-_EE_TRANSLATION_FUDGE_FACTOR = 1.0
-_EE_ROTATION_FUDGE_FACTOR = 1.0
+HOME_TAU_FRACTION = fc.control("homing.tau_fraction")
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -263,10 +256,14 @@ class BimanualFranka(Robot):
             # run with --friction-kc, say) otherwise silently persists into the
             # next run. The config must be the single source of truth or a sysid
             # sweep can measure a controller nobody configured.
+            # These are per-rig trims and live on the robot config, not in
+            # control.yaml -- unlike the control law's own constants. The
+            # server's starting values are torque.osc.lambda_dls_mu et al;
+            # this call is what overrides them for the session.
             self.robot_manager.set_tuning_all(
                 friction_kc=self.friction_kc,
-                uncouple_pos_ori=bool(getattr(self.config, "uncouple_pos_ori", True)),
-                dls_mu=float(getattr(self.config, "lambda_dls_mu", 0.15)),
+                uncouple_pos_ori=bool(self.config.uncouple_pos_ori),
+                dls_mu=float(self.config.lambda_dls_mu),
             )
             for arm in self.active_arms:
                 self.grippers[arm].home()

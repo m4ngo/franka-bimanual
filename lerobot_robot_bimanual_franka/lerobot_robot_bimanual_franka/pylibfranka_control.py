@@ -59,6 +59,7 @@ try:
         mat_to_quat_xyzw,
     )
     from . import pylibfranka_shm as shm
+    from .torque_config import torque
 except ImportError:
     from franka_jacobian import zero_jacobian  # type: ignore[no-redef]
     from osc_torque_controller import (  # type: ignore[no-redef]
@@ -66,9 +67,13 @@ except ImportError:
         mat_to_quat_xyzw,
     )
     import pylibfranka_shm as shm  # type: ignore[no-redef]
+    from torque_config import torque  # type: ignore[no-redef]
 
 logger = logging.getLogger("control")
 
+# Every constant below comes from config/control.yaml (`torque:`), which is where
+# the rationale for each value lives. This file runs on the NUC, so it reads them
+# through torque_config -- see that module for how the values get there.
 NUM_JOINTS = 7
 _TORQUE_THRESHOLD, _FORCE_THRESHOLD = 100.0, 200.0
 _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
@@ -83,38 +88,39 @@ _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 # over half the ticks landed late and libfranka aborted on
 # communication_constraints_violation. The guard and the rate limiter still run
 # every tick: both are bounds on what actually reaches the joints.
-_CONTROL_DECIMATION = 2
+_CONTROL_DECIMATION = int(torque("loop.control_decimation"))
 
-_TAU_SAFETY_FACTOR = 0.8
+_TAU_SAFETY_FACTOR = float(torque("limits.tau_safety_factor"))
 _TAU_LIMIT = np.asarray(JOINT_TORQUE_LIMITS, dtype=np.float64) * _TAU_SAFETY_FACTOR
-_MAX_TORQUE_RATE = 1000.0
+_MAX_TORQUE_RATE = float(torque("limits.max_torque_rate_nm_s"))
 
 # Speed guard on the RESULT: every client-settable knob multiplies commanded
 # torque and several compose. Must stay OUTSIDE the envelope a sim-parity action
 # produces (0.31 m/s, 3.06 rad/s -- the latter is ~0.9 of rated wrist velocity)
 # or it rescales the control law instead of bounding a runaway.
-_JOINT_VELOCITY_LIMITS = np.array([2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26])
-_JOINT_VELOCITY_TRIP = 0.95
+_JOINT_VELOCITY_LIMITS = np.asarray(torque("limits.joint_velocity_rad_s"), dtype=np.float64)
+_JOINT_VELOCITY_TRIP = float(torque("limits.velocity_trip_fraction"))
 _EE_LINEAR_TRIP, _EE_ANGULAR_TRIP = 1.20, 6.00
-_GUARD_HARD_STOP = 1.5
-_BRAKE_KD = np.array([40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0])
+_GUARD_HARD_STOP = float(torque("limits.guard_hard_stop"))
+_BRAKE_KD = np.asarray(torque("limits.brake_kd"), dtype=np.float64)
 
 # Measured on THIS arm (scripts/measure_joint_friction.py) at 0.10-0.20 rad/s.
 # What this assist must clear is BREAKAWAY, i.e. static friction, which is >= the
 # kinetic curve; extrapolating to the zero-speed intercept instead under-assists
 # (it cost X 80% -> 39% of command). Joints 5-6 remain poorly resolved.
-_FRICTION_COULOMB = np.array([1.19, 1.20, 0.83, 1.19, 0.26, 0.44, 0.41])
+_FRICTION_COULOMB = np.asarray(torque("friction.coulomb_nm"), dtype=np.float64)
 # Band width sets the assist's incremental gain, 1 + kc/frac -- 6x here, and tau
 # carries the measured dq, so the assist re-injects encoder noise at that gain.
 # Widen the band to reduce it; do NOT filter the assist. See _friction_feedforward.
-_FRICTION_TAU_EPS = 0.20 * _FRICTION_COULOMB
-_FRICTION_DQ_EPS = 0.02   # rad/s below which a joint counts as stuck
+_FRICTION_TAU_EPS = float(torque("friction.tau_eps_fraction")) * _FRICTION_COULOMB
+_FRICTION_DQ_EPS = float(torque("friction.dq_eps_rad_s"))
 
-_STALE_GOAL_TIMEOUT_S = 0.5
-_PUBLISH_DECIMATION = 10
+_STALE_GOAL_TIMEOUT_S = float(torque("loop.stale_goal_timeout_s"))
+_PUBLISH_DECIMATION = int(torque("loop.publish_decimation"))
 _RECOVERABLE = ("communication_constraint", "communication_constrains", "reflex",
                 "udp receive: timeout", "command not possible in the current mode")
-_ARM_ATTEMPTS, _ARM_BACKOFF_S = 6, 0.3
+_ARM_ATTEMPTS = int(torque("loop.arm_attempts"))
+_ARM_BACKOFF_S = float(torque("loop.arm_backoff_s"))
 
 
 def _friction_feedforward(kc, tau, coriolis):

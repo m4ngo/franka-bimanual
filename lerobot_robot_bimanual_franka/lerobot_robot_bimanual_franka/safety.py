@@ -142,16 +142,25 @@ class ActionSafetyScreen:
         center_world_z = float(self._pose_for(arm).apply(center_base)[2])
         return center_world_z - sphere.radius_m, lever_base
 
-    def _descent_envelope(self, snap: KinematicSnapshot) -> float:
+    def sphere_bottom_world_z(self, arm: str, ee_translation, ee_quat_xyzw) -> float:
+        """World-frame Z of the EE collision sphere's lowest point for a pose."""
+        return self._sphere_geometry(arm, ee_translation, ee_quat_xyzw)[0]
+
+    def _descent_envelope(self, arm: str, snap: KinematicSnapshot) -> float:
         """Max downward EE speed (m/s) that still allows stopping above the table."""
-        contact_z = float(np.asarray(snap[3])[2]) - self.end_effector_z_extension
+        contact_z = self.sphere_bottom_world_z(arm, snap[3], snap[4])
         safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
         return 0.0 if safe_dist <= 0.0 else float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
 
     @property
     def goal_z_floor(self) -> float:
-        """Lowest EE-frame z that may ever be commanded as a goal."""
-        return WORKTABLE_HEIGHT + WORKTABLE_DISTANCE_MIN + self.end_effector_z_extension
+        """Lowest WORLD-frame Z the EE collision sphere's bottom may be commanded to.
+
+        A plane, so it is arm-independent — the per-arm part (base pose, sphere
+        radius) lives in `sphere_bottom_world_z`, which is what this is compared
+        against. It is NOT a base-frame goal-position bound.
+        """
+        return WORKTABLE_HEIGHT + WORKTABLE_DISTANCE_MIN
 
     def shape_goal(
         self,
@@ -160,16 +169,34 @@ class ActionSafetyScreen:
         kp: np.ndarray,
         kd: np.ndarray,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Clamp EE goal positions: hard floor above the table, plus a cap on how
-        far below the current EE the goal may sit (the descent-speed envelope
-        re-expressed as a position error). Orientation goals pass through."""
+        """Raise EE goal positions along world-up: hard floor above the table,
+        plus a cap on how far below the current EE the goal may sit (the
+        descent-speed envelope re-expressed as a position error). Orientation
+        goals pass through.
+
+        Both bounds are evaluated on the goal's own collision sphere in WORLD
+        frame — using the COMMANDED orientation, since that is where the sphere
+        will be — and the correction is applied along world-up, so horizontal
+        motion is untouched and an arm whose base is tilted or raised gets the
+        right envelope without a per-arm threshold.
+        """
         kp_z, kd_z = float(np.asarray(kp)[2]), float(np.asarray(kd)[2])
         out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for arm, (goal_pos, goal_quat) in goals_by_arm.items():
-            goal_pos = np.asarray(goal_pos, dtype=np.float64).copy()
-            ee_z = float(np.asarray(kin_state[arm][3])[2])
-            max_down = self._descent_envelope(kin_state[arm]) * (kd_z / kp_z) if kp_z > 0.0 else 0.0
-            goal_pos[2] = max(goal_pos[2], ee_z - max_down, self.goal_z_floor)
+            goal_pos = np.asarray(goal_pos, dtype=np.float64)
+            snap = kin_state[arm]
+            goal_bottom_z = self.sphere_bottom_world_z(arm, goal_pos, goal_quat)
+            ee_bottom_z = self.sphere_bottom_world_z(arm, snap[3], snap[4])
+            max_down = self._descent_envelope(arm, snap) * (kd_z / kp_z) if kp_z > 0.0 else 0.0
+            # How far the goal must rise, in world-up metres, to satisfy both.
+            rise = max(
+                (ee_bottom_z - goal_bottom_z) - max_down,
+                self.goal_z_floor - goal_bottom_z,
+                0.0,
+            )
+            if rise > 0.0:
+                # world_up is unit, so this raises the world Z by exactly `rise`.
+                goal_pos = goal_pos + rise * self._world_up_in_base[arm]
             out[arm] = (goal_pos, goal_quat)
         return out
 
@@ -188,12 +215,19 @@ class ActionSafetyScreen:
         out: dict[str, np.ndarray] = {}
         for arm, goal_q in goals_by_arm.items():
             goal_q = np.asarray(goal_q, dtype=np.float64)
-            q, _, jacobian, _, _, _ = kin_state[arm]
+            snap = kin_state[arm]
+            q, _, jacobian, ee_translation, ee_quat_xyzw, _ = snap
             delta = goal_q - np.asarray(q, dtype=np.float64)
-            # J[2] @ delta_q is the EE z error the goal implies; the impedance
-            # loop turns that into (kp/kd) * error of descent speed.
-            descent_z = float(np.asarray(jacobian, dtype=np.float64)[2, :] @ delta)
-            limit = self._descent_envelope(kin_state[arm]) * max_descent_error
+            # world_up . (J @ delta_q) is the WORLD-frame descent the goal
+            # implies at the sphere centre (the lever carries the w x r term);
+            # the impedance loop turns that into (kp/kd) * error of speed.
+            jacobian = np.asarray(jacobian, dtype=np.float64)
+            _, lever = self._sphere_geometry(arm, ee_translation, ee_quat_xyzw)
+            twist_commanded = jacobian @ delta
+            descent_z = float(
+                self._world_up_in_base[arm] @ _point_velocity(twist_commanded, lever)
+            )
+            limit = self._descent_envelope(arm, snap) * max_descent_error
             if descent_z >= -WORKTABLE_VELOCITY_EPS or -descent_z <= limit:
                 out[arm] = goal_q
                 continue

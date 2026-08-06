@@ -36,6 +36,11 @@ class SpaceMouseLeaderFields:
     # Rotation increment (radians) per control tick at full axis deflection.
     rotation_scale: float = field(default_factory=lambda: _sm("rotation_scale"))
 
+    # Fraction of full deflection treated as zero, with the remainder rescaled
+    # so full deflection still reaches 1.0. The puck cross-talks badly; see
+    # spacemouse._apply_deadzone.
+    deadzone: float = field(default_factory=lambda: _sm("deadzone"))
+
     prefix: str = ""
     use_delta: bool = False
     # use_noise: bool = False
@@ -50,8 +55,9 @@ class SpaceMouseLeaderFields:
     # Initial EE orientation as a unit quaternion [qx, qy, qz, qw].
     initial_rot: tuple[float, float, float, float] = field(default_factory=_initial_rot_xyzw)
 
-    # Per-axis sign multipliers (+1 or -1) to match the robot's base frame.
-    # Order: (x, y, z) for translation and (roll, pitch, yaw) for rotation.
+    # Per-axis sign trims in BASE frame, applied AFTER spacemouse.py's
+    # LINEAR_DEVICE_TO_BASE / ANGULAR_DEVICE_TO_BASE. The device mounting lives
+    # in those matrices, not here. Order: (x, y, z) / (roll, pitch, yaw).
     translation_signs: tuple[int, int, int] = field(
         default_factory=lambda: tuple(_sm("translation_signs"))
     )

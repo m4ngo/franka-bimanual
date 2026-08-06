@@ -32,7 +32,9 @@ def _cmd_get(args) -> int:
 
 
 def _cmd_dump(args) -> int:
-    print(json.dumps(_loader.section(args.section), indent=2))
+    # get() takes a dotted path and returns the whole file for a bare section
+    # name, so `dump control` and `dump control.torque` both work.
+    print(json.dumps(_loader.get(args.section), indent=2))
     return 0
 
 

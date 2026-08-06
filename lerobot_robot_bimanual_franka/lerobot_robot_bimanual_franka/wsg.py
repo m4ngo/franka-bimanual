@@ -44,6 +44,8 @@ from dataclasses import dataclass, field
 
 import franka_config as fc
 
+logger = logging.getLogger(__name__)
+
 _WSG = fc.control("gripper.wsg")
 
 

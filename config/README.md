@@ -15,7 +15,7 @@ read from here instead.
 | `world.yaml` | World frame definition, calibration-frame origin, per-arm `robot_base_in_world`, worktable height (world frame), sim alignment |
 | `arms.yaml` | Per-arm NUC hosts, robot/gripper IPs, RPyC ports, gripper kind; home-pose directory |
 | `cameras.yaml` | `cam_1` … `cam_6`: type, name, IP, serial, role/mount, resolution, intrinsics + extrinsics |
-| `control.yaml` | Every control constant: rates, PD/OSC gains, fudge factors, velocity limits, worktable brake, Franka wire dynamics, homing tolerances, WSG params |
+| `control.yaml` | Every control constant: rates, velocity-domain PD gains, the whole `torque:` block (OSC schedule, delta envelope, joint impedance, torque/speed limits, friction, RT loop), fudge factors, worktable brake, Franka wire dynamics, homing budget, WSG params |
 | `rig.yaml` | Robot profiles — which arms and cameras each robot config exposes, under which key prefixes, and which leader device drives it |
 | `teleop.yaml` | GELLO and SpaceMouse device ports, scales, sign flips, calibration positions |
 | `policy.yaml` | Residual/policy normalization contract shared by sysid, residual_wrapper and trained checkpoints |
@@ -33,7 +33,7 @@ fc.control_fps()                     # 20
 fc.arm("right").robot_ip             # 192.168.201.10
 fc.camera("cam_2").calibration.cam_in_world   # Pose, camera -> world
 fc.robot_base_in_world("left")       # Pose, robot base -> world
-fc.control("gains.ee_pd.kp")         # 3.5
+fc.control("torque.osc.default_kp")  # 150.0
 fc.home_q(key="r")                   # from home_poses/<default>.json
 ```
 
@@ -78,6 +78,14 @@ alternate rig without editing tracked files.
   enumerate as identical HID devices, so an inferred device connects
   successfully and then silently does nothing.
 - **`config/` holds data only.** The loader lives in `franka_config/`.
+- **A constant defined twice is a bug, even when the values agree.** If a module
+  reads a value from here and then assigns a literal to the same name, the
+  literal wins and this file is decoration. Delete the literal.
+- **`torque:` is read on both machines.** The NUC has no `franka_config`, so
+  `scripts/deploy_nuc_server.sh` resolves that block here and ships it as
+  `nuc_control_config.py`; `torque_config.py` is what both sides read it
+  through. Derived quantities (the action→gain exponential bases) are computed
+  from `torque.osc.*`, never configured separately.
 
 ## After editing
 
@@ -86,8 +94,13 @@ stack will actually see:
 
 ```bash
 python -m franka_config dump control
+python -m franka_config dump control.torque   # dotted paths work too
 python -m franka_config cameras
 ```
+
+**Editing `torque:` is not enough on its own** — re-run
+`scripts/deploy_nuc_server.sh <mario|luigi>` or the arm keeps running the gains
+from the last deploy.
 
 Recalibrating a camera: run `python frames/camera/camera_calibration.py --cam cam_2`;
 it prints a ready-to-paste `cameras.yaml` calibration block in the calibration

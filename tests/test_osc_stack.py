@@ -261,8 +261,12 @@ _SESSION_KNOBS = {"friction_kc", "friction_kc_joint", "uncouple_pos_ori",
 # is control-path but gated by use_noise, which is pinned above.
 _INERT_FIELDS = {
     "active_arms", "calibration_dir", "cameras", "control_mode", "depth",
-    "depth_cam", "depth_crop_radius_m", "id", "noise_pos_scale", "noise_rot_scale",
+    "depth_cam", "depth_center_arm", "depth_crop_radius_m", "id",
+    "noise_pos_scale", "noise_rot_scale",
     "r_gripper_ip", "r_gripper_port", "r_port", "r_robot_ip", "r_server_ip",
+    # rig_profile selects arms/cameras/base poses. It reaches the torque path
+    # only through the safety screen, which the parity harness bypasses.
+    "rig_profile",
     "world_in_robot_quat_wxyz", "world_in_robot_translation_m",
 }
 
@@ -1310,8 +1314,12 @@ def test_worktable_brake_never_commands_below_the_floor():
     case = make_case(rng, ee_z=0.12)
     robot = make_robot(case, safety=True)
     robot.send_action(ee_delta_action([0, 0, -1.0], [0, 0, 0]))
-    goal_z = robot.robot_manager.osc_goals[-1]["r"][0][2]
-    assert goal_z >= robot.safety.goal_z_floor - 1e-12
+    goal_pos, goal_quat = robot.robot_manager.osc_goals[-1]["r"][:2]
+    # The floor is a WORLD-frame plane under the EE collision sphere's bottom,
+    # not a base-frame goal z: the goal's own orientation decides where the
+    # sphere sits, and the arm's base pose lifts it into world.
+    bottom = robot.safety.sphere_bottom_world_z("r", goal_pos, goal_quat)
+    assert bottom >= robot.safety.goal_z_floor - 1e-12
 
 
 def main() -> int:

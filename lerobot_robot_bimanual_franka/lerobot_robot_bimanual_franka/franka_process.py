@@ -27,22 +27,18 @@ from .franka_jacobian import zero_jacobian
 
 logger = logging.getLogger(__name__)
 
-NUM_JOINTS = 7
-EE_DELTA_DIMS = 6
 # Wire-level constants, all from config/control.yaml (franka: section).
 VELOCITY_COMMAND_DURATION_MS = fc.control("franka.velocity_command_duration_ms")
 NUM_JOINTS = fc.num_joints()
 EE_DELTA_DIMS = fc.control("franka.ee_delta_dims")
 
-DEFAULT_REQUEST_TIMEOUT_S = 5.0
-RPYC_TIMEOUT_S = 10
-FIRST_STATE_TIMEOUT_S = 5.0
+DEFAULT_REQUEST_TIMEOUT_S = fc.control("franka.request_timeout_s")
+RPYC_TIMEOUT_S = fc.control("franka.rpyc_timeout_s")
+FIRST_STATE_TIMEOUT_S = fc.control("franka.first_state_timeout_s")
 
 # Server-side control modes (pylibfranka_server.MODE_*).
 MODE_FLOAT = "float"
 MODE_HOLD = "hold"
-DEFAULT_REQUEST_TIMEOUT_S = fc.control("franka.request_timeout_s")
-RPYC_TIMEOUT_S = fc.control("franka.rpyc_timeout_s")
 
 _JACOBIAN_CACHE_Q_THRESHOLD = fc.control("franka.jacobian_cache_q_threshold_rad")  # rad, L-inf
 _JOINT_RELATIVE_DYNAMICS = tuple(fc.control("franka.joint_relative_dynamics"))

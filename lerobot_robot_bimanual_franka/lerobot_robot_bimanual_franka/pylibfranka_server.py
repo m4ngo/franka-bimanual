@@ -72,8 +72,10 @@ from rpyc.utils.server import ThreadedServer
 
 try:  # deployed flat next to this file on the NUC; importable as a package on the workstation
     from . import pylibfranka_shm as shm
+    from .torque_config import torque
 except ImportError:
     import pylibfranka_shm as shm  # type: ignore[no-redef]
+    from torque_config import torque  # type: ignore[no-redef]
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +90,14 @@ _FRICTION_KC = 0.0
 # Headroom above the nominal Coulomb constants, which are literature values
 # rather than measured on this arm. Over-compensation shows up as buzzing; the
 # control process's speed guard bounds it either way.
-_FRICTION_KC_MAX = 3.0
-_LAMBDA_DLS_MU = 0.10
+# config/control.yaml, `torque:` -- see torque_config for how it reaches the NUC.
+_FRICTION_KC_MAX = float(torque("friction.kc_max"))
+_LAMBDA_DLS_MU = float(torque("osc.lambda_dls_mu"))
 
 
 # The control loop is in another process now, so handler latency here cannot
 # starve it. Kept small anyway so RPC threads hand off promptly to each other.
-_GIL_SWITCH_INTERVAL_S = 5.0e-5
+_GIL_SWITCH_INTERVAL_S = float(torque("loop.gil_switch_interval_s"))
 
 # Substrings, matched case-insensitively. Note "constraint" without the closing
 # 's': libfranka 0.18 emits "communication_constraints_violation" where the
@@ -115,8 +118,8 @@ _RECOVERABLE_ERRORS = (
 # Arming retries. Every script's shutdown() calls robot.stop(), so a script run
 # back-to-back with another routinely tries to arm while libfranka is still
 # tearing the old session down.
-_ARM_ATTEMPTS = 6
-_ARM_BACKOFF_S = 0.3
+_ARM_ATTEMPTS = int(torque("loop.arm_attempts"))
+_ARM_BACKOFF_S = float(torque("loop.arm_backoff_s"))
 
 MODE_FLOAT = "float"
 MODE_HOLD = "hold"
@@ -126,7 +129,7 @@ MODE_OSC = "osc"
 
 # Cores left for the RT loop; 0-1 carry the ACPI/PM kworkers and everything we
 # deliberately pin away from it (the RPyC server, the gripper server).
-_RT_CPU_CANDIDATES = (2, 3, 4, 5, 6, 7)
+_RT_CPU_CANDIDATES = tuple(int(c) for c in torque("loop.rt_cpu_candidates"))
 
 
 def _quietest_cpu() -> str:

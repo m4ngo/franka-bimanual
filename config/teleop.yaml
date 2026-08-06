@@ -17,9 +17,24 @@ gello:
     right: {port: /dev/ttyUSB0}
 
 spacemouse:
+  # These are robosuite osc_pose.json's output_max, so full deflection is
+  # exactly a normalized +/-1 policy action -- teleop and policy drive the
+  # controller through identical units. clip_delta enforces the same bound
+  # downstream, so raising them past 0.05/0.5 only saturates earlier.
   translation_scale: 0.05   # metres per tick at full deflection
   rotation_scale: 0.5       # radians per tick at full deflection
-  translation_signs: [1, -1, 1]
+  # Fraction of full deflection treated as zero, with the remainder rescaled so
+  # full deflection still reaches 1.0. The puck cross-talks: twisting to yaw
+  # drives the linear axes to ~0.23, which is ~1.2 cm/tick of translation the
+  # operator never commanded.
+  deadzone: 0.08
+  # Per-axis sign trims in BASE frame, applied AFTER spacemouse.py's
+  # LINEAR_DEVICE_TO_BASE / ANGULAR_DEVICE_TO_BASE. The device mounting lives in
+  # those matrices, not here — these only exist to flip an axis without editing
+  # one. Identity for translation because the matrix already encodes this rig's
+  # mounting; a -1 here on top of it swaps X and Y rather than mirroring.
+  translation_signs: [1, 1, 1]
+  # Yaw is inverted on this puck; the controller itself is correctly signed.
   rotation_signs: [1, 1, -1]
   noise_pos_scale: 0.05
   noise_rot_scale: 0.03

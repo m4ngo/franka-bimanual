@@ -30,6 +30,14 @@ from __future__ import annotations
 
 import numpy as np
 
+try:  # package on the workstation, flat next to the server on the NUC
+    from .torque_config import torque
+except ImportError:
+    from torque_config import torque  # type: ignore[no-redef]
+
+# Every constant below comes from config/control.yaml (`torque:`); the rationale
+# for each value lives there. Redeploy the NUC after changing one.
+#
 # This stack always runs osc.py's impedance_mode="variable": kp and the damping
 # ratio come from the action every step (resolve_gains), never from a fixed
 # constant. Stated explicitly because the two modes are NOT interchangeable --
@@ -43,66 +51,42 @@ import numpy as np
 # To sweep gains against sim, regenerate it with
 #   sysid.controller_overrides: {impedance_mode: variable, kp_limits: [0, 1500]}
 # and an action carrying the gain channels.
-IMPEDANCE_MODE = "variable"
+IMPEDANCE_MODE = torque("osc.impedance_mode")
 
 # Sim-parity gain schedule (cfg/fast_default.yaml controller block).
-DEFAULT_KP = 150.0
-KP_LIMITS = (0.0, 1500.0)
-DEFAULT_DAMPING_RATIO = 1.0
-DAMPING_RATIO_LIMITS = (0.0, 10.0)
+DEFAULT_KP = float(torque("osc.default_kp"))
+KP_LIMITS = tuple(float(v) for v in torque("osc.kp_limits"))
+DEFAULT_DAMPING_RATIO = float(torque("osc.default_damping_ratio"))
+DAMPING_RATIO_LIMITS = tuple(float(v) for v in torque("osc.damping_ratio_limits"))
 
 # utils/envs/libero.py: exp_scale = limit_max / default, gains = exp_scale ** action * default.
+# DERIVED, never configured separately -- a second copy silently drifts from sim.
 KP_EXP_SCALE = KP_LIMITS[1] / DEFAULT_KP
 DAMPING_EXP_SCALE = DAMPING_RATIO_LIMITS[1] / DEFAULT_DAMPING_RATIO
 
 # osc_pose.json output_max/output_min: the per-step delta envelope in metres/radians.
-DELTA_POS_MAX = 0.05
-DELTA_ROT_MAX = 0.5
+DELTA_POS_MAX = float(torque("delta.pos_max_m"))
+DELTA_ROT_MAX = float(torque("delta.rot_max_rad"))
 
 # control_utils.nullspace_torques default.
-DEFAULT_NULLSPACE_KP = 10.0
+DEFAULT_NULLSPACE_KP = float(torque("osc.nullspace_kp"))
 
 # Damped-least-squares regularisation on lambda_full, in the units of J M^-1 J^T.
-# Only used when uncouple_pos_ori=False, which inverts the coupled 6x6 and so
-# blows up near a singularity. 0.05 bounds commanded torque at 24 Nm against the
-# 69.6 Nm clamp across the reach, at <=14 deg of direction error at the worst
-# pose and ~0 where the arm is well conditioned.
-# Caps lambda_full at 1/mu^2. 0.05 caps at 400 against a healthy 11, so it never
-# engaged before the torque clamp did: cond(J) 9->58 as the arm raises took joint 4
-# to 99 Nm against its 69.6 Nm clamp, which is the shaking. 0.15 caps at 44.
-LAMBDA_DLS_MU = 0.10
+LAMBDA_DLS_MU = float(torque("osc.lambda_dls_mu"))
 
 # FR3/Panda datasheet continuous joint torque limits (Nm).
-JOINT_TORQUE_LIMITS = (87.0, 87.0, 87.0, 87.0, 30.0, 25.0, 20.0)
+JOINT_TORQUE_LIMITS = tuple(float(v) for v in torque("limits.joint_torque_nm"))
 
-# Joint-space impedance for JOINT_POS / home() / hold. Per-joint stiffness, NOT
-# a scalar through the mass matrix: tau = M @ (kp*e) collapses on the wrist,
-# where M is ~0.01, so a 0.5 rad error asks for ~0.3 Nm -- under breakaway, which
-# is why home() could not rotate the wrist joints. These are libfranka's
-# joint_impedance_example values, in Nm/rad and Nms/rad.
-DEFAULT_JOINT_KP = np.array([300.0, 300.0, 300.0, 300.0, 400.0, 150.0, 100.0])
-# kd is sized per joint as 2*zeta*sqrt(kp*M) at zeta~0.7, NOT copied from
-# libfranka's example: those values assume the proximal joints' inertia, and on
-# the wrist (M ~ 0.01-0.05) they are both discretely unstable (kd/M above the
-# 500 Hz law's Nyquist) and self-throttling -- home()'s torque budget is
-# frac*tau_limit/(kd*(1+margin)), so kd=25 capped joint 6 at 0.13 rad/s and a
-# 1 rad wrist move could not finish inside the 5 s default max_time_s.
-DEFAULT_JOINT_KD = np.array([35.0, 35.0, 35.0, 35.0, 20.0, 10.0, 10.0])
-DEFAULT_JOINT_DAMPING_RATIO = 1.0
+# Joint-space impedance for JOINT_POS / home() / hold.
+DEFAULT_JOINT_KP = np.asarray(torque("joint_impedance.kp"), dtype=np.float64)
+DEFAULT_JOINT_KD = np.asarray(torque("joint_impedance.kd"), dtype=np.float64)
+DEFAULT_JOINT_DAMPING_RATIO = float(torque("joint_impedance.damping_ratio"))
 
-# Cap on each joint's velocity-loop pole kd/M (rad/s). The STIFFNESS must stay
-# un-weighted or the wrist cannot break away (see DEFAULT_JOINT_KP), but the
-# DAMPING then inherits the same tiny inertia: kd/M is 600-1500 rad/s on joints
-# 5-7, so -kd*dq alternates sign against the 500 Hz law and the wrist bang-bangs
-# its +/-12 Nm clamp -- the homing vibration. This is the failure the velocity
-# path already avoids by weighting through M (DEFAULT_JOINT_VEL_KV). 100 rad/s
-# leaves joints 1-4 untouched and lands 5-7 at damping ratio 0.58-0.71.
-JOINT_KD_POLE_MAX = 100.0
+# Cap on each joint's velocity-loop pole kd/M (rad/s).
+JOINT_KD_POLE_MAX = float(torque("joint_impedance.kd_pole_max_rad_s"))
 
-# Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix so the pole is
-# this on every joint; DEFAULT_JOINT_KD as a velocity gain puts the wrist at
-# kd/M = 600-7900 rad/s and chatters against the 500 Hz law.
-DEFAULT_JOINT_VEL_KV = 25.0
+# Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix.
+DEFAULT_JOINT_VEL_KV = float(torque("joint_impedance.velocity_kv"))
 
 
 def resolve_gains(
@@ -266,8 +250,8 @@ def clip_delta(delta_pos: np.ndarray, delta_rotvec: np.ndarray) -> tuple[np.ndar
     output bound -- scaling again here would double-apply it.
     """
     return (
-        delta_pos, # np.clip(delta_pos, -DELTA_POS_MAX, DELTA_POS_MAX),
-        delta_rotvec # np.clip(delta_rotvec, -DELTA_ROT_MAX, DELTA_ROT_MAX),
+        np.clip(delta_pos, -DELTA_POS_MAX, DELTA_POS_MAX),
+        np.clip(delta_rotvec, -DELTA_ROT_MAX, DELTA_ROT_MAX),
     )
 
 

@@ -37,6 +37,14 @@ class FramosCameraConfig(CameraConfig):
     #: If unset, FPS is snapped from `CameraConfig.fps` automatically in `FramosCamera`.
     streaming_fps: int | None = field(default_factory=lambda: fc.camera_stream_fps())
     options: dict[str, float] = field(default_factory=dict)
+    #: Isolated-point density filter on the projected cloud (config/cameras.yaml).
+    blob_filter: bool = field(default_factory=lambda: _default("blob_filter", False))
+    blob_filter_min_neighbors: int = field(
+        default_factory=lambda: _default("blob_filter_min_neighbors", 20)
+    )
+    blob_filter_radius_m: float = field(
+        default_factory=lambda: _default("blob_filter_radius_m", 0.01)
+    )
     # Populated from config/cameras.yaml by for_camera(); the bare defaults are
     # deliberately inert so an unconfigured camera can't silently deproject into
     # a plausible-looking but wrong world pose.
