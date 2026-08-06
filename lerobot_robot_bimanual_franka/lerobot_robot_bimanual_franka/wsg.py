@@ -35,6 +35,7 @@ Public API:
 
 from __future__ import annotations
 
+import logging
 import socket
 import threading
 import time
@@ -104,6 +105,7 @@ class WSG:
         self._last_move_send_t: float = 0.0
         self._cmd_queue: deque[tuple[bytes, _Waiter | None]] = deque()
         self._waiters: deque[_Waiter] = deque()
+        self._move_error = False
 
         self._closed = threading.Event()
 
@@ -257,8 +259,16 @@ class WSG:
                     self._gripper_state = int(text.split("=", 1)[1])
             except ValueError:
                 pass
-        elif text.startswith("ERR") and self.do_print:
-            print(f"{self.name}: [WSG] {text}")
+        elif text.startswith("ERR"):
+            # MOVE is fire-and-forget, so this is the only place its failure is
+            # ever observable; the sender clears the axis before the next one.
+            if "MOVE" in text:
+                with self._cond:
+                    self._move_error = True
+                    self._cond.notify()
+            logger.warning("%s: [WSG] %s", self.name, text)
+            if self.do_print:
+                print(f"{self.name}: [WSG] {text}")
 
         # Match the oldest waiter whose expected token appears in this
         # line.  One match per line; subsequent waiters keep waiting.
@@ -291,16 +301,20 @@ class WSG:
                 else:
                     now = time.monotonic()
                     target_dirty = self._target_dirty_locked()
+                    move_ready = (now - self._last_move_send_t) >= self._MIN_MOVE_INTERVAL_S
 
-                    if (
-                        target_dirty
-                        or (now - self._last_move_send_t) >= self._MIN_MOVE_INTERVAL_S
-                        and self._target_mm is not None
-                    ):
+                    # Both conditions, not either: a changed target still waits
+                    # out the rate cap, and an unchanged one is never re-sent.
+                    if target_dirty and move_ready:
                         target = self._target_mm
                         self._last_sent_target_mm = target
                         self._last_move_send_t = now
                         cmd_to_send = self._move_cmd(target)
+                        if self._move_error:
+                            # A faulted axis rejects the next MOVE until it is
+                            # cleared, which is how the gripper latches shut.
+                            cmd_to_send = b"STOP()\n" + cmd_to_send
+                            self._move_error = False
                     elif (now - last_pos_poll_t) >= self._POS_POLL_INTERVAL_S:
                         cmd_to_send = b"POS?\n"
                         last_pos_poll_t = now

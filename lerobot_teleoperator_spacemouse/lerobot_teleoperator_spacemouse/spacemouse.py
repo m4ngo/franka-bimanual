@@ -1,21 +1,35 @@
-"""3Dconnexion SpaceMouse teleoperator for absolute EE-pose robot control.
+"""3Dconnexion SpaceMouse teleoperator, emitting the sim policies' action.
 
-Thin wrapper around `pyspacemouse` that exposes the device as a LeRobot
-:class:`Teleoperator`. Each call to :pymeth:`get_action` integrates the
-device twist into a running absolute EE pose and returns:
+Thin wrapper around `pyspacemouse` exposing the device as a LeRobot
+:class:`Teleoperator`.
 
-- absolute Cartesian position (x, y, z) in metres, updated by the device's
-  linear axes (already normalized to [-1, 1] by pyspacemouse);
-- absolute orientation as a unit quaternion (qx, qy, qz, qw), updated by
-  composing a small-angle rotation from the device's angular axes onto the
-  current orientation;
-- a ``gripper`` target normalised to ``[0, 1]`` (0 = fully closed,
-  1 = ``gripper_norm_max_mm``), latched from the two device buttons:
-  left button = close (drive to ``gripper_min_mm``), right button = open
-  (drive to ``gripper_max_mm``).
+Action semantics (``use_delta=True``, the EE_DELTA path)
+-------------------------------------------------------
+Deliberately identical to what a base policy emits in simulation, so teleop
+demonstrations and policy rollouts drive the controller through the same units
+and conventions:
 
-Call :pymeth:`seed_state` before starting teleop to initialise the integrated
-pose from the robot arm's actual EE state.
+- **Full stick deflection == a normalized +/-1 policy action.** pyspacemouse
+  normalizes its axes to [-1, 1], and ``translation_scale`` /
+  ``rotation_scale`` default to robosuite's ``osc_pose.json`` output_max
+  (0.05 m, 0.5 rad). Deflection therefore maps onto exactly the envelope
+  ``OperationalSpaceController.scale_action`` produces, which is also what
+  ``osc_torque_controller.clip_delta`` enforces downstream.
+- **The rotation delta is an axis-angle vector**, as in ``set_goal_orientation``.
+  It goes on the wire as the equivalent quaternion only because
+  ``EE_FEATURE_KEYS`` is quaternion-shaped; ``BimanualFranka._delta_rotvec``
+  converts it straight back, exactly, for any angle below pi.
+- **Both channels are in the robot base frame**, each through its own
+  device->base rotation (``LINEAR_DEVICE_TO_BASE`` / ``ANGULAR_DEVICE_TO_BASE``;
+  see the note there on why they differ).
+
+With ``use_delta=False`` the same deltas are integrated into an absolute pose
+for the EE_POS path instead. Call :pymeth:`seed_state` first so that pose starts
+at the arm's real EE rather than ``config.initial_pos``.
+
+The ``gripper`` value is latched from the two buttons: left = close
+(``gripper_min_mm``), right = open (``gripper_max_mm``); open wins if both are
+pressed, so a fumbled double-press cannot crush the gripper.
 """
 
 import logging
@@ -36,6 +50,58 @@ logger = logging.getLogger(__name__)
 # call; bounding the loop guarantees we never spin indefinitely if the
 # device is somehow streaming faster than we can keep up.
 _MAX_DRAIN_PER_TICK = 64
+
+# Device -> robot base, per channel. These are NOT the same matrix, and that is
+# an empirical fact about pyspacemouse rather than a geometry mistake: its
+# (roll, pitch, yaw) triple is not reported on the same axes as its (x, y, z)
+# triple on this device. Deriving the angular map from the linear one -- correct
+# if both triples shared an axis convention -- put roll and pitch on swapped
+# robot axes, confirmed on hardware.
+#
+# The hardware probe is the authority here, not a derivation:
+#   python scripts/check_spacemouse.py --hidraw /dev/hidraw3
+#   python scripts/check_osc_axes.py --yes
+# Both must stay proper rotations; _validate_device_map() enforces that at import
+# so a reflection can never sneak in and make one channel mirror-imaged.
+LINEAR_DEVICE_TO_BASE = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+], dtype=np.float64)
+
+ANGULAR_DEVICE_TO_BASE = np.eye(3, dtype=np.float64)
+
+
+def _validate_device_map() -> None:
+    for name, m in (("LINEAR_DEVICE_TO_BASE", LINEAR_DEVICE_TO_BASE),
+                    ("ANGULAR_DEVICE_TO_BASE", ANGULAR_DEVICE_TO_BASE)):
+        det = float(np.linalg.det(m))
+        orth = float(np.max(np.abs(m @ m.T - np.eye(3))))
+        if abs(det - 1.0) > 1e-9 or orth > 1e-9:
+            raise ValueError(
+                f"{name} must be a proper rotation (det={det:.6f}, "
+                f"orthogonality error={orth:.2e}); a reflection would mirror "
+                "that channel."
+            )
+
+
+_validate_device_map()
+
+
+def _apply_deadzone(v: np.ndarray, deadzone: float) -> np.ndarray:
+    """Zero small deflections, then rescale so full deflection still reaches 1.
+
+    Not cosmetic: the puck cross-talks badly. Twisting it to yaw measurably
+    drives the x/y linear axes to ~0.23, which at full scale is ~1.2 cm of
+    translation per tick that the operator never asked for. Rescaling the
+    surviving range keeps the mapping linear and preserves the normalized
+    +/-1 == policy-action correspondence.
+    """
+    if deadzone <= 0.0:
+        return v
+    mag = np.abs(v)
+    scaled = (mag - deadzone) / (1.0 - deadzone)
+    return np.sign(v) * np.clip(scaled, 0.0, 1.0)
 
 
 class SpaceMouse(Teleoperator):
@@ -165,26 +231,30 @@ class SpaceMouse(Teleoperator):
             # self._gripper_target_mm = float(self.config.gripper_min_mm)
             delta = float(self.config.gripper_min_mm)
 
-        t_scale = self.config.translation_scale
-        r_scale = self.config.rotation_scale
-        tx, ty, tz = self.config.translation_signs
-        rx, ry, rz = self.config.rotation_signs
+        # Raw device axes, normalized to [-1, 1] by pyspacemouse. These ARE the
+        # normalized policy action once the deadzone rescale is applied.
+        lin_dev = _apply_deadzone(
+            np.array([state.x, state.y, state.z], dtype=np.float64), self.config.deadzone
+        )
+        ang_dev = _apply_deadzone(
+            np.array([state.roll, state.pitch, state.yaw], dtype=np.float64), self.config.deadzone
+        )
 
-        delta_pos = np.array([
-            state.y * t_scale * tx,
-            state.x * t_scale * ty,
-            state.z * t_scale * tz,
-        ], dtype=np.float64)
-        # Integrate orientation: compose a small-angle rotation onto cur_rot.
-        # Rotation.from_euler interprets the angles as intrinsic xyz (roll/pitch/yaw).
-        delta_rot = Rotation.from_euler("xyz", [
-            state.roll  * r_scale * rx,
-            state.pitch * r_scale * ry,
-            state.yaw   * r_scale * rz,
-        ])
+        # Into the base frame (per-channel map, see above), then per-axis sign
+        # trims, then the scale that makes full deflection == a +/-1 policy action.
+        lin_norm = LINEAR_DEVICE_TO_BASE @ lin_dev * np.asarray(self.config.translation_signs, dtype=np.float64)
+        ang_norm = ANGULAR_DEVICE_TO_BASE @ ang_dev * np.asarray(self.config.rotation_signs, dtype=np.float64)
 
-        # Update integrated state using clean (non-noisy) deltas.
-        # Spacemouse x/y are swapped relative to robot frame.
+        delta_pos = lin_norm * self.config.translation_scale
+        # Axis-angle, matching osc.py's set_goal_orientation input. from_rotvec,
+        # not from_euler: only the former agrees with that convention beyond
+        # infinitesimal angles.
+        delta_rotvec = ang_norm * self.config.rotation_scale
+        delta_rot = Rotation.from_rotvec(delta_rotvec)
+
+        # Integrated pose for the absolute (EE_POS) path. Position sums; the
+        # rotation pre-multiplies, i.e. composes in the base frame, the same way
+        # set_goal_orientation composes delta onto the current orientation.
         self.cur_pos = self.cur_pos + delta_pos
         self.cur_rot = delta_rot * self.cur_rot
 

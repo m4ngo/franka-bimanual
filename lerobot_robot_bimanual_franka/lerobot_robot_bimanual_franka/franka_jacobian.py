@@ -40,6 +40,27 @@ _DH = np.array([
 ])
 
 
+# Constant per-row DH terms, hoisted so the per-tick path only evaluates the
+# joint-angle-dependent entries. This runs inside the NUC's 1 kHz loop, where
+# the original per-call `np.array([[...]])` construction cost ~150 us/tick and
+# was a large part of what pushed the loop past its deadline.
+_A = np.ascontiguousarray(_DH[:, 0])
+_D = np.ascontiguousarray(_DH[:, 1])
+_CA = np.cos(_DH[:, 2])
+_SA = np.sin(_DH[:, 2])
+
+_N_LINKS = _DH.shape[0]
+
+# Everything in the DH transform that does not depend on theta.
+_TEMPLATE = np.zeros((_N_LINKS, 4, 4), dtype=np.float64)
+_TEMPLATE[:, 0, 3] = _A
+_TEMPLATE[:, 1, 2] = -_SA
+_TEMPLATE[:, 1, 3] = -_D * _SA
+_TEMPLATE[:, 2, 2] = _CA
+_TEMPLATE[:, 2, 3] = _D * _CA
+_TEMPLATE[:, 3, 3] = 1.0
+
+
 def _dh_matrix(a: float, d: float, alpha: float, theta: float) -> np.ndarray:
     """Modified DH (Craig) transform from frame i-1 to frame i."""
     ct, st = np.cos(theta), np.sin(theta)
@@ -58,30 +79,38 @@ def fk_chain(q: np.ndarray) -> np.ndarray:
     Entries 0..6 are the frames after each of the 7 joint rotations
     (``out[k] = 0_T_(k+1)``); entry 7 includes the fixed flange-to-EE step.
     """
-    out = np.empty((8, 4, 4), dtype=np.float64)
-    T = np.eye(4)
-    for i in range(7):
-        a, d, alpha = _DH[i]
-        T = T @ _dh_matrix(a, d, alpha, float(q[i]))
-        out[i] = T
-    a, d, alpha = _DH[7]
-    out[7] = T @ _dh_matrix(a, d, alpha, 0.0)
+    theta = np.zeros(_N_LINKS, dtype=np.float64)
+    theta[:7] = np.asarray(q, dtype=np.float64)[:7]
+    ct, st = np.cos(theta), np.sin(theta)
+
+    # Build all 8 link transforms at once, then chain them.
+    b = _TEMPLATE.copy()
+    b[:, 0, 0] = ct
+    b[:, 0, 1] = -st
+    b[:, 1, 0] = st * _CA
+    b[:, 1, 1] = ct * _CA
+    b[:, 2, 0] = st * _SA
+    b[:, 2, 1] = ct * _SA
+
+    out = np.empty((_N_LINKS, 4, 4), dtype=np.float64)
+    out[0] = b[0]
+    for i in range(1, _N_LINKS):
+        np.matmul(out[i - 1], b[i], out=out[i])
     return out
 
 
 def zero_jacobian(q: np.ndarray, ee_pos_base: np.ndarray | None = None) -> np.ndarray:
     """Base-frame geometric 6x7 Jacobian [linear(3); angular(3)] at the EE.
 
-    ``ee_pos_base`` anchors the linear block (pass the measured franky O_T_EE
+    ``ee_pos_base`` anchors the linear block (pass the measured O_T_EE
     translation to stay consistent with the measured-pose error). If omitted, the
     FK's own EE point is used. Validated == finite-difference of the FK.
     """
-    chain = fk_chain(np.asarray(q, dtype=np.float64))
+    chain = fk_chain(q)
     o_e = np.asarray(ee_pos_base, dtype=np.float64) if ee_pos_base is not None else chain[7][:3, 3]
-    J = np.zeros((6, 7), dtype=np.float64)
-    for k in range(7):
-        z_k = chain[k][:3, 2]      # joint k screw axis = z of frame k+1
-        o_k = chain[k][:3, 3]      # origin of frame k+1
-        J[:3, k] = np.cross(z_k, o_e - o_k)
-        J[3:, k] = z_k
+    z = chain[:7, :3, 2]           # joint k screw axis = z of frame k+1
+    o = chain[:7, :3, 3]           # origin of frame k+1
+    J = np.empty((6, 7), dtype=np.float64)
+    J[:3, :] = np.cross(z, o_e - o).T
+    J[3:, :] = z.T
     return J

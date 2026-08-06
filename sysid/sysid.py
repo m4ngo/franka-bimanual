@@ -46,7 +46,14 @@ Fields recorded in the output HDF5 (both modes):
     qpos          (T, 7) – actual joint angles
     qvel          (T, 7) – actual joint velocities
     t_sim         (T, 1) – wall-clock time since episode start
-    tau_cmd       (T, 7) – zeros (not accessible via current RPC interface)
+    tau_cmd       (T, 7) – joint torque the controller actually wrote, post
+                           clamp and rate limit (matches sim's tau_cmd)
+    tau_measured  (T, 7) – link-side measured joint torque (state.tau_J)
+    tau_ext       (T, 7) – libfranka's estimated external torque, i.e. what the
+                           dynamic model cannot account for. Commanded high but
+                           measured low with the joint stationary means the
+                           command is being absorbed mechanically, not a
+                           controller fault -- the distinction sim cannot show.
 
 Episodes are flushed incrementally (atomic tmp+rename, --flush-every steps)
 so a crash or Ctrl-C mid-episode keeps the data collected so far.
@@ -96,10 +103,11 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
     try:
         from env_wrapper import start_controller
         from lerobot_robot_bimanual_franka import SingleArmFranka  # noqa: F401
+        from lerobot_robot_bimanual_franka import SingleArmFrankaConfig as cfg
         from lerobot_robot_bimanual_franka import (
             bimanual_franka as bf,
             franka_process as fp,
-            osc_velocity_controller as osc,
+            osc_torque_controller as osc,
             safety as sf,
         )
     except ImportError:
@@ -107,7 +115,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
             return None
         raise
     _ROBOT_STACK = SimpleNamespace(
-        start_controller=start_controller, bf=bf, fp=fp, osc=osc, safety=sf,
+        start_controller=start_controller, bf=bf, fp=fp, osc=osc, safety=sf, cfg=cfg,
     )
     return _ROBOT_STACK
 
@@ -304,6 +312,9 @@ class _MockController:
             def recovery_counts(self):
                 return {_ARM_KEY: 0}
 
+            def torque_snapshot(self, name):
+                return (np.zeros(7), np.zeros(7), np.zeros(7))
+
         self.robot_manager = _RM()
 
     def home(self, home_q_left=None, home_q_right=None, **kwargs):
@@ -431,6 +442,7 @@ def _run_episode(
         "action", "action_norm", "eef_goal_pos", "eef_goal_quat",
         "eef_ang_vel", "eef_lin_vel", "eef_pos",
         "eef_quat", "fault_count", "qpos", "qvel", "t_sim", "tau_cmd",
+        "tau_measured", "tau_ext",
     )}
 
     record_video = video_dir is not None and bool(controller.cameras)
@@ -540,7 +552,12 @@ def _run_episode(
             buf["qpos"].append(np.asarray(q, dtype=np.float32))
             buf["qvel"].append(np.asarray(dq, dtype=np.float32))
             buf["t_sim"].append(np.array([t_now], dtype=np.float32))
-            buf["tau_cmd"].append(np.zeros(7, dtype=np.float32))
+            # Torques come from the same state read as q/dq above, so they are
+            # from one tick, not stitched across two.
+            tau_cmd, tau_meas, tau_ext = controller.robot_manager.torque_snapshot("r")
+            buf["tau_cmd"].append(np.asarray(tau_cmd, dtype=np.float32))
+            buf["tau_measured"].append(np.asarray(tau_meas, dtype=np.float32))
+            buf["tau_ext"].append(np.asarray(tau_ext, dtype=np.float32))
 
             # --- incremental flush (atomic tmp + rename) ----------------------
             if flush_path is not None and (step + 1) % flush_every == 0:
@@ -616,12 +633,14 @@ def save_sysid_hdf5(recorded: dict[str, np.ndarray], path: str, attrs: dict | No
 _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
     "bf": (
         "_EE_TRANSLATION_FUDGE_FACTOR", "_EE_ROTATION_FUDGE_FACTOR",
-        "OSC_BASE_KP", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
-        "EE_PD_KP", "EE_PD_KD", "JOINT_PD_KP", "JOINT_PD_KD",
+        "OSC_BASE_KP", "OSC_BASE_DAMPING_RATIO", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
+        "JOINT_IMPEDANCE_KP", "HOME_IMPEDANCE_KP", "HOME_MAX_QDOT",
     ),
     "osc": (
-        "DEFAULT_KP", "DEFAULT_DAMPING_RATIO", "DEFAULT_NULLSPACE_KP",
-        "DEFAULT_DLS_DAMPING", "DEFAULT_MAX_QDOT",
+        "IMPEDANCE_MODE",
+        "DEFAULT_KP", "KP_LIMITS", "DEFAULT_DAMPING_RATIO", "DAMPING_RATIO_LIMITS",
+        "KP_EXP_SCALE", "DAMPING_EXP_SCALE", "DEFAULT_NULLSPACE_KP",
+        "DELTA_POS_MAX", "DELTA_ROT_MAX", "DEFAULT_JOINT_KP", "JOINT_TORQUE_LIMITS",
     ),
     "safety": (
         "JOINT_VELOCITY_MAX", "EE_LINEAR_VELOCITY_MAX", "EE_ANGULAR_VELOCITY_MAX",
@@ -629,15 +648,38 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
         "EE_SPHERE",
     ),
     "fp": (
-        "VELOCITY_COMMAND_DURATION_MS", "_JOINT_RELATIVE_DYNAMICS",
-        "_EE_DELTA_RELATIVE_DYNAMICS", "_JOINT_STIFFNESS",
-        "_TORQUE_THRESHOLD", "_FORCE_THRESHOLD",
+        "NUM_JOINTS", "RPYC_TIMEOUT_S", "FIRST_STATE_TIMEOUT_S",
+    ),
+    # env_wrapper passes no overrides, so these class defaults ARE the plant;
+    # runs recorded under different ones are not comparable.
+    "cfg": (
+        "friction_kc", "uncouple_pos_ori", "kp_ori_scale", "kp_pos_scale",
+        "ee_translation_fudge", "ee_rotation_fudge",
     ),
 }
 _METADATA_MODULE_LABELS = {
-    "bf": "bimanual_franka", "osc": "osc_velocity_controller",
-    "safety": "safety", "fp": "franka_process",
+    "bf": "bimanual_franka", "osc": "osc_torque_controller",
+    "safety": "safety", "fp": "franka_process", "cfg": "single_arm_franka_config",
 }
+
+# The NUC-side law cannot be imported here (no pylibfranka), so pin the run to a
+# controller revision by hashing the files the deploy script ships.
+_CONTROL_STACK_FILES = ("pylibfranka_control.py", "osc_torque_controller.py",
+                        "franka_jacobian.py")
+
+
+def _control_stack_hashes(stack: SimpleNamespace | None) -> dict:
+    osc_mod = getattr(stack, "osc", None)
+    if osc_mod is None or not getattr(osc_mod, "__file__", None):
+        return {}
+    pkg = Path(osc_mod.__file__).resolve().parent
+    out = {}
+    for name in _CONTROL_STACK_FILES:
+        try:
+            out[name] = _sha256(str(pkg / name))
+        except OSError:
+            out[name] = None
+    return out
 
 
 def _sha256(path: str) -> str:
@@ -674,15 +716,16 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
         "episodes_completed": [],
         "derived_gains": {
             "kp_gain": kp_gain,
-            "effective_velocity_kp": kp_gain * osc_base_kp if osc_base_kp is not None else None,
-            "kd_note": "kd action is inert on this stack (_KD_GAIN_BASE == 1.0; "
-                       "OSCVelocityController's law has no kd term)",
+            "effective_kp": kp_gain * osc_base_kp if osc_base_kp is not None else None,
+            "kd_note": "kd action is the OSC damping_ratio: ratio = 10**kd, "
+                       "kd = 2*sqrt(kp)*ratio (robosuite impedance_mode='variable')",
         },
         "constants": constants,
         # Full YAML config snapshot: the constants above are read live from the
         # modules, but the modules now read from config/, so record the source.
         "config": fc.all_sections(),
         "config_dir": str(fc.config_dir()),
+        "control_stack_sha256": _control_stack_hashes(stack),
     }
 
 

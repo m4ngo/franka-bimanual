@@ -165,7 +165,11 @@ def split_gripper(obs: np.ndarray) -> np.ndarray:
 
 
 def extract_point_cloud(obs: dict) -> np.ndarray:
-    """Reconstruct (2048, 3) point cloud from flat depth_* scalars in obs."""
+    """Reconstruct (2048, 3) point cloud from flat depth_* scalars in obs.
+
+    Legacy layout only. get_observation no longer emits depth_* scalars; live
+    callers read the array off SingleArmFranka.last_full_point_cloud.
+    """
     flat = np.array([obs[f"depth_{i}"] for i in range(_DEPTH_FLAT_SIZE)], dtype=np.float32)
     return flat.reshape(_DEPTH_POINT_COUNT, 3)
 
@@ -194,6 +198,11 @@ def process_chunk(chunk: np.ndarray) -> np.ndarray:
     Returns:
         (_RESIDUAL_HORIZON, 9) — [dx, dy, dz, rx, ry, rz, gripper, kp, kd] normalised.
     """
+    if len(chunk) < _RESIDUAL_HORIZON:
+        raise ValueError(
+            f"base chunk has {len(chunk)} steps, residual context needs {_RESIDUAL_HORIZON}; "
+            f"raise the base policy's n_action_steps"
+        )
     result = np.zeros((_RESIDUAL_HORIZON, 9), dtype=np.float32)
     for i in range(_RESIDUAL_HORIZON):
         step = chunk[i]

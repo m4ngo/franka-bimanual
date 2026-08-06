@@ -65,7 +65,8 @@ episodes start and end at rest), and `tracks`: per-episode
 `{kind: sine|circle, axes, amp, freq_hz, duration_s}`. Axes 0–2 = position
 offsets in **meters**, 3–5 = rotation rotvec offsets in **radians** (base
 frame); circles take an `[u, v]` pair. Peak commanded speed = 2π·f·amp —
-keep well under the safety clamps (0.30 m/s, 1.2 rad/s). Checked-in specs:
+keep well under the NUC speed guard (1.2 m/s, 6.0 rad/s), which is what bounds
+the torque path -- `safety.py`'s velocity clamps do not apply here. Checked-in specs:
 `specs/smoke.json` (gentle 2-episode hardware smoke), `specs/sweep_full.json`
 (full grid, ~12 min/run incl. homing; designed ≤ 63%/78% of the clamps).
 

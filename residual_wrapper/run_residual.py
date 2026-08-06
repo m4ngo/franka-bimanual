@@ -10,6 +10,7 @@ import sys
 import termios
 import tty
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import cv2
@@ -34,7 +35,6 @@ from env_wrapper import (
     _ROT_SCALE,
     build_action,
     current_ee_pose,
-    extract_point_cloud,
     measured_ee_twist_world,
     process_chunk,
     split_gripper,
@@ -175,6 +175,121 @@ def _write_video_frame(writers, video_dir, video_stem, fps, cam_name, img, step_
     w.write(frame)
 
 
+def _infer_chunk(
+    controller,
+    base_policy: BasePolicy,
+    residual: "ResidualPolicy | None",
+    obs_no_depth: dict,
+    point_cloud: np.ndarray,
+    ee_pose: np.ndarray,
+    kin,
+    prev_kp: float,
+    prev_kd: float,
+    proprio_frame: str,
+    sim_proprio_convention: bool,
+    dump_dir: "Path | None",
+    infer_idx: int,
+) -> dict:
+    """One base (+ residual) inference pass over a caller-supplied snapshot.
+
+    Every input is a value the control loop already read, so this runs off the
+    loop thread without touching live robot state -- see _run_episode's
+    prefetch, which overlaps it with the tail of the current chunk.
+    """
+    base_chunk = base_policy.infer(obs_no_depth)
+    res_chunk: np.ndarray = np.empty((0, 9))
+    network_pcd = None
+
+    if residual is not None:
+        if kin is None:
+            vel = np.zeros(6)
+        else:
+            # Measured twist (J @ dq), in the same frame as the proprio pose.
+            r_w = (controller._r_robot_in_world if proprio_frame == "world"
+                   else np.eye(3))
+            vel = measured_ee_twist_world(kin['r'], r_w)
+        # The cloud is world-frame; franka_fk is robot-frame. In world
+        # mode, map the proprio pose into world so center_on_eef
+        # subtracts a point in the same frame as the cloud.
+        if proprio_frame == "world":
+            proprio_pose = ee_pose_to_world(
+                ee_pose,
+                controller._r_robot_in_world,
+                controller._t_robot_in_world,
+            )
+            # F5: express all world-frame quantities in sim's world
+            # convention (table z + yaw; see env_wrapper). Applied
+            # to pose, twist, and cloud together so the modalities
+            # stay mutually consistent. --raw-proprio disables.
+            if sim_proprio_convention:
+                proprio_pose = to_sim_world_pose(proprio_pose)
+                vel = to_sim_world_twist(vel)
+                point_cloud = to_sim_world_points(point_cloud)
+        else:
+            proprio_pose = ee_pose
+        processed_chunk = process_chunk(base_chunk)
+        residual_obs = {
+            "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
+            "proprio": np.concatenate([
+                split_gripper(proprio_pose).astype(np.float32),
+                # Sim controller_state convention: [damping_norm, kp_norm].
+                np.array([prev_kd, prev_kp], dtype=np.float32),
+                np.asarray(vel, dtype=np.float32),
+            ]),
+            "point_cloud": point_cloud,
+        }
+        res_chunk = residual.infer(residual_obs)
+        network_pcd = residual.last_network_pcd
+        if dump_dir is not None:
+            np.savez_compressed(
+                dump_dir / f"obs_{infer_idx:05d}.npz",
+                base_chunk_raw=base_chunk.astype(np.float32),
+                action_chunk=residual_obs["action_chunk"],
+                proprio=residual_obs["proprio"],
+                point_cloud=residual_obs["point_cloud"],
+                network_pcd=network_pcd,
+                res_chunk=res_chunk.astype(np.float32),
+            )
+
+    return {
+        "base_chunk": base_chunk,
+        "res_chunk": res_chunk,
+        "ee_pose": ee_pose,
+        "network_pcd": network_pcd,
+    }
+
+
+def _warmup_policies(
+    controller,
+    base_policy: BasePolicy,
+    residual: "ResidualPolicy | None",
+    proprio_frame: str,
+    sim_proprio_convention: bool,
+) -> None:
+    """Run the real inference path a few times before the episode starts.
+
+    torch.compile's first call, cuDNN algorithm selection and the CUDA context
+    together cost seconds; paying that on the first control step would stall the
+    arm mid-trajectory. Warms on the loop thread and once on a worker, since the
+    prefetch path calls the same compiled module from a different thread.
+    """
+    t0 = time.perf_counter()
+    obs = controller.get_observation()
+    args_ = (controller, base_policy, residual, strip_depth(obs),
+             controller.last_full_point_cloud,
+             current_ee_pose(obs, sim_convention=sim_proprio_convention),
+             controller.kin, 0.0, 0.0, proprio_frame, sim_proprio_convention, None, 0)
+    for _ in range(3):
+        _infer_chunk(*args_)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(_infer_chunk, *args_).result()
+    base_policy.reset()
+    # The warmup consumed the cached snapshot; the next send_action must not
+    # anchor its delta goal on a pose this old.
+    controller._cached_kin_state = None
+    print(f"policy warmup done in {time.perf_counter() - t0:.1f}s")
+
+
 def _run_episode(
     controller,
     base_policy: BasePolicy,
@@ -191,6 +306,7 @@ def _run_episode(
     video_dir: "Path | None" = None,
     video_cams: "list[str] | None" = None,
     video_stem: str = "episode",
+    infer_lead: int = 1,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -204,6 +320,9 @@ def _run_episode(
         task: task description string included in every recorded frame.
         recorder: optional EpisodeRecorder; when provided, per-step state is
             appended so save_episode_html can be called after the episode.
+        infer_lead: how many steps ahead of a chunk's first execution the
+            inference for it is started, on a worker thread. 1 disables the
+            overlap (inference blocks the loop, the old behaviour).
     """
     base_policy.reset()
 
@@ -221,12 +340,25 @@ def _run_episode(
     dt = 1.0 / fps
     t_start = time.perf_counter()
 
+    # Inference runs on a worker so it overlaps the tail of the chunk already
+    # executing instead of stalling the loop between the state read and the goal
+    # write. One worker only: the policies are stateful and must stay serialised.
+    infer_lead = int(np.clip(infer_lead, 1, _CHUNK_EXEC))
+    # Index within the chunk whose step submits the NEXT chunk's inference, so
+    # the obs it uses sits `infer_lead` steps before that chunk's first action.
+    submit_at = _CHUNK_EXEC - infer_lead
+    infer_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="infer")
+    pending: "Future | None" = None
+
     old_term = termios.tcgetattr(sys.stdin)
     tty.setraw(sys.stdin)
     fps_frames = 0
     fps_window_start = time.perf_counter()
     busy_ms_window: list[float] = []        # per-step busy time (pre-sleep), current window
     chunk_busy_ms_window: list[float] = []  # subset: steps that ran inference
+    wait_ms_window: list[float] = []        # blocked at the chunk swap (prefetch too late)
+    send_gap_ms_window: list[float] = []    # interval between consecutive send_action calls
+    t_prev_send = 0.0
     # Fixed-cadence deadline: sleeping to an absolute clock lets the idle slack
     # of ordinary steps absorb the few ms that inference steps overrun, so the
     # loop averages the target rate instead of accumulating per-step deficits.
@@ -252,6 +384,11 @@ def _run_episode(
             # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
             # times.append(time.perf_counter())
+            # Grab it here: send_action() consumes and clears the cache.
+            kin_snapshot = controller.kin
+            # Array channel, not obs scalars; a fresh array each get_observation,
+            # so the prefetch worker's reference stays valid across steps.
+            cloud_snapshot = controller.last_full_point_cloud
 
             if video_dir is not None:
                 for cam_name in (video_cams or sorted(controller.cameras.keys())):
@@ -262,69 +399,33 @@ def _run_episode(
             step_idx += 1
 
             if chunk_used >= _CHUNK_EXEC:
-                base_chunk = base_policy.infer(obs_no_depth)
-                # times.append(time.perf_counter())
+                if pending is None:
+                    # Cold start (and infer_lead=1): nothing was prefetched, so
+                    # this one pass does block the loop.
+                    result = _infer_chunk(
+                        controller, base_policy, residual, obs_no_depth,
+                        cloud_snapshot, ee_pose, kin_snapshot, prev_kp, prev_kd,
+                        proprio_frame, sim_proprio_convention, dump_dir, infer_idx,
+                    )
+                else:
+                    t_wait = time.perf_counter()
+                    result = pending.result()
+                    pending = None
+                    wait_ms_window.append((time.perf_counter() - t_wait) * 1000.0)
+                infer_idx += 1
+                base_chunk = result["base_chunk"]
+                res_chunk = result["res_chunk"]
+                # The forecast is anchored on the pose the policy actually saw,
+                # which with a prefetch is infer_lead steps behind this one.
+                chunk_ee_pose = result["ee_pose"]
                 chunk_used = 0
 
-                if residual is not None:
-                    kin = controller.kin
-                    if kin is None:
-                        vel = np.zeros(6)
-                    else:
-                        # Measured twist (J @ dq), in the same frame as the proprio pose.
-                        r_w = (controller._r_robot_in_world if proprio_frame == "world"
-                               else np.eye(3))
-                        vel = measured_ee_twist_world(kin['r'], r_w)
-                    point_cloud = extract_point_cloud(obs)
-                    # The cloud is world-frame; franka_fk is robot-frame. In world
-                    # mode, map the proprio pose into world so center_on_eef
-                    # subtracts a point in the same frame as the cloud.
-                    if proprio_frame == "world":
-                        proprio_pose = ee_pose_to_world(
-                            ee_pose,
-                            controller._r_robot_in_world,
-                            controller._t_robot_in_world,
-                        )
-                        # F5: express all world-frame quantities in sim's world
-                        # convention (table z + yaw; see env_wrapper). Applied
-                        # to pose, twist, and cloud together so the modalities
-                        # stay mutually consistent. --raw-proprio disables.
-                        if sim_proprio_convention:
-                            proprio_pose = to_sim_world_pose(proprio_pose)
-                            vel = to_sim_world_twist(vel)
-                            point_cloud = to_sim_world_points(point_cloud)
-                    else:
-                        proprio_pose = ee_pose
-                    # base_chunk = np.repeat(base_chunk, 2, axis=0)
-                    processed_chunk = process_chunk(base_chunk)
-                    residual_obs = {
-                        "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
-                        "proprio": np.concatenate([
-                            split_gripper(proprio_pose).astype(np.float32),
-                            # Sim controller_state convention: [damping_norm, kp_norm].
-                            np.array([prev_kd, prev_kp], dtype=np.float32),
-                            np.asarray(vel, dtype=np.float32),
-                        ]),
-                        "point_cloud": point_cloud,
-                    }
-                    res_chunk = residual.infer(residual_obs)
-                    if dump_dir is not None:
-                        np.savez_compressed(
-                            dump_dir / f"obs_{infer_idx:05d}.npz",
-                            base_chunk_raw=base_chunk.astype(np.float32),
-                            action_chunk=residual_obs["action_chunk"],
-                            proprio=residual_obs["proprio"],
-                            point_cloud=residual_obs["point_cloud"],
-                            network_pcd=residual.last_network_pcd,
-                            res_chunk=res_chunk.astype(np.float32),
-                        )
-                    infer_idx += 1
-                    if recorder is not None and residual.last_network_pcd is not None:
-                        recorder.record_policy_pcd(len(recorder), residual.last_network_pcd)
+                if recorder is not None and result["network_pcd"] is not None:
+                    recorder.record_policy_pcd(len(recorder), result["network_pcd"])
 
                 if recorder is not None:
-                    ee3 = ee_pose[:3].astype(np.float32)
-                    ee_pose_xyzw = ee_pose[:7].astype(np.float32)
+                    ee3 = chunk_ee_pose[:3].astype(np.float32)
+                    ee_pose_xyzw = chunk_ee_pose[:7].astype(np.float32)
                     # Raw unnormalised position deltas (metres) from postprocessor.
                     # Cumsum from current EE gives the commanded delta trajectory.
                     base_deltas = base_chunk[:_RESIDUAL_HORIZON, :3].astype(np.float32)
@@ -389,7 +490,24 @@ def _run_episode(
             # print(action)
             if residual is not None:
                 action["r_gripper"] = float(np.clip(action["r_gripper"] + res[8], -1.0, 1.0))
+            t_send = time.perf_counter()
             controller.send_action(action)
+            if t_prev_send:
+                send_gap_ms_window.append((t_send - t_prev_send) * 1000.0)
+            t_prev_send = t_send
+
+            # Kick off the next chunk's inference only after this step's goal is
+            # on the wire -- the whole point is to keep it out of the
+            # state-read -> goal-write path.
+            if chunk_used == submit_at and pending is None and infer_lead > 1:
+                # prev_kp/prev_kd, not this step's: the residual's proprio
+                # carries the controller state in effect when obs was READ, and
+                # this step's gains only take effect from the send_action above.
+                pending = infer_pool.submit(
+                    _infer_chunk, controller, base_policy, residual, obs_no_depth,
+                    cloud_snapshot, ee_pose, kin_snapshot, prev_kp, prev_kd,
+                    proprio_frame, sim_proprio_convention, dump_dir, infer_idx,
+                )
 
             if recorder is not None:
                 q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
@@ -440,15 +558,26 @@ def _run_episode(
                 actual_fps = fps_frames / window_s
                 chunk_avg = (sum(chunk_busy_ms_window) / len(chunk_busy_ms_window)
                              if chunk_busy_ms_window else 0.0)
+                # send-gap max is the number that matters for smoothness: it is
+                # how long the OSC loop sat on one goal, and a spike there is
+                # exactly the visible hitch at the chunk boundary.
                 logger.info(
-                    "loop fps: %.2f target: %.2f busy avg/max: %.1f/%.1f ms (chunk-step avg: %.1f ms)",
+                    "loop fps: %.2f target: %.2f busy avg/max: %.1f/%.1f ms "
+                    "(chunk-step avg: %.1f ms) send-gap avg/max: %.1f/%.1f ms "
+                    "prefetch-wait avg/max: %.1f/%.1f ms",
                     actual_fps, fps,
                     sum(busy_ms_window) / len(busy_ms_window), max(busy_ms_window), chunk_avg,
+                    (sum(send_gap_ms_window) / len(send_gap_ms_window)) if send_gap_ms_window else 0.0,
+                    max(send_gap_ms_window) if send_gap_ms_window else 0.0,
+                    (sum(wait_ms_window) / len(wait_ms_window)) if wait_ms_window else 0.0,
+                    max(wait_ms_window) if wait_ms_window else 0.0,
                 )
                 fps_window_start = now
                 fps_frames = 0
                 busy_ms_window.clear()
                 chunk_busy_ms_window.clear()
+                wait_ms_window.clear()
+                send_gap_ms_window.clear()
 
             sleep_s = t_deadline - time.perf_counter()
             if sleep_s > 0:
@@ -459,6 +588,17 @@ def _run_episode(
             if t_deadline < time.perf_counter():
                 t_deadline = time.perf_counter() + dt
     finally:
+        # Drain before shutdown: the in-flight pass holds the policies and may
+        # still be writing a dump npz.
+        if pending is not None:
+            try:
+                pending.result(timeout=5.0)
+            except Exception:
+                logger.exception("in-flight inference failed during teardown")
+        infer_pool.shutdown(wait=True)
+        stale = getattr(controller, "_kin_cache_stale", 0)
+        if stale:
+            logger.info("send_action re-read the kin snapshot %d time(s) (cache too old)", stale)
         for w in video_writers.values():
             w.release()
         if video_writers:
@@ -525,6 +665,25 @@ def main() -> None:
                              "env_wrapper.current_ee_pose) and feed the legacy raw "
                              "franka_fk pose to the residual policy")
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu)")
+    parser.add_argument("--infer-lead", type=int, default=1,
+                        help="Steps ahead of a chunk's first action to start its inference "
+                             "on a worker thread, so it overlaps the tail of the chunk "
+                             f"already executing (max {_CHUNK_EXEC}). Buys a uniform send "
+                             "cadence at the cost of the policy seeing an observation that "
+                             "many steps old. 1 = no prefetch: the chunk is inferred on the "
+                             "step that executes it, which fits the 20 Hz budget once the "
+                             "base policy is sped up (see --base-amp / --base-compile)")
+    parser.add_argument("--base-amp", choices=("fp16", "bf16", "none"), default="fp16",
+                        help="Autocast dtype for the base policy. Its cost is GPU compute, "
+                             "not launch overhead, so precision is the lever that shrinks it: "
+                             "fp16 takes the diffusion policy 33.0 -> 25.6 ms, and the "
+                             "commanded delta moves by at most 0.04 mm / 0.008 deg against a "
+                             "+/-50 mm, +/-28.6 deg envelope. 'none' restores fp32")
+    parser.add_argument("--base-compile", choices=("default", "max-autotune", "none"),
+                        default="default",
+                        help="torch.compile the denoising UNet. With fp16: 'default' 23.4 ms "
+                             "(~6 s startup), 'max-autotune' 21.8 ms (~20 s startup). Cost is "
+                             "paid by the pre-episode warmup, not the first control step")
     parser.add_argument(
         "--home-pose-name",
         default=fc.default_home_pose_name(),
@@ -587,7 +746,8 @@ def main() -> None:
 
     if args.replay_dataset is None:
         print(f"attempting to start base policy: {args.base_policy}")
-        base_policy = BasePolicy(args.base_policy, device=args.device)
+        base_policy = BasePolicy(args.base_policy, device=args.device,
+                                 amp=args.base_amp, compile_mode=args.base_compile)
         print("base policy started!")
     else:
         print(f"attempting to fetch replay dataset: {args.replay_dataset}")
@@ -601,6 +761,9 @@ def main() -> None:
         print(f"attempting to start residual policy: {args.residual_policy}")
         residual = ResidualPolicy(args.residual_policy, device=args.device)
         print("residual policy started")
+
+    _warmup_policies(controller, base_policy, residual,
+                     args.proprio_frame, not args.raw_proprio)
 
     dump_root: "Path | None" = None
     if args.dump_obs_dir:
@@ -652,6 +815,7 @@ def main() -> None:
                     dump_dir=dump_root / "ep000" if dump_root else None,
                     video_dir=Path(args.viz_dir) if args.save_videos else None,
                     video_cams=args.video_cams,
+                    infer_lead=args.infer_lead,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -693,6 +857,7 @@ def main() -> None:
                         video_dir=Path(args.viz_dir) if args.save_videos else None,
                         video_cams=args.video_cams,
                         video_stem=f"episode_{ep_idx:03d}",
+                        infer_lead=args.infer_lead,
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:

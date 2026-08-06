@@ -17,7 +17,7 @@ lerobot-train \
   --policy.type="diffusion" \
   --policy.noise_scheduler_type="DDIM" \
   --policy.num_train_timesteps=100 \
-  --policy.num_inference_steps=8 \
+  --policy.num_inference_steps=4 \
   --policy.horizon=16 \
   --policy.n_action_steps=10 \
   --policy.n_obs_steps=2 \
@@ -29,4 +29,5 @@ lerobot-train \
   --batch_size="$3" \
   --steps="$4" \
   --eval_freq=5000 \
-  --num_workers=18
+  --num_workers=18 \
+  --config_path=$6

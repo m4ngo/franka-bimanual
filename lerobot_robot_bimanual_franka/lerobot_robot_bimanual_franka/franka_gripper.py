@@ -3,15 +3,25 @@
 The gripper runs on its own RPyC connection so width commands never share a
 transport with arm motion. A single background worker keeps `grasp()` and
 `open()` off the caller thread.
+
+Backed by `pylibfranka.Gripper` (libfranka's gripper TCP port, separate from the
+FCI control channel, so it coexists with the arm's torque loop in the same server
+process). pylibfranka has no `grasp_async`/`open_async` the way franky did -- both
+`grasp()` and `move()` block until the motion finishes -- so the executor is now
+the only thing keeping callers off the wire, and an in-flight command is dropped
+rather than queued behind the worker.
 """
 
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import logging
 import time
 import threading
 
 import rpyc
+
+logger = logging.getLogger(__name__)
 
 RPYC_TIMEOUT_S = 10
 
@@ -36,22 +46,25 @@ class FrankaGripper:
         self._conn._config["sync_request_timeout"] = RPYC_TIMEOUT_S
         self._conn.execute(
             """
-import franky as _fr
+import pylibfranka as _pf
+
+# Franka Hand tops out at 0.1 m/s; libfranka raises on anything above it,
+# where franky silently accepted the same value.
+_MAX_SPEED = 0.1
 
 def init_gripper(ip):
-    return _fr.Gripper(ip)
+    return _pf.Gripper(ip)
 
 def home_gripper(controller):
-    controller.homing()
-    return True
+    return bool(controller.homing())
 
 def grasp_gripper(controller, width_m, speed_m_s, force_n):
-    controller.grasp_async(width_m, speed_m_s, force_n, epsilon_outer=1.0, epsilon_inner=1.0)
-    return True
+    # Wide epsilons: we want the fingers to close and hold, not to assert that
+    # an object of a known width ended up between them.
+    return bool(controller.grasp(width_m, min(speed_m_s, _MAX_SPEED), force_n, 1.0, 1.0))
 
 def open_gripper(controller, speed_m_s):
-    controller.open_async(speed_m_s)
-    return True
+    return bool(controller.move(controller.read_once().max_width, min(speed_m_s, _MAX_SPEED)))
 
 def close_gripper(controller):
     return None
@@ -66,6 +79,10 @@ def close_gripper(controller):
         self._is_open = True
         self._position_ts: float | None = None
         self._last_send: float = time.time()
+        # Worker handoff: at most one command in flight, at most one queued.
+        self._lock = threading.Lock()
+        self._pending: tuple | None = None
+        self._running = False
 
     @staticmethod
     def _clamp_mm(position_mm: float) -> float:
@@ -87,17 +104,11 @@ def close_gripper(controller):
     def move(self, position_mm: float, speed: float = _MOVE_SPEED_M_S, blocking: bool = False) -> bool:
         if position_mm < self.GRIPPER_TRUE_MAX_MM / 2 and self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = False
-            self._position_mm = self.GRIPPER_TRUE_MAX_MM
-            self._position_ts = time.monotonic()
-            # store time
-            self.grasp(0.0, speed, self._DEFAULT_FORCE)
+            self.grasp(0.0, speed, self._DEFAULT_FORCE, from_mm=self.GRIPPER_TRUE_MAX_MM)
             self._last_send = time.time()
         elif position_mm > self.GRIPPER_TRUE_MAX_MM / 2 and not self._is_open and time.time() - self._last_send > 0.5:
             self._is_open = True
-            self._position_mm = 0
-            self._position_ts = time.monotonic()
-            # store time
-            self.open(speed)
+            self.open(speed, from_mm=0.0)
             self._last_send = time.time()
         return True
 
@@ -115,11 +126,51 @@ def close_gripper(controller):
     def grip(self, force_n: float, speed: float, blocking: bool = True):
         return self.grasp(10.0, speed, force_n)
 
-    def grasp(self, width: float, speed: float, force_n: float):
-        self._executor.submit(self._rpc_grasp, self._controller, width, speed, force_n)
+    def grasp(self, width: float, speed: float, force_n: float, from_mm: float | None = None):
+        self._submit(self._rpc_grasp, (self._controller, width, speed, force_n), from_mm)
 
-    def open(self, speed: float):
-        self._executor.submit(self._rpc_open, self._controller, speed)
+    def open(self, speed: float, from_mm: float | None = None):
+        self._submit(self._rpc_open, (self._controller, speed), from_mm)
+
+    def _submit(self, rpc, args: tuple, from_mm: float | None = None) -> None:
+        """Coalesce onto the worker, latest command wins.
+
+        pylibfranka's grasp/move block for the whole motion, so queueing every
+        command would replay stale ones seconds late. But DROPPING one desyncs
+        `_is_open`, which move() has already committed: the open issued while a
+        grasp was still running vanished, `_is_open` said open, and the elif
+        never fired again -- the gripper stayed shut until reconnect.
+        """
+        with self._lock:
+            self._pending = (rpc, args, from_mm)
+            if self._running:
+                return
+            self._running = True
+        self._executor.submit(self._drain)
+
+    def _drain(self) -> None:
+        while True:
+            with self._lock:
+                job, self._pending = self._pending, None
+                if job is None:
+                    self._running = False
+                    return
+            rpc, args, from_mm = job
+            if from_mm is not None:
+                # Stamp when the motion starts, not when it was queued: position
+                # is dead-reckoned from here and a queued command can sit behind
+                # a blocking grasp for most of a second.
+                self._position_mm = from_mm
+                self._position_ts = time.monotonic()
+            self._call(rpc, *args)
+
+    @staticmethod
+    def _call(rpc, *args) -> None:
+        try:
+            rpc(*args)
+        except Exception as e:
+            # A failed grasp (nothing between the fingers) raises; not fatal.
+            logger.warning("gripper command failed: %s", e)
 
     def ack_fast_stop(self) -> bool:
         return True

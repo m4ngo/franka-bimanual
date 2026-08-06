@@ -16,6 +16,10 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 from numpy.typing import NDArray
+<<<<<<< HEAD
+=======
+from scipy.spatial import cKDTree
+>>>>>>> osc-7-27
 
 from lerobot.cameras.camera import Camera
 
@@ -79,12 +83,11 @@ class FramosCamera(Camera):
         self._output_width = int(config.width) if config.width is not None else int(config.color_width)
         self._output_height = int(config.height) if config.height is not None else int(config.color_height)
 
-        # Blob/outlier filter params (see _filter_lone_points). Exposed as
-        # attributes rather than config fields so existing configs keep working;
-        # override on the instance if a scene needs different tuning.
-        self._blob_filter_enabled: bool = True
-        self._blob_filter_min_neighbors: int = 20
-        self._blob_filter_radius_m: float = 0.01
+        # Blob/outlier filter params (see _filter_lone_points). Still settable on
+        # the instance; the config fields are what make the cost A/B-able.
+        self._blob_filter_enabled: bool = bool(getattr(config, "blob_filter", True))
+        self._blob_filter_min_neighbors: int = int(getattr(config, "blob_filter_min_neighbors", 20))
+        self._blob_filter_radius_m: float = float(getattr(config, "blob_filter_radius_m", 0.01))
 
     @property
     def is_connected(self) -> bool:
@@ -226,10 +229,11 @@ class FramosCamera(Camera):
             if self._last_depth is not None:
                 return self._last_depth.copy()
             return self._blank_depth()
-        arr = np.asanyarray(depth.get_data())
-        self._last_depth = arr
-        # print("hi")
-        return arr.copy()
+        # Copy, never the frame's own buffer: get_data() is a zero-copy view and
+        # librealsense recycles that memory once the frame is released, so a
+        # cached view tears under get_cropped_point_cloud, which reads it later.
+        self._last_depth = np.array(depth.get_data(), copy=True)
+        return self._last_depth.copy()
 
     def disconnect(self) -> None:
         if self._pipeline is not None:
@@ -260,10 +264,18 @@ class FramosCamera(Camera):
 
         No-ops (returns `points` unchanged) if filtering is disabled or if
         there are too few points for a meaningful neighborhood test.
+
+        scipy, not open3d's remove_radius_outlier, which returned a DIFFERENT
+        keep-set run-to-run on identical input (6 runs on one frozen frame gave
+        186/186/186/186/186/184 survivors) -- irreproducible policy input and
+        irreducible noise in any dump-vs-sim parity check. The keep-rule here is
+        the same one, count-within-radius > nb_points, and was verified to
+        reproduce open3d's keep-set exactly on real clouds from both cameras.
         """
         if not self._blob_filter_enabled or points.shape[0] < self._blob_filter_min_neighbors + 1:
             return points
 
+<<<<<<< HEAD
         side = float(self._blob_filter_radius_m)
         if side <= 0.0:
             return points
@@ -286,6 +298,20 @@ class FramosCamera(Camera):
 
         # totals counts the point itself, so require min_neighbors + 1.
         return points[totals[inv] > self._blob_filter_min_neighbors]
+=======
+        try:
+            counts = cKDTree(points).query_ball_point(
+                points, self._blob_filter_radius_m, return_length=True, workers=-1,
+            )
+        except Exception:
+            logger.debug("Blob/outlier filter failed; falling back to unfiltered points", exc_info=True)
+            return points
+
+        keep_idx = np.flatnonzero(counts > self._blob_filter_min_neighbors)
+        if keep_idx.size == 0:
+            return points[:0]
+        return points[keep_idx]
+>>>>>>> osc-7-27
 
     def get_cropped_point_cloud(
         self,
@@ -474,7 +500,8 @@ class FramosCamera(Camera):
                 return self._blank_color()
 
             if depth and self._config.enable_depth:
-                self._last_depth = np.asanyarray(depth.get_data())
+                # Copy: see read_depth -- the frame's buffer is recycled.
+                self._last_depth = np.array(depth.get_data(), copy=True)
 
             if not color:
                 if allow_stale and self._last_color is not None:
