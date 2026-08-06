@@ -82,6 +82,8 @@ DEFAULT_JOINT_KP = np.asarray(torque("joint_impedance.kp"), dtype=np.float64)
 DEFAULT_JOINT_KD = np.asarray(torque("joint_impedance.kd"), dtype=np.float64)
 DEFAULT_JOINT_DAMPING_RATIO = float(torque("joint_impedance.damping_ratio"))
 
+_JOINT_TORQUE_FACTORS = np.asarray(torque("osc.joint_torque_factors"), dtype=np.float64)
+
 # Cap on each joint's velocity-loop pole kd/M (rad/s).
 JOINT_KD_POLE_MAX = float(torque("joint_impedance.kd_pole_max_rad_s"))
 
@@ -353,6 +355,8 @@ class OSCTorqueController:
 
         # +coriolis, not +qfrc_bias: libfranka already compensates gravity.
         torques = J_full.T @ decoupled_wrench + coriolis
+
+        torques = np.multiply(torques, _JOINT_TORQUE_FACTORS)
 
         if use_nullspace:
             torques = torques + nullspace_torques(

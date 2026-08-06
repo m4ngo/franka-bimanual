@@ -46,9 +46,9 @@ class SingleArmFrankaConfig(RobotConfig):
     r_gripper_port: int = _arm_field("r", "gripper_port")
     active_arms: tuple[str, ...] = _VALID_ARMS
     # See BimanualFrankaConfig.friction_kc.
-    friction_kc: float = 0.9
+    friction_kc: float = fc.control("torque.friction.friction_kc")
     # Per-joint multiplier on friction_kc; see SingleArmFrankaConfig.
-    friction_kc_joint: tuple[float, ...] = (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 12.0)
+    friction_kc_joint: tuple[float, ...] = tuple(fc.control("torque.friction.friction_kc_joint"))
     # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
     # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
     ee_translation_fudge: float = field(
@@ -62,18 +62,18 @@ class SingleArmFrankaConfig(RobotConfig):
     # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
     # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
     # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
-    kp_ori_scale: tuple[float, float, float] = (0.8, 0.8, 0.8)
+    kp_ori_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kp_ori_scale"))
     # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
     # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
-    kp_pos_scale: tuple[float, float, float] = (1.5, 1.5, 1.5)
+    kp_pos_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kp_pos_scale"))
     # Damping-only trim, per block. kp_*_scale holds kp/kd fixed by construction,
     # so it cannot calm an axis that oscillates -- it stiffens it. These multiply
     # the damping ratio instead, which is the only knob that lowers kp/kd, i.e.
     # slows and damps the axis. Raise these when an axis vibrates; 1.0 is sim.
-    kd_ori_scale: tuple[float, float, float] = (0.5, 0.5, 0.5)
-    kd_pos_scale: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    kd_ori_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kd_ori_scale"))
+    kd_pos_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kd_pos_scale"))
     # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
     # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
     # translation force as if rotation were free, then fights the rotation that

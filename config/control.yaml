@@ -101,7 +101,9 @@ torque:
     # uncouple_pos_ori is false (the coupled 6x6 goes singular). Caps lambda_full
     # at 1/mu^2: 0.05 caps at 400 against a healthy 11 and never engaged before
     # the torque clamp; 0.10 caps at 100, 0.15 at 44.
-    lambda_dls_mu: 0.10
+    lambda_dls_mu: 0.05
+
+    joint_torque_factors: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
   delta:
     # osc_pose.json output_max/output_min: the per-step EE_DELTA envelope. Full
@@ -143,7 +145,7 @@ torque:
     # produces (v = (kp/kd)*delta = 0.31 m/s / 3.06 rad/s at the default kp, and
     # 3.06 rad/s runs the wrist at ~0.9 of rated) or it silently rescales the
     # control law. tests/test_osc_stack.py pins that margin.
-    joint_velocity_rad_s: [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26]
+    joint_velocity_rad_s: [2.62, 2.62, 2.62, 2.62, 3.26, 4.18, 5.26]
     velocity_trip_fraction: 0.95
     guard_hard_stop: 1.5
     brake_kd: [40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0]
@@ -158,6 +160,15 @@ torque:
     tau_eps_fraction: 0.20
     dq_eps_rad_s: 0.02   # below this a joint counts as stuck
     kc_max: 3.0          # ceiling on the client-settable assist scale
+
+    friction_kc: 0.9
+    friction_kc_joint: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0]
+
+    kp_ori_scale: [1.0, 1.0, 1.0]
+    kp_pos_scale: [1.5, 1.5, 1.5]
+
+    kd_ori_scale: [1.0, 1.0, 1.0]
+    kd_pos_scale: [0.8, 0.8, 0.8]
 
   loop:
     # The OSC law runs at 500 Hz, not 1 kHz, because that is robosuite's substep

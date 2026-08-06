@@ -39,8 +39,8 @@ profiles:
   openpi_single_arm:
     # scripts/openpi_client_franka.py — DROID-style joint-velocity client.
     arms:
-      r: right
-    cameras: [cam_2, cam_3]
+      r: left
+    cameras: [cam_2, cam_5]
     depth_cameras: []
     depth: false
     depth_center_arm: r
