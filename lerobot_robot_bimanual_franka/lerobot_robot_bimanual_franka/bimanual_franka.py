@@ -176,8 +176,11 @@ class BimanualFranka(Robot):
                 name=arm,
                 server_ip=getattr(self.config, f"{arm}_server_ip"),
                 robot_ip=getattr(self.config, f"{arm}_robot_ip"),
-                port=getattr(self.config, f"{arm}_gripper_port",
-                             getattr(self.config, f"{arm}_port")),
+                # No fallback to {arm}_port: both configs resolve this from
+                # arms.yaml, and silently using the ARM's port instead sends
+                # gripper commands to the torque server, which just refuses
+                # the connection somewhere far from the cause.
+                port=getattr(self.config, f"{arm}_gripper_port"),
                 do_print=False,
             )
         return WSG(name=arm, TCP_IP=gripper_ip, do_print=False)

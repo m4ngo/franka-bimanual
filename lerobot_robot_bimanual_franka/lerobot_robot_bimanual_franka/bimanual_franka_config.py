@@ -31,10 +31,14 @@ class BimanualFrankaConfig(RobotConfig):
     l_robot_ip: str = _arm_field("l", "robot_ip")
     l_gripper_ip: str = _arm_field("l", "gripper_ip")
     l_port: int = _arm_field("l", "port")
+    # Gripper RPyC port — a different process from the torque server, and a
+    # different port per arm. See SingleArmFrankaConfig.r_gripper_port.
+    l_gripper_port: int = _arm_field("l", "gripper_port")
     r_server_ip: str = _arm_field("r", "server_ip")
     r_robot_ip: str = _arm_field("r", "robot_ip")
     r_gripper_ip: str = _arm_field("r", "gripper_ip")
     r_port: int = _arm_field("r", "port")
+    r_gripper_port: int = _arm_field("r", "gripper_port")
     control_mode: ControlMode = field(
         default_factory=lambda: ControlMode(fc.profile(PROFILE).control_mode)
     )

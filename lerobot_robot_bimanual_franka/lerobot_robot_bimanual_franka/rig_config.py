@@ -42,8 +42,14 @@ def profile_depth_cameras(profile_name: str) -> dict[str, CameraConfig]:
 
 
 def profile_arm_fields(profile_name: str) -> dict[str, Any]:
-    """`{key}_server_ip` / `{key}_robot_ip` / `{key}_gripper_ip` / `{key}_port`
-    for every arm the profile exposes, ready to splat into a RobotConfig."""
+    """`{key}_server_ip` / `{key}_robot_ip` / `{key}_gripper_ip` / `{key}_port` /
+    `{key}_gripper_port` for every arm the profile exposes, ready to splat into
+    a RobotConfig.
+
+    `gripper_port` is a DIFFERENT process from the arm's torque server and
+    differs per arm (18822 right, 18823 left), so it has to be resolved through
+    the profile like everything else — the key prefix is not the physical arm.
+    """
     profile = fc.profile(profile_name)
     fields: dict[str, Any] = {}
     for key, arm_name in profile.arms.items():
@@ -52,6 +58,7 @@ def profile_arm_fields(profile_name: str) -> dict[str, Any]:
         fields[f"{key}_robot_ip"] = spec.robot_ip
         fields[f"{key}_gripper_ip"] = spec.gripper.ip
         fields[f"{key}_port"] = spec.rpyc_port
+        fields[f"{key}_gripper_port"] = spec.gripper_rpyc_port
     return fields
 
 

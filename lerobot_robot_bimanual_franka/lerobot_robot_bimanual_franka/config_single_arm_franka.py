@@ -38,9 +38,12 @@ class SingleArmFrankaConfig(RobotConfig):
     # Gripper bindings do not release the GIL across blocking calls, so a gripper
     # command issued in the torque server's process stalls the 1 kHz RT thread
     # (measured: 100 ms for a mere read_once) and libfranka aborts the motion with
-    # communication_constraints_violation. Set equal to the arm port to go back to
-    # sharing one process.
-    r_gripper_port: int = 18822
+    # communication_constraints_violation. Set an arm's gripper_rpyc_port equal to
+    # its rpyc_port in arms.yaml to go back to sharing one process.
+    #
+    # Resolved through the profile, NOT hardcoded: this rig exposes the LEFT arm
+    # under `r_`, whose gripper server is on 18823, not the right arm's 18822.
+    r_gripper_port: int = _arm_field("r", "gripper_port")
     active_arms: tuple[str, ...] = _VALID_ARMS
     # See BimanualFrankaConfig.friction_kc.
     friction_kc: float = 0.9

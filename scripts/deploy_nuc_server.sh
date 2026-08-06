@@ -98,7 +98,7 @@ EOF
 ssh "$HOST" "chmod +x ~/run_server.sh"
 
 echo "==> import check"
-ssh "$HOST" "source ~/pylibfranka_env/bin/activate && python -c '
+ssh "$HOST" "source ~/pylibfranka_env/bin/activate && python3 -c '
 import ast, sys
 for f in (\"pylibfranka_server.py\", \"pylibfranka_control.py\", \"pylibfranka_shm.py\", \"osc_torque_controller.py\", \"franka_jacobian.py\", \"torque_config.py\", \"nuc_control_config.py\"):
     ast.parse(open(f).read())
