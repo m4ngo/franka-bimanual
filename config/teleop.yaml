@@ -1,0 +1,34 @@
+# Leader-device hardware parameters. Ports and scales here are authoritative;
+# scripts/*.sh no longer pass them on the CLI.
+
+version: 2
+
+gello:
+  baudrate: 57600
+  # Reference joint angles (rad) at the calibration home pose, one per motor.
+  calibration_position: [0, 0, 0, -1.57, 0, 1.57, 0, 0]
+  joint_signs: [1, 1, 1, -1, 1, -1, 1, -1]
+  gripper_travel_counts: 575
+  smoothing: 0.99          # EMA alpha; 1.0 = no smoothing
+  use_async: true
+  use_noise: false
+  devices:
+    left: {port: /dev/ttyUSB1}
+    right: {port: /dev/ttyUSB0}
+
+spacemouse:
+  translation_scale: 0.05   # metres per tick at full deflection
+  rotation_scale: 0.5       # radians per tick at full deflection
+  translation_signs: [1, -1, 1]
+  rotation_signs: [1, 1, -1]
+  noise_pos_scale: 0.05
+  noise_rot_scale: 0.03
+  # Seeded from the arm by seed_state(); these only matter before the first read.
+  initial_pos: [0.5, 0.0, 0.5]
+  initial_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+  gripper_min_mm: -1.0
+  gripper_max_mm: 1.0
+  initial_gripper_mm: 0.9
+  devices:
+    left: {hidraw_path: /dev/hidraw2}
+    right: {hidraw_path: /dev/hidraw3}

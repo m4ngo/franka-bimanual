@@ -1,0 +1,9 @@
+{
+  "notes": "Hardware smoke test: two gentle episodes (3 cm y-sine, 0.15 rad rz-sine) at 0.25 Hz. Run with --hold-s 5 for the static-offset tier first. Peak speeds ~0.05 m/s / 0.24 rad/s, far under the safety clamps.",
+  "init_qpos": [0.0, -0.15, 0.0, -1.7, 0.0, 1.55, 0.785],
+  "ramp_s": 2.0,
+  "tracks": [
+    {"kind": "sine", "axes": 1, "amp": 0.03, "freq_hz": 0.25, "duration_s": 12.0},
+    {"kind": "sine", "axes": 5, "amp": 0.15, "freq_hz": 0.25, "duration_s": 12.0}
+  ]
+}

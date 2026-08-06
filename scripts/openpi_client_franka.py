@@ -2,13 +2,12 @@
 """OpenPI inference client for a single right-arm Franka.
 
 Hardware defaults (right arm from bimanual setup):
-  Robot server  192.168.3.10   port 18812
-  Robot arm     192.168.201.10
-  Gripper       192.168.2.20
+  Robot server / arm / gripper: the `openpi_single_arm` profile in
+  config/rig.yaml (arm addressing in config/arms.yaml).
 
 Cameras:
-  Base  (FRAMOS D71)  192.168.0.116  sn=6CD146030D71
-  Wrist (ARV BFS)     192.168.1.138
+  Base (scene) and wrist cameras: the profile's camera list, resolved
+  against config/cameras.yaml.
 
 Usage:
   python3 scripts/openpi_client_franka.py \\
@@ -28,6 +27,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import franka_config as fc
 import numpy as np
 import websockets.sync.client
 
@@ -39,10 +39,10 @@ for _p in (WORKSPACE_ROOT, OPENPI_CLIENT_ROOT):
 
 from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
-from lerobot_robot_bimanual_franka.lerobot_robot_bimanual_franka.franka_process import (
+from lerobot_robot_bimanual_franka.franka_process import (
     MultiRobotWrapper,
 )
-from lerobot_robot_bimanual_franka.lerobot_robot_bimanual_franka.wsg import WSG
+from lerobot_robot_bimanual_franka.wsg import WSG
 from openpi_client import msgpack_numpy as _msgpack_numpy
 from openpi_client.websocket_client_policy import WebsocketClientPolicy
 
@@ -117,31 +117,27 @@ class _WebsocketClient(WebsocketClientPolicy):
 # ── Robot constants ──────────────────────────────────────────────────────────
 
 NUM_JOINTS = 7
-_CAMERA_READ_TIMEOUT_MS = 5.0
+_CAMERA_READ_TIMEOUT_MS = fc.control("observation.camera_read_timeout_ms")
 _PROCESS_STARTUP_S = 1.0
 _CONNECT_RETRIES = 3
-_CONNECT_TIMEOUT_S = 10.0
+_CONNECT_TIMEOUT_S = fc.control("franka.connect_timeout_s")
 _RETRY_SLEEP_S = 1.0
 
-# FR3 joint velocity limits (rad/s) — joints 1-4 @ 2.175, joints 5-7 @ 2.61.
-_MAX_JOINT_VEL = np.array([2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]) * 0.9
-
-# FR3 joint acceleration limits (rad/s²).
+# FR3 joint velocity/acceleration limits (config/control.yaml, franka:).
 # Limiting Δv/step prevents joint_motion_generator_velocity_discontinuity reflexes.
-_MAX_JOINT_ACCEL = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]) * 0.75
+_MAX_JOINT_VEL = (np.array(fc.control("franka.max_joint_velocity_rad_s"))
+                  * fc.control("franka.joint_velocity_safety_factor"))
+_MAX_JOINT_ACCEL = (np.array(fc.control("franka.max_joint_accel_rad_s2"))
+                    * fc.control("franka.joint_accel_safety_factor"))
 
-# ── Hardware defaults ────────────────────────────────────────────────────────
+# ── Hardware, from the `openpi_single_arm` rig profile ───────────────────────
 
-_ARM_KEY = "r"
+_PROFILE = fc.profile("openpi_single_arm")
+_ARM_KEY = _PROFILE.depth_center_arm
+_ARM = _PROFILE.arm_spec(_ARM_KEY)
 
-_DEFAULT_R_SERVER_IP  = "192.168.3.10"
-_DEFAULT_R_ROBOT_IP   = "192.168.201.10"
-_DEFAULT_R_GRIPPER_IP = "192.168.2.20"
-_DEFAULT_R_PORT       = 18812
-
-_DEFAULT_BASE_CAM_IP = "192.168.0.116"
-_DEFAULT_BASE_CAM_SN = "6CD146030D71"
-_DEFAULT_WRIST_CAM_IP = "192.168.1.138"
+# Scene camera first, wrist camera second, per config/rig.yaml.
+_BASE_CAM_KEY, _WRIST_CAM_KEY = _PROFILE.cameras[0], _PROFILE.cameras[1]
 
 _INFERENCE_ERROR_SLEEP_S = 0.1
 
@@ -413,33 +409,33 @@ def _parse_args() -> argparse.Namespace:
                    help="Use TLS (wss://) — omit for local servers running plain ws://")
     p.add_argument("--prompt",      required=True,
                    help="Language task prompt sent to the policy")
-    p.add_argument("--fps",         type=float, default=15.0,
+    p.add_argument("--fps",         type=float, default=float(fc.control_fps()),
                    help="Control-loop frequency (Hz)")
     p.add_argument("--debug",       action="store_true", default=False,
                    help="Log joint obs, policy target, and PD error each chunk")
 
     # Right-arm hardware
-    p.add_argument("--r-server-ip",  default=_DEFAULT_R_SERVER_IP,
+    p.add_argument("--r-server-ip",  default=_ARM.server_ip,
                    help="Franka server IP (net_franky proxy)")
-    p.add_argument("--r-robot-ip",   default=_DEFAULT_R_ROBOT_IP,
+    p.add_argument("--r-robot-ip",   default=_ARM.robot_ip,
                    help="Franka robot IP")
-    p.add_argument("--r-gripper-ip", default=_DEFAULT_R_GRIPPER_IP,
+    p.add_argument("--r-gripper-ip", default=_ARM.gripper.ip,
                    help="WSG gripper IP")
-    p.add_argument("--r-port",       type=int, default=_DEFAULT_R_PORT,
+    p.add_argument("--r-port",       type=int, default=_ARM.rpyc_port,
                    help="net_franky proxy port")
 
     # Camera hardware
-    p.add_argument("--base-cam-ip",  default=_DEFAULT_BASE_CAM_IP,
+    p.add_argument("--base-cam-ip",  default=fc.camera(_BASE_CAM_KEY).ip,
                    help="FRAMOS base camera IP")
-    p.add_argument("--base-cam-sn",  default=_DEFAULT_BASE_CAM_SN,
+    p.add_argument("--base-cam-sn",  default=fc.camera(_BASE_CAM_KEY).serial_number,
                    help="FRAMOS base camera serial number")
-    p.add_argument("--wrist-cam-ip", default=_DEFAULT_WRIST_CAM_IP,
+    p.add_argument("--wrist-cam-ip", default=fc.camera(_WRIST_CAM_KEY).ip,
                    help="ARV wrist camera IP")
-    p.add_argument("--cam-width",    type=int, default=224,
+    p.add_argument("--cam-width",    type=int, default=fc.control("observation.image_width"),
                    help="Output image width (pixels)")
-    p.add_argument("--cam-height",   type=int, default=224,
+    p.add_argument("--cam-height",   type=int, default=fc.control("observation.image_height"),
                    help="Output image height (pixels)")
-    p.add_argument("--cam-fps",      type=int, default=15,
+    p.add_argument("--cam-fps",      type=int, default=fc.camera_stream_fps(),
                    help="Camera streaming frame rate")
 
     return p.parse_args()
@@ -452,16 +448,17 @@ def main() -> None:
     )
     args = _parse_args()
 
-    base_cam_cfg = FramosCameraConfig(
-        name="workspace_framos_d71",
+    # Names/serials come from config/cameras.yaml; CLI flags still override IPs.
+    base_cam_cfg = FramosCameraConfig.for_camera(
+        _BASE_CAM_KEY,
         ip=args.base_cam_ip,
         serial_number=args.base_cam_sn,
         fps=args.cam_fps,
         width=args.cam_width,
         height=args.cam_height,
     )
-    wrist_cam_cfg = ArvCameraConfig(
-        name="gripper_bfs_23595723",
+    wrist_cam_cfg = ArvCameraConfig.for_camera(
+        _WRIST_CAM_KEY,
         ip=args.wrist_cam_ip,
         fps=args.cam_fps,
         width=args.cam_width,

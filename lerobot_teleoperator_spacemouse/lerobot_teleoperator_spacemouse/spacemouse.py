@@ -57,7 +57,7 @@ class SpaceMouse(Teleoperator):
             )
 
         self._device: pyspacemouse.SpaceMouseDevice | None = None
-        self._gripper_target_mm: float = float(config.initial_gripper_mm)
+        # self._gripper_target_mm: float = float(config.initial_gripper_mm)
 
         self.cur_pos: np.ndarray = np.asarray(config.initial_pos, dtype=np.float64)
         self.cur_rot: Rotation = Rotation.from_quat(config.initial_rot)  # stored as xyzw
@@ -111,7 +111,7 @@ class SpaceMouse(Teleoperator):
         # get_action() can poll the latest state without ever stalling the
         # control loop.
         self._device = pyspacemouse.open_by_path(self.config.hidraw_path)
-        self._gripper_target_mm = float(self.config.initial_gripper_mm)
+        # self._gripper_target_mm = float(self.config.initial_gripper_mm)
         logger.info("%s connected on %s", self, self.config.hidraw_path)
 
     def disconnect(self) -> None:
@@ -157,10 +157,13 @@ class SpaceMouse(Teleoperator):
         # are pressed in the same sample we prefer "open" so an accidental
         # double-press doesn't crush the gripper.
         buttons = list(state.buttons)
+        delta = 0.0
         if len(buttons) >= 2 and buttons[1]:
-            self._gripper_target_mm = float(self.config.gripper_max_mm)
+            # self._gripper_target_mm = float(self.config.gripper_max_mm)
+            delta = float(self.config.gripper_max_mm)
         elif buttons and buttons[0]:
-            self._gripper_target_mm = float(self.config.gripper_min_mm)
+            # self._gripper_target_mm = float(self.config.gripper_min_mm)
+            delta = float(self.config.gripper_min_mm)
 
         t_scale = self.config.translation_scale
         r_scale = self.config.rotation_scale
@@ -205,7 +208,7 @@ class SpaceMouse(Teleoperator):
             f"{self._prefix}qy":      float(qy),
             f"{self._prefix}qz":      float(qz),
             f"{self._prefix}qw":      float(qw),
-            f"{self._prefix}gripper": self._gripper_target_mm,
+            f"{self._prefix}gripper": delta,
             "kp": 0.0,
             "kd": 0.0,
         }

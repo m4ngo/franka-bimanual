@@ -17,7 +17,8 @@ Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
                       Derived by converting each base-chunk step's delta quat to a rotvec
                       and dividing by the respective scales.
 
-Residual output     : (_CHUNK_EXEC, 9) chunk — [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
+Residual output     : (_CHUNK_EXEC, 9) chunk — [damping, stiffness, dx, dy, dz, rx, ry, rz, grip_delta]
+                      (gains first, DAMPING before stiffness — multi-fast convention)
                       per step (normalised, same scales as input).  Gains are at
                       indices 0–1, positional/rotational deltas at 2–7, gripper at 8.
 """
@@ -28,7 +29,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG
+from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG, _RESIDUAL_TRANS_MAG, _RESIDUAL_ROT_MAG
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference, populate_queues
@@ -137,25 +138,59 @@ class ResidualPolicy:
 
         self.device = torch.device(device)
         ckpt = torch.load(checkpoint_path, map_location=device)
+        # print(ckpt["model_init_kwargs"])
+        # ckpt["model_init_kwargs"]["disable_pcd"] = True
         if "model_init_kwargs" not in ckpt:
             raise KeyError("Checkpoint missing 'model_init_kwargs'.")
 
         encoder_type = ckpt["model_init_kwargs"].get("encoder_type", "pointnet_lite")
         policy_cls = (
             CrossAttentionPolicy
-            if encoder_type in ("pointnet_xa", "pointnet_xa2")
-            else MultiTaskPointCloudPolicy
+            # if encoder_type in ("pointnet_xa", "pointnet_xa2")
+            # else MultiTaskPointCloudPolicy
         )
         self.model = policy_cls(**ckpt["model_init_kwargs"])
         self.model.load_state_dict(ckpt["model"])
         self.model.to(self.device).eval()
 
+        # Preprocessing comes from the checkpoint's data_kwargs (the training
+        # contract), never hardcoded.
         data_kwargs = ckpt.get("data_kwargs", {})
         self.center_on_eef: bool = bool(data_kwargs.get("center_on_eef", False))
+        self.num_points: int = int(data_kwargs.get("num_points", 2048))
+        self.use_rgb: bool = bool(data_kwargs.get("use_rgb", False))
+        crop = data_kwargs.get("crop_half_extent", None)
+        self.crop_half_extent: float | None = None if crop is None else float(crop)
+        if self.use_rgb:
+            raise ValueError(
+                "Checkpoint trained with use_rgb=True; the real cloud is xyz-only. "
+                "Retrain without RGB or use a different checkpoint."
+            )
+        # Exact cloud fed to the network on the most recent infer() call
+        # (post crop/downsample/re-centering); for diagnostics.
+        self.last_network_pcd: np.ndarray | None = None
         logger.info(
-            "ResidualPolicy loaded: cls=%s encoder=%s center_on_eef=%s",
-            policy_cls.__name__, encoder_type, self.center_on_eef,
+            "ResidualPolicy loaded: cls=%s encoder=%s center_on_eef=%s num_points=%d "
+            "crop_half_extent=%s (frame=%s proprio_keys=%s)",
+            policy_cls.__name__, encoder_type, self.center_on_eef, self.num_points,
+            self.crop_half_extent, data_kwargs.get("frame"), data_kwargs.get("proprio_keys"),
         )
+
+    def _prepare_pcd(self, pcd: np.ndarray, eef_pos: np.ndarray) -> np.ndarray:
+        """Apply the checkpoint's preprocessing: crop -> resample -> center
+        (same order as the sim dataset path)."""
+        pcd = pcd[:, :3]
+        if self.crop_half_extent is not None:
+            mask = np.all(np.abs(pcd - eef_pos) <= self.crop_half_extent, axis=1)
+            if mask.any():
+                pcd = pcd[mask]
+        if len(pcd) != self.num_points:
+            idx = np.random.choice(len(pcd), self.num_points, replace=len(pcd) < self.num_points)
+            pcd = pcd[idx]
+        pcd = pcd.copy()
+        if self.center_on_eef:
+            pcd -= eef_pos
+        return pcd
 
     def infer(self, obs: dict) -> np.ndarray:
         """Run one residual inference pass.
@@ -165,12 +200,12 @@ class ResidualPolicy:
                 "action_chunk" (10, 9) — normalised delta chunk from base policy
                                          columns 0:7 = [dx, dy, dz, rx, ry, rz, grip]
                                          columns 7:9 = [kp, kd] (dropped before model)
-                "proprio"      (9,)    — [x, y, z, qx, qy, qz, qw, grip_r, -grip_r,
-                                          kp, kd, vx, vy, vz, wx, wy, wz]
+                "proprio"      (17,)    — [x, y, z, qx, qy, qz, qw, finger_qpos_m, -finger_qpos_m,
+                                          damping_norm, kp_norm, vx, vy, vz, wx, wy, wz]
                 "point_cloud"  (2048, 3) — xyz in robot/world frame
 
         Returns:
-            (_CHUNK_EXEC, 9) — per step: [kp, kd, dx, dy, dz, rx, ry, rz, grip_delta]
+            (_CHUNK_EXEC, 9) — per step: [damping, stiffness, dx, dy, dz, rx, ry, rz, grip_delta]
                                all normalised (gains-first layout from variable-impedance
                                sim training).
         """
@@ -181,10 +216,8 @@ class ResidualPolicy:
         # Feed only the 7 per-step channels the model was trained on; drop kp/kd.
         base_action = action_chunk[:, :7].flatten().astype(np.float32)  # (70,)
 
-        pcd = point_cloud.astype(np.float32)
-        if self.center_on_eef:
-            pcd = pcd.copy()
-            pcd[:, :3] -= proprio[:3]  # subtract EEF xyz
+        pcd = self._prepare_pcd(point_cloud.astype(np.float32), proprio[:3])
+        self.last_network_pcd = pcd
 
         pcd_t = torch.as_tensor(pcd, dtype=torch.float32, device=self.device).unsqueeze(0)
         proprio_t = torch.as_tensor(proprio, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -195,5 +228,7 @@ class ResidualPolicy:
 
         result = out.squeeze(0).cpu().numpy().reshape(_CHUNK_EXEC, 9)  # (5, 9)
         result[..., :2] = np.clip(result[..., :2], -_GAINS_MAG, _GAINS_MAG)
-        result[..., 2:] = np.clip(result[..., 2:], -_RESIDUAL_MAG, _RESIDUAL_MAG)
+        result[..., 2:5] = np.clip(result[..., 2:5], -_RESIDUAL_TRANS_MAG, _RESIDUAL_TRANS_MAG)
+        result[..., 5:8] = np.clip(result[..., 5:8], -_RESIDUAL_ROT_MAG, _RESIDUAL_ROT_MAG)
+        result[..., 8] = np.clip(result[..., 8], -_RESIDUAL_MAG, _RESIDUAL_MAG)
         return result

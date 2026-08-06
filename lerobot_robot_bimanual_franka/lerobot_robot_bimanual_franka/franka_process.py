@@ -9,25 +9,27 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
+import franka_config as fc
 import numpy as np
 import rpyc
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
 
-VELOCITY_COMMAND_DURATION_MS = 100
-NUM_JOINTS = 7
-EE_DELTA_DIMS = 6
+# Wire-level constants, all from config/control.yaml (franka: section).
+VELOCITY_COMMAND_DURATION_MS = fc.control("franka.velocity_command_duration_ms")
+NUM_JOINTS = fc.num_joints()
+EE_DELTA_DIMS = fc.control("franka.ee_delta_dims")
 
-DEFAULT_REQUEST_TIMEOUT_S = 5.0
-RPYC_TIMEOUT_S = 10
+DEFAULT_REQUEST_TIMEOUT_S = fc.control("franka.request_timeout_s")
+RPYC_TIMEOUT_S = fc.control("franka.rpyc_timeout_s")
 
-_JACOBIAN_CACHE_Q_THRESHOLD = 0.50  # rad, L-inf
-_JOINT_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_EE_DELTA_RELATIVE_DYNAMICS = (1.0, 0.25, 1.0)
-_TORQUE_THRESHOLD = 100.0  # Nm
-_FORCE_THRESHOLD = 200.0   # N
-_JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
+_JACOBIAN_CACHE_Q_THRESHOLD = fc.control("franka.jacobian_cache_q_threshold_rad")  # rad, L-inf
+_JOINT_RELATIVE_DYNAMICS = tuple(fc.control("franka.joint_relative_dynamics"))
+_EE_DELTA_RELATIVE_DYNAMICS = tuple(fc.control("franka.ee_delta_relative_dynamics"))
+_TORQUE_THRESHOLD = fc.control("franka.torque_threshold_nm")  # Nm
+_FORCE_THRESHOLD = fc.control("franka.force_threshold_n")     # N
+_JOINT_STIFFNESS = list(fc.control("franka.joint_stiffness"))
 
 _RECOVERABLE_ERRORS = (
     "UDP receive: Timeout",
@@ -85,7 +87,7 @@ def get_state(robot):
         tuple(float(x) for x in s.dq),
         tuple(float(x) for x in s.O_T_EE.translation),
         tuple(float(x) for x in s.O_T_EE.quaternion),
-        tuple(float(x) for x in s.O_dP_EE_c.linear) + tuple(float(x) for x in s.O_dP_EE_c.angular),
+        tuple(float(x) for x in s.O_dP_EE_d.linear) + tuple(float(x) for x in s.O_dP_EE_d.angular),
     )
 
 def get_jacobian(robot):
@@ -116,6 +118,9 @@ class RobotDriver:
 
     def __init__(self, server_ip: str, robot_ip: str, port: int, use_ee_delta: bool = False):
         self.use_ee_delta = use_ee_delta
+        # Cumulative count of recoverable-error recoveries (reflexes etc.) —
+        # lets recording scripts flag ticks where tracking was interrupted.
+        self.recovery_count = 0
         self._jac: NDArray | None = None
         self._jac_q: NDArray | None = None
 
@@ -149,6 +154,7 @@ class RobotDriver:
             self._rpc_send_jv(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
+                self.recovery_count += 1
                 try:
                     self.robot.recover_from_errors()
                 except Exception:
@@ -163,6 +169,7 @@ class RobotDriver:
             rpc(self.robot, tuple(vel))
         except Exception as e:
             if any(t in str(e) for t in _RECOVERABLE_ERRORS):
+                self.recovery_count += 1
                 try:
                     self.robot.recover_from_errors()
                 except Exception:
@@ -198,6 +205,10 @@ class MultiRobotWrapper:
     @property
     def num_alive(self) -> int:
         return sum(1 for d in self.drivers.values() if d.is_alive)
+
+    def recovery_counts(self) -> dict[str, int]:
+        """Cumulative recoverable-error recoveries per arm (see RobotDriver.recovery_count)."""
+        return {n: d.recovery_count for n, d in self.drivers.items()}
 
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
         futs = [(n, self._pool.submit(fn, n)) for n in names]

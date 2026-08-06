@@ -23,7 +23,9 @@ from pathlib import Path
 
 import numpy as np
 
-POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
+import franka_config as fc  # noqa: E402
+
+POSES_DIR = fc.home_poses_dir()
 
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.datasets.feature_utils import combine_feature_dicts
@@ -57,10 +59,8 @@ from lerobot_teleoperator_gello import (
 
 logger = logging.getLogger(__name__)
 
-# Rig defaults — match the existing shell scripts.
-_L_SERVER_IP, _L_ROBOT_IP, _L_GRIPPER_IP, _L_PORT = "192.168.3.11", "192.168.200.2", "192.168.2.21", 18813
-_R_SERVER_IP, _R_ROBOT_IP, _R_GRIPPER_IP, _R_PORT = "192.168.3.10", "192.168.201.10", "192.168.2.20", 18812
-_L_GELLO_PORT, _R_GELLO_PORT = "/dev/ttyUSB1", "/dev/ttyUSB0"
+# Rig addressing and leader ports all come from config/*.yaml.
+_PROFILE = "bimanual_franka"
 
 
 def _str2bool(v: str) -> bool:
@@ -68,13 +68,7 @@ def _str2bool(v: str) -> bool:
 
 
 def _build_robot(control_mode: ControlMode) -> BimanualFranka:
-    cfg = BimanualFrankaConfig(
-        l_server_ip=_L_SERVER_IP, l_robot_ip=_L_ROBOT_IP,
-        l_gripper_ip=_L_GRIPPER_IP, l_port=_L_PORT,
-        r_server_ip=_R_SERVER_IP, r_robot_ip=_R_ROBOT_IP,
-        r_gripper_ip=_R_GRIPPER_IP, r_port=_R_PORT,
-        control_mode=control_mode,
-    )
+    cfg = BimanualFrankaConfig(control_mode=control_mode)
     return make_robot_from_config(cfg)
 
 
@@ -82,14 +76,14 @@ def _build_teleop(mode: str, teleop_id: str):
     if mode == "gello":
         cfg = BimanualGelloConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT, use_noise=True),
-            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT, use_noise=True),
+            left_arm_config=GelloLeaderFields.for_side("left", use_noise=True),
+            right_arm_config=GelloLeaderFields.for_side("right", use_noise=True),
         )
     elif mode == "gello_ee":
         cfg = BimanualGelloEEConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields(port=_L_GELLO_PORT, use_noise=True),
-            right_arm_config=GelloLeaderFields(port=_R_GELLO_PORT, use_noise=True),
+            left_arm_config=GelloLeaderFields.for_side("left", use_noise=True),
+            right_arm_config=GelloLeaderFields.for_side("right", use_noise=True),
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello' or 'gello_ee'.")
@@ -157,7 +151,7 @@ def main() -> None:
     p.add_argument("--teleop-mode", default="gello_ee", choices=("gello", "gello_ee"),
                    help="Teleop type (ignored when --policy is set)")
     p.add_argument("--teleop-id", default="homed_teleop")
-    p.add_argument("--fps", type=int, default=30)
+    p.add_argument("--fps", type=int, default=fc.control_fps())
     p.add_argument("--episode-time-s", type=float, default=60.0)
     p.add_argument("--reset-time-s", type=float, default=3.0,
                    help="Time between episodes for the operator to reset the scene by hand")
@@ -165,22 +159,22 @@ def main() -> None:
     p.add_argument("--push-to-hub", type=_str2bool, default=True)
     p.add_argument("--play-sounds", type=_str2bool, default=False)
 
-    p.add_argument("--home-pose-name", default=None,
+    p.add_argument("--home-pose-name", default=fc.default_home_pose_name(),
                    help=f"Name of a saved pose in {POSES_DIR} (overrides --home-q-* and --home-gripper)")
     p.add_argument("--home-q-left", nargs=7, type=float,
-                   default=[0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0])
+                   default=None, help="7 joint angles (rad) overriding the saved home pose")
     p.add_argument("--home-q-right", nargs=7, type=float,
-                   default=[0.0, 0.0, 0.0, -1.5708, 0.0, 1.5708, 0.0])
-    p.add_argument("--home-gripper", type=float, default=1.0,
+                   default=None, help="7 joint angles (rad) overriding the saved home pose")
+    p.add_argument("--home-gripper", type=float, default=fc.control("homing.gripper_norm"),
                    help="Normalized gripper at home (0=closed, 1=open)")
-    p.add_argument("--home-max-time-s", type=float, default=3.0)
-    p.add_argument("--home-tol-rad", type=float, default=0.05,
+    p.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
+    p.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"),
                    help="Joint homing: max per-joint error (rad). EE homing: default rot tolerance if --home-tol-rot-rad unset.")
     p.add_argument("--home-fps", type=int, default=None,
                    help="Homing control rate (Hz). Default: max(--fps, 60) in EE mode, else --fps.")
-    p.add_argument("--home-tol-m", type=float, default=0.03,
+    p.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"),
                    help="EE homing only: max position error (m) per arm")
-    p.add_argument("--home-tol-rot-rad", type=float, default=None,
+    p.add_argument("--home-tol-rot-rad", type=float, default=fc.control("homing.tol_rot_rad"),
                    help="EE homing only: max axis-angle error (rad); defaults to --home-tol-rad")
 
     args = p.parse_args()
@@ -211,16 +205,16 @@ def main() -> None:
             },
         )
 
-    if args.home_pose_name:
-        pose_path = POSES_DIR / f"{args.home_pose_name}.json"
-        pose = json.loads(pose_path.read_text())
-        home_q_l = np.asarray(pose["l_q"], dtype=np.float64)
-        home_q_r = np.asarray(pose["r_q"], dtype=np.float64)
-        args.home_gripper = float(pose.get("gripper", args.home_gripper))
-        logger.info("Loaded home pose %r from %s", args.home_pose_name, pose_path)
-    else:
+    if args.home_q_left is not None and args.home_q_right is not None:
         home_q_l = np.asarray(args.home_q_left, dtype=np.float64)
         home_q_r = np.asarray(args.home_q_right, dtype=np.float64)
+    else:
+        pose = fc.load_home_pose(args.home_pose_name)
+        home_q_l = fc.home_q(args.home_pose_name, key="l")
+        home_q_r = fc.home_q(args.home_pose_name, key="r")
+        args.home_gripper = float(pose.get("gripper", args.home_gripper))
+        logger.info("Loaded home pose %r from %s", args.home_pose_name,
+                    POSES_DIR / f"{args.home_pose_name}.json")
 
     robot.connect()
     if teleop is not None:

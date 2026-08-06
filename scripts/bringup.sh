@@ -12,13 +12,18 @@
 
 set -u
 
-LEFT_NUC_HOST="luigi@192.168.3.11"
-RIGHT_NUC_HOST="mario@192.168.3.10"
-LEFT_ARM_IP="192.168.200.2"
-RIGHT_ARM_IP="192.168.201.10"
-LEFT_RPYC_PORT=18813
-RIGHT_RPYC_PORT=18812
-CAMERA_IPS=(192.168.0.142 192.168.0.116 192.168.1.138 192.168.1.139 192.168.1.143 192.168.1.102)
+# Hosts, arm IPs, RPyC ports and camera IPs all come from config/*.yaml.
+source "$(dirname "$0")/_config.sh"
+eval "$(cfg_arm left --prefix LEFT)"
+eval "$(cfg_arm right --prefix RIGHT)"
+
+LEFT_NUC_HOST="$LEFT_SSH"
+RIGHT_NUC_HOST="$RIGHT_SSH"
+LEFT_ARM_IP="$LEFT_ROBOT_IP"
+RIGHT_ARM_IP="$RIGHT_ROBOT_IP"
+LEFT_RPYC_PORT="$LEFT_PORT"
+RIGHT_RPYC_PORT="$RIGHT_PORT"
+mapfile -t CAMERA_IPS < <(cfg_cameras --field ip)
 TMUX_SESSION="franka-control"
 READY_TIMEOUT=45
 
@@ -53,7 +58,7 @@ cam_down=()
 for cam in "${CAMERA_IPS[@]}"; do
     check_ping "$cam" || cam_down+=("$cam")
 done
-if (( ${#cam_down[@]} == 0 )); then ok "all 6 cameras reachable"
+if (( ${#cam_down[@]} == 0 )); then ok "all ${#CAMERA_IPS[@]} cameras reachable"
 else warn "cameras down: ${cam_down[*]} (record/teleop may degrade those frames)"; fi
 
 if (( preflight_fail )); then

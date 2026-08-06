@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
 from typing import cast, Optional
 
+import franka_config as fc
 import numpy as np
 
 from lerobot.cameras.camera import Camera
@@ -21,19 +22,24 @@ from .franka_fk import franka_fk
 from .franka_process import NUM_JOINTS, KinematicSnapshot, MultiRobotWrapper
 from .safety import ActionSafetyScreen
 from .wsg import WSG
+from .osc_velocity_controller import OSCVelocityController
+from .franka_jacobian import zero_jacobian  # the new analytic module
 
-IMAGE_CHANNELS = 3
-_CAMERA_READ_TIMEOUT_MS: float = 5.0
-_CONNECT_TIMEOUT_S = 10.0
-_DEPTH_POINT_COUNT = 2048
+# Every constant below comes from config/control.yaml.
+IMAGE_CHANNELS = fc.control("observation.image_channels")
+_CAMERA_READ_TIMEOUT_MS: float = fc.control("observation.camera_read_timeout_ms")
+_CONNECT_TIMEOUT_S = fc.control("franka.connect_timeout_s")
+_DEPTH_POINT_COUNT = fc.control("observation.depth_point_count")
 
-JOINT_PD_KP, JOINT_PD_KD = 2.0, 0.1
-EE_PD_KP, EE_PD_KD = 3.5, 0.2
-_KP_GAIN_BASE = 10.0
-_KD_GAIN_BASE = 1.0
+JOINT_PD_KP, JOINT_PD_KD = fc.control("gains.joint_pd.kp"), fc.control("gains.joint_pd.kd")
+EE_PD_KP, EE_PD_KD = fc.control("gains.ee_pd.kp"), fc.control("gains.ee_pd.kd")
+_KP_GAIN_BASE = fc.control("gains.action_scaling.kp_base")
+_KD_GAIN_BASE = fc.control("gains.action_scaling.kd_base")
+OSC_BASE_KP = fc.control("gains.osc.base_kp")
+_GRIP_ACCUM_SPEED = fc.control("gripper_accum_speed")
 
-_EE_TRANSLATION_FUDGE_FACTOR = 2.0
-_EE_ROTATION_FUDGE_FACTOR = 1.0
+_EE_TRANSLATION_FUDGE_FACTOR = fc.control("fudge.ee_translation")
+_EE_ROTATION_FUDGE_FACTOR = fc.control("fudge.ee_rotation")
 
 JOINT_FEATURE_KEYS: tuple[str, ...] = (*(f"joint_{i}" for i in range(1, NUM_JOINTS + 1)), "gripper")
 EE_FEATURE_KEYS: tuple[str, ...] = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
@@ -43,7 +49,6 @@ _CAMERA_CTORS: dict[type, type] = {FramosCameraConfig: FramosCamera, ArvCameraCo
 
 _DEPTH_POINT_AXES: tuple[str, ...] = ("x", "y", "z")
 _DEPTH_FLAT_SIZE: int = _DEPTH_POINT_COUNT * len(_DEPTH_POINT_AXES)  # 6144
-_FULL_PCD_CROP_RADIUS_M: float = 0.5  # max distance from world origin for viz cloud
 
 logger = logging.getLogger(__name__)
 
@@ -69,33 +74,52 @@ class BimanualFranka(Robot):
         self.grippers: dict[str, WSG | FrankaGripper] = {
             arm: self._make_gripper(arm) for arm in self.active_arms
         }
-        self.safety = ActionSafetyScreen()
+        # Robot base expressed in world (config/world.yaml): p_world = R @ p_base + t.
+        # No inversion — the pose is already base-in-world, which is the direction
+        # every consumer (safety brake, depth crop, viz, sysid) needs.
+        self._base_in_world_by_arm = {
+            arm: config.base_in_world(arm) for arm in self.active_arms
+        }
+        # The worktable brake compares world-frame heights, so it needs each
+        # arm's base pose rather than one shared base-frame threshold, plus each
+        # arm's EE collision sphere (grippers differ in size between arms).
+        self._ee_sphere_by_arm = {
+            arm: fc.ee_sphere(config.arm_name(arm)) for arm in self.active_arms
+        }
+        self.safety = ActionSafetyScreen(self._base_in_world_by_arm, self._ee_sphere_by_arm)
         # Populated by get_observation, consumed by next send_action to skip a redundant RPyC round-trip.
         self._cached_kin_state: dict[str, KinematicSnapshot] | None = None
         self._kp_gain = 0.0
         self._kd_gain = 0.0
+        self._gripper_accum: dict[str, float] = {arm: 1.0 for arm in self.active_arms}
         self._camera_pool = ThreadPoolExecutor(max_workers=max(len(self.cameras) + 1, 1))
         self._use_depth = bool(getattr(config, "depth", False))
-        if config.depth_cam[0] in self.cameras.keys():
-            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], None)
-        else:
-            self._depth_cam: tuple[str, Optional[Camera]] = (config.depth_cam[0], _make_camera(config.depth_cam[1]))
+        self._depth_cam: dict[str, Optional[Camera]] = dict()
+        for s, cam in config.depth_cam.items():
+            if s in self.cameras.keys():
+                self._depth_cam[s] = None
+                continue
+            self._depth_cam[s] = _make_camera(cam)
+        # Half-extent of the world-axis-aligned box crop (sim collect convention).
         self._depth_crop_radius_m = float(getattr(config, "depth_crop_radius_m", 0.4))
 
-        world_in_robot_quat = getattr(config, "world_in_robot_quat_wxyz", (1.0, 0.0, 0.0, 0.0))
-        world_in_robot_translation = getattr(config, "world_in_robot_translation_m", (0.0, 0.0, 0.0))
-        r_w_in_r = self._quat_wxyz_to_rot(world_in_robot_quat)
-        t_w_in_r = np.asarray(world_in_robot_translation, dtype=np.float64)
-        # Invert world-in-robot pose to map robot-frame EE positions into world frame.
-        self._r_robot_in_world = r_w_in_r.T
-        self._t_robot_in_world = -self._r_robot_in_world @ t_w_in_r
+        depth_center = getattr(config, "depth_center_arm", self.active_arms[0])
+        # Fall back when the profile's depth-centre arm isn't among active_arms.
+        self._depth_center_arm = depth_center if depth_center in self.active_arms else self.active_arms[0]
+        base_pose = self._base_in_world_by_arm[self._depth_center_arm]
+        self._base_in_world = base_pose
+        self._r_robot_in_world = base_pose.rotation
+        self._t_robot_in_world = base_pose.translation
         # Residual offsets added on top of action commands via cache_delta().
         self.delta_pos = np.zeros(3)
         self.delta_rot = np.zeros(3)
-        # Full (uncropped, unsubsampled) point cloud from the depth camera, cached each
+        # Cropped and subsampled point cloud from the depth camera, cached each
         # get_observation() call.  None until the first observation is read.
         self._last_full_point_cloud: np.ndarray | None = None
-
+        self._osc_vel: dict[str, OSCVelocityController] = {
+            arm: OSCVelocityController(num_joints=NUM_JOINTS) for arm in self.active_arms
+        }
+        self._home_q: dict[str, np.ndarray] = {} # nullspace target; set in home()
 
 
     def _make_gripper(self, arm: str) -> WSG | FrankaGripper:
@@ -161,8 +185,14 @@ class BimanualFranka(Robot):
                     cam.connect()
                 except Exception as e:
                     logger.warning("Camera %s failed to connect: %s", n, e)
-            if self._use_depth and self._depth_cam[1] is not None:
-                self._depth_cam[1].connect()
+            if self._use_depth and len(self._depth_cam) > 0:
+                for s, cam in self._depth_cam.items():
+                    try:
+                        if cam is None:
+                            continue
+                        cam.connect()
+                    except Exception as e:
+                        logger.warning("Camera %s failed to connect: %s", s, e)
             for arm in self.active_arms:
                 self.robot_manager.add_robot(
                     arm,
@@ -174,6 +204,8 @@ class BimanualFranka(Robot):
                 self.robot_manager.current_kinematic_state(arm, timeout_s=_CONNECT_TIMEOUT_S)
             for arm in self.active_arms:
                 self.grippers[arm].home()
+
+                kin = self.robot_manager.current_kinematic_state(arm)
         except Exception:
             self.robot_manager.shutdown()
             raise
@@ -196,13 +228,19 @@ class BimanualFranka(Robot):
             for n, cam in self.cameras.items()
         }
 
-        standalone_depth_cam = None
-        if self._use_depth and self._depth_cam[0] not in self.cameras:
-            standalone_depth_cam = self._depth_cam[1]
-            depth_color_fut = self._camera_pool.submit(standalone_depth_cam.async_read, _CAMERA_READ_TIMEOUT_MS)
+        standalone_depth_cam = []
+        depth_color_fut = []
+        if self._use_depth:
+            for s, cam in self._depth_cam.items():
+                if cam is None:
+                    continue
+                standalone_depth_cam.append(cam)
+                depth_color_fut.append(self._camera_pool.submit(cam.async_read, _CAMERA_READ_TIMEOUT_MS))
 
         kin = self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+        kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         self._cached_kin_state = kin
+        ee_world = self._ee_world_center(kin)
 
         obs: RobotObservation = {}
 
@@ -221,45 +259,58 @@ class BimanualFranka(Robot):
                 blank = getattr(self.cameras[n], "blank_frame", None)
                 obs[n] = blank() if callable(blank) else np.zeros(self._camera_features[n], dtype=np.uint8)
 
-        if standalone_depth_cam is not None:
+        if len(standalone_depth_cam) > 0:
             try:
-                depth_color_fut.result()  # prime the buffer; result unused, not part of obs
+                for fut in depth_color_fut:
+                    fut.result()  # prime the buffer; result unused, not part of obs
             except Exception as e:
                 logger.warning("Standalone depth camera color read failed: %s", e)
 
         if self._use_depth:
-            if self._depth_cam[0] in self.cameras.keys():
-                depth_cam = self.cameras.get(self._depth_cam[0])
-            else:
-                depth_cam = self._depth_cam[1]
-            if depth_cam is None:
+            depth_cams = []
+            for s, cam in self._depth_cam.items():
+                if cam is None:
+                    depth_cams.append(self.cameras.get(s))
+                else:
+                    depth_cams.append(cam)
+            if len(depth_cams) <= 0:
                 raise KeyError(f"Depth camera {self._depth_cam!r} not found in cameras")
-            # Submit both depth reads concurrently; get_full_point_cloud only reads
-            # the already-cached _last_depth so both are pure CPU work with no I/O.
-            depth_fut = self._camera_pool.submit(getattr(depth_cam, "get_depth"))
-            full_pcd_fut = self._camera_pool.submit(getattr(depth_cam, "get_full_point_cloud"))
-            verts = depth_fut.result()
-            full_pcd = full_pcd_fut.result()
-            if len(full_pcd) > 0:
-                xyz = full_pcd[:, :3]
-                dist2 = np.einsum("ij,ij->i", xyz, xyz)
-                full_pcd = full_pcd[dist2 <= (_FULL_PCD_CROP_RADIUS_M ** 2)]
-            self._last_full_point_cloud = full_pcd
-            ee_world = self._ee_world_center(kin)
-            flat = self._sample_depth_points(verts, ee_world).reshape(-1)
-            for i, v in enumerate(flat):
-                obs[f"depth_{i}"] = float(v)
+
+            depth_futs = []
+            clouds: list[np.ndarray] = []
+            for c in depth_cams:
+                depth_futs.append(self._camera_pool.submit(
+                    c.get_cropped_point_cloud, ee_world, self._depth_crop_radius_m, _DEPTH_POINT_COUNT // len(depth_cams)
+                ))
+                
+            for fut in depth_futs:
+                clouds.append(fut.result())
+
+            self._last_full_point_cloud = np.concatenate(clouds,axis=0) # self._sample_depth_points(np.concatenate(clouds,axis=0), ee_world)
+            # print(self._last_full_point_cloud)
+            flat = self._last_full_point_cloud.reshape(-1).astype(np.float64)
+            # print(flat.shape)
+            obs.update(zip((f"depth_{i}" for i in range(_DEPTH_FLAT_SIZE)), flat.tolist()))
         return obs
 
     def _ee_world_center(self, kin: dict[str, KinematicSnapshot]) -> np.ndarray:
-        arm = "r" if "r" in self.active_arms else self.active_arms[0]
-        ee_robot = np.asarray(kin[arm][3], dtype=np.float64)
-        return self._r_robot_in_world @ ee_robot + self._t_robot_in_world
+        arm = self._depth_center_arm
+        return self._base_in_world.apply(np.asarray(kin[arm][3], dtype=np.float64))
 
-    def _sample_depth_points(self, verts: list[tuple[float, float, float]], center: np.ndarray) -> np.ndarray:
-        points = np.asarray(verts, dtype=np.float64).reshape(-1, 3)
+    @property
+    def base_in_world(self):
+        """`franka_config.Pose` mapping robot-base coordinates into world."""
+        return self._base_in_world
+
+    def _sample_depth_points(self, verts: np.ndarray, center: np.ndarray) -> np.ndarray:
+        points = np.asarray(verts, dtype=np.float64)
         if points.size == 0:
             return np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float32)
+        if points.ndim != 2 or points.shape[1] < 3:
+            raise ValueError(
+                f"expected (N, 3) or (N, 3+C) point cloud, got shape {points.shape}"
+            )
+        points = points[:, :3]
 
         points = points[np.isfinite(points).all(axis=1)]
         if points.shape[0] == 0:
@@ -268,34 +319,20 @@ class BimanualFranka(Robot):
         deltas = points - center.reshape(1, 3)
         dist2 = np.einsum("ij,ij->i", deltas, deltas)
         cropped = points[dist2 <= (self._depth_crop_radius_m ** 2)]
+        total = cropped.shape[0]
 
-        if cropped.shape[0] == 0:
+        if total == 0:
             sampled = np.zeros((_DEPTH_POINT_COUNT, 3), dtype=np.float64)
-        elif cropped.shape[0] >= _DEPTH_POINT_COUNT:
-            idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
-            sampled = cropped[idx]
         else:
-            reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
-            sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
+            # idx = np.linspace(0, cropped.shape[0] - 1, _DEPTH_POINT_COUNT, dtype=np.int64)
+            idx = np.random.choice(np.arange(0,total), size=_DEPTH_POINT_COUNT, replace=False)
+            sampled = cropped[idx]
+        # else:
+        #     reps = (_DEPTH_POINT_COUNT + cropped.shape[0] - 1) // cropped.shape[0]
+        #     sampled = np.tile(cropped, (reps, 1))[:_DEPTH_POINT_COUNT]
 
         return np.asarray(sampled, dtype=np.float32)
 
-    @staticmethod
-    def _quat_wxyz_to_rot(q: tuple[float, float, float, float]) -> np.ndarray:
-        w, x, y, z = q
-        n = float(np.sqrt(w * w + x * x + y * y + z * z))
-        if n < 1e-12:
-            return np.eye(3, dtype=np.float64)
-        w, x, y, z = w / n, x / n, y / n, z / n
-        return np.array(
-            [
-                [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w), 2.0 * (x * z + y * w)],
-                [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-                [2.0 * (x * z - y * w), 2.0 * (y * z + x * w), 1.0 - 2.0 * (x * x + y * y)],
-            ],
-            dtype=np.float64,
-        )
-    
     @property
     def kp_gain(self) -> float:
         return self._kp_gain
@@ -307,16 +344,29 @@ class BimanualFranka(Robot):
     @property
     def kin(self) -> Optional[dict[str, KinematicSnapshot]]:
         return self._cached_kin_state
+    
+    @staticmethod
+    def _patch_jacobian(snap: KinematicSnapshot) -> KinematicSnapshot:
+        """franky's zero_jacobian returns all-zero on this build; recompute
+        the geometric Jacobian analytically from q, anchored on the measured
+        EE position so it stays consistent with the pose error used elsewhere."""
+        q, dq, J, ee_pos, ee_quat_xyzw, ee_twist = snap
+        q = np.asarray(q, dtype=np.float64)
+        ee_pos = np.asarray(ee_pos, dtype=np.float64)
+        J_real = zero_jacobian(q, ee_pos_base=ee_pos)
+        return (q, dq, J_real, ee_pos, ee_quat_xyzw, ee_twist)
 
     def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
         kin = self._cached_kin_state or self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
         self._cached_kin_state = None
+        kin = {arm: self._patch_jacobian(snap) for arm, snap in kin.items()}
         self._kp_gain = _KP_GAIN_BASE ** np.clip(action["kp"], -1.0, 1.0)
         self._kd_gain = _KD_GAIN_BASE ** (np.clip(action["kd"], -1.0, 1.0) * 2 * np.sqrt(self.kp_gain))
 
         for arm in self.active_arms:
+            self._gripper_accum[arm] = np.clip(self._gripper_accum[arm] + (action[f"{arm}_gripper"]) * _GRIP_ACCUM_SPEED, -1.0, 1.0)
             self.grippers[arm].move(
-                np.clip(action[f"{arm}_gripper"], 0.0, 1.0) * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
+                (self._gripper_accum[arm] + 1.0) / 2.0 * self.grippers[arm].GRIPPER_TRUE_MAX_MM,
                 blocking=False,
             )
 
@@ -331,11 +381,16 @@ class BimanualFranka(Robot):
                     action[f"{arm}_{ax}"] *= _EE_ROTATION_FUDGE_FACTOR
 
             # print(action)
-            cmds = self.safety.shape_ee(
-                {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
+            # cmds = self.safety.shape_ee(
+            #     {arm: self._ee_delta(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
+            #      for arm in self.active_arms}, kin
+            # )
+            cmds = self.safety.shape_joint(
+                {arm: self._qdot_ee_delta(arm, action, kin[arm], self.delta_pos, self.delta_rot, self.config.use_noise, self.config.noise_pos_scale, self.config.noise_rot_scale)
                  for arm in self.active_arms}, kin
             )
-            self.robot_manager.move_ee_delta_batch({a: c.tolist() for a, c in cmds.items()})
+
+            self.robot_manager.move_joint_velocity_batch({a: c.tolist() for a, c in cmds.items()})
         elif self.control_mode == ControlMode.EE_POS:
             cmds = self.safety.shape_ee(
                 {arm: self._ee_pd(self.kp_gain, self.kd_gain, action, arm, kin[arm], self.delta_pos, self.delta_rot, ignore_action)
@@ -353,14 +408,14 @@ class BimanualFranka(Robot):
         self,
         home_q_left: np.ndarray | None,
         home_q_right: np.ndarray | None,
-        gripper_norm: float = 1.0,
-        max_time_s: float = 5.0,
-        tol_rad: float = 0.05,
-        fps: int = 30,
+        gripper_norm: float = fc.control("homing.gripper_norm"),
+        max_time_s: float = fc.control("homing.max_time_s"),
+        tol_rad: float = fc.control("homing.tol_rad"),
+        fps: int = fc.control_fps(),
         *,
         home_fps: int | None = None,
-        tol_pos_m: float = 0.025,
-        tol_rot_rad: float | None = None,
+        tol_pos_m: float = fc.control("homing.tol_pos_m"),
+        tol_rot_rad: float | None = fc.control("homing.tol_rot_rad"),
     ) -> bool:
         """Drive both arms to a saved home configuration.
 
@@ -387,7 +442,7 @@ class BimanualFranka(Robot):
             self.grippers[arm].move(gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False)
 
         use_ee_homing = False # self.control_mode != ControlMode.JOINT_POS
-        rate_hz = float(home_fps if home_fps is not None else (max(fps, 60) if use_ee_homing else fps))
+        rate_hz = float(home_fps if home_fps is not None else fc.home_fps())
         period_s = 1.0 / rate_hz
         deadline = time.perf_counter() + max_time_s
         names = list(targets_q)
@@ -441,6 +496,8 @@ class BimanualFranka(Robot):
             max_err = max(float(np.max(np.abs(targets_q[arm] - kin[arm][0]))) for arm in names)
             if max_err < tol_rad:
                 self._cached_kin_state = None
+                for arm in names:
+                    self._home_q[arm] = targets_q[arm].copy()
                 return True
             if tick_start >= deadline:
                 self._cached_kin_state = None
@@ -451,13 +508,97 @@ class BimanualFranka(Robot):
             if elapsed < period_s:
                 time.sleep(period_s - elapsed)
 
+    def _qdot_ee_delta(
+        self,
+        arm: str,
+        action,  # RobotAction
+        snap,  # KinematicSnapshot = (q, dq, J, ee_pos, ee_quat_xyzw, ee_twist)
+        dpos_cached: np.ndarray,
+        drot_cached: np.ndarray,
+        use_noise: bool,
+        noise_pos_scale: float,
+        noise_rot_scale: float,
+    ) -> np.ndarray:
+        """Replacement for the old `_ee_delta`. Integrates the incoming delta
+        action into a persistent per-arm goal pose (mirroring robosuite OSC's
+        set_goal() under use_delta=True), then servos the current EE toward that
+        goal with OSCVelocityController -- rather than treating the raw delta as
+        a one-shot velocity command every tick.
+        """
+
+        if use_noise:
+            pos_noise = np.random.normal(0.0, noise_pos_scale, 3)
+            rot_noise = Rotation.from_euler("xyz", np.random.normal(0.0, noise_rot_scale, 3)).as_quat()
+        else:
+            pos_noise = 0
+            rot_noise = 0
+
+
+        q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
+        ee_pos = np.asarray(ee_pos, dtype=np.float64)
+        ee_quat_xyzw = np.asarray(ee_quat_xyzw, dtype=np.float64)
+        action_dpos = np.fromiter(
+            (action[f"{arm}_{ax}"] for ax in ("x", "y", "z")),
+            dtype=np.float64, count=3,
+        ) + pos_noise
+        action_dquat_xyzw = np.fromiter(
+            (action[f"{arm}_{ax}"] for ax in ("qx", "qy", "qz", "qw")),
+            dtype=np.float64, count=4,
+        ) + rot_noise
+
+        # ---- integrate delta into the persistent goal (position: simple sum;
+        #      orientation: compose as delta * goal) ----
+        goal_pos = ee_pos + action_dpos + dpos_cached
+
+        dq = action_dquat_xyzw / max(float(np.linalg.norm(action_dquat_xyzw)), 1e-12)
+        gx, gy, gz, gw = ee_quat_xyzw
+        dx, dy, dz, dw = dq
+        new_quat = np.array([
+            dw * gx + dx * gw + dy * gz - dz * gy,
+            dw * gy - dx * gz + dy * gw + dz * gx,
+            dw * gz + dx * gy - dy * gx + dz * gw,
+            dw * gw - dx * gx - dy * gy - dz * gz,
+        ])
+        goal_quat_xyzw = new_quat / max(float(np.linalg.norm(new_quat)), 1e-12)
+
+        if drot_cached is not None and np.any(drot_cached):
+            angle = float(np.linalg.norm(drot_cached))
+            if angle > 1e-9:
+                axis = drot_cached / angle
+                s, c = np.sin(angle / 2.0), np.cos(angle / 2.0)
+                bx, by, bz, bw = axis[0] * s, axis[1] * s, axis[2] * s, c
+                gx, gy, gz, gw = goal_quat_xyzw
+                composed = np.array([
+                    bw * gx + bx * gw + by * gz - bz * gy,
+                    bw * gy - bx * gz + by * gw + bz * gx,
+                    bw * gz + bx * gy - by * gx + bz * gw,
+                    bw * gw - bx * gx - by * gy - bz * gz,
+                ])
+                goal_quat_xyzw = composed / max(float(np.linalg.norm(composed)), 1e-12)
+
+        # ---- servo current EE toward the (now-updated) goal ----
+
+        q, dq_, J, ee_pos, ee_quat_xyzw, ee_twist = snap
+        return self._osc_vel[arm].compute_qdot(
+            goal_pos=goal_pos,
+            goal_quat_xyzw=goal_quat_xyzw,
+            ee_pos=ee_pos,
+            ee_quat_xyzw=ee_quat_xyzw,
+            ee_twist=np.asarray(ee_twist, dtype=np.float64),
+            J=np.asarray(J, dtype=np.float64),
+            q=np.asarray(q, dtype=np.float64),
+            q_nullspace_target=self._home_q.get(arm),
+            kp=self.kp_gain * OSC_BASE_KP,
+            rot_fudge=_EE_ROTATION_FUDGE_FACTOR
+    )
+
     def cache_delta(self, dpos: np.ndarray, drot: np.ndarray) -> None:
         self.delta_pos = dpos
         self.delta_rot = drot
 
     @property
     def last_full_point_cloud(self) -> np.ndarray | None:
-        """Full (uncropped, unsubsampled) world-space point cloud from the depth camera.
+        """Cropped and subsampled world-space point cloud from the depth camera.
 
         Updated every get_observation() call when depth is enabled.
         Shape: (N, 3) float32 in world-frame metres, or None before the first observation.

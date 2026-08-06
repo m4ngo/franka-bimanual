@@ -1,6 +1,7 @@
 """Entry point for running and recording residual-policy episodes on the Franka."""
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -11,22 +12,30 @@ import tty
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 from scipy.spatial.transform import Rotation
 
 import env_wrapper
-from viz import EpisodeRecorder, save_episode_html, save_rollout_html
+from viz import EpisodeRecorder, save_episode_html, save_rollout_html, save_policy_pcd_npz
 from viz import _propagate_pose_traj
 from env_wrapper import (
+    ee_pose_to_world,
+    to_sim_world_points,
+    to_sim_world_pose,
+    to_sim_world_twist,
     _ACTION_KEYS,
     _CHUNK_EXEC,
     _RESIDUAL_HORIZON,
     _STATE_OBS_KEYS,
+    _RES_POS_GAIN,
+    _RES_ROT_GAIN,
     _POS_SCALE,
     _ROT_SCALE,
     build_action,
     current_ee_pose,
     extract_point_cloud,
+    measured_ee_twist_world,
     process_chunk,
     split_gripper,
     strip_depth,
@@ -37,11 +46,10 @@ from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 
 logger = logging.getLogger(__name__)
 
-_POSES_DIR = Path(__file__).resolve().parent.parent / "home_poses"
-_DEFAULT_HOME_Q = [
-    -0.28223089288736675, -0.5594522989991991, -0.4191884798561259,
-    -1.82212661700904, 0.06416041394704838, 1.5246974433097138, -0.7569427650529224,
-]
+import franka_config as fc  # noqa: E402
+from env_wrapper import default_home_q as _default_home_q  # noqa: E402
+
+_POSES_DIR = fc.home_poses_dir()
 
 
 def _stdin_key_pressed() -> bool:
@@ -144,6 +152,29 @@ def _build_dataset(args, controller) -> LeRobotDataset:
 # Episode loop
 # ---------------------------------------------------------------------------
 
+def _write_video_frame(writers, video_dir, video_stem, fps, cam_name, img, step_idx):
+    """Lazily create one mp4 writer per camera and append an annotated frame.
+
+    Frame index == control-loop step index (first frame = first post-homing,
+    first-inference step), so base/residual runs at the same fps are
+    time-aligned by construction for side-by-side stitching.
+    """
+    w = writers.get(cam_name)
+    if w is None:
+        video_dir.mkdir(parents=True, exist_ok=True)
+        w = cv2.VideoWriter(str(video_dir / f"{video_stem}_{cam_name}.mp4"),
+                            cv2.VideoWriter_fourcc(*"mp4v"), fps,
+                            (img.shape[1], img.shape[0]))
+        writers[cam_name] = w
+    frame = np.ascontiguousarray(img[:, :, ::-1])  # RGB->BGR; copy keeps the obs image pristine
+    label = f"{step_idx:05d} {step_idx / fps:6.2f}s"
+    cv2.putText(frame, label, (4, frame.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (0, 0, 0), 2, cv2.LINE_AA)
+    cv2.putText(frame, label, (4, frame.shape[0] - 6), cv2.FONT_HERSHEY_SIMPLEX,
+                0.35, (255, 255, 255), 1, cv2.LINE_AA)
+    w.write(frame)
+
+
 def _run_episode(
     controller,
     base_policy: BasePolicy,
@@ -153,7 +184,13 @@ def _run_episode(
     fps: float = 20.0,
     task: str = "",
     recorder: "EpisodeRecorder | None" = None,
-    replaying: bool = False
+    replaying: bool = False,
+    proprio_frame: str = "world",
+    sim_proprio_convention: bool = True,
+    dump_dir: "Path | None" = None,
+    video_dir: "Path | None" = None,
+    video_cams: "list[str] | None" = None,
+    video_stem: str = "episode",
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -175,6 +212,11 @@ def _run_episode(
     chunk_used = _CHUNK_EXEC   # triggers immediate inference on first step
     prev_kp = 0.0
     prev_kd = 0.0
+    infer_idx = 0
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+    video_writers: dict[str, "cv2.VideoWriter"] = {}
+    step_idx = 0
 
     dt = 1.0 / fps
     t_start = time.perf_counter()
@@ -183,6 +225,12 @@ def _run_episode(
     tty.setraw(sys.stdin)
     fps_frames = 0
     fps_window_start = time.perf_counter()
+    busy_ms_window: list[float] = []        # per-step busy time (pre-sleep), current window
+    chunk_busy_ms_window: list[float] = []  # subset: steps that ran inference
+    # Fixed-cadence deadline: sleeping to an absolute clock lets the idle slack
+    # of ordinary steps absorb the few ms that inference steps overrun, so the
+    # loop averages the target rate instead of accumulating per-step deficits.
+    t_deadline = time.perf_counter() + dt
     try:
         while True:
             t_step = time.perf_counter()
@@ -195,13 +243,27 @@ def _run_episode(
                 if key == "right":
                     print("\r\nearly stop requested", flush=True)
                     break
-
+            
+            # times = []
+            # times.append(time.perf_counter())
             obs = controller.get_observation()
-            ee_pose = current_ee_pose(obs)
+            # times.append(time.perf_counter())
+            ee_pose = current_ee_pose(obs, sim_convention=sim_proprio_convention)
+            # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
+            # times.append(time.perf_counter())
+
+            if video_dir is not None:
+                for cam_name in (video_cams or sorted(controller.cameras.keys())):
+                    img = obs.get(cam_name)
+                    if isinstance(img, np.ndarray) and img.ndim == 3:
+                        _write_video_frame(video_writers, video_dir, video_stem,
+                                           fps, cam_name, img, step_idx)
+            step_idx += 1
 
             if chunk_used >= _CHUNK_EXEC:
                 base_chunk = base_policy.infer(obs_no_depth)
+                # times.append(time.perf_counter())
                 chunk_used = 0
 
                 if residual is not None:
@@ -209,21 +271,56 @@ def _run_episode(
                     if kin is None:
                         vel = np.zeros(6)
                     else:
-                        vel = kin['r'][5]
+                        # Measured twist (J @ dq), in the same frame as the proprio pose.
+                        r_w = (controller._r_robot_in_world if proprio_frame == "world"
+                               else np.eye(3))
+                        vel = measured_ee_twist_world(kin['r'], r_w)
                     point_cloud = extract_point_cloud(obs)
+                    # The cloud is world-frame; franka_fk is robot-frame. In world
+                    # mode, map the proprio pose into world so center_on_eef
+                    # subtracts a point in the same frame as the cloud.
+                    if proprio_frame == "world":
+                        proprio_pose = ee_pose_to_world(
+                            ee_pose,
+                            controller._r_robot_in_world,
+                            controller._t_robot_in_world,
+                        )
+                        # F5: express all world-frame quantities in sim's world
+                        # convention (table z + yaw; see env_wrapper). Applied
+                        # to pose, twist, and cloud together so the modalities
+                        # stay mutually consistent. --raw-proprio disables.
+                        if sim_proprio_convention:
+                            proprio_pose = to_sim_world_pose(proprio_pose)
+                            vel = to_sim_world_twist(vel)
+                            point_cloud = to_sim_world_points(point_cloud)
+                    else:
+                        proprio_pose = ee_pose
                     # base_chunk = np.repeat(base_chunk, 2, axis=0)
                     processed_chunk = process_chunk(base_chunk)
                     residual_obs = {
                         "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
                         "proprio": np.concatenate([
-                            split_gripper(ee_pose).astype(np.float32),
-                            np.array([controller.kp_gain, controller.kd_gain], dtype=np.float32),
+                            split_gripper(proprio_pose).astype(np.float32),
+                            # Sim controller_state convention: [damping_norm, kp_norm].
+                            np.array([prev_kd, prev_kp], dtype=np.float32),
                             np.asarray(vel, dtype=np.float32),
                         ]),
                         "point_cloud": point_cloud,
-                        "gains": np.array([prev_kp, prev_kd], dtype=np.float32),
                     }
                     res_chunk = residual.infer(residual_obs)
+                    if dump_dir is not None:
+                        np.savez_compressed(
+                            dump_dir / f"obs_{infer_idx:05d}.npz",
+                            base_chunk_raw=base_chunk.astype(np.float32),
+                            action_chunk=residual_obs["action_chunk"],
+                            proprio=residual_obs["proprio"],
+                            point_cloud=residual_obs["point_cloud"],
+                            network_pcd=residual.last_network_pcd,
+                            res_chunk=res_chunk.astype(np.float32),
+                        )
+                    infer_idx += 1
+                    if recorder is not None and residual.last_network_pcd is not None:
+                        recorder.record_policy_pcd(len(recorder), residual.last_network_pcd)
 
                 if recorder is not None:
                     ee3 = ee_pose[:3].astype(np.float32)
@@ -238,10 +335,16 @@ def _run_episode(
                     base_traj_pose = _propagate_pose_traj(ee_pose_xyzw, base_deltas, base_rotvecs)
                     if residual is not None and len(res_chunk) > 0:
                         K_res = min(len(res_chunk), _RESIDUAL_HORIZON)
+                        # Same headroom clip as the execution path so plots show
+                        # what actually runs.
                         total_deltas = base_deltas.copy()
-                        total_deltas[:K_res] += res_chunk[:K_res, 2:5].astype(np.float32) * _POS_SCALE
+                        total_deltas[:K_res] = np.clip(
+                            base_deltas[:K_res] / _POS_SCALE + res_chunk[:K_res, 2:5], -1.0, 1.0
+                        ).astype(np.float32) * _POS_SCALE
                         total_rotvecs = base_rotvecs.copy()
-                        total_rotvecs[:K_res] += res_chunk[:K_res, 5:8].astype(np.float32) * _ROT_SCALE
+                        total_rotvecs[:K_res] = np.clip(
+                            base_rotvecs[:K_res] / _ROT_SCALE + res_chunk[:K_res, 5:8], -1.0, 1.0
+                        ).astype(np.float32) * _ROT_SCALE
                         total_traj = np.vstack([ee3, ee3 + np.cumsum(total_deltas, axis=0)])
                         total_traj_pose = _propagate_pose_traj(ee_pose_xyzw, total_deltas, total_rotvecs)
                     else:
@@ -258,15 +361,20 @@ def _run_episode(
 
             if residual is not None:
                 res = res_chunk[chunk_used]
-                dpos = res[2:5] * _POS_SCALE
-                drot = res[5:8] * _ROT_SCALE
+                # Sim executes clip(base + residual, -1, 1) per normalized channel;
+                # clip the residual to the base's remaining headroom to match.
+                b_pos = base_chunk[chunk_used, :3].astype(np.float64) / _POS_SCALE
+                b_rot = Rotation.from_quat(base_chunk[chunk_used, 3:7]).as_rotvec() / _ROT_SCALE
+                dpos = (np.clip(b_pos + res[2:5], -1.0, 1.0) - b_pos) * _POS_SCALE * _RES_POS_GAIN
+                drot = (np.clip(b_rot + res[5:8], -1.0, 1.0) - b_rot) * _ROT_SCALE * _RES_ROT_GAIN
                 if replaying:
                     # residual is visualized only; base/trajectory gains drive execution
                     kp = float(base_chunk[chunk_used, 8])
                     kd = float(base_chunk[chunk_used, 9])
                 else:
-                    kp = float(res[0])
-                    kd = float(res[1])
+                    # Residual layout is [damping, stiffness, ...] (multi-fast convention).
+                    kp = float(res[1])
+                    kd = float(res[0])
             else:
                 dpos = np.zeros(3, dtype=np.float32)
                 drot = np.zeros(3, dtype=np.float32)
@@ -275,7 +383,12 @@ def _run_episode(
 
             if not replaying:
                 controller.cache_delta(dpos, drot)
+            # print('base grip', base_chunk[chunk_used][8])
+            # print('res grip', res[8])
             action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
+            # print(action)
+            if residual is not None:
+                action["r_gripper"] = float(np.clip(action["r_gripper"] + res[8], -1.0, 1.0))
             controller.send_action(action)
 
             if recorder is not None:
@@ -292,7 +405,10 @@ def _run_episode(
                     kp=kp,
                     kd=kd,
                     gripper=action["r_gripper"],
+                    res_gripper=res[8] if residual is not None else 0,
                     point_cloud=controller.last_full_point_cloud,
+                    # point_cloud=point_cloud,
+                    res_rotvec=drot,
                 )
 
             if dataset is not None:
@@ -312,20 +428,41 @@ def _run_episode(
             chunk_used += 1
 
 
+            elapsed = time.perf_counter() - t_step
+            busy_ms_window.append(elapsed * 1000.0)
+            if chunk_used == 1:  # this iteration ran inference
+                chunk_busy_ms_window.append(elapsed * 1000.0)
+
             fps_frames += 1
             now = time.perf_counter()
             window_s = now - fps_window_start
             if window_s >= 1.0:
                 actual_fps = fps_frames / window_s
-                logger.info("loop fps: %.2f target: %.2f", actual_fps, fps)
+                chunk_avg = (sum(chunk_busy_ms_window) / len(chunk_busy_ms_window)
+                             if chunk_busy_ms_window else 0.0)
+                logger.info(
+                    "loop fps: %.2f target: %.2f busy avg/max: %.1f/%.1f ms (chunk-step avg: %.1f ms)",
+                    actual_fps, fps,
+                    sum(busy_ms_window) / len(busy_ms_window), max(busy_ms_window), chunk_avg,
+                )
                 fps_window_start = now
                 fps_frames = 0
+                busy_ms_window.clear()
+                chunk_busy_ms_window.clear()
 
-            elapsed = time.perf_counter() - t_step
-            sleep_s = dt - elapsed
+            sleep_s = t_deadline - time.perf_counter()
             if sleep_s > 0:
                 time.sleep(sleep_s)
+            t_deadline += dt
+            # After a large stall (episode-start model warmup, operator pause),
+            # resync instead of racing to repay an unpayable debt.
+            if t_deadline < time.perf_counter():
+                t_deadline = time.perf_counter() + dt
     finally:
+        for w in video_writers.values():
+            w.release()
+        if video_writers:
+            logger.info("saved %d camera video(s) to %s", len(video_writers), video_dir)
         termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_term)
 
 
@@ -348,6 +485,11 @@ def _save_viz(
     else:
         save_episode_html(recorder, path, title=f"residual — {title}",
                           frame_stride=frame_stride, fps=fps)
+    if recorder.policy_pcd_events:
+        pcd_path = (path[:-len(".html")] if path.endswith(".html") else path) + "_policy_pcd.npz"
+        centered = residual is not None and residual.center_on_eef
+        save_policy_pcd_npz(recorder.policy_pcd_events, pcd_path, center_on_eef=centered, fps=fps)
+        print(f"saved policy-input clouds to {pcd_path} (plot with plot_policy_pcd.py)")
 
 
 def _str2bool(v: str) -> bool:
@@ -362,22 +504,40 @@ def main() -> None:
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
         help="Path to residual policy checkpoint (best.pt)",
     )
+    parser.add_argument("--save-videos", action="store_true",
+                        help="Write one time-aligned mp4 per camera into --viz-dir "
+                             "(frame index == control step; see stitch_videos.py)")
+    parser.add_argument("--video-cams", nargs="+", default=None,
+                        help="Camera obs keys to record (default: all connected cameras)")
+    parser.add_argument("--dump-obs-dir", default=None,
+                        help="Dump every residual_obs bundle (+ residual output) to npz under "
+                             "this dir, one timestamped run subdir per invocation; feeds the "
+                             "Tier 1/2 checks in STUDENT_INPUT_PARITY.md")
     parser.add_argument("--no-residual", action="store_true",
                         help="Disable the residual policy; run base policy only")
+    parser.add_argument("--proprio-frame", choices=("robot", "world"), default="world",
+                        help="Frame for the residual proprio pose: 'robot' = raw franka_fk "
+                             "(current behavior), 'world' = transformed to the world frame "
+                             "the point cloud lives in")
+    parser.add_argument("--raw-proprio", action="store_true",
+                        help="A/B control: skip the sim-convention proprio correction "
+                             "(45\u00b0 flange-vs-body quat + 6.9 mm TCP-vs-site pos; see "
+                             "env_wrapper.current_ee_pose) and feed the legacy raw "
+                             "franka_fk pose to the residual policy")
     parser.add_argument("--device", default="cuda", help="Torch device (cuda/cpu)")
     parser.add_argument(
         "--home-pose-name",
-        default=None,
+        default=fc.default_home_pose_name(),
         help=f"Name of a saved pose JSON in {_POSES_DIR} (overrides --home-q)",
     )
     parser.add_argument(
-        "--home-q", nargs=7, type=float, default=_DEFAULT_HOME_Q,
-        help="7 joint angles (rad) for the right arm home pose",
+        "--home-q", nargs=7, type=float, default=None,
+        help="7 joint angles (rad) overriding the saved home pose",
     )
-    parser.add_argument("--home-gripper", type=float, default=1.0)
-    parser.add_argument("--home-max-time-s", type=float, default=3.0)
-    parser.add_argument("--home-tol-rad", type=float, default=0.05)
-    parser.add_argument("--home-tol-m", type=float, default=0.025)
+    parser.add_argument("--home-gripper", type=float, default=fc.control("homing.gripper_norm"))
+    parser.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
+    parser.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
+    parser.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"))
 
     # Recording options (all optional; omitting --repo-id disables recording).
     parser.add_argument("--repo-id", default=None,
@@ -390,7 +550,7 @@ def main() -> None:
                         help="Number of episodes to record (only used when recording)")
     parser.add_argument("--episode-time-s", type=float, default=60.0,
                         help="Duration of each episode in seconds (only used when recording)")
-    parser.add_argument("--fps", type=int, default=20,
+    parser.add_argument("--fps", type=int, default=fc.control_fps(),
                         help="Dataset fps (only used when creating a new dataset)")
     parser.add_argument("--push-to-hub", type=_str2bool, default=True,
                         help="Push dataset to HuggingFace Hub after recording")
@@ -406,18 +566,20 @@ def main() -> None:
 
     if args.repo_id and not args.output_dir:
         parser.error("--output-dir is required when --repo-id is set")
+    if args.save_videos and not args.viz_dir:
+        parser.error("--viz-dir is required when --save-videos is set")
     if args.repo_id and not args.task:
         parser.error("--task is required when --repo-id is set")
 
     logging.basicConfig(level=logging.INFO, force=True)
 
-    if args.home_pose_name:
-        pose = json.loads((_POSES_DIR / f"{args.home_pose_name}.json").read_text())
-        home_q = np.asarray(pose["r_q"], dtype=np.float64)
-        home_gripper = float(pose.get("gripper", args.home_gripper))
-    else:
+    if args.home_q is not None:
         home_q = np.asarray(args.home_q, dtype=np.float64)
         home_gripper = args.home_gripper
+    else:
+        pose = fc.load_home_pose(args.home_pose_name)
+        home_q = _default_home_q(args.home_pose_name)
+        home_gripper = float(pose.get("gripper", args.home_gripper))
 
     print("attempting connection to robot...")
     controller = env_wrapper.start_controller()
@@ -439,6 +601,28 @@ def main() -> None:
         print(f"attempting to start residual policy: {args.residual_policy}")
         residual = ResidualPolicy(args.residual_policy, device=args.device)
         print("residual policy started")
+
+    dump_root: "Path | None" = None
+    if args.dump_obs_dir:
+        if residual is None:
+            print("--dump-obs-dir ignored: residual_obs only exists with a residual policy")
+        else:
+            dump_root = Path(args.dump_obs_dir).expanduser() / time.strftime("%Y%m%d_%H%M%S")
+            dump_root.mkdir(parents=True, exist_ok=True)
+            h = hashlib.sha256()
+            with open(args.residual_policy, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            (dump_root / "meta.json").write_text(json.dumps({
+                "residual_policy": str(Path(args.residual_policy).resolve()),
+                "residual_policy_sha256": h.hexdigest(),
+                "base_policy": args.base_policy or args.replay_dataset,
+                "proprio_frame": args.proprio_frame,
+                "raw_proprio": bool(args.raw_proprio),
+                "fps": args.fps,
+                "argv": sys.argv,
+            }, indent=2))
+            print(f"dumping residual obs bundles to {dump_root}")
 
     home_kwargs = dict(
         home_q_left=None,
@@ -462,7 +646,12 @@ def main() -> None:
                     controller, base_policy, residual,
                     dataset=None, episode_time_s=None,
                     fps=args.fps, recorder=recorder,
-                    replaying=args.replay_dataset is not None
+                    replaying=args.replay_dataset is not None,
+                    proprio_frame=args.proprio_frame,
+                    sim_proprio_convention=not args.raw_proprio,
+                    dump_dir=dump_root / "ep000" if dump_root else None,
+                    video_dir=Path(args.viz_dir) if args.save_videos else None,
+                    video_cams=args.video_cams,
                 )
             finally:
                 if recorder is not None and len(recorder) > 0:
@@ -497,7 +686,13 @@ def main() -> None:
                         fps=args.fps,
                         task=args.task,
                         recorder=recorder,
-                        replaying=args.replay_dataset is not None
+                        replaying=args.replay_dataset is not None,
+                        proprio_frame=args.proprio_frame,
+                        sim_proprio_convention=not args.raw_proprio,
+                        dump_dir=dump_root / f"ep{dataset.num_episodes:03d}" if dump_root else None,
+                        video_dir=Path(args.viz_dir) if args.save_videos else None,
+                        video_cams=args.video_cams,
+                        video_stem=f"episode_{ep_idx:03d}",
                     )
                 finally:
                     if recorder is not None and len(recorder) > 0:

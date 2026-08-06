@@ -1,45 +1,37 @@
 #!/usr/bin/env bash
 
-# Script for recording data for a given task.
-# $1 is repo id
-# $2 is number of episodes
-# $3 is task name
+# Bimanual GELLO joint-mode recording.
+# $1 repo_id  $2 num_episodes  $3 task  $4 output_dir  $5 resume
 #
-# Display:
-# Run local Rerun viewer on the robot/workstation host.
-# Forward the viewer ports over SSH to view on your machine.
-
+# Display: run a local Rerun viewer on the workstation and forward its ports
+# over SSH to view remotely.
+#
 # If recording hangs after "Recording episode 0", try:
 #   --dataset.vcodec=libsvtav1   (avoid six parallel NVENC sessions)
 #   --dataset.streaming_encoding=false
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ]; then
+
+set -euo pipefail
+source "$(dirname "$0")/_config.sh"
+
+if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ] || [ -z "${5:-}" ]; then
     echo "Usage: $0 <repo_id> <number_of_episodes> <task_name> <output_dir> <resume>"
     exit 1
 fi
+
 lerobot-record \
-    --resume=$5\
+    --resume="$5" \
     --robot.type=bimanual_franka \
-    --robot.l_server_ip=192.168.3.11 \
-    --robot.l_robot_ip=192.168.200.2 \
-    --robot.l_gripper_ip=192.168.2.21 \
-    --robot.l_port=18813 \
-    --robot.r_server_ip=192.168.3.10 \
-    --robot.r_robot_ip=192.168.201.10 \
-    --robot.r_gripper_ip=192.168.2.20 \
-    --robot.r_port=18812 \
     --robot.control_mode=JOINT_POS \
     --teleop.type=bimanual_gello \
+    --teleop.id=gello_teleop \
+    --teleop.left_arm_config.use_noise=true \
+    --teleop.right_arm_config.use_noise=true \
     --dataset.repo_id="$1" \
     --dataset.num_episodes="$2" \
     --dataset.single_task="$3" \
     --dataset.root="$4" \
     --dataset.streaming_encoding=true \
     --dataset.vcodec=auto \
-    --dataset.fps=30 \
+    --dataset.fps="$CONTROL_FPS" \
     --display_data=false \
-    --display_compressed_images=true \
-    --teleop.id=gello_teleop \
-    --teleop.left_arm_config.port=/dev/ttyUSB1 \
-    --teleop.left_arm_config.use_noise=true \
-    --teleop.right_arm_config.port=/dev/ttyUSB0 \
-    --teleop.right_arm_config.use_noise=true
+    --display_compressed_images=true

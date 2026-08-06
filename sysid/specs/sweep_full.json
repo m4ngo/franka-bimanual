@@ -1,0 +1,45 @@
+{
+  "notes": "Full sysid excitation grid (SYSID_UPDATE.md phase 3). Per axis: two amplitudes x three frequencies (large amp skips 1.0 Hz to respect speed clamps), bracketing the real stack's ~0.8 Hz velocity-loop pole; two circles probe cross-axis coupling. Peak commanded speeds <= 0.19 m/s linear / 0.94 rad/s angular (clamps: 0.30 / 1.2). ~6.5 min of motion across 32 episodes; run once per gain condition via --kp, with --hold-s 5 for the static-offset tier. Durations give >= 3 cycles at the lowest frequency plus ramp room.",
+  "init_qpos": [0.0, -0.15, 0.0, -1.7, 0.0, 1.55, 0.785],
+  "ramp_s": 2.0,
+  "tracks": [
+    {"kind": "sine", "axes": 0, "amp": 0.03, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 0, "amp": 0.03, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 0, "amp": 0.03, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 0, "amp": 0.06, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 0, "amp": 0.06, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "sine", "axes": 1, "amp": 0.03, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 1, "amp": 0.03, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 1, "amp": 0.03, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 1, "amp": 0.06, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 1, "amp": 0.06, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "sine", "axes": 2, "amp": 0.03, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 2, "amp": 0.03, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 2, "amp": 0.03, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 2, "amp": 0.06, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 2, "amp": 0.06, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "sine", "axes": 3, "amp": 0.15, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 3, "amp": 0.15, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 3, "amp": 0.15, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 3, "amp": 0.30, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 3, "amp": 0.30, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "sine", "axes": 4, "amp": 0.15, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 4, "amp": 0.15, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 4, "amp": 0.15, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 4, "amp": 0.30, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 4, "amp": 0.30, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "sine", "axes": 5, "amp": 0.15, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 5, "amp": 0.15, "freq_hz": 0.5,  "duration_s": 10.0},
+    {"kind": "sine", "axes": 5, "amp": 0.15, "freq_hz": 1.0,  "duration_s": 8.0},
+    {"kind": "sine", "axes": 5, "amp": 0.30, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "sine", "axes": 5, "amp": 0.30, "freq_hz": 0.5,  "duration_s": 10.0},
+
+    {"kind": "circle", "axes": [1, 2], "amp": 0.04, "freq_hz": 0.25, "duration_s": 16.0},
+    {"kind": "circle", "axes": [0, 1], "amp": 0.04, "freq_hz": 0.25, "duration_s": 16.0}
+  ]
+}

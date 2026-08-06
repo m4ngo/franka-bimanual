@@ -41,6 +41,10 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 
+import franka_config as fc
+
+_WSG = fc.control("gripper.wsg")
+
 
 @dataclass
 class _Waiter:
@@ -51,29 +55,29 @@ class _Waiter:
 
 
 class WSG:
-    # Motion / range tuning.
-    GRIPPER_TRUE_MAX_MM = 110.0
-    MOVE_SPEED_MM_S = 420.0
-    GRIPPER_MIN_MM = 10.0
-    GRIPPER_MAX_MM = 100.0
-    DEFAULT_TIMEOUT_S = 10.0
+    # Motion / range tuning — config/control.yaml, gripper.wsg.
+    GRIPPER_TRUE_MAX_MM = _WSG["true_max_mm"]
+    MOVE_SPEED_MM_S = _WSG["move_speed_mm_s"]
+    GRIPPER_MIN_MM = _WSG["min_mm"]
+    GRIPPER_MAX_MM = _WSG["max_mm"]
+    DEFAULT_TIMEOUT_S = _WSG["default_timeout_s"]
 
     # Rate caps.  ``_MIN_MOVE_INTERVAL_S`` keeps overlapping motion plans
     # from piling up at the gripper, ``_TARGET_CHANGE_THRESH_MM`` absorbs
     # noisy teleop input without an actual dead-zone.
-    _MIN_MOVE_INTERVAL_S = 0.1       # ~20 Hz max MOVE rate
-    _TARGET_CHANGE_THRESH_MM = 5.0
-    _POS_POLL_INTERVAL_S = 0.050       # ~20 Hz POS? poll
-    _SOCK_RECV_TIMEOUT_S = 0.5
-    _RECV_BUF_SIZE = 4096
-    _RELEASE_PULL_BACK_MM = 10.0
-    _CLOSE_JOIN_TIMEOUT_S = 1.0
+    _MIN_MOVE_INTERVAL_S = _WSG["min_move_interval_s"]
+    _TARGET_CHANGE_THRESH_MM = _WSG["target_change_thresh_mm"]
+    _POS_POLL_INTERVAL_S = _WSG["pos_poll_interval_s"]
+    _SOCK_RECV_TIMEOUT_S = _WSG["sock_recv_timeout_s"]
+    _RECV_BUF_SIZE = _WSG["recv_buf_size"]
+    _RELEASE_PULL_BACK_MM = _WSG["release_pull_back_mm"]
+    _CLOSE_JOIN_TIMEOUT_S = _WSG["close_join_timeout_s"]
 
     def __init__(
         self,
         name: str = "",
-        TCP_IP: str = "192.168.1.20",
-        TCP_PORT: int = 1000,
+        TCP_IP: str = "",
+        TCP_PORT: int = _WSG["tcp_port"],
         do_print: bool = False,
     ):
         self.name = name

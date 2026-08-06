@@ -1,0 +1,115 @@
+# Every control-loop constant for the FR3 stack: gains, fudge factors, limits,
+# rates, and wire-level dynamics. Nothing here should be duplicated in Python.
+
+version: 2
+
+rates:
+  # Single global control rate (Hz) for teleop, recording, rollout, sysid,
+  # and residual runs.
+  control_fps: 20
+  # Camera stream rate; the D415e only accepts 6/15/30/60/90.
+  camera_stream_fps: 30
+  # Homing loop rate; null falls back to control_fps.
+  home_fps: null
+
+gains:
+  joint_pd: {kp: 2.0, kd: 0.1}
+  ee_pd: {kp: 3.5, kd: 0.2}
+  # send_action maps the action's kp/kd channels via kp_gain = kp_base ** kp
+  # and kd_gain = kd_base ** (kd * 2 * sqrt(kp_gain)).
+  action_scaling: {kp_base: 10.0, kd_base: 1.0}
+  osc:
+    base_kp: 5.0
+    default_kp: 3.5
+    damping_ratio: 1.0
+    nullspace_kp: 1.0
+    dls_damping: 0.01
+    max_qdot: 2.5
+
+fudge:
+  # Applied to EE_DELTA actions before they reach the OSC controller.
+  ee_translation: 1.2
+  ee_rotation: 0.9
+
+gripper_accum_speed: 1.0
+
+limits:
+  joint_velocity_max: 2.0        # rad/s, L2-norm ceiling
+  ee_linear_velocity_max: 1.0    # m/s
+  ee_angular_velocity_max: 2.0   # rad/s
+
+worktable_brake:
+  # Table height itself lives in world.yaml (worktable.height_m, world frame).
+  #
+  # The EE is modelled as a SPHERE, not a point, so a tilted gripper cannot
+  # touch the table with its side while the TCP still reads as clear. The
+  # centre is given in the TOOL frame and rotates with the EE; the brake uses
+  # the sphere's lowest point, centre_world_z - radius_m.
+  #
+  # center_tool_m [0,0,0] puts the sphere on the TCP itself. Push it along -z
+  # to cover a gripper whose bulk sits behind the fingertips.
+  ee_sphere:
+    center_tool_m: [0.0, 0.0, -0.10]
+    # 0.10 m is a deliberately conservative enclosure of the Franka Hand / WSG
+    # jaw assembly. It brakes early and costs workspace near the table; shrink
+    # it once the real jaw extent is measured.
+    radius_m: 0.10
+  distance_min_m: 0.01
+  max_decel_mps2: 0.5
+  velocity_eps_mps: 1.0e-4
+
+franka:
+  num_joints: 7
+  ee_delta_dims: 6
+  velocity_command_duration_ms: 100
+  joint_relative_dynamics: [1.0, 0.25, 1.0]
+  ee_delta_relative_dynamics: [1.0, 0.25, 1.0]
+  joint_stiffness: [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
+  torque_threshold_nm: 100.0
+  force_threshold_n: 200.0
+  jacobian_cache_q_threshold_rad: 0.50
+  request_timeout_s: 5.0
+  rpyc_timeout_s: 10
+  connect_timeout_s: 10.0
+  # FR3 datasheet limits; joints 1-4 @ 2.175 rad/s, joints 5-7 @ 2.61 rad/s.
+  max_joint_velocity_rad_s: [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
+  max_joint_accel_rad_s2: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
+  joint_velocity_safety_factor: 0.9
+  joint_accel_safety_factor: 0.75
+
+homing:
+  gripper_norm: 1.0
+  max_time_s: 3.0
+  tol_rad: 0.05
+  tol_pos_m: 0.03
+  tol_rot_rad: null   # null -> tol_rad
+
+observation:
+  image_width: 224
+  image_height: 224
+  image_channels: 3
+  camera_read_timeout_ms: 5.0
+  depth_point_count: 2048
+  # Half-extent of the world-axis-aligned box crop centred on the EE.
+  depth_crop_radius_m: 0.3
+
+gripper:
+  wsg:
+    tcp_port: 1000
+    true_max_mm: 110.0
+    min_mm: 10.0
+    max_mm: 100.0
+    move_speed_mm_s: 420.0
+    default_timeout_s: 10.0
+    min_move_interval_s: 0.1
+    target_change_thresh_mm: 5.0
+    pos_poll_interval_s: 0.050
+    sock_recv_timeout_s: 0.5
+    recv_buf_size: 4096
+    release_pull_back_mm: 10.0
+    close_join_timeout_s: 1.0
+
+noise:
+  # Action noise injected by the follower when use_noise is set.
+  pos_scale_m: 0.01
+  rot_scale_rad: 0.075

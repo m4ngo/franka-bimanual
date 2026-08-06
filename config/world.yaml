@@ -1,0 +1,63 @@
+# Canonical world frame for the TRI bimanual FR3 rig.
+#
+# world: right-handed, +Z up, origin on the FLOOR directly below the
+# calibration board centre. Chosen so the rig matches the sim convention
+# (robosuite EmptyArena mounts the Franka base at z = 0.912).
+#
+# Every extrinsic, point cloud, and EE pose in this codebase resolves to THIS
+# frame. Camera extrinsics stay in the calibration frame exactly as
+# frames/camera/camera_calibration.py emits them; the loader lifts them into
+# world with calib_origin_in_world. That replaces the `+ 0.908` literal that
+# used to be baked into t_cam_in_world.
+#
+# Quaternion convention: every quaternion in config/ is wxyz (scalar first).
+
+version: 2
+
+calib_origin_in_world:
+  # The calibration frame is the ChArUco board CENTRE, lying on the table.
+  # This is the ONLY place the board-to-world offset is expressed: camera
+  # extrinsics are emitted board-centre-relative and lifted here at load time.
+  # Changing it never invalidates a calibration.
+  #
+  # x = -0.10: the world origin sits 0.10 m along +X from the board centre.
+  # z =  0.908: the board (on the table) is 0.908 m above the floor.
+  translation_m: [-0.10, 0.0, 0.908]
+  quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+
+robot_base_in_world:
+  # p_world = R(quat_wxyz) @ p_robot_base + translation_m
+  left:
+    translation_m: [-0.66, 0.0, 0.912]
+    quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+    verified: true
+  right:
+    # xy + yaw carried over from the 2026-07 table-frame calibration
+    # (0.669, 0.003, 0.120); z set to the left arm's measured table height
+    # rather than the lifted 1.028, since both arms bolt to the same table.
+    translation_m: [0.669, 0.003, 0.912]
+    quat_wxyz: [-0.376557, 0.0, 0.0, 0.926393]
+    verified: false
+
+worktable:
+  # Table surface in WORLD frame — safety.py lifts each arm's EE into world via
+  # that arm's robot_base_in_world before comparing, so one number covers both
+  # arms regardless of where their bases sit.
+  #
+  # 0.905 is the real table top. The brake previously used 0.11 in ROBOT BASE
+  # frame, i.e. world 1.022 with the base at 0.912 — ~12 cm above the actual
+  # surface. Moving to the true plane lowers the brake by that much, so the
+  # effective stop is worktable.height_m + worktable_brake.distance_min_m.
+  height_m: 0.905
+  frame: world
+
+sim_alignment:
+  # Maps real-world quantities into the sim world convention. Identity =
+  # disabled (the real world frame above already IS the sim convention).
+  world_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
+  world_translation_m: [0.0, 0.0, 0.0]
+  ee_convention:
+    # franka_fk returns TCP position + FLANGE orientation; sim-trained
+    # students expect robosuite's grip-SITE position + hand-BODY orientation.
+    rotvec_rad: [0.0, 0.0, -0.785891]
+    pos_tool_m: [0.0, 0.0, -0.0069]

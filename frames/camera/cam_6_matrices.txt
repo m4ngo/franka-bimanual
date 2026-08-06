@@ -1,0 +1,25 @@
+[intrinsics] final RMS reprojection error: 0.1278 px  (good)
+[intrinsics] camera matrix:
+ [[896.16738407   0.         623.03492019]
+ [  0.         887.37167772 353.61930747]
+ [  0.           0.           1.        ]]
+[intrinsics] distortion coeffs:
+ [-3.49668586e-03  1.29032071e+00 -1.50837926e-03 -9.31210944e-05
+ -5.63551716e+00]
+
+[extrinsics] translation std-dev across 28 shots (m): [1.08090741e-05 5.38133712e-06 3.61575165e-05]
+
+[extrinsics] R (world->camera):
+ [[-0.84769453  0.33176631  0.41393851]
+ [ 0.07912915  0.85065211 -0.51973991]
+ [-0.52454986 -0.40782608 -0.74734553]]
+[extrinsics] t (world->camera):
+ [-0.12054652  0.04240953  1.11580737]
+
+[extrinsics] Camera pose in world coordinates (BOARD_TO_WORLD_R applied):
+R_cam_in_world:
+ [[-0.84769453  0.07912915 -0.52454986]
+ [ 0.33176631  0.85065211 -0.40782608]
+ [ 0.41393851 -0.51973991 -0.74734553]]
+t_cam_in_world (camera position, meters):
+ [0.47975414 0.45897286 0.90583442]

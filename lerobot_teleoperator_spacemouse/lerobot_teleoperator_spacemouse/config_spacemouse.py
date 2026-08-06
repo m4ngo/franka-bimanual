@@ -10,44 +10,65 @@ with ``SpaceMouseLeaderFields`` for the single-arm case.
 
 from dataclasses import dataclass, field
 
+import franka_config as fc
 from lerobot.teleoperators.config import TeleoperatorConfig
+
+
+def _sm(path: str):
+    return fc.teleop(f"spacemouse.{path}")
+
+
+def _initial_rot_xyzw() -> tuple[float, float, float, float]:
+    """config/teleop.yaml stores wxyz; this field is xyzw."""
+    return fc.quat_wxyz_to_xyzw(tuple(_sm("initial_quat_wxyz")))
 
 
 @dataclass
 class SpaceMouseLeaderFields:
-    """Hardware parameters for one SpaceMouse device."""
+    """Hardware parameters for one SpaceMouse device (config/teleop.yaml)."""
 
     # Path to the hidraw node. Two SpaceMice appear as separate /dev/hidrawN.
-    hidraw_path: str = "/dev/hidraw4"
+    hidraw_path: str = field(default_factory=lambda: _sm("devices.right.hidraw_path"))
 
     # Position increment (metres) per control tick at full axis deflection.
     # pyspacemouse normalises axis values to [-1, 1].
-    translation_scale: float = 0.05
+    translation_scale: float = field(default_factory=lambda: _sm("translation_scale"))
     # Rotation increment (radians) per control tick at full axis deflection.
-    rotation_scale: float = 0.5
+    rotation_scale: float = field(default_factory=lambda: _sm("rotation_scale"))
 
     prefix: str = ""
     use_delta: bool = False
     # use_noise: bool = False
-    noise_pos_scale: float = 0.05   # metres, added to position output each step
-    noise_rot_scale: float = 0.03    # radians (axis-angle), added to rotation output each step
+    noise_pos_scale: float = field(default_factory=lambda: _sm("noise_pos_scale"))
+    noise_rot_scale: float = field(default_factory=lambda: _sm("noise_rot_scale"))
 
     # Initial EE Cartesian position [x, y, z] in metres. Override with
     # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.
-    initial_pos: tuple[float, float, float] = field(default_factory=lambda: (0.5, 0.0, 0.5))
+    initial_pos: tuple[float, float, float] = field(
+        default_factory=lambda: tuple(_sm("initial_pos"))
+    )
     # Initial EE orientation as a unit quaternion [qx, qy, qz, qw].
-    initial_rot: tuple[float, float, float, float] = field(default_factory=lambda: (1.0, 0.0, 0.0, 0.0))
+    initial_rot: tuple[float, float, float, float] = field(default_factory=_initial_rot_xyzw)
 
     # Per-axis sign multipliers (+1 or -1) to match the robot's base frame.
     # Order: (x, y, z) for translation and (roll, pitch, yaw) for rotation.
-    translation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, -1, 1))
-    rotation_signs: tuple[int, int, int] = field(default_factory=lambda: (1, 1, -1))
+    translation_signs: tuple[int, int, int] = field(
+        default_factory=lambda: tuple(_sm("translation_signs"))
+    )
+    rotation_signs: tuple[int, int, int] = field(
+        default_factory=lambda: tuple(_sm("rotation_signs"))
+    )
 
     # Gripper travel limits (mm). Right button → open, left button → close.
-    gripper_min_mm: float = 0.1
-    gripper_max_mm: float = 0.9
+    gripper_min_mm: float = field(default_factory=lambda: _sm("gripper_min_mm"))
+    gripper_max_mm: float = field(default_factory=lambda: _sm("gripper_max_mm"))
     # Gripper target on connect, before any button press.
-    initial_gripper_mm: float = 0.9
+    initial_gripper_mm: float = field(default_factory=lambda: _sm("initial_gripper_mm"))
+
+    @classmethod
+    def for_side(cls, side: str, **overrides) -> "SpaceMouseLeaderFields":
+        """Leader fields for the "left"/"right" SpaceMouse out of config/teleop.yaml."""
+        return cls(hidraw_path=_sm(f"devices.{side}.hidraw_path"), **overrides)
 
 
 @TeleoperatorConfig.register_subclass("spacemouse")

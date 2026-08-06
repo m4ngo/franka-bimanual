@@ -8,11 +8,14 @@
 # $3 task             single_task description
 # $4 output_dir       local dataset root (must not exist unless --resume)
 # $5 resume           true|false
-# $6 home_pose_name   name of a saved pose in ~/franka_ws/home_poses/
+# $6 home_pose_name   name of a saved pose in config/arms.yaml home_poses dir
 # $7 mode             gello | gello_ee | spacemouse   (optional, default gello_ee)
 # $8 depth            true | false                    (optional, default true)
 
-if [ -z "$1" ] || [ -z "$2" ] || [ -z "$3" ] || [ -z "$4" ] || [ -z "$5" ] || [ -z "$6" ]; then
+set -euo pipefail
+source "$(dirname "$0")/_config.sh"
+
+if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ] || [ -z "${5:-}" ] || [ -z "${6:-}" ]; then
     echo "Usage: $0 <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [gello|gello_ee|spacemouse] [true|false]"
     exit 1
 fi
@@ -28,6 +31,7 @@ case "$MODE" in
 esac
 
 python "$(dirname "$0")/lerobot_record_homed_single_arm.py" \
+    --fps "$CONTROL_FPS" \
     --repo-id "$1" \
     --num-episodes "$2" \
     --task "$3" \

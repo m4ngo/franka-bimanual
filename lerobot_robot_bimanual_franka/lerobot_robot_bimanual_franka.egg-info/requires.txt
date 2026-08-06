@@ -3,3 +3,4 @@ lerobot_camera_arv
 lerobot_camera_framos
 net_franky
 opencv-python-headless
+scipy

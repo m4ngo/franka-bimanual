@@ -20,5 +20,9 @@ from .config_gello import GelloLeaderFields
 class BimanualGelloEEConfig(TeleoperatorConfig):
     """Pair of GELLO EE leaders driving a bimanual follower (left + right arm)."""
 
-    left_arm_config: GelloLeaderFields = field(default_factory=GelloLeaderFields)
-    right_arm_config: GelloLeaderFields = field(default_factory=GelloLeaderFields)
+    left_arm_config: GelloLeaderFields = field(
+        default_factory=lambda: GelloLeaderFields.for_side("left")
+    )
+    right_arm_config: GelloLeaderFields = field(
+        default_factory=lambda: GelloLeaderFields.for_side("right")
+    )

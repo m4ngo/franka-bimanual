@@ -1,0 +1,48 @@
+# Per-arm hardware topology. One entry per physical FR3.
+#
+# `key` is the action/observation prefix the arm is exposed under; it is
+# deliberately separate from the arm's physical identity so the single-arm
+# profile can drive the LEFT FR3 while keeping the `r_` dataset keys.
+#
+# gripper.kind: "wsg" (Schunk WSG over GCL) or "franka_hand" (native hand via
+# the RPyC bridge). franka_hand is selected when gripper ip == robot ip.
+#
+# An arm may override the worktable brake's EE collision sphere with its own
+# `ee_sphere: {center_tool_m: [...], radius_m: ...}` when its gripper differs
+# in size from the shared default in control.yaml (worktable_brake.ee_sphere).
+
+version: 2
+
+arms:
+  left:
+    nuc_host: luigi
+    nuc_user: luigi
+    server_ip: 192.168.3.11
+    robot_ip: 192.168.200.2
+    rpyc_port: 18813
+    gripper_rpyc_port: 18823
+    gripper:
+      # The left arm currently runs its native Franka Hand. The bimanual
+      # scripts historically drove a WSG at 192.168.2.21 on this arm; a rig
+      # profile can select it back with `gripper: {kind: wsg, ip: 192.168.2.21}`.
+      kind: franka_hand
+      ip: 192.168.200.2
+    default_key: l
+
+  right:
+    nuc_host: mario
+    nuc_user: mario
+    server_ip: 192.168.3.10
+    robot_ip: 192.168.201.10
+    rpyc_port: 18812
+    gripper_rpyc_port: 18822
+    gripper:
+      kind: wsg
+      ip: 192.168.2.20
+    default_key: r
+
+home_poses:
+  # Names resolve to home_poses/<name>.json — the single source of truth for
+  # home configurations. No home q vectors live in Python any more.
+  dir: home_poses
+  default: home_pose

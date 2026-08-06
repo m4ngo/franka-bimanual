@@ -1,23 +1,25 @@
-temp="$1"
+#!/usr/bin/env bash
+# Forward local port 443 to a Franka control box so Desk is reachable.
+#
+# Usage: open_fci.sh [mario|luigi|left|right]
+#
+# Arm IPs and NUC SSH targets come from config/arms.yaml. Override the key with
+# SSH_KEY=/path/to/key.
+set -euo pipefail
+source "$(dirname "$0")/_config.sh"
 
-VALID_NAMES=("mario" "luigi")
-is_valid_enum() {
-    local value="$1"
-    for item in "${VALID_NAMES[@]}"; do
-        if [[ "$item" == "$value" ]]; then
-            return 0
-        fi
-    done
-    return 1
-}
+TARGET="${1:-}"
 
-if is_valid_enum "$temp"; then
-    if [ "$temp" = "mario" ]; then
-        sudo ssh -N -L 443:192.168.201.10:443 -i /home/qirico/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new mario@192.168.3.10
-    else
-        sudo ssh -N -L 443:192.168.200.2:443 -i /home/qirico/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new luigi@192.168.3.11
-    fi
-else
-    echo "Invalid choice. Should either be mario or luigi"
-    exit 1
-fi
+case "$TARGET" in
+  mario) ARM=right ;;
+  luigi) ARM=left  ;;
+  left|right) ARM="$TARGET" ;;
+  *) echo "Invalid choice '$TARGET'. Expected mario/luigi or left/right." >&2; exit 1 ;;
+esac
+
+eval "$(cfg_arm "$ARM" --prefix FCI)"
+
+sudo ssh -N -L "443:${FCI_ROBOT_IP}:443" \
+    -i "${SSH_KEY:-$HOME/.ssh/id_ed25519}" \
+    -o StrictHostKeyChecking=accept-new \
+    "$FCI_SSH"

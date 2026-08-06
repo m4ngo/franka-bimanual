@@ -12,6 +12,8 @@ self-contained animated HTML containing:
       is inferred, stays fixed within a chunk execution window.
     - Total chunk forecast — base + residual projected trajectory (solid blue);
       shows what the residual-modified plan looks like over the whole chunk.
+    - World origin and depth-camera pose, each drawn as a static RGB axis triad
+      with an origin marker (legend-toggleable).
     - Time-series panels (right column): kp, kd, commanded gripper
 
 Terminology
@@ -24,12 +26,21 @@ base forecast      : ee_pos_at_inference + cumsum(commanded_delta × EE_PD_KP ×
 total forecast     : same, but residual position corrections are included for the
                      first _CHUNK_EXEC steps, using the residual policy's kp_gain.
 
+All geometry rendered by this module — skeleton, EE poses, and chunk
+forecasts — is expressed in WORLD frame. FK produces robot-frame geometry,
+which is transformed into world frame via the robot's base pose in world, read
+from config/world.yaml (robot_base_in_world): the robot base (skeleton joint 0)
+is placed at that translation, oriented per that quaternion. Point clouds
+recorded by EpisodeRecorder are assumed to already be in world frame and are
+used as-is.
+
 The HTML is self-contained via ``include_plotlyjs="cdn"`` and mirrors the
 animated-slider pattern from multi-fast/utils/distill/pcd_viz.py.
 """
 
 import os
 
+import franka_config as fc
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -37,9 +48,14 @@ from scipy.spatial.transform import Rotation
 
 from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
 
-# Default world→robot transform (matches BimanualFrankaConfig defaults).
-_DEFAULT_WORLD_IN_ROBOT_T = (0.669, 0.003, 0.120)
-_DEFAULT_WORLD_IN_ROBOT_Q_WXYZ = (-0.376557, 0.0, 0.0, 0.926393)
+_PROFILE = "single_arm_franka"
+_ARM = fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
+
+# Robot base pose expressed in world frame (translation + wxyz quaternion),
+# from config/world.yaml. Skeleton joint 0 (the robot origin) is placed here.
+_BASE_IN_WORLD = fc.robot_base_in_world(_ARM)
+_DEFAULT_ROBOT_IN_WORLD_T = tuple(float(v) for v in _BASE_IN_WORLD.translation)
+_DEFAULT_ROBOT_IN_WORLD_Q_WXYZ = _BASE_IN_WORLD.quat_wxyz
 _AXIS_COLORS = (
     "rgba(220, 40, 40, 0.92)",
     "rgba(40, 170, 80, 0.92)",
@@ -47,16 +63,17 @@ _AXIS_COLORS = (
 )
 _FORECAST_AXIS_LENGTH = 0.038
 _CURRENT_AXIS_COLORS = _AXIS_COLORS
-_TOTAL_AXIS_COLORS = (
-    "rgba(190, 55, 210, 0.82)",
-    "rgba(45, 155, 180, 0.82)",
-    "rgba(70, 115, 255, 0.82)",
-)
 _BASE_AXIS_COLORS = (
     "rgba(235, 95, 35, 0.82)",
     "rgba(95, 180, 70, 0.82)",
     "rgba(55, 120, 220, 0.82)",
 )
+# Depth-camera pose in world frame, from config/cameras.yaml (camera -> world).
+_DEPTH_CAM_KEY = fc.profile(_PROFILE).depth_cameras[0]
+_DEPTH_CAM_IN_WORLD = fc.camera(_DEPTH_CAM_KEY).calibration.cam_in_world
+_DEFAULT_CAM_IN_WORLD_R = tuple(tuple(float(v) for v in row) for row in _DEPTH_CAM_IN_WORLD.rotation)
+_DEFAULT_CAM_IN_WORLD_T = tuple(float(v) for v in _DEPTH_CAM_IN_WORLD.translation)
+_STATIC_AXIS_LENGTH = 0.12
 
 
 # ---------------------------------------------------------------------------
@@ -83,9 +100,13 @@ class EpisodeRecorder:
         self.kp: list[float] = []
         self.kd: list[float] = []
         self.gripper: list[float] = []
+        self.res_gripper: list[float] = []
+        self.res_rotvecs: list[np.ndarray] = []       # (3,) executed residual rotvec (rad) per step
         self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
         # Per-inference chunk forecast events, sorted by ascending step index.
         self.chunk_events: list[dict] = []
+        # Per-inference network-input clouds (post crop/downsample/re-centering).
+        self.policy_pcd_events: list[dict] = []
 
     def record(
         self,
@@ -96,7 +117,9 @@ class EpisodeRecorder:
         kp: float,
         kd: float,
         gripper: float,
+        res_gripper: float,
         point_cloud: np.ndarray | None = None,
+        res_rotvec: np.ndarray | None = None,
     ) -> None:
         """Record one control step.
 
@@ -109,6 +132,8 @@ class EpisodeRecorder:
             kd:                Derivative gain   (normalised, range [-1, 1]).
             gripper:           Commanded gripper normalised to [0, 1].
             point_cloud:       (N, 3) point cloud in world space, or None.
+            res_rotvec:        (3,) residual rotation correction executed this
+                               step, as a rotvec in radians; None records zeros.
         """
         self.joint_angles.append(np.asarray(q, dtype=np.float64).copy())
         self.actual_ee_pos.append(np.asarray(actual_ee_pos[:3], dtype=np.float32).copy())
@@ -117,8 +142,13 @@ class EpisodeRecorder:
         self.kp.append(float(kp))
         self.kd.append(float(kd))
         self.gripper.append(float(gripper))
+        self.res_gripper.append(float(res_gripper))
         self.point_clouds.append(
             np.asarray(point_cloud, dtype=np.float32).copy() if point_cloud is not None else None
+        )
+        self.res_rotvecs.append(
+            np.asarray(res_rotvec, dtype=np.float32).copy() if res_rotvec is not None
+            else np.zeros(3, dtype=np.float32)
         )
 
     def record_chunk(
@@ -163,6 +193,19 @@ class EpisodeRecorder:
             "total_traj_pose": total_traj_pose_arr,
         })
 
+    def record_policy_pcd(self, step: int, pcd: np.ndarray) -> None:
+        """Record the exact cloud fed to the residual network at one inference event.
+
+        Args:
+            step: Episode step index at inference time.
+            pcd:  (N, 3) float array, already cropped/downsampled/re-centered —
+                  taken verbatim from ResidualPolicy.last_network_pcd.
+        """
+        self.policy_pcd_events.append({
+            "step": int(step),
+            "pcd": np.asarray(pcd, dtype=np.float32).copy(),
+        })
+
     def __len__(self) -> int:
         return len(self.joint_angles)
 
@@ -172,13 +215,16 @@ class EpisodeRecorder:
 # ---------------------------------------------------------------------------
 
 def _skeleton_pts(q: np.ndarray) -> np.ndarray:
-    """Return (9, 3) skeleton positions: robot base origin + 7 joint frames + EE."""
+    """Return (9, 3) skeleton positions in ROBOT frame: robot base origin + 7
+    joint frames + EE. Call _apply_robot_to_world on the result to get world
+    frame."""
     chain = franka_fk_chain(q)  # (8, 4, 4)
     return np.vstack([np.zeros((1, 3)), chain[:, :3, 3]])  # (9, 3)
 
 
 def _fk_pose(q: np.ndarray) -> np.ndarray:
-    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q."""
+    """Return [x, y, z, qx, qy, qz, qw] for the EE pose implied by q, in
+    ROBOT frame. Call _apply_robot_to_world_pose to get world frame."""
     chain = franka_fk_chain(q)
     pose = np.empty(7, dtype=np.float32)
     pose[:3] = chain[7, :3, 3]
@@ -187,7 +233,7 @@ def _fk_pose(q: np.ndarray) -> np.ndarray:
 
 
 def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
-    """Return (T, 7) EE poses for a list of joint-angle vectors."""
+    """Return (T, 7) EE poses (robot frame) for a list of joint-angle vectors."""
     return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
 
 
@@ -244,8 +290,16 @@ def _pose_axes_traces(
     colors: tuple[str, str, str] = _AXIS_COLORS,
     width: int = 4,
     opacity: float = 1.0,
+    dash: str = "solid",
+    legendgroup: str | None = None,
 ) -> list[go.Scatter3d]:
-    """Build three local x/y/z axis traces for a pose trajectory."""
+    """Build three local x/y/z axis traces for a pose trajectory.
+
+    All triads share the same RGB axis colors so x/y/z correspondence holds
+    across current/total/base; groups are told apart by dash style and by
+    toggling. When legendgroup is set, the first axis trace carries a legend
+    entry that toggles the whole triad (plotly's default groupclick).
+    """
     traces: list[go.Scatter3d] = []
     for axis_idx, color in enumerate(colors):
         xs, ys, zs = _pose_axis_segments(poses, axis_idx, length)
@@ -253,14 +307,94 @@ def _pose_axes_traces(
             go.Scatter3d(
                 x=xs, y=ys, z=zs,
                 mode="lines",
-                line=dict(color=color, width=width),
+                line=dict(color=color, width=width, dash=dash),
                 opacity=opacity,
-                name=f"{name_prefix} axis {axis_idx}",
-                showlegend=False,
+                name=name_prefix if (legendgroup and axis_idx == 0) else f"{name_prefix} axis {axis_idx}",
+                legendgroup=legendgroup,
+                showlegend=bool(legendgroup) and axis_idx == 0,
                 hoverinfo="skip",
             )
         )
     return traces
+
+
+def _select_poses(poses: np.ndarray, idxs: tuple[int, ...]) -> np.ndarray:
+    """Pick waypoint poses by index, dropping indices past the end.
+
+    Used to draw orientation triads at a sparse set of semantically meaningful
+    waypoints (e.g. end of executed chunk, end of horizon) instead of every
+    step, which reads as clutter.
+    """
+    poses = np.asarray(poses)
+    if len(poses) == 0:
+        return poses.reshape(0, 7)
+    sel: list[int] = []
+    for i in idxs:
+        if i < 0:
+            i += len(poses)
+        if 0 <= i < len(poses) and i not in sel:
+            sel.append(i)
+    return poses[sel]
+
+
+def _static_frame_traces(
+    rotation: np.ndarray,
+    translation: np.ndarray,
+    name: str,
+    length: float,
+    marker_color: str,
+    marker_symbol: str = "diamond",
+) -> list[go.Scatter3d]:
+    """Origin marker + RGB axis triad for a fixed world-frame pose.
+
+    Static (never included in a go.Frame update), so append these after every
+    animated trace. `rotation` is a 3x3 matrix mapping frame-local vectors into
+    world frame; `translation` is the frame origin in world frame.
+    """
+    rotation = np.asarray(rotation, dtype=np.float64)
+    translation = np.asarray(translation, dtype=np.float64)
+    pose = np.empty((1, 7), dtype=np.float64)
+    pose[0, :3] = translation
+    pose[0, 3:] = Rotation.from_matrix(rotation).as_quat()
+    marker = go.Scatter3d(
+        x=[float(translation[0])], y=[float(translation[1])], z=[float(translation[2])],
+        mode="markers",
+        marker=dict(size=5, color=marker_color, symbol=marker_symbol),
+        name=name,
+        legendgroup=name,
+        showlegend=False,
+        hoverinfo="text",
+        text=[name],
+    )
+    return [marker] + _pose_axes_traces(
+        pose, name, length, width=5, opacity=0.9, legendgroup=name
+    )
+
+
+def _reference_frame_traces(
+    cam_in_world_rotation: np.ndarray | None,
+    cam_in_world_translation: np.ndarray | None,
+) -> list[go.Scatter3d]:
+    """World-origin triad plus the camera pose triad (skipped when unset)."""
+    traces = _static_frame_traces(
+        np.eye(3), (0.0, 0.0, 0.0), "world origin", _STATIC_AXIS_LENGTH, "black"
+    )
+    if cam_in_world_rotation is not None and cam_in_world_translation is not None:
+        traces += _static_frame_traces(
+            cam_in_world_rotation, cam_in_world_translation, "camera",
+            _STATIC_AXIS_LENGTH, "gold",
+        )
+    return traces
+
+
+def _reference_frame_points(
+    cam_in_world_translation: np.ndarray | None,
+) -> list[np.ndarray]:
+    """Frame origins to fold into the scene bbox so the triads stay in view."""
+    pts = [np.zeros((1, 3), dtype=np.float32)]
+    if cam_in_world_translation is not None:
+        pts.append(np.asarray(cam_in_world_translation, dtype=np.float32).reshape(1, 3))
+    return pts
 
 
 def _skeleton_trace(pts: np.ndarray) -> go.Scatter3d:
@@ -305,15 +439,19 @@ def _metric_trace(
     )
 
 
-def _build_world_to_robot(
+def _build_robot_to_world(
     translation: tuple[float, float, float],
     quat_wxyz: tuple[float, float, float, float],
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return (R, t) for p_robot = R @ p_world + t.
+    """Return (R, t) for p_world = R @ p_robot + t.
+
+    This places the robot base (robot-frame origin) at `translation` in world
+    frame, oriented per `quat_wxyz`.
 
     Args:
-        translation:  (tx, ty, tz) in metres.
-        quat_wxyz:    Unit quaternion (w, x, y, z).
+        translation:  (tx, ty, tz) in metres — robot base position in world frame.
+        quat_wxyz:    Unit quaternion (w, x, y, z) — robot base orientation in
+                      world frame.
     """
     w, x, y, z = quat_wxyz
     R = Rotation.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
@@ -321,19 +459,41 @@ def _build_world_to_robot(
     return R, t
 
 
-def _apply_world_to_robot(
+def _apply_robot_to_world(
     pts: np.ndarray,
     R: np.ndarray,
     t: np.ndarray,
 ) -> np.ndarray:
     """Apply rigid transform to the xyz columns; pass any extra columns (e.g. RGB) through.
 
-    pts: (N, 3) or (N, 6) — xyz [+ rgb].  Returns same shape.
+    pts: (N, 3) or (N, 6) — xyz [+ rgb].  Returns same shape, in world frame.
     """
+    pts = np.asarray(pts)
+    if len(pts) == 0:
+        return pts.astype(np.float32)
     xyz_out = (R @ pts[:, :3].T).T + t
     if pts.shape[1] == 3:
-        return xyz_out
-    return np.concatenate([xyz_out, pts[:, 3:]], axis=1)
+        return xyz_out.astype(np.float32)
+    return np.concatenate([xyz_out, pts[:, 3:]], axis=1).astype(np.float32)
+
+
+def _apply_robot_to_world_pose(
+    poses: np.ndarray,
+    R: np.ndarray,
+    t: np.ndarray,
+) -> np.ndarray:
+    """Transform an array of [x,y,z,qx,qy,qz,qw] poses from robot frame to world frame.
+
+    poses: (N, 7). Returns (N, 7), or the same empty array if poses is empty.
+    """
+    poses = np.asarray(poses, dtype=np.float64)
+    if len(poses) == 0:
+        return poses.astype(np.float32)
+    R_rot = Rotation.from_matrix(R)
+    out = np.empty_like(poses, dtype=np.float64)
+    out[:, :3] = (R @ poses[:, :3].T).T + t
+    out[:, 3:] = (R_rot * Rotation.from_quat(poses[:, 3:7])).as_quat()
+    return out.astype(np.float32)
 
 
 def _pcd_marker(pts: np.ndarray) -> dict:
@@ -363,6 +523,60 @@ def _pcd_trace(pts: np.ndarray) -> go.Scatter3d:
 
 _EMPTY_FORECAST = np.zeros((1, 3), dtype=np.float32)
 
+# Executed steps per chunk (_CHUNK_EXEC in env_wrapper; duplicated to keep viz
+# free of robot-stack imports).
+_EXEC_STEPS = 5
+# Waypoint marker colorscales, matching multi-fast pcd_viz: base yellow→red,
+# total (student) cyan→blue. Step-k on both traces shares the same color rank so
+# base/total divergence is readable waypoint-by-waypoint.
+_BASE_FCAST_COLORSCALE = [[0.0, "yellow"], [1.0, "red"]]
+_TOTAL_FCAST_COLORSCALE = [[0.0, "cyan"], [1.0, "blue"]]
+
+
+def _forecast_traces(
+    fcast: np.ndarray,
+    colorscale: list,
+    line_color: str,
+    name: str,
+    cmax: int,
+    show_legend: bool = False,
+) -> tuple[go.Scatter3d, go.Scatter3d]:
+    """Build (executed, lookahead) Scatter3d pair for one chunk forecast.
+
+    The first _EXEC_STEPS waypoints (plus the current-EE anchor at index 0) are
+    drawn solid; the remaining horizon is drawn dashed, sharing its first point
+    with the executed segment so the polylines connect. Waypoint markers are
+    colored by within-chunk timestep on a fixed [0, cmax] scale.
+    """
+    fcast = np.asarray(fcast, dtype=np.float32)
+    n = len(fcast)
+    exec_end = min(n, _EXEC_STEPS + 1)
+    executed = fcast[:exec_end]
+    ts_exec = np.arange(exec_end)
+    if n > exec_end:
+        lookahead = fcast[exec_end - 1:]
+        ts_look = np.arange(exec_end - 1, n)
+    else:
+        lookahead = np.zeros((0, 3), dtype=np.float32)
+        ts_look = np.zeros((0,), dtype=np.int64)
+    exec_trace = go.Scatter3d(
+        x=executed[:, 0], y=executed[:, 1], z=executed[:, 2],
+        mode="lines+markers",
+        line=dict(color=line_color, width=5),
+        marker=dict(size=6, color=ts_exec, colorscale=colorscale, cmin=0, cmax=cmax),
+        name=name,
+        showlegend=show_legend,
+    )
+    look_trace = go.Scatter3d(
+        x=lookahead[:, 0], y=lookahead[:, 1], z=lookahead[:, 2],
+        mode="lines+markers",
+        line=dict(color=line_color, width=3, dash="dash"),
+        marker=dict(size=4, color=ts_look, colorscale=colorscale, cmin=0, cmax=cmax),
+        name=f"{name} (lookahead)",
+        showlegend=False,
+    )
+    return exec_trace, look_trace
+
 
 def _active_chunk_event(chunk_events: list[dict], step_idx: int) -> "dict | None":
     """Return the most recent chunk event whose step <= step_idx, or None."""
@@ -385,11 +599,18 @@ def save_episode_html(
     title: str = "Residual episode",
     frame_stride: int = 1,
     fps: float = 20.0,
-    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
     pcd_max_pts: int = 3000,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
+    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
 ) -> None:
     """Write a self-contained animated Plotly HTML from recorded episode data.
+
+    Everything is rendered in WORLD frame. The robot base (skeleton joint 0)
+    is placed at `robot_base_in_world_translation`, oriented per
+    `robot_base_in_world_quat_wxyz`. Point clouds recorded by the EpisodeRecorder
+    are assumed to already be in world frame and are plotted as-is.
 
     Layout:
         Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray,
@@ -402,14 +623,16 @@ def save_episode_html(
     Trace index map (for go.Frame updates):
         0  skeleton            — animated arm FK chain
         1  actual trail        — cumulative actual EE path (FK from obs)
-        2  total chunk forecast — base + residual projected trajectory for active chunk
-        3  base chunk forecast  — base-policy-only projected trajectory for active chunk
-        4  kp metric
-        5  kp_true metric
-        6  kd metric
-        7  kd_true metric
-        8  gripper metric
-        9  point cloud         — only present when recorder.point_clouds contains data
+        2  total chunk forecast — executed segment (base + residual), timestep-colored markers
+        3  base chunk forecast  — executed segment (base only), timestep-colored markers
+        4-6   current EE orientation triad
+        7-9   total forecast triad — final executed waypoint only
+        10-12 base forecast triads — matching executed waypoint + horizon end
+        13-17 kp / kp_true / kd / kd_true / gripper metrics
+        18-20 executed residual rotvec components (rad)
+        21 total forecast lookahead — dashed remainder of the horizon (empty: no residual past _EXEC_STEPS)
+        22 base forecast lookahead  — dashed remainder of the horizon
+        23 point cloud        — only present when recorder.point_clouds contains data
         (static zero-lines appended last, not in any frame update)
 
     Args:
@@ -419,14 +642,19 @@ def save_episode_html(
         frame_stride:              Emit every Nth step (default 1 = all).
                                    Use 2–4 to reduce file size for long episodes.
         fps:                       Playback speed in frames per second (default 20).
-        world_in_robot_translation: (tx, ty, tz) metres — translation part of the
-                                   world→robot rigid transform.  Defaults to
-                                   BimanualFrankaConfig values.
-        world_in_robot_quat_wxyz:  (w, x, y, z) unit quaternion — rotation part of
-                                   the world→robot rigid transform.  Defaults to
+        robot_base_in_world_translation: (tx, ty, tz) metres — robot base position in
+                                   world frame. Defaults to BimanualFrankaConfig
+                                   values.
+        robot_base_in_world_quat_wxyz:  (w, x, y, z) unit quaternion — robot base
+                                   orientation in world frame. Defaults to
                                    BimanualFrankaConfig values.
         pcd_max_pts:               Max points to render per frame (uniformly
                                    subsampled).  Reduces HTML size for dense clouds.
+        cam_in_world_rotation:     3x3 camera->world rotation; None hides the
+                                   camera frame. Defaults to the cam_2_scene
+                                   calibration in config_single_arm_franka.
+        cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
+                                   frame; None hides the camera frame.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -436,54 +664,79 @@ def save_episode_html(
 
     frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
 
+    # --- robot -> world rigid transform --------------------------------------
+    R_r2w, t_r2w = _build_robot_to_world(robot_base_in_world_translation, robot_base_in_world_quat_wxyz)
+
     # --- apply stride --------------------------------------------------------
     indices = list(range(0, T_full, max(1, frame_stride)))
     T = len(indices)
 
     joint_angles     = [recorder.joint_angles[i]      for i in indices]
-    actual_pos       = np.array([recorder.actual_ee_pos[i]     for i in indices])  # (T, 3)
-    total_des_pos    = np.array([recorder.total_desired_pos[i] for i in indices])  # (T, 3)
-    base_des_pos     = np.array([recorder.base_desired_pos[i]  for i in indices])  # (T, 3)
     kp_arr           = np.array([recorder.kp[i]      for i in indices])
     kd_arr           = np.array([recorder.kd[i]      for i in indices])
     grip_arr         = np.array([recorder.gripper[i] for i in indices])
+    res_grip_arr     = np.array([recorder.res_gripper[i] for i in indices])
+    # Backward compat: recorders predating res_rotvecs plot a zero panel.
+    res_rot_arr      = (np.array([recorder.res_rotvecs[i] for i in indices])
+                        if len(recorder.res_rotvecs) == T_full
+                        else np.zeros((T, 3), dtype=np.float32))  # (T, 3)
     ts               = np.array(indices, dtype=np.float32)
 
-    # --- point clouds: transform world→robot and subsample -------------------
-    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
+    # --- point clouds: already world frame; subsample only -------------------
     raw_pcds = [recorder.point_clouds[i] for i in indices]  # (T,) list of (N,3) or None
     has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
 
-    pcd_robot: list[np.ndarray] = []
+    pcd_world: list[np.ndarray] = []
     if has_pcd:
         empty = np.zeros((0, 3), dtype=np.float32)
         for pts in raw_pcds:
             if pts is None or len(pts) == 0:
-                pcd_robot.append(empty)
+                pcd_world.append(empty)
                 continue
-            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
-            if len(transformed) > pcd_max_pts:
-                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
-                transformed = transformed[idx]
-            pcd_robot.append(transformed)
+            pts = np.asarray(pts, dtype=np.float32)
+            # if len(pts) > pcd_max_pts:
+            #     idx = np.random.choice(len(pts), pcd_max_pts, replace=False)
+            #     pts = pts[idx]
+            pcd_world.append(pts)
 
-    # --- forward kinematics --------------------------------------------------
+    # --- forward kinematics (robot frame) -> transform to world frame --------
     fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
-    skeletons = [item[0] for item in fk_frames]  # T × (9, 3)
-    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)  # T × (7,)
+    skeletons = [_apply_robot_to_world(item[0], R_r2w, t_r2w) for item in fk_frames]  # T × (9, 3)
+    ee_poses = np.array(
+        [_apply_robot_to_world_pose(item[1][None, :], R_r2w, t_r2w)[0] for item in fk_frames],
+        dtype=np.float32,
+    )  # T × (7,)
+    actual_pos = np.array([pose[:3] for pose in ee_poses], dtype=np.float32)  # (T, 3), world frame
 
-    # --- chunk forecast events -----------------------------------------------
-    chunk_events = recorder.chunk_events  # sorted ascending by step
+    # --- chunk forecast events (robot frame) -> transform to world frame -----
+    chunk_events = [
+        {
+            "step": ev["step"],
+            "ee_pos": _apply_robot_to_world(ev["ee_pos"][None, :], R_r2w, t_r2w)[0],
+            "base_traj": _apply_robot_to_world(ev["base_traj"], R_r2w, t_r2w),
+            "total_traj": _apply_robot_to_world(ev["total_traj"], R_r2w, t_r2w),
+            "base_traj_pose": (
+                _apply_robot_to_world_pose(ev["base_traj_pose"], R_r2w, t_r2w)
+                if ev.get("base_traj_pose") is not None else None
+            ),
+            "total_traj_pose": (
+                _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
+                if ev.get("total_traj_pose") is not None else None
+            ),
+        }
+        for ev in recorder.chunk_events
+    ]  # sorted ascending by step (order preserved from recorder)
 
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
-    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
     chunk_pts = []
     for ev in chunk_events:
         chunk_pts.append(ev["base_traj"])
         chunk_pts.append(ev["total_traj"])
+    frame_pts = _reference_frame_points(cam_in_world_translation)
     all_xyz = np.concatenate(
-        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
-        else [actual_pos] + skeletons + pcd_for_bbox,
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -506,14 +759,15 @@ def save_episode_html(
     # Col 1 (65 %): 3D scene spanning all 3 rows.
     # Col 2 (35 %): three stacked 2D panels — kp, kd, gripper.
     fig = make_subplots(
-        rows=3, cols=2,
+        rows=4, cols=2,
         specs=[
-            [{"type": "scene", "rowspan": 3}, {"type": "xy"}],
+            [{"type": "scene", "rowspan": 4}, {"type": "xy"}],
+            [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
         ],
         column_widths=[0.65, 0.35],
-        row_heights=[0.33, 0.33, 0.34],
+        row_heights=[0.25, 0.25, 0.25, 0.25],
         horizontal_spacing=0.04,
         vertical_spacing=0.06,
     )
@@ -534,25 +788,30 @@ def save_episode_html(
                      width=3, marker_size=2),
         row=1, col=1,
     )
-    # Trace 2: total chunk forecast (base + residual projected trajectory)
-    fig.add_trace(
-        _trail_trace(_init_total_fcast, color="royalblue", name="total chunk forecast"),
-        row=1, col=1,
-    )
-    # Trace 3: base chunk forecast (base-policy projected trajectory)
-    fig.add_trace(
-        _trail_trace(_init_base_fcast, color="darkorange", name="base chunk forecast",
-                     dash="dash"),
-        row=1, col=1,
-    )
-    # Trace 4-6: live EE orientation triad.
-    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95):
+    # Fixed marker colorscale ceiling: full horizon length across all events.
+    fcast_cmax = max((len(ev["total_traj"]) for ev in chunk_events), default=2) - 1
+    # Trace 2: total chunk forecast, executed segment only (base + residual).
+    # The residual only modifies the first _EXEC_STEPS deltas, so a "total
+    # lookahead" would just re-plot base deltas; truncate instead (matches
+    # multi-fast pcd_viz, where only the base trajectory gets a lookahead).
+    _init_total_exec, _init_total_look = _forecast_traces(
+        _init_total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
+        "total chunk forecast", fcast_cmax, show_legend=True)
+    fig.add_trace(_init_total_exec, row=1, col=1)
+    # Trace 3: base chunk forecast, executed segment (base-policy only)
+    _init_base_exec, _init_base_look = _forecast_traces(
+        _init_base_fcast, _BASE_FCAST_COLORSCALE, "gray",
+        "base chunk forecast", fcast_cmax, show_legend=True)
+    fig.add_trace(_init_base_exec, row=1, col=1)
+    # Trace 4-6: live EE orientation triad (toggleable via legend).
+    for axis_trace in _pose_axes_traces(ee_poses[:1], "current ee", _FORECAST_AXIS_LENGTH, width=5, opacity=0.95, legendgroup="current ee"):
         fig.add_trace(axis_trace, row=1, col=1)
-    # Trace 7-9: total forecast orientation triad trail.
-    for axis_trace in _pose_axes_traces(_init_total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68):
+    # Trace 7-9: total forecast triad at the final executed waypoint only.
+    for axis_trace in _pose_axes_traces(_select_poses(_init_total_pose, (_EXEC_STEPS,)), "total forecast triad", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, legendgroup="total triad"):
         fig.add_trace(axis_trace, row=1, col=1)
-    # Trace 10-12: base forecast orientation triad trail.
-    for axis_trace in _pose_axes_traces(_init_base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68):
+    # Trace 10-12: base forecast triads (dashed) at the matching executed waypoint
+    # (direct comparison vs the residual) and at the end of the lookahead horizon.
+    for axis_trace in _pose_axes_traces(_select_poses(_init_base_pose, (_EXEC_STEPS, -1)), "base forecast triad", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, dash="dash", legendgroup="base triad"):
         fig.add_trace(axis_trace, row=1, col=1)
     # Traces 13-14: kp_gain (solid) and kp_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
@@ -569,19 +828,30 @@ def save_episode_html(
         _metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"),
         row=3, col=2,
     )
-    # Trace 18 (optional): point cloud at step 0 in robot space
+    # Traces 18-20: executed residual rotation (rotvec components, rad)
+    for c_idx, (c_color, c_name) in enumerate(zip(_AXIS_COLORS, ("res rx", "res ry", "res rz"))):
+        fig.add_trace(_metric_trace(ts[:1], res_rot_arr[:1, c_idx], c_color, c_name), row=4, col=2)
+    # Traces 21-22: dashed lookahead segments of the two chunk forecasts
+    fig.add_trace(_init_total_look, row=1, col=1)
+    fig.add_trace(_init_base_look, row=1, col=1)
+    # Trace 23 (optional): point cloud at step 0 in world space
     if has_pcd:
-        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
-
+        fig.add_trace(_pcd_trace(pcd_world[0] if len(pcd_world[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+    # Trace 23 (or 24 if pcd present): res_gripper, same panel as gripper
+    fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
     # --- animation frames ----------------------------------------------------
-    # Traces 0-17 are always animated; trace 18 (point cloud) is added when present.
+    # Traces 0-22 are always animated; trace 23 (point cloud) is added when present.
     # Index mapping:
-    #   0 skeleton  1 actual  2 total  3 base  4-6 current EE axes
-    #   7-9 total forecast axes  10-12 base forecast axes
-    #   13 kp_gain  14 kp_true  15 kd_gain  16 kd_true  17 gripper  [18 point cloud]
-    animated_traces = list(range(18))
+    #   0 skeleton  1 actual  2 total executed  3 base executed  4-6 current EE axes
+    #   7-9 total forecast triad (final executed waypoint)
+    #   10-12 base forecast triads (matching waypoint + horizon end)
+    #   13 kp_gain  14 kp_true  15 kd_gain  16 kd_true  17 gripper  18-20 res rotvec
+    #   21 total lookahead  22 base lookahead  [23 point cloud]
+    animated_traces = list(range(23))
     if has_pcd:
-        animated_traces.append(18)
+        animated_traces.append(23)
+    res_grip_trace_idx = len(fig.data) - 1  # index of the res_gripper trace just added
+    animated_traces.append(res_grip_trace_idx)
 
     frames = []
     for t in range(T):
@@ -613,24 +883,23 @@ def save_episode_html(
                 line=dict(color="slategray", width=3),
                 marker=dict(size=2, color="slategray"),
             ),
-            # 2: total chunk forecast (base + residual full projected trajectory)
-            go.Scatter3d(
-                x=total_fcast[:, 0], y=total_fcast[:, 1], z=total_fcast[:, 2],
-                mode="lines+markers",
-                line=dict(color="royalblue", width=5),
-                marker=dict(size=3, color="royalblue"),
-            ),
-            # 3: base chunk forecast (base-policy full projected trajectory)
-            go.Scatter3d(
-                x=base_fcast[:, 0], y=base_fcast[:, 1], z=base_fcast[:, 2],
-                mode="lines+markers",
-                line=dict(color="darkorange", width=4, dash="dash"),
-                marker=dict(size=3, color="darkorange"),
-            ),
         ]
-        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95))
-        frame_data.extend(_pose_axes_traces(total_pose, "total forecast", _FORECAST_AXIS_LENGTH, colors=_TOTAL_AXIS_COLORS, width=4, opacity=0.68))
-        frame_data.extend(_pose_axes_traces(base_pose, "base forecast", _FORECAST_AXIS_LENGTH, colors=_BASE_AXIS_COLORS, width=4, opacity=0.68))
+        # 2-3: executed forecast segments; lookahead pair appended as 18-19 below.
+        # Total forecast is truncated to the executed segment — no residual
+        # exists past _EXEC_STEPS, so its "lookahead" trace stays empty.
+        total_exec_tr, total_look_tr = _forecast_traces(
+            total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
+            "total chunk forecast", fcast_cmax)
+        base_exec_tr, base_look_tr = _forecast_traces(
+            base_fcast, _BASE_FCAST_COLORSCALE, "gray",
+            "base chunk forecast", fcast_cmax)
+        frame_data.append(total_exec_tr)
+        frame_data.append(base_exec_tr)
+        frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, width=5, opacity=0.95))
+        # 7-9: total forecast triad at the final executed waypoint only
+        frame_data.extend(_pose_axes_traces(_select_poses(total_pose, (_EXEC_STEPS,)), "total forecast", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8))
+        # 10-12: base forecast triads (dashed) at the matching executed waypoint + horizon end
+        frame_data.extend(_pose_axes_traces(_select_poses(base_pose, (_EXEC_STEPS, -1)), "base forecast", _FORECAST_AXIS_LENGTH, width=4, opacity=0.8, dash="dash"))
         frame_data.extend([
             # 13: kp_gain 0..t
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
@@ -647,17 +916,27 @@ def save_episode_html(
             # 17: gripper 0..t
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
+            # 18-20: executed residual rotvec components 0..t
+            *[go.Scatter(x=ts[:t + 1], y=res_rot_arr[:t + 1, c_idx], mode="lines",
+                         line=dict(color=c_color, width=2))
+              for c_idx, c_color in enumerate(_AXIS_COLORS)],
         ])
+        # 21-22: dashed lookahead segments of the two chunk forecasts
+        frame_data.append(total_look_tr)
+        frame_data.append(base_look_tr)
         if has_pcd:
-            pts = pcd_robot[t]
+            pts = pcd_world[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
-            # 18: point cloud at step t
+            # 23: point cloud at step t
             frame_data.append(go.Scatter3d(
                 x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
                 mode="markers",
                 marker=_pcd_marker(pts),
             ))
+        # res_gripper 0..t
+        frame_data.append(go.Scatter(x=ts[:t + 1], y=res_grip_arr[:t + 1], mode="lines",
+                                     line=dict(color="goldenrod", width=2)))
         frames.append(
             go.Frame(data=frame_data, traces=animated_traces, name=str(t))
         )
@@ -725,24 +1004,26 @@ def save_episode_html(
     x_end = float(ts[-1]) + 1
     fig.update_yaxes(title_text="kp",      row=1, col=2)
     fig.update_yaxes(title_text="kd",      row=2, col=2)
-    fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(title_text="res rot (rad)", row=4, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=3, col=2)
+    fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=4, col=2)
 
-    # Zero-reference lines for kp and kd (static — appended after the 7 animated
-    # traces so go.Frame updates don't touch them).
+    # Zero-reference lines for kp, kd, and residual rotation (static — appended
+    # after the animated traces so go.Frame updates don't touch them).
     _zero_line = dict(color="black", width=1, dash="dot")
-    fig.add_trace(
-        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
-                   line=_zero_line, showlegend=False, hoverinfo="skip"),
-        row=1, col=2,
-    )
-    fig.add_trace(
-        go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
-                   line=_zero_line, showlegend=False, hoverinfo="skip"),
-        row=2, col=2,
-    )
+    for _zl_row in (1, 2, 4):
+        fig.add_trace(
+            go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
+                       line=_zero_line, showlegend=False, hoverinfo="skip"),
+            row=_zl_row, col=2,
+        )
+
+    # World origin + camera pose triads (static, appended after all animated traces).
+    for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
+        fig.add_trace(frame_trace, row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")
 
@@ -753,9 +1034,11 @@ def save_rollout_html(
     title: str = "Base policy rollout",
     frame_stride: int = 1,
     fps: float = 20.0,
-    world_in_robot_translation: tuple[float, float, float] = _DEFAULT_WORLD_IN_ROBOT_T,
-    world_in_robot_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_WORLD_IN_ROBOT_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
     pcd_max_pts: int = 3000,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
+    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
 ) -> None:
     """Write a self-contained animated Plotly HTML for a base-policy-only rollout.
 
@@ -763,6 +1046,11 @@ def save_rollout_html(
     gray) and the base chunk forecast (royalblue) — the base policy's full projected
     trajectory updated each time a new chunk is inferred.  Use this when there is no
     residual policy.
+
+    Everything is rendered in WORLD frame. The robot base (skeleton joint 0)
+    is placed at `robot_base_in_world_translation`, oriented per
+    `robot_base_in_world_quat_wxyz`. Point clouds recorded by the EpisodeRecorder
+    are assumed to already be in world frame and are plotted as-is.
 
     Layout:
         Left 65 %  — animated 3D arm skeleton + actual EE trail (thin gray) +
@@ -776,9 +1064,15 @@ def save_rollout_html(
         title:                     Figure title.
         frame_stride:              Emit every Nth step (default 1 = all).
         fps:                       Playback speed in frames per second.
-        world_in_robot_translation: (tx, ty, tz) metres — world→robot transform.
-        world_in_robot_quat_wxyz:  (w, x, y, z) — rotation part of world→robot.
+        robot_base_in_world_translation: (tx, ty, tz) metres — robot base position in
+                                   world frame.
+        robot_base_in_world_quat_wxyz:  (w, x, y, z) — robot base orientation in
+                                   world frame.
         pcd_max_pts:               Max points to render per frame.
+        cam_in_world_rotation:     3x3 camera->world rotation; None hides the
+                                   camera frame.
+        cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
+                                   frame; None hides the camera frame.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -788,45 +1082,66 @@ def save_rollout_html(
 
     frame_duration_ms = int(round(1000.0 / max(fps, 1.0)))
 
+    R_r2w, t_r2w = _build_robot_to_world(robot_base_in_world_translation, robot_base_in_world_quat_wxyz)
+
     indices = list(range(0, T_full, max(1, frame_stride)))
     T = len(indices)
 
     joint_angles   = [recorder.joint_angles[i]     for i in indices]
-    actual_pos     = np.array([recorder.actual_ee_pos[i]    for i in indices])  # (T, 3)
-    commanded_pos  = np.array([recorder.base_desired_pos[i] for i in indices])  # (T, 3)
     kp_arr         = np.array([recorder.kp[i]      for i in indices])
     kd_arr         = np.array([recorder.kd[i]      for i in indices])
     grip_arr       = np.array([recorder.gripper[i] for i in indices])
+    res_grip_arr       = np.array([recorder.res_gripper[i] for i in indices])
     ts             = np.array(indices, dtype=np.float32)
 
-    R_w2r, t_w2r = _build_world_to_robot(world_in_robot_translation, world_in_robot_quat_wxyz)
     raw_pcds = [recorder.point_clouds[i] for i in indices]
     has_pcd = any(p is not None and len(p) > 0 for p in raw_pcds)
 
-    pcd_robot: list[np.ndarray] = []
+    pcd_world: list[np.ndarray] = []
     if has_pcd:
         empty = np.zeros((0, 3), dtype=np.float32)
         for pts in raw_pcds:
             if pts is None or len(pts) == 0:
-                pcd_robot.append(empty)
+                pcd_world.append(empty)
                 continue
-            transformed = _apply_world_to_robot(pts.astype(np.float64), R_w2r, t_w2r).astype(np.float32)
-            if len(transformed) > pcd_max_pts:
-                idx = np.random.choice(len(transformed), pcd_max_pts, replace=False)
-                transformed = transformed[idx]
-            pcd_robot.append(transformed)
+            pts = np.asarray(pts, dtype=np.float32)
+            if len(pts) > pcd_max_pts:
+                idx = np.random.choice(len(pts), pcd_max_pts, replace=False)
+                pts = pts[idx]
+            pcd_world.append(pts)
 
     fk_frames = [(_skeleton_pts(q), _fk_pose(q)) for q in joint_angles]
-    skeletons = [item[0] for item in fk_frames]
-    ee_poses = np.array([item[1] for item in fk_frames], dtype=np.float32)
+    skeletons = [_apply_robot_to_world(item[0], R_r2w, t_r2w) for item in fk_frames]
+    ee_poses = np.array(
+        [_apply_robot_to_world_pose(item[1][None, :], R_r2w, t_r2w)[0] for item in fk_frames],
+        dtype=np.float32,
+    )
+    actual_pos = np.array([pose[:3] for pose in ee_poses], dtype=np.float32)  # (T, 3), world frame
 
-    chunk_events = recorder.chunk_events  # sorted ascending by step
+    chunk_events = [
+        {
+            "step": ev["step"],
+            "ee_pos": _apply_robot_to_world(ev["ee_pos"][None, :], R_r2w, t_r2w)[0],
+            "base_traj": _apply_robot_to_world(ev["base_traj"], R_r2w, t_r2w),
+            "total_traj": _apply_robot_to_world(ev["total_traj"], R_r2w, t_r2w),
+            "base_traj_pose": (
+                _apply_robot_to_world_pose(ev["base_traj_pose"], R_r2w, t_r2w)
+                if ev.get("base_traj_pose") is not None else None
+            ),
+            "total_traj_pose": (
+                _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
+                if ev.get("total_traj_pose") is not None else None
+            ),
+        }
+        for ev in recorder.chunk_events
+    ]  # sorted ascending by step (order preserved from recorder)
 
-    pcd_for_bbox = [p[:, :3] for p in pcd_robot if len(p) > 0] if has_pcd else []
+    pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
     chunk_pts = [ev["base_traj"] for ev in chunk_events]
+    frame_pts = _reference_frame_points(cam_in_world_translation)
     all_xyz = np.concatenate(
-        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox if chunk_pts
-        else [actual_pos] + skeletons + pcd_for_bbox,
+        [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
+        else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
         axis=0,
     )
     mn, mx = all_xyz.min(0), all_xyz.max(0)
@@ -894,11 +1209,13 @@ def save_rollout_html(
     fig.add_trace(_metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"), row=3, col=2)
     # Trace 14 (optional): point cloud
     if has_pcd:
-        fig.add_trace(_pcd_trace(pcd_robot[0] if len(pcd_robot[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+        fig.add_trace(_pcd_trace(pcd_world[0] if len(pcd_world[0]) > 0 else np.zeros((1, 3), dtype=np.float32)), row=1, col=1)
+    fig.add_trace(_metric_trace(ts[:1], res_grip_arr[:1], "goldenrod", "res_gripper"), row=3, col=2)
 
     animated_traces = list(range(14))
     if has_pcd:
         animated_traces.append(14)
+    animated_traces.append(len(fig.data) - 1)
 
     frames = []
     for t in range(T):
@@ -947,7 +1264,7 @@ def save_rollout_html(
                        line=dict(color="darkorchid", width=2)),
         ])
         if has_pcd:
-            pts = pcd_robot[t]
+            pts = pcd_world[t]
             if len(pts) == 0:
                 pts = np.zeros((1, 3), dtype=np.float32)
             frame_data.append(go.Scatter3d(
@@ -955,6 +1272,8 @@ def save_rollout_html(
                 mode="markers",
                 marker=_pcd_marker(pts),
             ))
+        frame_data.append(go.Scatter(x=ts[:t + 1], y=res_grip_arr[:t + 1], mode="lines",
+                                     line=dict(color="goldenrod", width=2)))
         frames.append(go.Frame(data=frame_data, traces=animated_traces, name=str(t)))
     fig.frames = frames
 
@@ -1013,7 +1332,7 @@ def save_rollout_html(
     x_end = float(ts[-1]) + 1
     fig.update_yaxes(title_text="kp",      row=1, col=2)
     fig.update_yaxes(title_text="kd",      row=2, col=2)
-    fig.update_yaxes(range=[-0.05, 1.05], title_text="gripper", row=3, col=2)
+    fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=3, col=2)
@@ -1028,6 +1347,167 @@ def save_rollout_html(
         go.Scatter(x=[float(ts[0]), x_end], y=[0.0, 0.0], mode="lines",
                    line=_zero_line, showlegend=False, hoverinfo="skip"),
         row=2, col=2,
+    )
+
+    # World origin + camera pose triads (static, appended after all animated traces).
+    for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
+        fig.add_trace(frame_trace, row=1, col=1)
+
+    fig.write_html(path, include_plotlyjs="cdn")
+
+
+def save_policy_pcd_npz(
+    events: list[dict],
+    path: str,
+    center_on_eef: bool = False,
+    fps: float = 20.0,
+) -> None:
+    """Save per-inference network-input clouds for offline comparison plotting.
+
+    Companion to plot_policy_pcd.py, which overlays any number of these dumps
+    (e.g. real vs sim rollouts) in one animated HTML.
+
+    Args:
+        events:        recorder.policy_pcd_events — list of {"step", "pcd"}.
+        path:          output .npz path.
+        center_on_eef: whether the clouds are EE-centered (from the checkpoint).
+        fps:           control-loop fps, stored for animation timing.
+    """
+    if not events:
+        return
+    np.savez_compressed(
+        path,
+        pcds=np.stack([ev["pcd"][:, :3] for ev in events]).astype(np.float32),
+        steps=np.array([ev["step"] for ev in events], dtype=np.int64),
+        center_on_eef=np.bool_(center_on_eef),
+        fps=np.float64(fps),
+    )
+
+
+_SERIES_COLORS = ("dimgray", "crimson", "royalblue", "darkorange", "seagreen", "purple")
+
+
+def save_policy_pcd_html(
+    series: list[tuple[str, list[dict]]],
+    path: str,
+    title: str = "Network-input point cloud",
+    frame_stride: int = 1,
+    fps: float = 20.0,
+) -> None:
+    """Write an animated Plotly HTML overlaying network-input clouds per series.
+
+    One frame per inference event. Each series (e.g. a real rollout and a sim
+    rollout) gets a flat color; a series shorter than the longest one holds its
+    last cloud for the remaining frames.
+
+    Args:
+        series:       list of (label, events) where events is a list of
+                      {"step", "pcd"} dicts as recorded by record_policy_pcd.
+        path:         output HTML path.
+        title:        figure title.
+        frame_stride: animate every Nth inference event.
+        fps:          control-loop fps; sets frame duration via the chunk period.
+    """
+    stride = max(1, int(frame_stride))
+    series = [(label, events[::stride]) for label, events in series if events]
+    if not series:
+        return
+    n_frames = max(len(events) for _, events in series)
+    # Slider labels come from the longest series' step indices.
+    label_events = max(series, key=lambda s: len(s[1]))[1]
+
+    # Shared cubic axis range across all frames so the animation doesn't rescale.
+    all_pts = np.concatenate(
+        [ev["pcd"][:, :3] for _, events in series for ev in events], axis=0
+    )
+    lo = all_pts.min(axis=0)
+    hi = all_pts.max(axis=0)
+    center = (lo + hi) / 2.0
+    half = max(float((hi - lo).max()) / 2.0, 0.05) * 1.05
+    x_range = [float(center[0] - half), float(center[0] + half)]
+    y_range = [float(center[1] - half), float(center[1] + half)]
+    z_range = [float(center[2] - half), float(center[2] + half)]
+
+    def _series_trace(s_idx: int, label: str, pts: np.ndarray) -> go.Scatter3d:
+        return go.Scatter3d(
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2],
+            mode="markers",
+            marker=dict(size=4, color=_SERIES_COLORS[s_idx % len(_SERIES_COLORS)], opacity=0.55),
+            name=label,
+        )
+
+    def _frame_data(i: int) -> list[go.Scatter3d]:
+        # Hold the last cloud when a series has fewer events than the longest.
+        return [
+            _series_trace(s, label, events[min(i, len(events) - 1)]["pcd"])
+            for s, (label, events) in enumerate(series)
+        ]
+
+    # Traces 0..M-1: animated clouds. Trace M: static origin marker — the EE
+    # position for center_on_eef checkpoints, the world origin otherwise.
+    fig = go.Figure(
+        data=[
+            *_frame_data(0),
+            go.Scatter3d(
+                x=[0.0], y=[0.0], z=[0.0], mode="markers",
+                marker=dict(size=8, color="gold", symbol="diamond"),
+                name="origin / EE",
+            ),
+        ],
+        frames=[
+            go.Frame(data=_frame_data(i), traces=list(range(len(series))), name=str(i))
+            for i in range(n_frames)
+        ],
+    )
+
+    # Real time between inference events (one chunk = _CHUNK_EXEC steps).
+    frame_duration_ms = int(1000.0 * 5 * frame_stride / max(fps, 1e-6))
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis=dict(range=x_range, autorange=False, title="x (m)"),
+            yaxis=dict(range=y_range, autorange=False, title="y (m)"),
+            zaxis=dict(range=z_range, autorange=False, title="z (m)"),
+            aspectmode="cube",
+        ),
+        updatemenus=[dict(
+            type="buttons",
+            showactive=False,
+            x=0.0, y=0.0, xanchor="left", yanchor="top",
+            buttons=[
+                dict(
+                    label="Play",
+                    method="animate",
+                    args=[None, dict(
+                        frame=dict(duration=frame_duration_ms, redraw=True),
+                        fromcurrent=True,
+                        transition=dict(duration=0),
+                    )],
+                ),
+                dict(
+                    label="Pause",
+                    method="animate",
+                    args=[[None], dict(
+                        frame=dict(duration=0, redraw=False),
+                        mode="immediate",
+                    )],
+                ),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue=dict(prefix="step: "),
+            pad=dict(t=40),
+            steps=[dict(
+                method="animate",
+                args=[[str(i)], dict(
+                    mode="immediate",
+                    frame=dict(duration=0, redraw=True),
+                    transition=dict(duration=0),
+                )],
+                label=str(label_events[min(i, len(label_events) - 1)]["step"]),
+            ) for i in range(n_frames)],
+        )],
     )
 
     fig.write_html(path, include_plotlyjs="cdn")

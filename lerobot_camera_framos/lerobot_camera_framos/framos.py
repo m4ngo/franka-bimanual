@@ -16,7 +16,6 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 from numpy.typing import NDArray
-import open3d as o3d
 
 from lerobot.cameras.camera import Camera
 
@@ -75,9 +74,17 @@ class FramosCamera(Camera):
         self._intrinsics = np.asarray(config.intrinsic_matrix, dtype=np.float64)
         self._r_world_from_cam = np.asarray(config.r_cam_in_world, dtype=np.float64)
         self._t_world_from_cam = np.asarray(config.t_cam_in_world, dtype=np.float64)
+        self._rng = np.random.default_rng()
 
         self._output_width = int(config.width) if config.width is not None else int(config.color_width)
         self._output_height = int(config.height) if config.height is not None else int(config.color_height)
+
+        # Blob/outlier filter params (see _filter_lone_points). Exposed as
+        # attributes rather than config fields so existing configs keep working;
+        # override on the instance if a scene needs different tuning.
+        self._blob_filter_enabled: bool = True
+        self._blob_filter_min_neighbors: int = 20
+        self._blob_filter_radius_m: float = 0.01
 
     @property
     def is_connected(self) -> bool:
@@ -192,10 +199,14 @@ class FramosCamera(Camera):
         )
 
     def read(self) -> NDArray[Any]:
-        return self._fetch_color(timeout_ms=1000.0, allow_stale=False)
+        if self._config.enable_color:
+            return self._fetch_color(timeout_ms=1000.0, allow_stale=False)
+        return self.read_depth()
 
     def async_read(self, timeout_ms: float = 500) -> NDArray[Any]:
-        return self._fetch_color(timeout_ms=timeout_ms, allow_stale=True)
+        if self._config.enable_color:
+            return self._fetch_color(timeout_ms=timeout_ms, allow_stale=True)
+        return self.read_depth(timeout_ms=timeout_ms)
 
     def read_depth(self, timeout_ms: float = 1000.0) -> NDArray[Any]:
         if self._pipeline is None:
@@ -217,6 +228,7 @@ class FramosCamera(Camera):
             return self._blank_depth()
         arr = np.asanyarray(depth.get_data())
         self._last_depth = arr
+        # print("hi")
         return arr.copy()
 
     def disconnect(self) -> None:
@@ -230,6 +242,128 @@ class FramosCamera(Camera):
         self._pipeline = None
         self._profile = None
         self._aligner = None
+
+    def _filter_lone_points(self, points: np.ndarray) -> np.ndarray:
+        """Remove isolated points ("blob detection" for point clouds).
+
+        A point survives only if at least `_blob_filter_min_neighbors` other
+        points fall in the 3x3x3 block of `_blob_filter_radius_m` voxels
+        centred on its own voxel (a spatial density filter). Points that don't
+        clear that bar are treated as sensor noise / stray returns and dropped
+        before subsampling, so `num_points` is spent on points that belong to
+        real surface blobs rather than isolated noise.
+
+        Bucket counting is O(N) and stays in numpy, unlike the KD-tree radius
+        query it replaces; the 3-voxel block circumscribes the ball of radius
+        `_blob_filter_radius_m`, so the count is an upper bound on the true
+        in-radius neighbour count and dense surfaces survive at any range.
+
+        No-ops (returns `points` unchanged) if filtering is disabled or if
+        there are too few points for a meaningful neighborhood test.
+        """
+        if not self._blob_filter_enabled or points.shape[0] < self._blob_filter_min_neighbors + 1:
+            return points
+
+        side = float(self._blob_filter_radius_m)
+        if side <= 0.0:
+            return points
+
+        # Voxel index per point, shifted by 1 so the +/-1 shifts below stay in range.
+        q = np.floor(points / side).astype(np.int64)
+        q -= q.min(axis=0) - 1
+        span = q.max(axis=0) + 2
+        key = (q[:, 0] * span[1] + q[:, 1]) * span[2] + q[:, 2]
+
+        uniq, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+        totals = np.zeros(uniq.size, dtype=np.int64)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    shifted = uniq + (dx * span[1] + dy) * span[2] + dz
+                    pos = np.searchsorted(uniq, shifted)
+                    np.clip(pos, 0, uniq.size - 1, out=pos)
+                    totals += np.where(uniq[pos] == shifted, cnt[pos], 0)
+
+        # totals counts the point itself, so require min_neighbors + 1.
+        return points[totals[inv] > self._blob_filter_min_neighbors]
+
+    def get_cropped_point_cloud(
+        self,
+        center: np.ndarray | None = None,
+        radius_m: float | None = None,
+        num_points: int = 2048,
+        stride: int = 2,
+    ) -> np.ndarray:
+        """Project depth to world space, optionally crop to a world-axis-aligned
+        BOX of half-extent `radius_m` around `center` (matching the sim collect
+        crop; see STUDENT_INPUT_PARITY.md F8), filter out isolated/lone points
+        (points without enough nearby neighbors — a spatial density filter
+        analogous to blob detection, see `_filter_lone_points`), then randomly
+        subsample to `num_points`. Cropping/filtering/downsampling all happen
+        here, before the array crosses the thread-pool boundary.
+
+        Hot path in the control loop (~2-4 ms at 720p, stride 2, filter off;
+        add a few ms when the blob filter is enabled since it builds a KD-tree
+        over the cropped points):
+        - The pixel grid is strided before deprojection; a 720p frame still leaves
+          ~10x more crop candidates than num_points, so the sample distribution is
+          unaffected while the crop test shrinks by stride^2.
+        - Crop math runs in float32; depth is uint16 * scale so no isfinite pass
+          is needed (the product is always finite).
+        - Two-stage crop: a camera-frame prefilter with the circumscribed ball
+          (radius sqrt(3)*radius_m — rotation-invariant, so valid before the R/t
+          transform), then the exact world-frame L-inf box test on the survivors.
+          Only ball survivors get the matmul.
+        - Lone-point filtering runs on the (small) cropped/surviving set, not the
+          full frame, and happens before subsampling so `num_points` isn't wasted
+          on noise that would otherwise get filtered later.
+        """
+        depth_image = self._last_depth
+        if depth_image is None:
+            return np.zeros((num_points, 3), dtype=np.float32)
+
+        stride = max(1, int(stride))
+        depth_m = np.asarray(depth_image)[::stride, ::stride].astype(np.float32) * self._depth_scale
+        yy, xx = np.nonzero(depth_m > 0.0)
+        if yy.size == 0:
+            return np.zeros((num_points, 3), dtype=np.float32)
+        z = depth_m[yy, xx]
+        fx = float(self._intrinsics[0, 0])
+        fy = float(self._intrinsics[1, 1])
+        cx = float(self._intrinsics[0, 2])
+        cy = float(self._intrinsics[1, 2])
+
+        # Deproject to camera frame (strided indices map back to full-res pixels).
+        x_cam = (xx.astype(np.float32) * stride - cx) * z / fx
+        y_cam = (yy.astype(np.float32) * stride - cy) * z / fy
+
+        if center is not None and radius_m is not None:
+            center_w = np.asarray(center, dtype=np.float64)
+            # center_cam = R^T @ (center_world - t)
+            center_cam = (self._r_world_from_cam.T @ (center_w - self._t_world_from_cam)).astype(np.float32)
+            # Circumscribed-ball prefilter (camera frame), then exact box test (world).
+            d2 = (x_cam - center_cam[0]) ** 2 + (y_cam - center_cam[1]) ** 2 + (z - center_cam[2]) ** 2
+            keep = np.flatnonzero(d2 <= 3.0 * np.float32(radius_m) ** 2)
+            if keep.size == 0:
+                return np.zeros((num_points, 3), dtype=np.float32)
+            cam_points = np.stack((x_cam[keep], y_cam[keep], z[keep]), axis=1).astype(np.float64, copy=False)
+            world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+            world_points = world_points[np.max(np.abs(world_points - center_w), axis=1) <= radius_m]
+            world_points = self._filter_lone_points(world_points)
+            if world_points.shape[0] == 0:
+                return np.zeros((num_points, 3), dtype=np.float32)
+            sel = self._rng.choice(world_points.shape[0], size=num_points,
+                                   replace=world_points.shape[0] < num_points)
+            return world_points[sel].astype(np.float32)
+
+        cam_points = np.stack((x_cam, y_cam, z), axis=1).astype(np.float64, copy=False)
+        world_points = (self._r_world_from_cam @ cam_points.T).T + self._t_world_from_cam
+        world_points = self._filter_lone_points(world_points)
+        if world_points.shape[0] == 0:
+            return np.zeros((num_points, 3), dtype=np.float32)
+        sel = self._rng.choice(world_points.shape[0], size=num_points,
+                               replace=world_points.shape[0] < num_points)
+        return world_points[sel].astype(np.float32)
 
     def get_full_point_cloud(self) -> np.ndarray:
         """Return ALL valid depth pixels projected to world space.
@@ -267,14 +401,14 @@ class FramosCamera(Camera):
         # Attach per-point RGB when the full-res color frame is available and
         # its pixel grid matches the depth image (guaranteed when the aligner is
         # set to align depth→color, which is the default).
-        color_img = self._last_color_full
-        if (
-            color_img is not None
-            and color_img.ndim == 3
-            and color_img.shape[:2] == depth_image.shape[:2]
-        ):
-            rgb = color_img[yy, xx].astype(np.float32) / 255.0  # (N, 3) in [0, 1]
-            return np.concatenate([xyz, rgb], axis=1)            # (N, 6)
+        # color_img = self._last_color_full
+        # if (
+        #     color_img is not None
+        #     and color_img.ndim == 3
+        #     and color_img.shape[:2] == depth_image.shape[:2]
+        # ):
+        #     rgb = color_img[yy, xx].astype(np.float32) / 255.0  # (N, 3) in [0, 1]
+        #     return np.concatenate([xyz, rgb], axis=1)            # (N, 6)
         return xyz
 
     def get_depth(self) -> list[tuple[float, float, float]]:
@@ -358,6 +492,28 @@ class FramosCamera(Camera):
             if full_arr.ndim == 3 and full_arr.shape[2] == 3 and self._config.color_format.lower() == "bgr8":
                 full_arr = cv2.cvtColor(full_arr, cv2.COLOR_BGR2RGB)
             self._last_color_full = full_arr
+
+            # Center-crop the color frame to the requested output aspect ratio
+            # before resizing. This avoids skewing when downsampling from a
+            # different source aspect ratio.
+            if arr.ndim == 3:
+                h, w = arr.shape[:2]
+                desired_w = int(self._output_width)
+                desired_h = int(self._output_height)
+                if desired_h > 0 and desired_w > 0:
+                    desired_ratio = float(desired_w) / float(desired_h)
+                    current_ratio = float(w) / float(h)
+                    if abs(current_ratio - desired_ratio) > 1e-6:
+                        if current_ratio > desired_ratio:
+                            # source is wider than desired -> crop width
+                            crop_w = int(round(h * desired_ratio))
+                            crop_x = (w - crop_w) // 2
+                            arr = arr[:, crop_x : crop_x + crop_w]
+                        else:
+                            # source is taller than desired -> crop height
+                            crop_h = int(round(w / desired_ratio))
+                            crop_y = (h - crop_h) // 2
+                            arr = arr[crop_y : crop_y + crop_h, :]
 
             if arr.ndim == 3 and (
                 arr.shape[0] != self._output_height or arr.shape[1] != self._output_width
