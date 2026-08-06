@@ -154,7 +154,7 @@ torque:
     # Per-joint Coulomb breakaway (Nm) from scripts/measure_joint_friction.py.
     # The feedforward cancels a plant term the sim does not have, so a non-zero
     # assist is CLOSER to osc.py's motion, not further from it.
-    coulomb_nm: [1.19, 1.20, 0.83, 1.19, 0.26, 0.44, 0.41]
+    coulomb_nm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0]
     # Assist band, as a fraction of coulomb_nm: below this the joint is treated
     # as not yet commanded to move.
     tau_eps_fraction: 0.20
