@@ -28,9 +28,7 @@ from .franka_jacobian import zero_jacobian
 logger = logging.getLogger(__name__)
 
 # Wire-level constants, all from config/control.yaml (franka: section).
-VELOCITY_COMMAND_DURATION_MS = fc.control("franka.velocity_command_duration_ms")
 NUM_JOINTS = fc.num_joints()
-EE_DELTA_DIMS = fc.control("franka.ee_delta_dims")
 
 DEFAULT_REQUEST_TIMEOUT_S = fc.control("franka.request_timeout_s")
 RPYC_TIMEOUT_S = fc.control("franka.rpyc_timeout_s")
@@ -39,21 +37,6 @@ FIRST_STATE_TIMEOUT_S = fc.control("franka.first_state_timeout_s")
 # Server-side control modes (pylibfranka_server.MODE_*).
 MODE_FLOAT = "float"
 MODE_HOLD = "hold"
-
-_JACOBIAN_CACHE_Q_THRESHOLD = fc.control("franka.jacobian_cache_q_threshold_rad")  # rad, L-inf
-_JOINT_RELATIVE_DYNAMICS = tuple(fc.control("franka.joint_relative_dynamics"))
-_EE_DELTA_RELATIVE_DYNAMICS = tuple(fc.control("franka.ee_delta_relative_dynamics"))
-_TORQUE_THRESHOLD = fc.control("franka.torque_threshold_nm")  # Nm
-_FORCE_THRESHOLD = fc.control("franka.force_threshold_n")     # N
-_JOINT_STIFFNESS = list(fc.control("franka.joint_stiffness"))
-
-_RECOVERABLE_ERRORS = (
-    "UDP receive: Timeout",
-    "communication_constrains_violation",
-    'current mode ("Reflex")',
-    "type of motion cannot change",
-    "singular"
-)
 
 # (q, dq, jacobian, ee_pos, ee_rot_xyzw, ee_twist)
 KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
@@ -158,20 +141,12 @@ class RobotDriver:
     def set_mode(self, mode: str) -> None:
         self._push(self._root.set_mode, mode)
 
-    def set_tuning(
-        self,
-        joint_damping_kv: float | None = None,
-        uncouple_pos_ori: bool | None = None,
-        friction_kc: float | np.ndarray | tuple | None = None,
-        dls_mu: float | None = None,
-    ) -> None:
-        """Live server-side tuning. joint_damping_kv=0, uncouple_pos_ori=True and
-        friction_kc=0 together restore exact osc.py behaviour. friction_kc is a
-        scalar or a per-joint 7-vector."""
+    def set_tuning(self, friction_kc: float | np.ndarray | tuple | None = None) -> None:
+        """Live server-side tuning. friction_kc=0 restores exact osc.py behaviour;
+        it is a scalar or a per-joint 7-vector."""
         if friction_kc is not None and np.ndim(friction_kc) > 0:
             friction_kc = _t(friction_kc)
-        self._push(self._root.set_tuning, joint_damping_kv, uncouple_pos_ori, friction_kc,
-                   dls_mu)
+        self._push(self._root.set_tuning, friction_kc)
 
     def _push(self, rpc, *args) -> None:
         try:
@@ -256,18 +231,8 @@ class MultiRobotWrapper:
     def set_mode_all(self, mode: str) -> None:
         self._gather(lambda n: self.drivers[n].set_mode(mode), list(self.drivers))
 
-    def set_tuning_all(
-        self,
-        joint_damping_kv: float | None = None,
-        uncouple_pos_ori: bool | None = None,
-        friction_kc: float | None = None,
-        dls_mu: float | None = None,
-    ) -> None:
-        self._gather(
-            lambda n: self.drivers[n].set_tuning(joint_damping_kv, uncouple_pos_ori,
-                                                 friction_kc, dls_mu),
-            list(self.drivers),
-        )
+    def set_tuning_all(self, friction_kc: float | np.ndarray | tuple | None = None) -> None:
+        self._gather(lambda n: self.drivers[n].set_tuning(friction_kc), list(self.drivers))
 
     def stop_all_motion(self) -> None:
         self._gather(lambda n: self.drivers[n].stop(), [n for n, d in self.drivers.items() if d.is_alive])

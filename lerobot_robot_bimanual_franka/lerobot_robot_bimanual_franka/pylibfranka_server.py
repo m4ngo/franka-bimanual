@@ -82,19 +82,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_PORT = 18812
 NUM_JOINTS = 7
 
-# Defaults for the tuning knobs the client can set. The control law that uses
-# them lives in pylibfranka_control.py; these are the values a session starts
-# with, and 0.0 for both means exact robosuite behaviour.
-_JOINT_DAMPING_KV = 0.0
-_FRICTION_KC = 0.0
-# Headroom above the nominal Coulomb constants, which are literature values
-# rather than measured on this arm. Over-compensation shows up as buzzing; the
-# control process's speed guard bounds it either way.
-# config/control.yaml, `torque:` -- see torque_config for how it reaches the NUC.
-_FRICTION_KC_MAX = float(torque("friction.kc_max"))
-_LAMBDA_DLS_MU = float(torque("osc.lambda_dls_mu"))
-
-
 # The control loop is in another process now, so handler latency here cannot
 # starve it. Kept small anyway so RPC threads hand off promptly to each other.
 _GIL_SWITCH_INTERVAL_S = float(torque("loop.gil_switch_interval_s"))
@@ -175,9 +162,8 @@ class _ArmSession:
         self.ch = shm.ShmChannel(create=True)
         self.proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
-        # Sensible defaults so a client that never calls set_tuning gets sim parity.
-        self.ch.goal[shm.G_UNCOUPLE] = 1.0
-        self.ch.goal[shm.G_DLS_MU] = _LAMBDA_DLS_MU
+        # A client that never calls set_tuning gets zero friction assist, i.e.
+        # exact osc.py behaviour.
         self.ch.goal[shm.G_MODE] = shm.MODE_HOLD
         logger.info("shm channel %s created for %s", self.ch.name, robot_ip)
 
@@ -253,26 +239,15 @@ class _ArmSession:
     def set_mode(self, mode: str) -> None:
         self.ch.write_goal(G_MODE=shm.MODE_NAMES.get(mode, shm.MODE_HOLD))
 
-    def set_tuning(self, joint_damping_kv=None, uncouple_pos_ori=None, friction_kc=None,
-                   dls_mu=None) -> None:
-        fields = {}
-        if joint_damping_kv is not None:
-            fields["G_JOINT_DAMPING_KV"] = float(joint_damping_kv)
-        if uncouple_pos_ori is not None:
-            fields["G_UNCOUPLE"] = 1.0 if uncouple_pos_ori else 0.0
-        if dls_mu is not None:
-            fields["G_DLS_MU"] = float(np.clip(dls_mu, 0.0, 1.0))
+    def set_tuning(self, friction_kc=None) -> None:
+        """The only live-tunable server-side knob. friction_kc is a scalar or a
+        per-joint 7-vector; 0 is exact osc.py."""
         if friction_kc is not None:
             # Scalar broadcasts; a 7-vector sets each joint's own factor.
             kc = np.broadcast_to(np.asarray(friction_kc, dtype=np.float64), (NUM_JOINTS,))
-            fields["G_FRICTION_KC"] = np.clip(kc, 0.0, _FRICTION_KC_MAX)
-        if fields:
-            self.ch.write_goal(**fields)
-        g = self.ch.goal
-        logger.info("%s: tuning -> uncouple=%s joint_damping_kv=%.3f friction_kc=%s",
-                    self.robot_ip, bool(g[shm.G_UNCOUPLE]),
-                    g[shm.G_JOINT_DAMPING_KV],
-                    np.array2string(g[shm.G_FRICTION_KC], precision=2))
+            self.ch.write_goal(G_FRICTION_KC=kc)
+        logger.info("%s: tuning -> friction_kc=%s", self.robot_ip,
+                    np.array2string(self.ch.goal[shm.G_FRICTION_KC], precision=2))
 
     # ---- state ----
 
@@ -355,15 +330,8 @@ class FrankaTorqueService(SlaveService):
         self._sessions[robot_ip].set_mode(mode)
         return True
 
-    def exposed_set_tuning(
-        self,
-        robot_ip: str,
-        joint_damping_kv: float | None = None,
-        uncouple_pos_ori: bool | None = None,
-        friction_kc: float | None = None,
-        dls_mu: float | None = None,
-    ) -> bool:
-        self._sessions[robot_ip].set_tuning(joint_damping_kv, uncouple_pos_ori, friction_kc, dls_mu)
+    def exposed_set_tuning(self, robot_ip: str, friction_kc: float | None = None) -> bool:
+        self._sessions[robot_ip].set_tuning(friction_kc)
         return True
 
     def exposed_get_state(self, robot_ip: str) -> tuple:

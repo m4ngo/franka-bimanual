@@ -39,9 +39,6 @@ for _p in (WORKSPACE_ROOT, OPENPI_CLIENT_ROOT):
 
 from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
-from lerobot_robot_bimanual_franka.lerobot_robot_bimanual_franka.config_single_arm_franka import (
-    SingleArmFrankaConfig,
-)
 from lerobot_robot_bimanual_franka.lerobot_robot_bimanual_franka.franka_process import (
     MultiRobotWrapper,
 )
@@ -194,9 +191,7 @@ class SingleFrankaRobot:
             use_ee_delta=False,
         )
         # ALWAYS push: server sessions outlive their clients.
-        self._robot_manager.set_tuning_all(
-            friction_kc=SingleArmFrankaConfig.friction_kc,
-            uncouple_pos_ori=SingleArmFrankaConfig.uncouple_pos_ori)
+        self._robot_manager.set_tuning_all(friction_kc=fc.control("tuning.friction_kc"))
         time.sleep(_PROCESS_STARTUP_S)
         self._probe_arm()
         self._prev_vel[:] = 0.0

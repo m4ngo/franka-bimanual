@@ -43,10 +43,7 @@ G_JOINT_Q = slice(29, 36)
 G_JOINT_KP = 36
 G_JOINT_RATIO = 37
 G_FRICTION_KC = slice(38, 45)   # per joint: friction is a per-joint property
-G_JOINT_DAMPING_KV = 45
-G_UNCOUPLE = 46
-G_RUNNING = 47       # server -> control: 0 asks the loop to stop
-G_DLS_MU = 48
+G_RUNNING = 45       # server -> control: 0 asks the loop to stop
 GOAL_SIZE = 56
 
 # ---- state block (written by the control process, read by the server) ----
@@ -61,7 +58,7 @@ S_TAU_CMD = slice(29, 36)
 S_TAU_MEAS = slice(36, 43)
 S_TAU_EXT = slice(43, 50)
 S_SUCCESS_RATE = 50
-S_GUARD_TRIPS = 51
+S_CLAMP_TRIPS = 51   # ticks the law asked past the torque clamp
 S_ALIVE = 52         # 1 while the control loop is armed and ticking
 S_STATE_SEQ = 53     # bumped per published state; 0 = nothing published yet
 STATE_SIZE = 64

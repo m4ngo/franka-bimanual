@@ -643,23 +643,15 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
         "DELTA_POS_MAX", "DELTA_ROT_MAX", "DEFAULT_JOINT_KP", "JOINT_TORQUE_LIMITS",
     ),
     "safety": (
-        "JOINT_VELOCITY_MAX", "EE_LINEAR_VELOCITY_MAX", "EE_ANGULAR_VELOCITY_MAX",
-        "WORKTABLE_HEIGHT", "WORKTABLE_DISTANCE_MIN", "WORKTABLE_MAX_DECEL",
-        "EE_SPHERE",
+        "WORKTABLE_HEIGHT", "WORKTABLE_DISTANCE_MIN", "EE_SPHERE",
     ),
     "fp": (
         "NUM_JOINTS", "RPYC_TIMEOUT_S", "FIRST_STATE_TIMEOUT_S",
     ),
-    # env_wrapper passes no overrides, so these class defaults ARE the plant;
-    # runs recorded under different ones are not comparable.
-    "cfg": (
-        "friction_kc", "uncouple_pos_ori", "kp_ori_scale", "kp_pos_scale",
-        "ee_translation_fudge", "ee_rotation_fudge",
-    ),
 }
 _METADATA_MODULE_LABELS = {
     "bf": "bimanual_franka", "osc": "osc_torque_controller",
-    "safety": "safety", "fp": "franka_process", "cfg": "single_arm_franka_config",
+    "safety": "safety", "fp": "franka_process",
 }
 
 # The NUC-side law cannot be imported here (no pylibfranka), so pin the run to a
@@ -699,6 +691,11 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
         }
         for key, names in _METADATA_CONSTANT_NAMES.items()
     }
+    # env_wrapper passes no config overrides, so control.yaml's `tuning:` block
+    # IS the plant; runs recorded under different values are not comparable.
+    # Read from the config rather than scraped off the dataclass: every field
+    # there is a default_factory, so the class carries no readable attribute.
+    constants["control.yaml tuning"] = dict(fc.control("tuning"))
     kp_gain = 10.0 ** args.kp
     osc_base_kp = constants["bimanual_franka"]["OSC_BASE_KP"]
     input_file = args.traj_file if args.mode == "replay" else args.track_spec
@@ -882,7 +879,6 @@ def main() -> None:
                     gripper_norm=args.gripper_norm,
                     max_time_s=args.home_max_time_s,
                     tol_rad=args.home_tol_rad,
-                    tol_pos_m=args.home_tol_m,
                 )
                 if not converged:
                     logger.warning("homing did not converge; proceeding anyway")

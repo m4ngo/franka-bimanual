@@ -113,6 +113,161 @@ def _geodesic_angles(q1_xyzw: np.ndarray, q2_xyzw: np.ndarray) -> np.ndarray:
     return 2.0 * np.arccos(dot)
 
 
+def _stats(arr: np.ndarray) -> dict:
+    """Shared by absolute and delta error blocks — mean/max/rms/final."""
+    return {
+        "mean":  float(arr.mean()),
+        "max":   float(arr.max()),
+        "rms":   float(np.sqrt((arr ** 2).mean())),
+        "final": float(arr[-1]),
+    }
+ 
+ 
+def _delta_error_distribution(err: np.ndarray) -> dict:
+    """Distribution summary for a 1D signed or unsigned error series.
+ 
+    Used for delta errors specifically (as opposed to `_stats`, which is used
+    for absolute/aligned errors and keeps a "final" value that isn't
+    meaningful for a per-step delta series).
+    """
+    return {
+        "mean":     float(err.mean()),          # signed: friction/offset bias
+        "std":      float(err.std()),
+        "rms":      float(np.sqrt((err ** 2).mean())),
+        "max":      float(err.max()),
+        "min":      float(err.min()),
+        "p50":      float(np.percentile(err, 50)),
+        "p95":      float(np.percentile(np.abs(err), 95)),
+    }
+ 
+ 
+def _reversal_mask(ref_delta_1d: np.ndarray, lag_steps: int = 1) -> np.ndarray:
+    """Boolean mask (len = len(ref_delta_1d)) flagging steps at or within
+    `lag_steps` ticks after a sign change in the reference's step-to-step
+    motion (a commanded direction reversal).
+ 
+    Steps where ref_delta is ~0 don't count as a reversal by themselves, but
+    a reversal flag still propagates onto them via the lag window.
+    """
+    n = len(ref_delta_1d)
+    sign = np.sign(ref_delta_1d)
+    reversal_at = np.zeros(n, dtype=bool)
+    last_sign = 0.0
+    for i in range(n):
+        s = sign[i]
+        if s != 0.0:
+            if last_sign != 0.0 and s != last_sign:
+                reversal_at[i] = True
+            last_sign = s
+    mask = reversal_at.copy()
+    for k in range(1, lag_steps + 1):
+        mask[k:] |= reversal_at[:-k]
+    return mask
+ 
+ 
+def _vector_delta_error_stats(ref_arr: np.ndarray, rep_arr: np.ndarray) -> dict | None:
+    """Distribution stats on ||delta_rep - delta_ref|| for a (T, D) series.
+ 
+    Truncates both to the shorter length before differencing, so ref/rep of
+    unequal length still align delta[t] with delta[t] rather than drifting.
+    Returns None if fewer than 2 usable steps.
+    """
+    T_min = min(len(ref_arr), len(rep_arr))
+    if T_min < 2:
+        return None
+    ref_d = np.diff(np.asarray(ref_arr[:T_min], dtype=np.float64), axis=0)  # (T_min-1, D)
+    rep_d = np.diff(np.asarray(rep_arr[:T_min], dtype=np.float64), axis=0)
+    err = np.linalg.norm(rep_d - ref_d, axis=1)  # unsigned by construction (a norm)
+    return _delta_error_distribution(err)
+ 
+ 
+def _rotation_delta_error_stats(ref_quat: np.ndarray, rep_quat: np.ndarray) -> dict | None:
+    """Geodesic angle between ref's and rep's incremental (step-to-step)
+    rotation at each tick — how much the two sides disagree on *how far they
+    rotated this step*, independent of any constant orientation offset.
+ 
+    incremental_rotation[t] = R(t-1)^-1 * R(t)
+    delta error angle[t] = angle(incremental_rep[t]^-1 * incremental_ref[t])
+    """
+    T_min = min(len(ref_quat), len(rep_quat))
+    if T_min < 2:
+        return None
+    ref_q = _normalized_quats(ref_quat[:T_min])
+    rep_q = _normalized_quats(rep_quat[:T_min])
+    ref_rot = Rotation.from_quat(ref_q)
+    rep_rot = Rotation.from_quat(rep_q)
+    ref_inc = ref_rot[:-1].inv() * ref_rot[1:]
+    rep_inc = rep_rot[:-1].inv() * rep_rot[1:]
+    err_angle = (ref_inc.inv() * rep_inc).magnitude()  # unsigned (a rotation magnitude)
+    return _delta_error_distribution(err_angle)
+ 
+ 
+def _argmax_ignoring_none(vals: list) -> int | None:
+    idxs = [i for i, v in enumerate(vals) if v is not None]
+    if not idxs:
+        return None
+    return int(max(idxs, key=lambda i: vals[i]))
+ 
+ 
+def _per_joint_delta_error_stats(
+    ref_qpos: np.ndarray, rep_qpos: np.ndarray, reversal_lag_steps: int = 1,
+) -> dict | None:
+    """Per-joint delta error (signed, radians) with a reversal-point
+    breakdown for friction/stiction diagnosis.
+ 
+    For each joint: signed mean/std/rms/max/min/p50/p95 (see module
+    docstring), plus `near_reversal` / `away_from_reversal` sub-stats and
+    their RMS ratio. A ratio well above 1.0 means error concentrates at
+    direction changes -- the stiction signature. A ratio near 1.0 means the
+    error isn't specifically friction-shaped.
+ 
+    n_joints is inferred from the data (not hardcoded) so this works for any
+    DOF count.
+    """
+    T_min = min(len(ref_qpos), len(rep_qpos))
+    if T_min < 3:  # need >=2 deltas to detect a reversal
+        return None
+    ref_q = np.asarray(ref_qpos[:T_min], dtype=np.float64)
+    rep_q = np.asarray(rep_qpos[:T_min], dtype=np.float64)
+    n_joints = min(ref_q.shape[1], rep_q.shape[1])
+    ref_d = np.diff(ref_q[:, :n_joints], axis=0)  # (T_min-1, n_joints)
+    rep_d = np.diff(rep_q[:, :n_joints], axis=0)
+    err = rep_d - ref_d  # signed, (T_min-1, n_joints)
+ 
+    per_joint = []
+    for j in range(n_joints):
+        e = err[:, j]
+        dist = _delta_error_distribution(e)
+ 
+        mask = _reversal_mask(ref_d[:, j], lag_steps=reversal_lag_steps)
+        near = e[mask]
+        away = e[~mask]
+        near_rms = float(np.sqrt((near ** 2).mean())) if len(near) else None
+        away_rms = float(np.sqrt((away ** 2).mean())) if len(away) else None
+        ratio = (near_rms / away_rms) if (near_rms is not None and away_rms not in (None, 0.0)) else None
+ 
+        per_joint.append({
+            "joint": j,
+            **dist,
+            "mean_abs": float(np.abs(e).mean()),
+            "reversal_breakdown": {
+                "n_near_reversal": int(len(near)),
+                "n_away_from_reversal": int(len(away)),
+                "near_reversal_rms": near_rms,
+                "away_from_reversal_rms": away_rms,
+                "near_over_away_ratio": ratio,
+            },
+        })
+ 
+    return {
+        "per_joint": per_joint,
+        "overall_rms": float(np.sqrt((err ** 2).mean())),
+        "worst_joint_by_mean_abs": int(np.argmax([p["mean_abs"] for p in per_joint])),
+        "worst_joint_by_reversal_ratio": _argmax_ignoring_none(
+            [p["reversal_breakdown"]["near_over_away_ratio"] for p in per_joint]
+        ),
+    }
+
 def _fault_steps(fault_count: np.ndarray) -> np.ndarray:
     """Step indices where the cumulative recovery counter incremented."""
     fc = np.asarray(fault_count, dtype=np.int64).ravel()
@@ -199,11 +354,20 @@ def compute_trajectory_errors(
     saturation_level: float = 0.9,
 ) -> dict:
     """Position/rotation tracking errors plus run-health diagnostics.
-
+ 
     Returns a dict suitable for inclusion in the errors JSON:
         name, n_steps,
         position_error_m / rotation_error_rad — absolute real-vs-sim errors {mean, max, rms, final}
         start_aligned      — same errors with the t=0 offset removed (homing residual excluded)
+        delta_error        — step-to-step ("delta-vs-delta") errors, invariant to any constant
+                             offset or slow drift between ref and rep (re-zeroed every step, not
+                             just at t=0). Useful for friction/stiction diagnosis — see the
+                             module docstring in _viz.py for what each statistic means:
+                               position_delta_error_m   — ||Δrep_pos - Δref_pos|| distribution
+                               rotation_delta_error_rad — incremental-rotation disagreement
+                               joint_delta_error_rad    — per-joint signed Δqpos error, with a
+                                                          near-reversal vs away-from-reversal RMS
+                                                          breakdown (stiction signature)
         initial_offset     — the t=0 position/rotation offset itself
         goal_decomposition — real and sim lag vs the sim OSC's internal goal (needs ref eef_goal_quat)
         timing_dt_s        — realized control-period stats from recorded t_sim
@@ -214,23 +378,18 @@ def compute_trajectory_errors(
     ref_pos = ref["eef_pos"] - resolve_world_frame_offset(ref)  # robot frame
     rep_pos = recorded["eef_pos"]
     T_min = min(len(ref_pos), len(rep_pos))
-
+ 
     pos_err_vec  = rep_pos[:T_min] - ref_pos[:T_min]   # (T_min, 3)
     pos_err_norm = np.linalg.norm(pos_err_vec, axis=1)  # (T_min,)
     pos_aligned  = np.linalg.norm(pos_err_vec - pos_err_vec[0], axis=1)
-
-    def _stats(arr: np.ndarray) -> dict:
-        return {
-            "mean":  float(arr.mean()),
-            "max":   float(arr.max()),
-            "rms":   float(np.sqrt((arr ** 2).mean())),
-            "final": float(arr[-1]),
-        }
-
+ 
+    position_delta_error_m = _vector_delta_error_stats(ref_pos, rep_pos)
+ 
     rot_stats = None
     rot_aligned_stats = None
     initial_rot = None
     goal_decomp = None
+    rotation_delta_error_rad = None
     ref_quat = ref.get("eef_quat")
     rep_quat = recorded.get("eef_quat")
     if ref_quat is not None and rep_quat is not None:
@@ -238,15 +397,15 @@ def compute_trajectory_errors(
         rot_err = _geodesic_angles(ref_quat[:T_q], rep_quat[:T_q])
         rot_stats = _stats(rot_err)
         initial_rot = float(rot_err[0])
-
-        # Start-aligned: angle between the two start-relative rotations, so the
-        # homing residual at t=0 doesn't contaminate the tracking comparison.
+ 
         def _rel(qs: np.ndarray) -> Rotation:
             q = _normalized_quats(qs[:T_q])
             return Rotation.from_quat(q[0]).inv() * Rotation.from_quat(q)
-
+ 
         rot_aligned_stats = _stats((_rel(ref_quat).inv() * _rel(rep_quat)).magnitude())
-
+ 
+        rotation_delta_error_rad = _rotation_delta_error_stats(ref_quat, rep_quat)
+ 
         goal_quat = ref.get("eef_goal_quat")
         if goal_quat is not None:
             goal_quat, frame_offset_deg = _align_goal_quats(ref_quat, goal_quat)
@@ -256,7 +415,13 @@ def compute_trajectory_errors(
                 "sim_vs_goal_rad":  _stats(_geodesic_angles(ref_quat[:T_g], goal_quat[:T_g])),
                 "frame_offset_deg": frame_offset_deg,
             }
-
+ 
+    joint_delta_error_rad = None
+    ref_qpos = ref.get("qpos")
+    rep_qpos = recorded.get("qpos")
+    if ref_qpos is not None and rep_qpos is not None:
+        joint_delta_error_rad = _per_joint_delta_error_stats(ref_qpos, rep_qpos)
+ 
     timing = None
     t_sim = recorded.get("t_sim")
     if t_sim is not None and len(t_sim) > 1:
@@ -266,7 +431,7 @@ def compute_trajectory_errors(
             "p95":  float(np.percentile(dts, 95)),
             "max":  float(dts.max()),
         }
-
+ 
     qvel_info = None
     qvel = recorded.get("qvel")
     if qvel is not None and len(qvel):
@@ -275,12 +440,12 @@ def compute_trajectory_errors(
             "max": float(qn.max()),
             "saturated_fraction": float((qn > saturation_level * joint_vel_l2_max).mean()),
         }
-
+ 
     faults = None
     if recorded.get("fault_count") is not None and len(recorded["fault_count"]):
         steps = _fault_steps(recorded["fault_count"])
         faults = {"count": len(steps), "step_indices": [int(s) for s in steps]}
-
+ 
     return {
         "name":               name,
         "n_steps":            int(T_min),
@@ -289,6 +454,11 @@ def compute_trajectory_errors(
         "start_aligned": {
             "position_error_m":   _stats(pos_aligned),
             "rotation_error_rad": rot_aligned_stats,
+        },
+        "delta_error": {
+            "position_delta_error_m":   position_delta_error_m,
+            "rotation_delta_error_rad": rotation_delta_error_rad,
+            "joint_delta_error_rad":    joint_delta_error_rad,
         },
         "initial_offset": {
             "position_m":   float(pos_err_norm[0]),
@@ -301,12 +471,13 @@ def compute_trajectory_errors(
     }
 
 
+ 
 def save_errors_json(
     trajectory_errors: list[dict],
     path: str,
 ) -> None:
     """Write per-trajectory and aggregate error stats to a JSON file.
-
+ 
     trajectory_errors: list of dicts returned by compute_trajectory_errors.
     """
     def _agg(key: str, sub: str) -> dict | None:
@@ -319,23 +490,90 @@ def save_errors_json(
             "max":   float(arr.max()),
             "total": float(arr.sum()),
         }
-
+ 
     pos_agg = {k: _agg("position_error_m", k) for k in ("mean", "max", "rms", "final")}
     rot_vals = [t["rotation_error_rad"] for t in trajectory_errors if t["rotation_error_rad"] is not None]
     rot_agg: dict | None = None
     if rot_vals:
         rot_agg = {k: _agg("rotation_error_rad", k) for k in ("mean", "max", "rms", "final")}
-
+ 
+    # --- delta-error aggregate: average each episode's already-computed
+    # distribution stats across episodes (mean-of-means / mean-of-stds /
+    # max-of-maxes), rather than re-pooling raw per-step samples, since raw
+    # samples aren't retained per-trajectory once compute_trajectory_errors
+    # returns. This is an aggregate of summaries, not a re-derived pooled
+    # statistic -- fine for spotting a run-level pattern, but if a single
+    # distribution across every step of every episode pooled together is
+    # needed, that has to be computed before per-episode summarization
+    # discards the raw arrays.
+    def _delta_agg(sub_key: str, field: str) -> dict | None:
+        vals = [
+            t["delta_error"][sub_key][field]
+            for t in trajectory_errors
+            if t.get("delta_error") and t["delta_error"].get(sub_key) is not None
+        ]
+        if not vals:
+            return None
+        arr = np.array(vals, dtype=np.float64)
+        return {"mean": float(arr.mean()), "max": float(arr.max()), "min": float(arr.min())}
+ 
+    delta_agg = {}
+    for sub_key in ("position_delta_error_m", "rotation_delta_error_rad"):
+        entry = {f: _delta_agg(sub_key, f) for f in ("mean", "std", "rms", "max", "min", "p50", "p95")}
+        if any(v is not None for v in entry.values()):
+            delta_agg[sub_key] = entry
+ 
+    # Per-joint delta-error aggregate: average each joint's stats across
+    # episodes. Assumes joint indexing is consistent across episodes (true
+    # for a fixed-arm run); joints beyond the shortest episode's count are
+    # dropped rather than raising, so a mixed-length batch still aggregates.
+    joint_delta_entries = [
+        t["delta_error"]["joint_delta_error_rad"]
+        for t in trajectory_errors
+        if t.get("delta_error") and t["delta_error"].get("joint_delta_error_rad") is not None
+    ]
+    joint_delta_agg = None
+    if joint_delta_entries:
+        n_joints = min(len(e["per_joint"]) for e in joint_delta_entries)
+        per_joint_agg = []
+        for j in range(n_joints):
+            joint_entries = [e["per_joint"][j] for e in joint_delta_entries]
+            agg_fields = {}
+            for f in ("mean", "std", "rms", "max", "min", "p50", "p95", "mean_abs"):
+                vals = [je[f] for je in joint_entries]
+                agg_fields[f] = {
+                    "mean_across_episodes": float(np.mean(vals)),
+                    "max_across_episodes":  float(np.max(vals)),
+                }
+            ratios = [
+                je["reversal_breakdown"]["near_over_away_ratio"]
+                for je in joint_entries
+                if je["reversal_breakdown"]["near_over_away_ratio"] is not None
+            ]
+            agg_fields["reversal_ratio_mean_across_episodes"] = (
+                float(np.mean(ratios)) if ratios else None
+            )
+            per_joint_agg.append({"joint": j, **agg_fields})
+        joint_delta_agg = {
+            "per_joint": per_joint_agg,
+            "worst_joint_by_mean_abs_across_episodes": int(np.argmax(
+                [p["mean_abs"]["mean_across_episodes"] for p in per_joint_agg]
+            )),
+        }
+    if joint_delta_agg is not None:
+        delta_agg["joint_delta_error_rad"] = joint_delta_agg
+ 
     # Run-level reflex rollup: which episodes were fault-corrupted, at a glance.
     faulty = {t["name"]: t["faults"]["count"]
               for t in trajectory_errors if t.get("faults") and t["faults"]["count"] > 0}
-
+ 
     payload = {
         "trajectories": trajectory_errors,
         "aggregate": {
             "n_trajectories":    len(trajectory_errors),
             "position_error_m":  pos_agg,
             "rotation_error_rad": rot_agg,
+            "delta_error": delta_agg if delta_agg else None,
             "faults": {
                 "episodes_with_faults": len(faulty),
                 "total_recoveries": sum(faulty.values()),
@@ -343,7 +581,7 @@ def save_errors_json(
             },
         },
     }
-
+ 
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w") as fh:
         json.dump(payload, fh, indent=2)

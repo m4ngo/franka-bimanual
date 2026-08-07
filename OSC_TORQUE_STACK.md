@@ -14,7 +14,7 @@ flowchart TD
     D --> E["FrankaTorqueService on the NUC"]
     E --> F["pylibfranka_control.py realtime loop"]
     F --> G["OSCTorqueController or JointImpedanceController"]
-    G --> H["Speed guard + torque rate limit"]
+    G --> H["Torque rate limit + clamp"]
     H --> I["libfranka writeOnce / Torques"]
 
     J["RobotState readOnce"] --> F
@@ -87,15 +87,13 @@ The same cached residual delta offsets from `cache_delta()` are applied here too
 
 #### `JOINT_POS`
 
-This mode sends a joint position target to the server. The robot-side goal is shaped by `shape_joint_goal()` before dispatch. The NUC then runs a joint impedance controller instead of OSC.
+This mode sends a joint position target to the server, unscreened: the worktable floor bounds an EE goal pose and a joint-position command has none. The NUC then runs a joint impedance controller instead of OSC.
 
 ### Safety before dispatch
 
 All three modes are screened by `ActionSafetyScreen` before being sent.
 
-- `shape_goal()` is used for OSC modes. It clamps downward motion above the worktable and caps the commanded descent envelope.
-- `shape_joint_goal()` is used for joint-position homing and joint-position control. It scales the joint target so the implied EE descent stays inside the same braking envelope.
-- `shape_ee()` and `shape_joint()` are retained for velocity-domain callers.
+- `shape_goal()` is the only screen, and applies to the OSC modes. It raises the goal along world-up until the EE collision sphere clears the worktable floor. There is no descent envelope, no joint-space form, and no velocity-domain form: it is a pure position clamp, independent of `kp`/`kd`.
 
 The screen is pure: it transforms `(action, kin_state)` into a safer action without side effects.
 
@@ -182,7 +180,7 @@ The loop is pipelined:
 
 That ordering is intentional. Writing first keeps the response path short enough to stay within the realtime budget.
 
-The control law itself is recomputed every other tick (`_CONTROL_DECIMATION = 2`). That matches the sim’s 500 Hz controller cadence more closely than recomputing at the full 1 kHz loop rate. The speed guard, torque-rate limiter, and write still run every tick.
+The control law itself is recomputed every other tick (`_CONTROL_DECIMATION = 2`). That matches the sim’s 500 Hz controller cadence more closely than recomputing at the full 1 kHz loop rate. `_enforce_limits` and the write still run every tick.
 
 ### Process setup
 
@@ -205,7 +203,7 @@ At each tick the loop does:
 
 1. Read the robot state.
 2. If there is no cached raw torque yet, compute one from the current goal.
-3. Apply the speed guard to the torque prepared on the previous tick.
+3. Apply `_enforce_limits` to the torque prepared on the previous tick.
 4. Apply the torque-rate limiter against `state.tau_J_d`.
 5. Write the resulting torques.
 6. Compute the next raw torque during slack time if this is a control-law tick.
@@ -246,8 +244,18 @@ Those are combined into a desired force and a desired torque.
 
 Two details matter here:
 
-- `uncouple_pos_ori=True` uses separate position and orientation inverses, which matches robosuite parity.
-- `uncouple_pos_ori=False` uses the full 6x6 coupling path, optionally damped with `dls_mu` to keep singularities bounded.
+The wrench is always the **coupled** `lambda_full @ [force, torque]`, i.e. osc.py's `uncouple_pos_ori=False`. It is baked into `OSCTorqueController` -- no flag, no config key, no constructor argument -- and `test_coupled_wrench_is_baked_in_and_matches_robosuite` asserts it stays that way.
+
+osc_pose.json sets `True`, which applies `lambda_pos`/`lambda_ori` to the two halves separately: it sizes the translation force as if rotation were free and scales the moment by the ~0.002 kg m^2 wrist inertia, which left joint 4 at 0.25x breakaway on +X and put orientation commands under breakaway friction. The coupled form is the exact operational-space solution: response is the commanded acceleration, cross-coupling is zero, and X went from 43-71% to ~100% of command, pose-independently.
+
+Two modifications come with it, both baked in and both inseparable from the choice:
+
+1. **`lambda_full` is damped** by `LAMBDA_DLS_MU` (0.025). The coupled form inverts a 6x6 whose condition number runs 6.4e3 at the home pose and 1.2e7 as joint 4 extends; undamped, a full 5 cm delta at that reach commanded 156 Nm against an 87 Nm clamp, and a saturated clamp is maximum-force motion, which the robot reports as `cartesian_reflex`. At 0.025 the same pose asks 22.5 Nm and the home pose moves 18.6 -> 18.4 Nm.
+2. **The orientation->force block is dropped** (`lambda_full[:3, 3:]`). That block is the force which cancels the linear acceleration a pure moment implies -- correct only if the moment is actually delivered. Under breakaway friction the wrist stalls while the proximal joints deliver the compensating force in full, so what survives is a standing push: 9.1 N for a 0.05 rad residual at the home pose, 5.7x the force a 1 mm position error makes. Nothing opposes it, because EE_DELTA rebuilds `goal_pos` from the measured pose every step and no position error ever accumulates, so the arm settles into a ~5.7 cm/s drift at rest.
+
+Both are asserted behaviourally in `tests/test_osc_stack.py` (`test_dls_bounds_lambda_full_near_a_singularity`, `test_pure_orientation_error_produces_no_translational_wrench`) rather than by transcription, and the parity harnesses apply the same two modifications to their robosuite reference so a *third* divergence still fails them.
+
+Watch `clamp_trips` in the NUC health log: it is the signal that a gain is out of range for the pose.
 
 The final task wrench is then projected back to joint torques with `J^T`.
 
@@ -278,9 +286,9 @@ This path exists because OSC is not the right tool for directly converging to a 
 
 The control loop has a second layer of protection beyond the robot-side safety screen.
 
-### Speed guard
+### Torque limits
 
-The speed guard checks the measured joint velocities and, when available, the measured EE twist. If the motion is outside the allowed envelope, it either scales the torque back or replaces it with a braking torque.
+`_enforce_limits` is the only bound on what reaches the joints: rate-limit against `state.tau_J_d` at `max_torque_rate_nm_s`, then clamp to the datasheet `joint_torque_nm`. There is no velocity guard. A law that asks past the clamp reads as a saturated joint (`clamp_trips` in the health log), not as a silently rescaled control law.
 
 This guard is intentionally inside the realtime loop because it bounds what actually reaches the joints.
 
@@ -315,7 +323,7 @@ The control loop publishes state into shared memory. `RobotDriver.get_kinematic_
 4. The server stores the goal in shared memory.
 5. The control loop converts goal error and velocity into wrench.
 6. OSC maps wrench to joint torques.
-7. Speed guard and torque-rate limit shape the final torque.
+7. `_enforce_limits` rate-limits and clamps the final torque.
 8. `writeOnce(Torques)` sends the torques to libfranka.
 
 ### `EE_POS`
@@ -328,7 +336,7 @@ Same as above, except the action already carries the absolute pose instead of a 
 2. `BimanualFranka` shapes the target for table safety.
 3. The server stores a joint-goal block.
 4. The control loop runs joint impedance instead of OSC.
-5. The same speed guard and torque-rate limit still apply.
+5. The same `_enforce_limits` still applies.
 6. Torques are written to libfranka.
 
 ## Validation Scripts

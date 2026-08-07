@@ -56,9 +56,17 @@ mid-trajectory and read as a jerk:
 
 **`config/*.yaml` is the single source of truth for every environment constant**:
 world origin, per-arm base poses, arm IPs/ports, camera intrinsics/extrinsics,
-control gains, **every torque-loop constant**, safety limits, fudge factors, and
-the control rate. Nothing outside `config/` should hardcode any of them. See
+control gains, **every torque-loop constant**, limits, per-rig trims, and the
+control rate. Nothing outside `config/` should hardcode any of them. See
 [config/README.md](config/README.md) for the file-by-file breakdown.
+
+**`control.yaml`'s `tuning:` block is where you tune.** Every per-rig hardware
+trim lives there and nowhere else — the delta fudges, `friction_kc` and its
+per-joint vector, and the four `kp_`/`kd_` `pos`/`ori` gain scales. Each is a
+no-op at its sim-parity value, and both robot configs read them through
+`default_factory`, so the yaml is the only place any of them is written down.
+Everything under `torque:` is the *control law*, defined by the sim; do not
+tune it to fix the rig.
 
 Read it through the `franka_config` package (never by parsing YAML yourself):
 
@@ -178,12 +186,10 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   under pylibfranka, still zero) so the analytic `franka_jacobian` is used
   instead; torque rate limiting against `state.tau_J_d` is mandatory; the law runs
   at **500 Hz, not 1 kHz**, because that is robosuite's substep rate; the write
-  precedes the compute; the speed guard's envelope must stay **outside** the one
-  a ±1 sim action produces (`v = (kp/kd)·delta` = 0.31 m/s / 3.06 rad/s at the
-  default kp, and 3.06 rad/s runs the wrist at ~0.9 of rated) or it silently
-  rescales the control law; and recoverable errors (reflex,
-  `communication_constraints_violation`, UDP timeout) re-arm torque control
-  holding the pose the arm actually ended up in.
+  precedes the compute; `_enforce_limits` is the **only** thing that rescales tau
+  anywhere in the stack, so nothing else may be added to that path; and
+  recoverable errors (reflex, `communication_constraints_violation`, UDP timeout)
+  re-arm torque control holding the pose the arm actually ended up in.
 - [pylibfranka_shm.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/pylibfranka_shm.py)
   — the goal/state block the two share, with a seqlock so neither ever blocks the
   other. Only the creator may unlink it: Python's `resource_tracker` otherwise
@@ -194,7 +200,7 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   `impedance_mode="variable"`. Deployed to the NUC alongside the server, so it
   stays numpy-only with no *unguarded* package-relative imports — the one import
   it has (`torque_config`) uses the same relative/flat try-except the other NUC
-  modules use. Verify changes with `scripts/check_osc_parity.py`, which diffs it
+  modules use. Verify changes with `scripts/osc_check/check_osc_parity.py`, which diffs it
   against robosuite's real modules.
 - [torque_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/torque_config.py)
   — resolves `control.yaml`'s `torque:` block on either side of the RPyC link.
@@ -203,29 +209,23 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   — the bridge from `config/rig.yaml` profiles to concrete camera configs and
   per-arm connection fields. Keeps `franka_config` free of LeRobot imports.
 - [safety.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/safety.py)
-  — `ActionSafetyScreen` applies pre-dispatch shaping to goal poses (torque
-  paths) or velocity commands (the remaining velocity callers). Every threshold
-  comes from `config/control.yaml` and `config/world.yaml`:
-  - **Worktable brake**: caps downward motion by `sqrt(2·MAX_DECEL·clearance)`
-    so the EE can stop before reaching `worktable.height_m + distance_min_m`.
-    `shape_goal` / `shape_joint_goal` express that envelope as a bound on the
-    downward position error (the impedance loop settles at `v = (kp/kd)·error`)
-    plus a hard floor the goal can never cross; `shape_ee` / `shape_joint` keep
-    the velocity-domain form.
-  - All four reason in **world frame**: the screen is constructed with each arm's
+  — `ActionSafetyScreen.shape_goal` raises an OSC goal along world-up until the
+  EE collision sphere's lowest point clears
+  `world.worktable.height_m + worktable_brake.distance_min_m`. That is the whole
+  layer: a pure `(goal, pose) → goal` clamp with no dependence on gains,
+  measured velocity, or the previous step, so a gain sweep cannot move the floor
+  and the floor cannot eat part of a commanded delta.
+  - It reasons in **world frame**: constructed with each arm's
     `robot_base_in_world`, so one table plane covers arms whose bases differ in
     height or yaw. The EE is a **sphere**, not a point
     (`worktable_brake.ee_sphere`, per-arm overridable in `arms.yaml`): its centre
-    is a TOOL-frame offset that rotates with the gripper, clearance is measured
-    from the sphere's bottom, and the centre's velocity carries the `ω × r` lever
-    term — so a tilted or rotating gripper can't graze the table while the TCP
-    still reads clear. `goal_z_floor` is a **world-frame plane compared against
-    `sphere_bottom_world_z`**, not a base-frame goal-z bound. Corrections are
-    applied along world-up only; joint mode scales the whole vector to preserve
-    direction.
-  - L2-norm clamps on joint velocity and EE linear/angular velocity
-    (`limits.*`). These bound the *velocity-domain* callers only; the torque
-    paths are bounded by the NUC's speed guard instead.
+    is a TOOL-frame offset that rotates with the gripper and clearance is
+    measured from the sphere's bottom, so a tilted gripper can't graze the table
+    while the TCP still reads clear. `goal_z_floor` is a **world-frame plane
+    compared against `sphere_bottom_world_z`**, not a base-frame goal-z bound.
+  - **`JOINT_POS` and `home()` are not screened.** The floor bounds an EE goal
+    pose and a joint-position command has none; both drive saved configurations
+    with an operator present.
   - Bimanual arm-repel is **not yet implemented** (noted in the module
     docstring).
 - [wsg.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/wsg.py)
@@ -364,9 +364,9 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `home_pose.py` | Save / drive named home configurations (`home_poses/*.json`) | joint |
 | `openpi_client_franka.py` | Single-arm OpenPI inference client; DROID-style joint-velocity observations to a remote websocket policy | joint |
 | `deploy_nuc_server.sh <mario\|luigi>` | Resolve `torque:` config, copy the torque server + controller to a NUC, restart under `chrt -f 80` | — |
-| `check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
-| `check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
-| `check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
+| `osc_check/check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
+| `osc_check/check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
+| `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `sweep_sim_match.py` | Search `friction_kc` + the delta fudges against a sim reference | EE |
 | `../sysid/sweep_gains.py` | Search the OSC gain scales (per axis) against one sim trajectory; rejects trials that saturate the torque clamp | EE |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
@@ -393,6 +393,17 @@ connects cleanly and then does nothing.
   in `pylibfranka_control.py`; anything at policy rate (goal composition, safety
   shaping, gains) belongs in `bimanual_franka.py`. Re-deploy the NUC side after
   touching it or after editing `torque:` — the workstation copy is not what runs.
+- **There are exactly two limit layers, and adding a third is a regression.**
+  `safety.shape_goal` bounds *where* the workstation may command the EE (a
+  world-frame floor under the collision sphere); `pylibfranka_control`'s
+  `_enforce_limits` bounds *what reaches the joints* (torque rate limit, then
+  the datasheet clamp). Nothing else may rescale a goal, a delta, or a torque.
+  This stack previously had six overlapping envelopes — a velocity guard with
+  a two-stage brake, a `sqrt(2·a·d)` descent envelope coupled to `kp/kd`,
+  L2 velocity clamps, DLS regularisation, per-joint torque factors, and a
+  torque safety factor — and the cost was that a gain change stopped mattering
+  somewhere with nothing in the log to say where. Bound the command or bound
+  the torque; do not silently scale things in between.
 - **Pure (action, state) → action transforms in `safety.py`.** Don't push
   side effects into `ActionSafetyScreen`; it is intended to be a pre-dispatch
   shaping layer.
@@ -427,6 +438,14 @@ gain remap, the delta envelope, the goal-orientation hold rule, both
 `uncouple_pos_ori` settings, the nullspace reference, the torque clamp/rate
 limiter, and that every hardware-bridging knob is a no-op at its default.
 
+`test_torque_limits_are_the_only_thing_that_rescales_tau` is a **structural**
+test, not a numerical one: it reads `ControlLoop.run`'s source and rejects any
+second scaling of tau, any `guard`/`brake`-shaped name, and any `set_tuning`
+parameter beyond `friction_kc`. It is written that way because a reintroduced
+velocity guard passes every numerical test in the file — it only fires outside
+their range. If it fails, a limit layer came back; that is the thing to remove,
+not the assertion.
+
 **A tuning knob must be pinned in the parity harness or it silently disables the
 suite.** `make_robot` builds the robot from `SingleArmFrankaConfig`, so any field
 it does not override is inherited from the rig and fed to *both* sides of the
@@ -454,7 +473,7 @@ controller stops matching the policies' training dynamics.
 
 `ActionSafetyScreen` is bypassed in the parity tests (robosuite has no
 equivalent) and tested separately — if a parity test starts failing on a
-downward-z action, suspect the worktable brake before the controller.
+downward-z action, suspect the worktable floor before the controller.
 
 ## When something breaks
 

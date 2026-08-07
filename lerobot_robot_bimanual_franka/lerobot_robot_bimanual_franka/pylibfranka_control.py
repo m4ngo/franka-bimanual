@@ -19,17 +19,17 @@ is not how long a tick takes but how soon the command follows the state: with
 the law computed before the write, response ran ~400 us on the ticks that
 recomputed and libfranka dropped them, pinning control_command_success_rate at
 0.47-0.72 no matter how much total slack the tick had. So each tick writes the
-torque prepared during the previous tick's slack -- only the speed guard, the
-rate limiter and the write itself sit in the response path (~92 us mean, 207 us
-worst) -- and then spends the remaining ~600 us computing the next one. Measured
-1.000 success rate holding and 0.99-1.00 tracking, zero aborts either way.
+torque prepared during the previous tick's slack -- only ``_enforce_limits`` and
+the write itself sit in the response path -- and then spends the remaining
+~600 us computing the next one. Measured 1.000 success rate holding and
+0.99-1.00 tracking, zero aborts either way.
 
 The cost is that tau is one tick (1 ms) older than the state it is applied
 against. That is strictly better than the alternative it replaced: a dropped
 command leaves the robot on its *previous* command anyway, for an unbounded and
-nondeterministic staleness rather than a fixed 1 ms. The guard and the rate
-limiter are deliberately left in the response path so both still see the fresh
-state -- they bound what actually reaches the joints.
+nondeterministic staleness rather than a fixed 1 ms. ``_enforce_limits`` is
+deliberately left in the response path so it still sees ``tau_J_d`` from the
+fresh state -- it is the only bound on what reaches the joints.
 
 Launched as a child of pylibfranka_server.py:
     python pylibfranka_control.py --robot-ip <ip> --shm <name>
@@ -55,7 +55,7 @@ import pylibfranka
 try:
     from .franka_jacobian import zero_jacobian
     from .osc_torque_controller import (
-        JOINT_TORQUE_LIMITS, LAMBDA_DLS_MU, JointImpedanceController, OSCTorqueController,
+        JOINT_TORQUE_LIMITS, JointImpedanceController, OSCTorqueController,
         mat_to_quat_xyzw,
     )
     from . import pylibfranka_shm as shm
@@ -63,7 +63,7 @@ try:
 except ImportError:
     from franka_jacobian import zero_jacobian  # type: ignore[no-redef]
     from osc_torque_controller import (  # type: ignore[no-redef]
-        JOINT_TORQUE_LIMITS, LAMBDA_DLS_MU, JointImpedanceController, OSCTorqueController,
+        JOINT_TORQUE_LIMITS, JointImpedanceController, OSCTorqueController,
         mat_to_quat_xyzw,
     )
     import pylibfranka_shm as shm  # type: ignore[no-redef]
@@ -75,8 +75,6 @@ logger = logging.getLogger("control")
 # the rationale for each value lives. This file runs on the NUC, so it reads them
 # through torque_config -- see that module for how the values get there.
 NUM_JOINTS = 7
-_TORQUE_THRESHOLD, _FORCE_THRESHOLD = 100.0, 200.0
-_JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 
 # Recompute the control law every Nth tick and hold tau in between. This is not
 # an approximation of the sim -- it IS the sim: robosuite steps mujoco at
@@ -86,23 +84,14 @@ _JOINT_STIFFNESS = [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
 # full 1 kHz was the less faithful choice, and it cost ~150 us/tick we did not
 # have -- compute ran 355 us against a 1000 us budget with read taking 640, so
 # over half the ticks landed late and libfranka aborted on
-# communication_constraints_violation. The guard and the rate limiter still run
-# every tick: both are bounds on what actually reaches the joints.
+# communication_constraints_violation. The torque limiter still runs every tick:
+# it is the only bound on what actually reaches the joints.
 _CONTROL_DECIMATION = int(torque("loop.control_decimation"))
 
-_TAU_SAFETY_FACTOR = float(torque("limits.tau_safety_factor"))
-_TAU_LIMIT = np.asarray(JOINT_TORQUE_LIMITS, dtype=np.float64) * _TAU_SAFETY_FACTOR
+# The ONE limit layer. osc.py's clip_torques plus the rate limit libfranka
+# mandates -- nothing else rescales tau anywhere in this stack.
+_TAU_LIMIT = np.asarray(JOINT_TORQUE_LIMITS, dtype=np.float64)
 _MAX_TORQUE_RATE = float(torque("limits.max_torque_rate_nm_s"))
-
-# Speed guard on the RESULT: every client-settable knob multiplies commanded
-# torque and several compose. Must stay OUTSIDE the envelope a sim-parity action
-# produces (0.31 m/s, 3.06 rad/s -- the latter is ~0.9 of rated wrist velocity)
-# or it rescales the control law instead of bounding a runaway.
-_JOINT_VELOCITY_LIMITS = np.asarray(torque("limits.joint_velocity_rad_s"), dtype=np.float64)
-_JOINT_VELOCITY_TRIP = float(torque("limits.velocity_trip_fraction"))
-_EE_LINEAR_TRIP, _EE_ANGULAR_TRIP = 1.20, 6.00
-_GUARD_HARD_STOP = float(torque("limits.guard_hard_stop"))
-_BRAKE_KD = np.asarray(torque("limits.brake_kd"), dtype=np.float64)
 
 # Measured on THIS arm (scripts/measure_joint_friction.py) at 0.10-0.20 rad/s.
 # What this assist must clear is BREAKAWAY, i.e. static friction, which is >= the
@@ -113,7 +102,6 @@ _FRICTION_COULOMB = np.asarray(torque("friction.coulomb_nm"), dtype=np.float64)
 # carries the measured dq, so the assist re-injects encoder noise at that gain.
 # Widen the band to reduce it; do NOT filter the assist. See _friction_feedforward.
 _FRICTION_TAU_EPS = float(torque("friction.tau_eps_fraction")) * _FRICTION_COULOMB
-_FRICTION_DQ_EPS = float(torque("friction.dq_eps_rad_s"))
 
 _STALE_GOAL_TIMEOUT_S = float(torque("loop.stale_goal_timeout_s"))
 _PUBLISH_DECIMATION = int(torque("loop.publish_decimation"))
@@ -156,21 +144,15 @@ class ControlLoop:
         self.ch = channel
         cfg = pylibfranka.RealtimeConfig.kEnforce
         self.robot = pylibfranka.Robot(robot_ip, cfg)
-        self.robot.set_collision_behavior(
-            [_TORQUE_THRESHOLD] * NUM_JOINTS, [_TORQUE_THRESHOLD] * NUM_JOINTS,
-            [_FORCE_THRESHOLD] * 6, [_FORCE_THRESHOLD] * 6)
-        self.robot.set_joint_impedance(_JOINT_STIFFNESS)
         self.model = self.robot.load_model()
 
         self.osc = OSCTorqueController(num_joints=NUM_JOINTS)
         self.joint = JointImpedanceController(num_joints=NUM_JOINTS)
-        self.dls_mu = LAMBDA_DLS_MU
-        self.ori_force_coupling = False
         self.control = None
         self.recovery_count = 0
-        self.guard_trips = 0
         # Ticks the law asked past the clamp: beyond it the arm is under maximum
-        # force, not under the OSC law. Signals a gain out of range for the pose.
+        # force, not under the OSC law. Signals a gain out of range for the pose,
+        # and is the only saturation signal now that nothing else scales tau.
         self.clamp_trips = 0
         self._last_tau = np.zeros(NUM_JOINTS)
         self._raw_tau = None
@@ -179,7 +161,6 @@ class ControlLoop:
         self._last_mode = None
         self._last_cmd_seq = -1.0
         self._stale = False
-        self._guard_ts = 0.0
 
         self._prof = dict(self._PROF_KEYS)
         self._prof_sum = dict(self._PROF_KEYS)
@@ -215,26 +196,15 @@ class ControlLoop:
         self._last_J, self._last_J_q = J, q
         return J
 
-    def _speed_guard(self, tau, dq):
-        over = float(np.max(np.abs(dq) / (_JOINT_VELOCITY_LIMITS * _JOINT_VELOCITY_TRIP)))
-        if self._last_J is not None:
-            tw = self._last_J @ dq
-            over = max(over, float(np.linalg.norm(tw[:3]) / _EE_LINEAR_TRIP),
-                       float(np.linalg.norm(tw[3:]) / _EE_ANGULAR_TRIP))
-        if over <= 1.0:
-            return tau
-        self.guard_trips += 1
-        now = time.monotonic()
-        if now - self._guard_ts > 1.0:
-            self._guard_ts = now
-            logger.warning("SPEED GUARD %.2fx over envelope -> %s", over,
-                           "braking" if over >= _GUARD_HARD_STOP else "cutting back")
-        if over >= _GUARD_HARD_STOP:
-            return np.clip(-_BRAKE_KD * dq, -_TAU_LIMIT, _TAU_LIMIT)
-        return tau * ((_GUARD_HARD_STOP - over) / (_GUARD_HARD_STOP - 1.0))
-
     @staticmethod
-    def _limit(tau, tau_prev, duration):
+    def _enforce_limits(tau, tau_prev, duration):
+        """The single limit layer: rate-limit against tau_J_d, then clamp.
+
+        Runs every tick in the response path, so it sees the fresh state even on
+        the ticks the law is not recomputed. Nothing upstream or downstream of
+        this rescales tau -- a gain that asks for more than the clamp reads as a
+        saturated joint (clamp_trips), not as a silently shrunk control law.
+        """
         tau = np.nan_to_num(tau, nan=0.0, posinf=0.0, neginf=0.0)
         dt = float(np.clip(duration.to_sec(), 1e-3, 1e-2))
         step = _MAX_TORQUE_RATE * dt
@@ -262,7 +232,6 @@ class ControlLoop:
                 # The velocity setpoint rides G_JOINT_Q.
                 self.joint.set_goal(goal_dq=goal[shm.G_JOINT_Q],
                                     damping_ratio=goal[shm.G_JOINT_RATIO])
-            self.osc.uncoupling = bool(goal[shm.G_UNCOUPLE])
 
         if mode != shm.MODE_FLOAT and getattr(self, "_goal_ts", 0.0):
             if time.monotonic() - self._goal_ts > _STALE_GOAL_TIMEOUT_S:
@@ -283,11 +252,7 @@ class ControlLoop:
             tw = J @ dq
             tau = self.osc.run_controller(
                 ee_pos=T[:3, 3], ee_ori_mat=T[:3, :3], ee_pos_vel=tw[:3], ee_ori_vel=tw[3:],
-                J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis,
-                joint_damping_kv=float(goal[shm.G_JOINT_DAMPING_KV]),
-                # Only the coupled path inverts the 6x6 that goes singular.
-                dls_mu=0.0 if self.osc.uncoupling else float(goal[shm.G_DLS_MU]),
-                ori_force_coupling=self.ori_force_coupling)
+                J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis)
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
@@ -319,7 +284,7 @@ class ControlLoop:
             shm.S_TAU_MEAS: np.asarray(state.tau_J, dtype=np.float64),
             shm.S_TAU_EXT: np.asarray(state.tau_ext_hat_filtered, dtype=np.float64),
             shm.S_SUCCESS_RATE: float(getattr(state, "control_command_success_rate", 1.0)),
-            shm.S_GUARD_TRIPS: float(self.guard_trips),
+            shm.S_CLAMP_TRIPS: float(self.clamp_trips),
             shm.S_ALIVE: 1.0,
         })
 
@@ -349,10 +314,10 @@ class ControlLoop:
                 if self._raw_tau is None:               # first tick, or just re-armed
                     self._raw_tau = self._compute_tau(state, self._goal())[0]
                 # Shape and send FIRST, from the torque prepared last tick. Only
-                # the guard, the rate limiter and the write sit between the state
-                # arriving and the command leaving.
-                tau = self._speed_guard(self._raw_tau, dq)
-                tau = self._limit(tau, np.asarray(state.tau_J_d, dtype=np.float64), duration)
+                # the limiter and the write sit between the state arriving and
+                # the command leaving.
+                tau = self._enforce_limits(
+                    self._raw_tau, np.asarray(state.tau_J_d, dtype=np.float64), duration)
                 self._last_tau = tau
                 self.control.writeOnce(pylibfranka.Torques(tau.tolist()))
                 _t1 = time.perf_counter()
@@ -380,8 +345,8 @@ class ControlLoop:
                         rate = float(getattr(state, "control_command_success_rate", 1.0))
                         log = logger.warning if rate < 0.95 else logger.info
                         log("success rate %.3f, worst response %.0f us, recoveries %d, "
-                            "guard trips %d, clamp trips %d%s  [us mean/max: %s]", rate, worst_us,
-                            self.recovery_count, self.guard_trips, self.clamp_trips,
+                            "clamp trips %d%s  [us mean/max: %s]", rate, worst_us,
+                            self.recovery_count, self.clamp_trips,
                             "  <- MISSING DEADLINES" if rate < 0.95 else "",
                             " ".join(
                                 f"{k}={self._prof_sum[k] / max(self._prof_n[k], 1):.0f}/{v:.0f}"

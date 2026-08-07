@@ -49,8 +49,9 @@ _GRIP_ACCUM_SPEED = fc.control("gripper_accum_speed")
 _KIN_CACHE_MAX_AGE_S = fc.control("observation.kin_cache_max_age_s")
 
 # Parity knobs on the incoming delta action; 1.0 = exactly what the policy emits.
-_EE_TRANSLATION_FUDGE_FACTOR = fc.control("fudge.ee_translation")
-_EE_ROTATION_FUDGE_FACTOR = fc.control("fudge.ee_rotation")
+# Fallbacks only -- the robot config resolves the same `tuning:` block.
+_EE_TRANSLATION_FUDGE_FACTOR = fc.control("tuning.ee_translation_fudge")
+_EE_ROTATION_FUDGE_FACTOR = fc.control("tuning.ee_rotation_fudge")
 
 # Exponential action->gain remap, matching the sim wrapper the policies were
 # trained against (utils/envs/libero.py: exp_scale = limit_max / default).
@@ -254,20 +255,12 @@ class BimanualFranka(Robot):
                 # robosuite's Controller.__init__ captures initial_joint.
                 self._home_q[arm] = np.asarray(snap[0], dtype=np.float64).copy()
                 self._osc_goal_ori[arm] = Rotation.from_quat(np.asarray(snap[4], dtype=np.float64))
-            # ALWAYS push, even at defaults. Server sessions are keyed by robot_ip
-            # and outlive the client, so tuning set by an earlier script (a probe
-            # run with --friction-kc, say) otherwise silently persists into the
-            # next run. The config must be the single source of truth or a sysid
-            # sweep can measure a controller nobody configured.
-            # These are per-rig trims and live on the robot config, not in
-            # control.yaml -- unlike the control law's own constants. The
-            # server's starting values are torque.osc.lambda_dls_mu et al;
-            # this call is what overrides them for the session.
-            self.robot_manager.set_tuning_all(
-                friction_kc=self.friction_kc,
-                uncouple_pos_ori=bool(self.config.uncouple_pos_ori),
-                dls_mu=float(self.config.lambda_dls_mu),
-            )
+            # ALWAYS push, even at the default. Server sessions are keyed by
+            # robot_ip and outlive the client, so an assist set by an earlier
+            # script (a probe run with --friction-kc, say) otherwise silently
+            # persists into the next run, and a sysid sweep would measure a
+            # controller nobody configured.
+            self.robot_manager.set_tuning_all(friction_kc=self.friction_kc)
             for arm in self.active_arms:
                 self.grippers[arm].home()
         except Exception:
@@ -463,12 +456,10 @@ class BimanualFranka(Robot):
             )
 
         if self.control_mode == ControlMode.JOINT_POS:
-            goals = self.safety.shape_joint_goal(
-                {arm: self._joint_goal(action, arm) for arm in self.active_arms},
-                kin,
-                float(np.max(JOINT_IMPEDANCE_KP)) * self.kp_gain,
-                self.kd_gain,
-            )
+            # Not screened: the worktable floor is a bound on an EE goal pose,
+            # and a joint-position command has none. JOINT_POS is GELLO teleop
+            # with an operator in the loop.
+            goals = {arm: self._joint_goal(action, arm) for arm in self.active_arms}
             self.robot_manager.move_joint_goal_batch(
                 {a: (g, self.kp_gain, self.kd_gain) for a, g in goals.items()}
             )
@@ -495,7 +486,7 @@ class BimanualFranka(Robot):
                 for arm in self.active_arms
             }
 
-        goals = self.safety.shape_goal(goals, kin, kp, kd)
+        goals = self.safety.shape_goal(goals)
         self.robot_manager.move_osc_goal_batch(
             {a: (pos, quat, kp, kd, self._home_q.get(a)) for a, (pos, quat) in goals.items()}
         )
@@ -511,8 +502,7 @@ class BimanualFranka(Robot):
         fps: int = fc.control_fps(),
         *,
         home_fps: int | None = None,
-        tol_pos_m: float = fc.control("homing.tol_pos_m"),
-        tol_rot_rad: float | None = fc.control("homing.tol_rot_rad"),
+        **_unused,
     ) -> bool:
         """Drive both arms to a saved home configuration.
 
@@ -524,8 +514,8 @@ class BimanualFranka(Robot):
         instead of overshooting.
 
         On success the target also becomes the OSC nullspace reference.
-        ``tol_pos_m`` / ``tol_rot_rad`` are accepted for call-site compatibility
-        and unused; convergence is judged in joint space against ``tol_rad``.
+        Convergence is judged in joint space against ``tol_rad``; ``**_unused``
+        swallows the EE-space tolerances older call sites still pass.
         """
         if not self.is_connected:
             raise ConnectionError(f"{self} is not connected.")
@@ -575,9 +565,10 @@ class BimanualFranka(Robot):
                 # Re-anchors only once the arm has fallen behind.
                 ramp[arm] = kin[arm][0] + np.clip(lead - kin[arm][0], -max_lead, max_lead)
                 commanded[arm] = ramp[arm]
-            goals = self.safety.shape_joint_goal(commanded, kin, float(np.max(HOME_IMPEDANCE_KP)))
+            # Not screened: a home configuration is a saved, known-safe q, and
+            # the worktable floor only bounds an EE goal pose.
             self.robot_manager.move_joint_goal_batch(
-                {a: (g, 1.0, 1.0) for a, g in goals.items()}
+                {a: (g, 1.0, 1.0) for a, g in commanded.items()}
             )
 
             max_err = max(float(np.max(np.abs(targets_q[arm] - kin[arm][0]))) for arm in names)

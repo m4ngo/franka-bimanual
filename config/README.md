@@ -15,7 +15,7 @@ read from here instead.
 | `world.yaml` | World frame definition, calibration-frame origin, per-arm `robot_base_in_world`, worktable height (world frame), sim alignment |
 | `arms.yaml` | Per-arm NUC hosts, robot/gripper IPs, RPyC ports, gripper kind; home-pose directory |
 | `cameras.yaml` | `cam_1` … `cam_6`: type, name, IP, serial, role/mount, resolution, intrinsics + extrinsics |
-| `control.yaml` | Every control constant: rates, velocity-domain PD gains, the whole `torque:` block (OSC schedule, delta envelope, joint impedance, torque/speed limits, friction, RT loop), fudge factors, worktable brake, Franka wire dynamics, homing budget, WSG params |
+| `control.yaml` | Every control constant: rates, the `tuning:` trims, the whole `torque:` block (OSC schedule, delta envelope, joint impedance, torque limits, friction, RT loop), worktable floor, RPyC timeouts, homing budget, observation and WSG params |
 | `rig.yaml` | Robot profiles — which arms and cameras each robot config exposes, under which key prefixes, and which leader device drives it |
 | `teleop.yaml` | GELLO and SpaceMouse device ports, scales, sign flips, calibration positions |
 | `policy.yaml` | Residual/policy normalization contract shared by sysid, residual_wrapper and trained checkpoints |
@@ -63,15 +63,30 @@ alternate rig without editing tracked files.
   `world.calib_origin_in_world`. That single transform is the *only* place the
   board-to-world offset is expressed; the calibration script has no origin knob,
   so moving the world origin never invalidates a calibration.
-- **The worktable brake is world-frame.** `world.worktable.height_m` is a single
-  plane; `ActionSafetyScreen` lifts each arm's EE through that arm's
-  `robot_base_in_world` before comparing, so no per-arm threshold exists.
+- **There are exactly two limit layers.** `worktable_brake` bounds *where* the
+  workstation may command the EE; `torque.limits` bounds *what reaches the
+  joints*. Nothing else in this directory rescales a goal, a delta, or a
+  torque, and a third envelope is a regression — the previous six overlapping
+  ones are why a gain change could stop mattering with nothing in the log to
+  say where.
+- **The worktable floor is world-frame.** `world.worktable.height_m` is a single
+  plane; `ActionSafetyScreen` lifts each arm's goal through that arm's
+  `robot_base_in_world` before comparing, so no per-arm threshold exists. It is
+  a pure position clamp — no velocity envelope, no dependence on `kp`/`kd`, so
+  a tuning sweep cannot move it.
 - **The EE is a sphere, not a point.** `control.yaml`'s
   `worktable_brake.ee_sphere` gives a TOOL-frame centre (rotates with the
   gripper) and a radius; clearance is measured from the sphere's lowest point.
   An arm with a different gripper can override it with its own `ee_sphere`
   under `arms.yaml`. The default radius is a conservative 0.10 m — measure the
   real jaw extent and shrink it to recover workspace near the table.
+- **`tuning:` is the tuning surface; `torque:` is the control law.** Everything
+  under `tuning:` is a per-rig hardware trim that is a no-op at its sim-parity
+  value, and both robot configs read every one of them through
+  `default_factory` — so a literal default in a dataclass would win over the
+  yaml and is a bug. Everything under `torque:` is defined by the sim the
+  policies were trained in; changing it there without changing the sim breaks
+  parity rather than fixing the rig.
 - **The leader device is not derived from the arm.** `rig.yaml`'s
   `teleop_device` names which physical GELLO/SpaceMouse the operator holds; it
   is independent of which follower arm the profile drives. Both SpaceMice

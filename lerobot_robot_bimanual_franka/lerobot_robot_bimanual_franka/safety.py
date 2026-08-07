@@ -1,44 +1,35 @@
-"""Action safety screens for the bimanual Franka.
+"""The one workstation-side screen: a hard floor under the commanded OSC goal.
 
-All checks are pure (action, kin_state) → action transforms applied before dispatch.
-Currently implements a worktable brake; bimanual arm-repel is not yet implemented.
+`shape_goal` raises a goal position along world-up until the EE collision
+sphere's lowest point sits at or above `worktable.height_m + distance_min_m`.
+That is the whole layer. It is a pure (goal, pose) -> goal transform with no
+dependence on gains, measured velocity, or the previous step, so it cannot
+interact with a tuning sweep: changing kp/kd cannot move the floor.
 
-Under torque control the dispatched quantity is a *goal pose*, not a velocity, so
-``shape_goal`` / ``shape_joint_goal`` are the live screens; ``shape_ee`` and
-``shape_joint`` remain for the velocity-domain callers (openpi client, the
-joint-velocity diagnostic path). The braking envelope is identical in all four --
-what differs is how it is expressed. For a goal, the OSC closed loop settles at
-``v = (kp/kd) * error``, so capping the descent speed at ``v_envelope`` means
-capping the downward position error at ``v_envelope * kd/kp``.
-
-Every threshold here comes from config/control.yaml and config/world.yaml.
-
-The worktable brake reasons in WORLD frame: the table is one plane shared by
-both arms, so each arm's EE height and vertical velocity are lifted through
-that arm's `robot_base_in_world` before being compared against it. Arms whose
-bases sit at different heights or orientations therefore get the right
-envelope without any per-arm threshold.
+It reasons in WORLD frame. The table is one plane shared by both arms, so each
+arm's goal is lifted through that arm's `robot_base_in_world` before being
+compared against it; arms whose bases sit at different heights or orientations
+get the right floor with no per-arm threshold.
 
 The EE is treated as a SPHERE, not a point. Its centre is given in the TOOL
-frame and rotates with the gripper, and clearance is measured from the
-sphere's lowest point — so a tilted gripper cannot graze the table with its
-side while the TCP still reads as clear.
+frame and rotates with the gripper, and clearance is measured from the sphere's
+lowest point, so a tilted gripper cannot graze the table with its side while the
+TCP still reads as clear.
+
+Everything that reaches the joints is bounded on the NUC instead, by the torque
+rate limit and clamp in `pylibfranka_control`. There is no velocity envelope and
+no joint-space form here; JOINT_POS and `home()` drive saved configurations and
+are not screened.
+
+Bimanual arm-repel is not implemented.
 """
 
 import franka_config as fc  # type: ignore
 import numpy as np
 
-from .franka_process import KinematicSnapshot
-
-WORKTABLE_HEIGHT = fc.worktable_height_m()                                   # m, WORLD-frame Z of the worktable surface
-EE_SPHERE = fc.default_ee_sphere()                                           # shared EE collision sphere; arms may override
-WORKTABLE_DISTANCE_MIN = fc.control("worktable_brake.distance_min_m")        # m, minimum clearance; downward velocity zeroed at/past this
-WORKTABLE_MAX_DECEL = fc.control("worktable_brake.max_decel_mps2")           # m/s², assumed deceleration for the braking envelope
-WORKTABLE_VELOCITY_EPS = fc.control("worktable_brake.velocity_eps_mps")      # m/s, ignore commands smaller than this (float noise)
-
-JOINT_VELOCITY_MAX = fc.control("limits.joint_velocity_max")          # rad/s, L2-norm ceiling on joint velocity commands
-EE_LINEAR_VELOCITY_MAX = fc.control("limits.ee_linear_velocity_max")  # m/s
-EE_ANGULAR_VELOCITY_MAX = fc.control("limits.ee_angular_velocity_max")  # rad/s
+WORKTABLE_HEIGHT = fc.worktable_height_m()                             # m, WORLD-frame Z of the worktable surface
+EE_SPHERE = fc.default_ee_sphere()                                     # shared EE collision sphere; arms may override
+WORKTABLE_DISTANCE_MIN = fc.control("worktable_brake.distance_min_m")  # m, minimum clearance above the surface
 
 
 def _quat_xyzw_to_matrix(q_xyzw) -> np.ndarray:
@@ -46,39 +37,8 @@ def _quat_xyzw_to_matrix(q_xyzw) -> np.ndarray:
     return fc.quat_wxyz_to_matrix(fc.quat_xyzw_to_wxyz(tuple(np.asarray(q_xyzw, dtype=np.float64))))
 
 
-def _point_velocity(twist: np.ndarray, lever: np.ndarray) -> np.ndarray:
-    """Linear velocity of a point offset `lever` from the twist's reference point.
-
-    Rigid-body carry: v_point = v + w x r. With a zero lever this is just the
-    twist's linear part, which is the case for a sphere centred on the TCP.
-    """
-    twist = np.asarray(twist, dtype=np.float64)
-    if not lever.any():
-        return twist[:3]
-    return twist[:3] + np.cross(twist[3:6], lever)
-
-
-def _clamp_joint_velocity(velocity: np.ndarray) -> np.ndarray:
-    norm = float(np.linalg.norm(velocity))
-    return velocity * (JOINT_VELOCITY_MAX / norm) if norm > JOINT_VELOCITY_MAX else velocity
-
-
-def _clamp_ee_twist(twist: np.ndarray) -> np.ndarray:
-    twist = np.asarray(twist, dtype=np.float64).copy()
-    linear, angular = twist[:3], twist[3:]
-    lin_norm = float(np.linalg.norm(linear))
-    if lin_norm > EE_LINEAR_VELOCITY_MAX:
-        linear *= EE_LINEAR_VELOCITY_MAX / lin_norm
-    ang_norm = float(np.linalg.norm(angular))
-    if ang_norm > EE_ANGULAR_VELOCITY_MAX:
-        angular *= EE_ANGULAR_VELOCITY_MAX / ang_norm
-    twist[:3] = linear
-    twist[3:] = angular
-    return twist
-
-
 class ActionSafetyScreen:
-    """Screens arm actions before dispatch, braking toward-table motion.
+    """Clamps EE goal poses so the gripper cannot be commanded into the table.
 
     Args:
         base_in_world: arm key -> `franka_config.Pose` of that arm's base in the
@@ -112,46 +72,6 @@ class ActionSafetyScreen:
             for arm, sphere in self._ee_spheres.items()
         }
 
-    def _pose_for(self, arm: str):
-        try:
-            return self._base_in_world[arm]
-        except KeyError:
-            raise KeyError(
-                f"no robot_base_in_world pose for arm {arm!r}; known: "
-                f"{sorted(self._base_in_world)}. The worktable brake is world-frame "
-                "and cannot screen an arm whose base pose is unknown."
-            ) from None
-
-    def _sphere_geometry(self, arm: str, ee_translation, ee_quat_xyzw) -> tuple[float, np.ndarray]:
-        """(world Z of the sphere's lowest point, lever arm from EE to centre).
-
-        The centre is defined in the TOOL frame, so it is rotated by the current
-        EE orientation before being lifted into world — that is what keeps the
-        clearance honest when the gripper is tilted. The sphere is rotationally
-        symmetric, so its lowest point is always centre_z - radius.
-
-        The returned lever arm (base frame, EE origin -> centre) is what the
-        caller needs to carry the EE twist over to the centre: v_c = v + w x r.
-        """
-        sphere = self._ee_spheres[arm]
-        center_tool = self._sphere_center_tool[arm]
-        lever_base = np.zeros(3)
-        if center_tool.any():
-            lever_base = _quat_xyzw_to_matrix(ee_quat_xyzw) @ center_tool
-        center_base = np.asarray(ee_translation, dtype=np.float64) + lever_base
-        center_world_z = float(self._pose_for(arm).apply(center_base)[2])
-        return center_world_z - sphere.radius_m, lever_base
-
-    def sphere_bottom_world_z(self, arm: str, ee_translation, ee_quat_xyzw) -> float:
-        """World-frame Z of the EE collision sphere's lowest point for a pose."""
-        return self._sphere_geometry(arm, ee_translation, ee_quat_xyzw)[0]
-
-    def _descent_envelope(self, arm: str, snap: KinematicSnapshot) -> float:
-        """Max downward EE speed (m/s) that still allows stopping above the table."""
-        contact_z = self.sphere_bottom_world_z(arm, snap[3], snap[4])
-        safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
-        return 0.0 if safe_dist <= 0.0 else float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
-
     @property
     def goal_z_floor(self) -> float:
         """Lowest WORLD-frame Z the EE collision sphere's bottom may be commanded to.
@@ -162,157 +82,46 @@ class ActionSafetyScreen:
         """
         return WORKTABLE_HEIGHT + WORKTABLE_DISTANCE_MIN
 
+    def sphere_bottom_world_z(self, arm: str, ee_translation, ee_quat_xyzw) -> float:
+        """World Z of the EE collision sphere's lowest point for a base-frame pose.
+
+        The centre is defined in the TOOL frame, so it is rotated by the given EE
+        orientation before being lifted into world — that is what keeps the
+        clearance honest when the gripper is tilted. The sphere is rotationally
+        symmetric, so its lowest point is always centre_z - radius.
+        """
+        try:
+            pose = self._base_in_world[arm]
+        except KeyError:
+            raise KeyError(
+                f"no robot_base_in_world pose for arm {arm!r}; known: "
+                f"{sorted(self._base_in_world)}. The worktable floor is world-frame "
+                "and cannot screen an arm whose base pose is unknown."
+            ) from None
+        center_tool = self._sphere_center_tool[arm]
+        center_base = np.asarray(ee_translation, dtype=np.float64)
+        if center_tool.any():
+            center_base = center_base + _quat_xyzw_to_matrix(ee_quat_xyzw) @ center_tool
+        return float(pose.apply(center_base)[2]) - self._ee_spheres[arm].radius_m
+
     def shape_goal(
         self,
         goals_by_arm: dict[str, tuple[np.ndarray, np.ndarray]],
-        kin_state: dict[str, KinematicSnapshot],
-        kp: np.ndarray,
-        kd: np.ndarray,
     ) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-        """Raise EE goal positions along world-up: hard floor above the table,
-        plus a cap on how far below the current EE the goal may sit (the
-        descent-speed envelope re-expressed as a position error). Orientation
-        goals pass through.
+        """Raise each EE goal along world-up until its collision sphere clears the
+        floor. Orientation goals pass through untouched.
 
-        Both bounds are evaluated on the goal's own collision sphere in WORLD
-        frame — using the COMMANDED orientation, since that is where the sphere
-        will be — and the correction is applied along world-up, so horizontal
-        motion is untouched and an arm whose base is tilted or raised gets the
-        right envelope without a per-arm threshold.
+        The sphere is evaluated at the COMMANDED orientation, since that is where
+        it will be, and the correction is applied along world-up only, so
+        horizontal motion is unaffected and an arm whose base is tilted or raised
+        gets the right floor without a per-arm threshold.
         """
-        kp_z, kd_z = float(np.asarray(kp)[2]), float(np.asarray(kd)[2])
         out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         for arm, (goal_pos, goal_quat) in goals_by_arm.items():
             goal_pos = np.asarray(goal_pos, dtype=np.float64)
-            snap = kin_state[arm]
-            goal_bottom_z = self.sphere_bottom_world_z(arm, goal_pos, goal_quat)
-            ee_bottom_z = self.sphere_bottom_world_z(arm, snap[3], snap[4])
-            max_down = self._descent_envelope(arm, snap) * (kd_z / kp_z) if kp_z > 0.0 else 0.0
-            # How far the goal must rise, in world-up metres, to satisfy both.
-            rise = max(
-                (ee_bottom_z - goal_bottom_z) - max_down,
-                self.goal_z_floor - goal_bottom_z,
-                0.0,
-            )
+            rise = self.goal_z_floor - self.sphere_bottom_world_z(arm, goal_pos, goal_quat)
             if rise > 0.0:
                 # world_up is unit, so this raises the world Z by exactly `rise`.
                 goal_pos = goal_pos + rise * self._world_up_in_base[arm]
             out[arm] = (goal_pos, goal_quat)
-        return out
-
-    def shape_joint_goal(
-        self,
-        goals_by_arm: dict[str, np.ndarray],
-        kin_state: dict[str, KinematicSnapshot],
-        kp: float,
-        damping_ratio: float = 1.0,
-    ) -> dict[str, np.ndarray]:
-        """Scale a joint-position goal's delta so the EE descent it implies stays
-        inside the braking envelope. Uniform scale keeps the joint-space
-        direction, matching shape_joint."""
-        kd = 2.0 * np.sqrt(kp) * damping_ratio
-        max_descent_error = (kd / kp) if kp > 0.0 else 0.0
-        out: dict[str, np.ndarray] = {}
-        for arm, goal_q in goals_by_arm.items():
-            goal_q = np.asarray(goal_q, dtype=np.float64)
-            snap = kin_state[arm]
-            q, _, jacobian, ee_translation, ee_quat_xyzw, _ = snap
-            delta = goal_q - np.asarray(q, dtype=np.float64)
-            # world_up . (J @ delta_q) is the WORLD-frame descent the goal
-            # implies at the sphere centre (the lever carries the w x r term);
-            # the impedance loop turns that into (kp/kd) * error of speed.
-            jacobian = np.asarray(jacobian, dtype=np.float64)
-            _, lever = self._sphere_geometry(arm, ee_translation, ee_quat_xyzw)
-            twist_commanded = jacobian @ delta
-            descent_z = float(
-                self._world_up_in_base[arm] @ _point_velocity(twist_commanded, lever)
-            )
-            limit = self._descent_envelope(arm, snap) * max_descent_error
-            if descent_z >= -WORKTABLE_VELOCITY_EPS or -descent_z <= limit:
-                out[arm] = goal_q
-                continue
-            out[arm] = np.asarray(q, dtype=np.float64) + delta * (limit / -descent_z)
-        return out
-
-    def shape_ee(
-        self,
-        ee_by_arm: dict[str, np.ndarray],
-        kin_state: dict[str, KinematicSnapshot],
-    ) -> dict[str, np.ndarray]:
-        ee_by_arm = self._apply_worktable_brake(ee_by_arm, kin_state, is_ee=True)
-        return {arm: _clamp_ee_twist(twist) for arm, twist in ee_by_arm.items()}
-
-    def shape_joint(
-        self,
-        joint_velocities_by_arm: dict[str, np.ndarray],
-        kin_state: dict[str, KinematicSnapshot],
-    ) -> dict[str, np.ndarray]:
-        joint_velocities_by_arm = self._apply_worktable_brake(
-            joint_velocities_by_arm, kin_state, is_ee=False
-        )
-        return {arm: _clamp_joint_velocity(vel) for arm, vel in joint_velocities_by_arm.items()}
-
-    def _apply_worktable_brake(
-        self,
-        action_by_arm: dict[str, np.ndarray],
-        kin_state: dict[str, KinematicSnapshot],
-        is_ee: bool,
-    ) -> dict[str, np.ndarray]:
-        """Limit downward EE velocity to prevent table contact.
-
-        Heights and vertical velocities are evaluated in WORLD frame against
-        WORKTABLE_HEIGHT; the arm's own base pose supplies the conversion. The
-        clearance is measured from the bottom of the EE collision sphere, not
-        from the TCP, so tilting the gripper cannot hide its lower edge.
-
-        Layer 1: cap downward speed at sqrt(2 * MAX_DECEL * clearance) so the arm can decelerate
-        before reaching WORKTABLE_DISTANCE_MIN.
-        Layer 2: if measured downward speed already exceeds the envelope, zero commanded downward vel.
-
-        EE mode: the twist's linear part is corrected along world-up only, so
-        horizontal motion is untouched.
-        Joint mode: the whole vector is uniformly scaled to preserve joint-space direction.
-        """
-        out: dict[str, np.ndarray] = {}
-        for arm, action in action_by_arm.items():
-            action = np.asarray(action, dtype=np.float64)
-            _, dq, jacobian, ee_translation, ee_quat_xyzw, _ = kin_state[arm]
-            jacobian = np.asarray(jacobian, dtype=np.float64)
-            dq = np.asarray(dq, dtype=np.float64)
-
-            world_up = self._world_up_in_base[arm]
-            contact_z, lever = self._sphere_geometry(arm, ee_translation, ee_quat_xyzw)
-
-            safe_dist = contact_z - WORKTABLE_HEIGHT - WORKTABLE_DISTANCE_MIN
-            v_envelope = 0.0 if safe_dist <= 0.0 else float(np.sqrt(2.0 * WORKTABLE_MAX_DECEL * safe_dist))
-            # Velocity of the SPHERE CENTRE, not the EE origin: an offset sphere
-            # on a rotating wrist descends faster than the TCP does.
-            twist_measured = jacobian @ dq
-            v_actual_z = float(world_up @ _point_velocity(twist_measured, lever))
-            twist_commanded = action if is_ee else jacobian @ action
-            v_commanded_z = float(world_up @ _point_velocity(twist_commanded, lever))
-
-            if v_commanded_z >= -WORKTABLE_VELOCITY_EPS:
-                out[arm] = action
-                continue
-
-            v_target_z = max(v_commanded_z, -v_envelope)
-            if -v_actual_z > v_envelope:
-                v_target_z = max(v_target_z, 0.0)
-
-            if v_target_z == v_commanded_z:
-                out[arm] = action
-                continue
-
-            if is_ee:
-                # Minimum-norm correction along world-up (unit), so only the
-                # world-vertical component of the twist changes.
-                action = action.copy()
-                action[:3] += (v_target_z - v_commanded_z) * world_up
-            else:
-                # Uniform scale preserves joint-space direction while braking descent.
-                scale = max(0.0, v_target_z / v_commanded_z)
-                action = action * scale
-
-            out[arm] = action
         return out

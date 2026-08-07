@@ -45,52 +45,38 @@ class SingleArmFrankaConfig(RobotConfig):
     # under `r_`, whose gripper server is on 18823, not the right arm's 18822.
     r_gripper_port: int = _arm_field("r", "gripper_port")
     active_arms: tuple[str, ...] = _VALID_ARMS
-    # See BimanualFrankaConfig.friction_kc.
-    friction_kc: float = fc.control("torque.friction.friction_kc")
-    # Per-joint multiplier on friction_kc; see SingleArmFrankaConfig.
-    friction_kc_joint: tuple[float, ...] = tuple(fc.control("torque.friction.friction_kc_joint"))
-    # Sim-to-real scaling on the EE_DELTA action, applied to the position delta
-    # and the axis-angle rotation delta. 1.0 = exactly what the policy emits.
+    # Every knob below is a per-rig hardware trim and lives in ONE place,
+    # config/control.yaml's `tuning:` block. A literal default here would win
+    # over the yaml and make it decoration -- see config/README.md.
+    friction_kc: float = field(default_factory=lambda: fc.control("tuning.friction_kc"))
+    friction_kc_joint: tuple[float, ...] = field(
+        default_factory=lambda: tuple(fc.control("tuning.friction_kc_joint"))
+    )
     ee_translation_fudge: float = field(
-        default_factory=lambda: fc.control("fudge.ee_translation")
+        default_factory=lambda: fc.control("tuning.ee_translation_fudge")
     )
     ee_rotation_fudge: float = field(
-        default_factory=lambda: fc.control("fudge.ee_rotation")
+        default_factory=lambda: fc.control("tuning.ee_rotation_fudge")
     )
-    # Per-axis OSC gain scales, capped at 10 by KP_LIMITS. Stiffness only: the
-    # damping ratio is derived as sqrt(scale), so these buy friction rejection
-    # and not speed. Measure with scripts/check_osc_axes.py; 1.0 is sim.
-    # Orientation: lambda_ori is 0.028/0.031/0.0019 kg m^2 against robosuite's
-    # 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
-    kp_ori_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kp_ori_scale"))
+    # Orientation stiffness trim: lambda_ori is 0.028/0.031/0.0019 kg m^2 against
+    # robosuite's 0.18-0.58, so a sim-gain wrist moment lands under breakaway.
+    # Measure with scripts/osc_check/check_osc_axes.py.
+    kp_ori_scale: tuple[float, float, float] = field(
+        default_factory=lambda: tuple(fc.control("tuning.kp_ori_scale"))
+    )
     # Translation: prefer 1.0. Unlike lambda_ori, lambda_pos rotates with the
     # arm (lambda_pos_XX 0.74 kg folded, 4.2 extended), so a base-frame constant
     # tuned where X is light over-drives it elsewhere -- 4.0 reached 84 Nm
     # against the 69.6 Nm clamp at full reach. Prefer friction_kc, pose-independent.
-    kp_pos_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kp_pos_scale"))
-    # Damping-only trim, per block. kp_*_scale holds kp/kd fixed by construction,
-    # so it cannot calm an axis that oscillates -- it stiffens it. These multiply
-    # the damping ratio instead, which is the only knob that lowers kp/kd, i.e.
-    # slows and damps the axis. Raise these when an axis vibrates; 1.0 is sim.
-    kd_ori_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kd_ori_scale"))
-    kd_pos_scale: tuple[float, float, float] = tuple(fc.control("torque.friction.kd_pos_scale"))
-    # True is osc_pose.json's setting and applies Lambda_pos/Lambda_ori to the two
-    # halves of the wrench separately, i.e. DROPS the coupling terms: it sizes the
-    # translation force as if rotation were free, then fights the rotation that
-    # push causes. On this arm that leaves joint 4 at 0.25x breakaway on +X.
-    # False applies Lambda_full to the whole wrench -- the exact operational-space
-    # form -- which is what lets X move: 43-71% -> ~100% of command, and
-    # pose-independent. Requires two guards, both on by default in the control
-    # loop: LAMBDA_DLS_MU (the coupled 6x6 goes singular) and the dropped
-    # orientation->force block (that term turns an orientation error the wrist
-    # cannot clear into a standing translational push -- 215 mm of walk measured).
-    uncouple_pos_ori: bool = False
-    # Damped-least-squares floor on lambda_full, active only when
-    # uncouple_pos_ori is False. Caps lambda_full at 1/mu^2: cond(J) rises
-    # 9->58 as the arm raises and an undamped lambda_full took joint 4 past
-    # its 69.6 Nm clamp, which shakes. Costs ~24% of the commanded torque at
-    # well-conditioned poses, so lower it if translation goes weak.
-    lambda_dls_mu: float = 0.025
+    kp_pos_scale: tuple[float, float, float] = field(
+        default_factory=lambda: tuple(fc.control("tuning.kp_pos_scale"))
+    )
+    kd_ori_scale: tuple[float, float, float] = field(
+        default_factory=lambda: tuple(fc.control("tuning.kd_ori_scale"))
+    )
+    kd_pos_scale: tuple[float, float, float] = field(
+        default_factory=lambda: tuple(fc.control("tuning.kd_pos_scale"))
+    )
     use_noise: bool = False
     noise_pos_scale: float = field(default_factory=lambda: fc.control("noise.pos_scale_m"))
     noise_rot_scale: float = field(default_factory=lambda: fc.control("noise.rot_scale_rad"))

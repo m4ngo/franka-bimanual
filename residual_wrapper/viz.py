@@ -107,6 +107,9 @@ class EpisodeRecorder:
         self.chunk_events: list[dict] = []
         # Per-inference network-input clouds (post crop/downsample/re-centering).
         self.policy_pcd_events: list[dict] = []
+        # Reach-task target, world frame; None for every other base policy.
+        self.reach_waypoints: np.ndarray | None = None   # (N, 3)
+        self.reach_goal: np.ndarray | None = None        # (3,)
 
     def record(
         self,
@@ -192,6 +195,26 @@ class EpisodeRecorder:
             "base_traj_pose": base_traj_pose_arr,
             "total_traj_pose": total_traj_pose_arr,
         })
+
+    def record_reach_target(
+        self,
+        waypoints: np.ndarray | None,
+        goal: np.ndarray | None,
+    ) -> None:
+        """Record the reach curve the base policy tracked, in WORLD frame.
+
+        Args:
+            waypoints: (N, 3) dense curve the cursor walks, or None.
+            goal:      (3,) final target position, or None.
+        """
+        self.reach_waypoints = (
+            None if waypoints is None
+            else np.asarray(waypoints, dtype=np.float32).reshape(-1, 3).copy()
+        )
+        self.reach_goal = (
+            None if goal is None
+            else np.asarray(goal, dtype=np.float32).reshape(3).copy()
+        )
 
     def record_policy_pcd(self, step: int, pcd: np.ndarray) -> None:
         """Record the exact cloud fed to the residual network at one inference event.
@@ -385,6 +408,53 @@ def _reference_frame_traces(
             _STATIC_AXIS_LENGTH, "gold",
         )
     return traces
+
+
+def _reach_target_traces(
+    waypoints: np.ndarray | None,
+    goal: np.ndarray | None,
+) -> list[go.Scatter3d]:
+    """Reach curve + goal marker for the analytic reach base policy.
+
+    Both are already world frame (ReachBasePolicy does all curve math there),
+    so they are plotted as-is. Static — append after every animated trace.
+    """
+    traces: list[go.Scatter3d] = []
+    if waypoints is not None and len(waypoints) > 0:
+        wp = np.asarray(waypoints, dtype=np.float32).reshape(-1, 3)
+        traces.append(go.Scatter3d(
+            x=wp[:, 0], y=wp[:, 1], z=wp[:, 2],
+            mode="lines+markers",
+            line=dict(color="mediumvioletred", width=3),
+            marker=dict(size=3, color="mediumvioletred"),
+            name="reach waypoints",
+            legendgroup="reach target",
+            hovertemplate="wp %{pointNumber}<br>%{x:.3f} %{y:.3f} %{z:.3f}<extra></extra>",
+        ))
+    if goal is not None:
+        g = np.asarray(goal, dtype=np.float32).reshape(3)
+        traces.append(go.Scatter3d(
+            x=[float(g[0])], y=[float(g[1])], z=[float(g[2])],
+            mode="markers",
+            marker=dict(size=4.5, color="mediumvioletred", symbol="x"),
+            name=f"reach goal ({g[0]:.3f}, {g[1]:.3f}, {g[2]:.3f})",
+            legendgroup="reach target",
+            hovertemplate="goal<br>%{x:.3f} %{y:.3f} %{z:.3f}<extra></extra>",
+        ))
+    return traces
+
+
+def _reach_target_points(
+    waypoints: np.ndarray | None,
+    goal: np.ndarray | None,
+) -> list[np.ndarray]:
+    """Reach curve/goal points to fold into the scene bbox so they stay in view."""
+    pts: list[np.ndarray] = []
+    if waypoints is not None and len(waypoints) > 0:
+        pts.append(np.asarray(waypoints, dtype=np.float32).reshape(-1, 3))
+    if goal is not None:
+        pts.append(np.asarray(goal, dtype=np.float32).reshape(1, 3))
+    return pts
 
 
 def _reference_frame_points(
@@ -734,6 +804,7 @@ def save_episode_html(
         chunk_pts.append(ev["base_traj"])
         chunk_pts.append(ev["total_traj"])
     frame_pts = _reference_frame_points(cam_in_world_translation)
+    frame_pts += _reach_target_points(recorder.reach_waypoints, recorder.reach_goal)
     all_xyz = np.concatenate(
         [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
         else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
@@ -1025,6 +1096,10 @@ def save_episode_html(
     for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
         fig.add_trace(frame_trace, row=1, col=1)
 
+    # Reach curve + goal (static; absent for every other base policy).
+    for reach_trace in _reach_target_traces(recorder.reach_waypoints, recorder.reach_goal):
+        fig.add_trace(reach_trace, row=1, col=1)
+
     fig.write_html(path, include_plotlyjs="cdn")
 
 
@@ -1139,6 +1214,7 @@ def save_rollout_html(
     pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
     chunk_pts = [ev["base_traj"] for ev in chunk_events]
     frame_pts = _reference_frame_points(cam_in_world_translation)
+    frame_pts += _reach_target_points(recorder.reach_waypoints, recorder.reach_goal)
     all_xyz = np.concatenate(
         [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
         else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
@@ -1352,6 +1428,10 @@ def save_rollout_html(
     # World origin + camera pose triads (static, appended after all animated traces).
     for frame_trace in _reference_frame_traces(cam_in_world_rotation, cam_in_world_translation):
         fig.add_trace(frame_trace, row=1, col=1)
+
+    # Reach curve + goal (static; absent for every other base policy).
+    for reach_trace in _reach_target_traces(recorder.reach_waypoints, recorder.reach_goal):
+        fig.add_trace(reach_trace, row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")
 

@@ -231,10 +231,7 @@ class _PassThroughSafety:
 
     goal_z_floor = -np.inf
 
-    def shape_goal(self, goals, kin, kp, kd):
-        return goals
-
-    def shape_joint_goal(self, goals, kin, kp, damping_ratio=1.0):
+    def shape_goal(self, goals):
         return goals
 
 
@@ -254,8 +251,7 @@ _SIM_PARITY_KNOBS = {
 }
 
 # Reach the control loop through make_session, not the robot config.
-_SESSION_KNOBS = {"friction_kc", "friction_kc_joint", "uncouple_pos_ori",
-                  "lambda_dls_mu"}
+_SESSION_KNOBS = {"friction_kc", "friction_kc_joint"}
 
 # Transport, framing and perception: cannot reach the torque path. noise_*_scale
 # is control-path but gated by use_noise, which is pinned above.
@@ -288,7 +284,7 @@ def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     return robot
 
 
-def make_session(case, uncouple=True, friction_kc=0.0, joint_damping_kv=0.0):
+def make_session(case, uncouple=True, friction_kc=0.0):
     """A real ControlLoop with only the fields the compute path touches.
 
     The loop now runs in its own process (pylibfranka_control), so the law under
@@ -308,17 +304,11 @@ def make_session(case, uncouple=True, friction_kc=0.0, joint_damping_kv=0.0):
     s._last_J = None
     s._last_J_q = None
     s._last_tau = np.zeros(7)
-    s._guard_ts = 0.0
-    s.guard_trips = 0
     s.clamp_trips = 0
     s.recovery_count = 0
-    # Parity is against robosuite's exact lambda_full; the DLS guard is a
-    # deliberate deviation and has its own test.
-    s.dls_mu = 0.0
-    s.ori_force_coupling = True   # robosuite's exact lambda_full
-    # Tuning reaches the loop through the goal block, so stash it for _goal_block.
-    s._test_tuning = dict(uncouple=uncouple, friction_kc=friction_kc,
-                          joint_damping_kv=joint_damping_kv)
+    # uncoupling is an OSCTorqueController constructor arg (osc.py's own), set
+    # above; only friction_kc still reaches the loop through the goal block.
+    s._test_tuning = dict(friction_kc=friction_kc)
     return s
 
 
@@ -333,9 +323,7 @@ def _goal_block(session, goal_pos, goal_quat, kp, kd, ns):
     g[_shm.G_KP] = kp
     g[_shm.G_KD] = kd
     g[_shm.G_NULLSPACE] = np.zeros(7) if ns is None else ns
-    g[_shm.G_UNCOUPLE] = 1.0 if t["uncouple"] else 0.0
     g[_shm.G_FRICTION_KC] = t["friction_kc"]
-    g[_shm.G_JOINT_DAMPING_KV] = t["joint_damping_kv"]
     return g
 
 
@@ -951,12 +939,11 @@ def test_every_hardware_knob_is_pinned():
 
 
 def test_defaults_are_exact_parity():
-    """Pin the deliberate deviations from osc.py, and their preconditions.
+    """Pin the deliberate deviations from osc.py.
 
-    friction_kc cancels a plant term the sim lacks. uncouple_pos_ori=False uses
-    the exact operational-space form instead of osc.py's decoupled approximation,
-    which the sim's frictionless plant can afford and this arm cannot. It is only
-    safe with the DLS guard, so that pairing is asserted rather than assumed.
+    friction_kc cancels a plant term the sim lacks; the gain scales retune a
+    block without leaving osc.py's own action space. Those are the only two
+    deviations left -- everything else is bit-exact robosuite.
     """
     cfg = SingleArmFrankaConfig(r_server_ip="x", r_robot_ip="y", r_gripper_ip="y", r_port=1,
                                 control_mode=ControlMode.EE_DELTA, cameras={}, depth=False,
@@ -966,11 +953,6 @@ def test_defaults_are_exact_parity():
         f"rotation={cfg.ee_rotation_fudge}. The policy's own delta is being "
         "rescaled before it reaches the OSC goal, so the arm tracks a different "
         "command than the sim it was trained in.")
-    # The coupled path inverts a 6x6 that goes singular; without damping it
-    # commanded 709 Nm against a 69.6 Nm clamp in test_dls_bounds_lambda_full.
-    from lerobot_robot_bimanual_franka.osc_torque_controller import LAMBDA_DLS_MU
-    if not cfg.uncouple_pos_ori:
-        assert LAMBDA_DLS_MU > 0.0, "uncouple_pos_ori=False needs the DLS guard"
     # Above 1.0 the assist injects more than the friction it cancels, so the net
     # plant friction goes negative, and the band's incremental gain (1 + kc/0.20)
     # multiplies the OSC law -- and the measured dq inside it -- by that much.
@@ -992,9 +974,6 @@ def test_defaults_are_exact_parity():
                                 np.broadcast_to(cfg.kd_ori_scale, 3)])
     assert np.allclose((kp_tuned / kd_tuned) * kd_scale6, kp_sim / kd_sim), (
         "a gain scale changed the slew rate by something other than kd_*_scale")
-    from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
-    assert _srv._FRICTION_KC == 0.0
-    assert _srv._JOINT_DAMPING_KV == 0.0
     kp, kd = resolve_gains(0.0, 0.0)
     assert np.allclose(kp, 150.0) and np.allclose(kd, 2 * np.sqrt(150.0))
 
@@ -1017,72 +996,33 @@ def test_hardware_knobs_only_perturb_when_enabled():
     assert np.all(np.abs(fr - base) <= bound + 1e-9), "friction exceeded its saturation bound"
 
 
-def test_speed_guard_cuts_back_then_brakes():
-    """The last-resort guard. Not client-tunable by design: every exposed knob
-    (kp, kp_ori_scale, uncouple_pos_ori, the fudges, friction_kc) multiplies
-    commanded torque and several compose, so bounding the command is not enough
-    -- a sweep once demanded ~110 Nm against a 69.6 Nm clamp, and a saturated
-    clamp IS maximum-force motion. This bounds the resulting speed instead.
+def test_torque_limits_are_the_only_thing_that_rescales_tau():
+    """One layer, and it is _enforce_limits. Anything else that scales tau on its
+    way to the joints is a second envelope the tuner cannot see: it makes a gain
+    change stop mattering somewhere, with nothing in the log to say where.
+
+    Asserted structurally, because a reintroduced guard would pass every
+    numerical test in this file -- it only fires outside their range.
     """
-    case = make_case(np.random.default_rng(0))
-    tau = np.full(7, 60.0)
-    trip = srv._JOINT_VELOCITY_LIMITS * srv._JOINT_VELOCITY_TRIP
+    import inspect
+    body = inspect.getsource(srv.ControlLoop.run)
+    sends = [ln.strip() for ln in body.splitlines() if "writeOnce" in ln]
+    assert len(sends) == 1, f"expected one write path, found {len(sends)}"
+    # The tau that is written must come straight out of the limiter.
+    assert "tau = self._enforce_limits(" in body
+    assert "writeOnce(pylibfranka.Torques(tau.tolist()))" in sends[0]
 
-    # Joint-speed term in isolation (no Jacobian -> no EE term).
-    s = make_session(case)
-    s._last_J = None
-    assert np.allclose(srv.ControlLoop._speed_guard(s, tau.copy(), trip * 0.5), tau)
-    prev = np.inf
-    for f in (1.05, 1.2, 1.35, 1.49):
-        mag = float(np.max(np.abs(srv.ControlLoop._speed_guard(s, tau.copy(), trip * f))))
-        assert mag < prev, f"cutback not monotonic at {f}x"
-        prev = mag
-    for f in (1.6, 3.0, 10.0):
-        dq = trip * f
-        out = srv.ControlLoop._speed_guard(s, tau.copy(), dq)
-        assert np.all(out * dq <= 1e-9), f"did not brake at {f}x"
-        assert np.all(np.abs(out) <= srv._TAU_LIMIT + 1e-9), (
-            f"brake torque {np.max(np.abs(out)):.1f} Nm exceeds the clamp at {f}x")
-    assert s.guard_trips > 0
+    for name in dir(srv.ControlLoop):
+        assert "guard" not in name and "brake" not in name, (
+            f"ControlLoop.{name} looks like a second limit layer")
+    for name in dir(srv):
+        assert "VELOCITY" not in name and "BRAKE" not in name, (
+            f"pylibfranka_control.{name} looks like a velocity envelope")
 
-    # EE speed trips independently, and SHOULD fire before joint limits do --
-    # a modest joint speed near an extended pose is a fast end effector.
-    s2 = make_session(case)
-    s2._last_J = case["J"]
-    assert np.allclose(srv.ControlLoop._speed_guard(s2, tau.copy(), np.zeros(7)), tau)
-    dq_ee = np.linalg.pinv(case["J"]) @ np.array([2.0, 0, 0, 0, 0, 0])   # 2 m/s EE
-    out = srv.ControlLoop._speed_guard(s2, tau.copy(), dq_ee)
-    assert not np.allclose(out, tau), "EE-speed term did not trip"
-    assert np.all(np.abs(out) <= srv._TAU_LIMIT + 1e-9)
-
-
-def test_speed_guard_clears_the_sim_action_envelope():
-    """The guard must sit OUTSIDE the motion a +/-1 sim action asks for.
-
-    Inside it, the guard rescales the control law instead of bounding a runaway.
-    """
-    kp, kd = resolve_gains(0.0, 0.0)
-    v_lin = (kp[0] / kd[0]) * DELTA_POS_MAX
-    v_ang = (kp[3] / kd[3]) * DELTA_ROT_MAX
-    worst = 0.0
-    for seed in range(24):
-        case = make_case(np.random.default_rng(seed))
-        s = make_session(case)
-        s._last_J = case["J"]
-        J_pinv = np.linalg.pinv(case["J"])
-        for axis in range(6):
-            twist = np.zeros(6)
-            twist[axis] = v_lin if axis < 3 else v_ang
-            dq = J_pinv @ twist
-            if np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS) > 0.98:
-                continue          # the arm's own rated velocity, not our envelope
-            tau = np.full(7, 5.0)
-            out = srv.ControlLoop._speed_guard(s, tau.copy(), dq)
-            assert np.allclose(out, tau), (
-                f"guard fired inside the sim envelope (seed {seed}, axis {axis}, "
-                f"max dq/limit {np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS):.2f})")
-            worst = max(worst, float(np.max(np.abs(dq) / srv._JOINT_VELOCITY_LIMITS)))
-    return f"sim-parity peak joint speed {worst:.2f} of rated, guard trips at {srv._JOINT_VELOCITY_TRIP}"
+    # And the client cannot install one.
+    from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
+    assert set(inspect.signature(_srv._ArmSession.set_tuning).parameters) == {
+        "self", "friction_kc"}
 
 
 def test_friction_feedforward_cannot_drive_an_idle_arm():
@@ -1255,58 +1195,27 @@ def test_friction_assist_is_osc_only():
         assert np.allclose(tau, plain), f"friction assist leaked into mode {mode}"
 
 
-def test_dls_bounds_lambda_full_near_a_singularity():
-    """uncouple_pos_ori=False inverts the coupled 6x6, which blows up as J loses
-    rank; the guard must bound it there and be near-exact where it does not."""
-    from lerobot_robot_bimanual_franka.osc_torque_controller import (
-        LAMBDA_DLS_MU, opspace_matrices)
-    M = REAL_M
-    cmd = np.concatenate([np.full(3, 7.5), np.zeros(3)])
-
-    exact, damped, worst_rel = [], [], 0.0
-    for q4 in (-2.4, -1.6, -1.2, -0.8, -0.5, -0.3):
-        q = REAL_Q.copy(); q[3] = q4
-        Jx = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
-        lf_e = opspace_matrices(M, Jx, Jx[:3], Jx[3:])[0]
-        lf_d = opspace_matrices(M, Jx, Jx[:3], Jx[3:], dls_mu=LAMBDA_DLS_MU)[0]
-        exact.append(np.max(np.abs(Jx.T @ (lf_e @ cmd))))
-        damped.append(np.max(np.abs(Jx.T @ (lf_d @ cmd))))
-        cond = np.linalg.cond(Jx @ np.linalg.inv(M) @ Jx.T)
-        if cond < 1e3:            # well conditioned: the guard must barely bite
-            worst_rel = max(worst_rel, _rel(lf_d @ cmd, lf_e @ cmd))
-
-    # Absolute Nm depends on the mass matrix, which make_case synthesises; what
-    # must hold for any M is that the worst pose is bounded well below the exact
-    # blow-up while the well-conditioned poses are barely touched.
-    assert max(damped) < 0.5 * max(exact), (
-        f"DLS only cut the worst torque {max(exact):.0f} -> {max(damped):.0f} Nm")
-    assert worst_rel < 0.15, f"DLS distorts a well-conditioned pose by {worst_rel:.2%}"
-    return (f"peak tau {max(exact):.0f} -> {max(damped):.0f} Nm, "
-            f"well-conditioned distortion {worst_rel:.1%}")
-
-
-def test_speed_guard_is_not_reachable_from_the_client():
-    """set_tuning must not expose the safety envelope."""
-    import inspect
-    from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
-    sig = inspect.signature(_srv._ArmSession.set_tuning)
-    for p in sig.parameters:
-        assert "veloc" not in p and "guard" not in p and "brake" not in p, p
-
-
 def test_torque_limit_and_rate_limit():
-    """_limit clamps per joint and respects libfranka's 1000 Nm/s."""
+    """_enforce_limits clamps per joint and respects libfranka's 1000 Nm/s.
+
+    This is now the ONLY bound between the control law and the joints, so a
+    regression here has nothing behind it.
+    """
     class _Dur:
         def to_sec(self):
             return 1e-3
 
     huge = np.array([500.0, -500, 500, -500, 500, -500, 500])
-    out = srv.ControlLoop._limit(huge, np.zeros(7), _Dur())
+    out = srv.ControlLoop._enforce_limits(huge, np.zeros(7), _Dur())
     assert np.all(np.abs(out) <= 1.0 + 1e-12), "rate limit not applied from tau_prev=0"
-    out2 = srv.ControlLoop._limit(huge, huge, _Dur())
+    out2 = srv.ControlLoop._enforce_limits(huge, huge, _Dur())
     assert np.all(np.abs(out2) <= srv._TAU_LIMIT + 1e-9), "per-joint clamp not applied"
-    nan = srv.ControlLoop._limit(np.full(7, np.nan), np.zeros(7), _Dur())
+    nan = srv.ControlLoop._enforce_limits(np.full(7, np.nan), np.zeros(7), _Dur())
     assert np.all(np.isfinite(nan)), "NaN torque not sanitised"
+    # The clamp is the datasheet limit itself: no safety factor in between, so
+    # what the log calls a clamp trip is the joint's real ceiling.
+    from lerobot_robot_bimanual_franka.osc_torque_controller import JOINT_TORQUE_LIMITS
+    assert np.allclose(srv._TAU_LIMIT, JOINT_TORQUE_LIMITS)
 
 
 def test_worktable_brake_never_commands_below_the_floor():

@@ -86,7 +86,7 @@ def section(name: str) -> dict[str, Any]:
 
 
 def get(path: str, default: Any = ...) -> Any:
-    """Dotted lookup, e.g. get("control.gains.joint_pd.kp").
+    """Dotted lookup, e.g. get("control.torque.osc.default_kp").
 
     The first segment names the YAML file. Raises KeyError on a missing key
     unless a default is given — a silent None here would become a silent

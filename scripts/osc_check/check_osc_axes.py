@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import time
 
+import franka_config as fc
 import numpy as np
 from scipy.spatial.transform import Rotation
 
@@ -112,9 +113,9 @@ def verdicts(rows, args) -> list[tuple[str, float, float, str]]:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--server-ip", default="192.168.3.10")
-    ap.add_argument("--robot-ip", default="192.168.201.10")
-    ap.add_argument("--port", type=int, default=18812)
+    ap.add_argument("--server-ip", default="192.168.3.11")
+    ap.add_argument("--robot-ip", default="192.168.200.2")
+    ap.add_argument("--port", type=int, default=18813)
     ap.add_argument("--pos-step", type=float, default=0.03, help="metres")
     ap.add_argument("--rot-step", type=float, default=0.15, help="radians")
     ap.add_argument("--settle", type=float, default=1.5, help="seconds per probe")
@@ -122,20 +123,17 @@ def main() -> None:
                     help="action kp in [-1,1]; 0 = robosuite default 150, +1 = 1500")
     ap.add_argument("--kd", type=float, default=0.0,
                     help="action kd in [-1,1]; damping_ratio = 10**kd")
-    ap.add_argument("--uncouple", choices=("true", "false"), default=None,
-                    help="osc.py's uncouple_pos_ori. false applies Lambda_full to the whole "
-                         "wrench: zero cross-coupling and far more torque per axis")
     ap.add_argument("--kp-ori-scale", type=float, nargs="+",
-                    default=list(SingleArmFrankaConfig.kp_ori_scale),
+                    default=list(fc.control("tuning.kp_ori_scale")),
                     help="multiply the orientation gains only (scalar or rx ry rz); leaves "
                          "translation at the sim default so the arm stays gentle. Capped at "
                          "10x by KP_LIMITS -- yaw needs its own value, roll/pitch saturate "
                          "the wrist torque clamp long before it does")
     ap.add_argument("--kp-pos-scale", type=float, nargs="+",
-                    default=list(SingleArmFrankaConfig.kp_pos_scale),
+                    default=list(fc.control("tuning.kp_pos_scale")),
                     help="same for the translation gains (scalar or x y z). X is the weak "
                          "one here: lambda_pos is ~0.85 kg along it against 6.3 along Z")
-    ap.add_argument("--friction-kc", type=float, default=SingleArmFrankaConfig.friction_kc,
+    ap.add_argument("--friction-kc", type=float, default=fc.control("tuning.friction_kc"),
                     help="server-side Coulomb friction feedforward (0..1); defaults to the "
                          "robot config's value so a probe measures what teleop flies. Sweep it "
                          "to find the smallest value that un-stalls the rotation axes.")
@@ -183,9 +181,8 @@ def main() -> None:
     robot.connect()
     mgr = robot.robot_manager
     # ALWAYS push: server sessions outlive their clients.
-    unc = cfg.uncouple_pos_ori if args.uncouple is None else (args.uncouple == "true")
-    mgr.set_tuning_all(friction_kc=args.friction_kc, uncouple_pos_ori=unc)
-    print(f"friction_kc={args.friction_kc}  uncouple_pos_ori={unc}  "
+    mgr.set_tuning_all(friction_kc=args.friction_kc)
+    print(f"friction_kc={args.friction_kc}  "
           f"kp_pos_scale={pos_scale}  kp_ori_scale={ori_scale}  kp={kp[0]:.0f}")
     print(f"commanding {args.pos_step} m / {args.rot_step} rad per axis")
 

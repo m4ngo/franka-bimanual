@@ -44,6 +44,8 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import VideoEncodingManager
 from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 
+from reach_base_policy import ReachBasePolicy
+
 logger = logging.getLogger(__name__)
 
 import franka_config as fc  # noqa: E402
@@ -632,6 +634,17 @@ def _save_viz(
         print(f"saved policy-input clouds to {pcd_path} (plot with plot_policy_pcd.py)")
 
 
+def _record_reach_target(recorder: "EpisodeRecorder | None", base_policy) -> None:
+    """Hand the episode's reach curve to the recorder so the viz can draw it.
+
+    Called after the episode: the curve is anchored lazily on the first infer(),
+    so it does not exist yet when the recorder is created.
+    """
+    if recorder is None or not isinstance(base_policy, ReachBasePolicy):
+        return
+    recorder.record_reach_target(base_policy.waypoints_world, base_policy.goal_pos_world)
+
+
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
@@ -719,6 +732,14 @@ def main() -> None:
     parser.add_argument("--viz-stride", type=int, default=1,
                         help="Animate every Nth step in the visualization (default 1)")
     parser.add_argument("--replay-dataset", default=None, help="HuggingFace id for the dataset to replay from")
+    parser.add_argument("--reach-goal", nargs=3, type=float, default=None,
+                        help="Goal EE position [x y z] (world/robot frame per "
+                             "--proprio-frame) for the analytic Reach base policy; "
+                             "enables the reach task in place of --base-policy")
+    parser.add_argument("--reach-n-waypoints", type=int, default=128)
+    parser.add_argument("--reach-control-offset", type=float, default=0.15)
+    parser.add_argument("--reach-advance-threshold", type=float, default=0.02)
+    parser.add_argument("--reach-lookahead-k", type=int, default=5)
 
     args = parser.parse_args()
 
@@ -743,7 +764,21 @@ def main() -> None:
     controller = env_wrapper.start_controller()
     print("robot initialized!")
 
-    if args.replay_dataset is None:
+    if args.reach_goal is not None:
+        print(f"attempting to start analytic reach base policy toward "
+              f"{args.reach_goal} (world frame)")
+        base_policy = ReachBasePolicy(
+            goal_pos=np.asarray(args.reach_goal, dtype=np.float64),
+            r_robot_in_world=controller._r_robot_in_world,
+            t_robot_in_world=controller._t_robot_in_world,
+            n_waypoints=args.reach_n_waypoints,
+            control_offset=args.reach_control_offset,
+            advance_threshold=args.reach_advance_threshold,
+            lookahead_k=args.reach_lookahead_k,
+            sim_proprio_convention=not args.raw_proprio,
+        )
+        print("reach base policy started!")
+    elif args.replay_dataset is None:
         print(f"attempting to start base policy: {args.base_policy}")
         base_policy = BasePolicy(args.base_policy, device=args.device,
                                  amp=args.base_amp, compile_mode=args.base_compile)
@@ -763,6 +798,9 @@ def main() -> None:
 
     _warmup_policies(controller, base_policy, residual,
                      args.proprio_frame, not args.raw_proprio)
+
+    if isinstance(base_policy, ReachBasePolicy):
+        base_policy.reset_curve()   # discard the warmup-anchored curve
 
     dump_root: "Path | None" = None
     if args.dump_obs_dir:
@@ -799,6 +837,8 @@ def main() -> None:
 
     if not recording:
             print("homing...")
+            if isinstance(base_policy, ReachBasePolicy):
+                base_policy.reset_curve()   # anchor to the true post-homing pose
             if not controller.home(**home_kwargs):
                 logger.warning("homing did not converge; proceeding anyway")
             recorder = EpisodeRecorder() if args.viz_dir else None
@@ -816,6 +856,7 @@ def main() -> None:
                     infer_lead=args.infer_lead,
                 )
             finally:
+                _record_reach_target(recorder, base_policy)
                 if recorder is not None and len(recorder) > 0:
                     viz_path = os.path.join(args.viz_dir, "episode.html")
                     print(f"saving visualization to {viz_path}...")
@@ -829,6 +870,8 @@ def main() -> None:
         with VideoEncodingManager(dataset):
             # Home once before the first episode.
             print(f"homing before episode {dataset.num_episodes}...")
+            if isinstance(base_policy, ReachBasePolicy):
+                base_policy.reset_curve()   # anchor to the true post-homing pose
             if not controller.home(**home_kwargs):
                 logger.warning("homing did not converge; proceeding anyway")
 
@@ -858,6 +901,7 @@ def main() -> None:
                         infer_lead=args.infer_lead,
                     )
                 finally:
+                    _record_reach_target(recorder, base_policy)
                     if recorder is not None and len(recorder) > 0:
                         viz_path = os.path.join(
                             args.viz_dir, f"episode_{ep_idx:03d}.html"
@@ -869,6 +913,8 @@ def main() -> None:
 
                 if ep_idx < args.num_episodes - 1:
                     print("resetting environment — homing arm before next episode...")
+                    if isinstance(base_policy, ReachBasePolicy):
+                        base_policy.reset_curve() 
                     if not controller.home(**home_kwargs):
                         logger.warning("homing did not converge; proceeding anyway")
     finally:

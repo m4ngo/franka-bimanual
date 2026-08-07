@@ -102,7 +102,6 @@ def main() -> None:
     parser.add_argument("--home-gripper", type=float, default=fc.control("homing.gripper_norm"))
     parser.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
     parser.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
-    parser.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"))
 
     parser.add_argument("--repo-id", default=None)
     parser.add_argument("--output-dir", default=None)
@@ -189,7 +188,6 @@ def main() -> None:
         gripper_norm=home_gripper,
         max_time_s=args.home_max_time_s,
         tol_rad=args.home_tol_rad,
-        tol_pos_m=args.home_tol_m,
     )
 
     recording = args.repo_id is not None

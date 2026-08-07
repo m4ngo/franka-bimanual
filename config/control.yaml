@@ -1,5 +1,9 @@
-# Every control-loop constant for the FR3 stack: gains, fudge factors, limits,
+# Every control-loop constant for the FR3 stack: gains, tuning trims, limits,
 # rates, and wire-level dynamics. Nothing here should be duplicated in Python.
+#
+# There is exactly ONE bound on what reaches the joints (torque.limits) and ONE
+# geometric screen on what the workstation may command (worktable_brake). If you
+# find yourself adding a third, it belongs in one of those two.
 
 version: 2
 
@@ -12,61 +16,74 @@ rates:
   # Homing loop rate; null falls back to control_fps.
   home_fps: null
 
-gains:
-  # VELOCITY-domain PD, used only by the remaining velocity callers (the openpi
-  # client and the joint-velocity diagnostic path). The live control modes are
-  # torque; their gains are under `torque:` below.
-  joint_pd: {kp: 2.0, kd: 0.1}
-  ee_pd: {kp: 3.5, kd: 0.2}
-
-fudge:
+# The per-rig hardware trims -- the only knobs meant to be swept. Every one of
+# them is a deliberate deviation from the sim, and every one is a no-op at the
+# value listed as sim parity. Both robot configs read these directly, so a
+# dataclass literal for any of them is a bug (see config/README.md).
+tuning:
   # Sim-to-real scaling applied to EE_DELTA actions before they reach the OSC
   # controller. 1.0 = exactly what the policy emits, which is what sim parity is
-  # defined at (tests/test_osc_stack.py pins these). Anything else is a rig trim.
-  ee_translation: 1.0
-  ee_rotation: 1.0
+  # defined at (tests/test_osc_stack.py pins these).
+  ee_translation_fudge: 1.0
+  ee_rotation_fudge: 1.0
+
+  # Coulomb friction feedforward scale. The assist cancels a plant term the sim
+  # does not have, so a non-zero value is CLOSER to osc.py's motion, not further
+  # from it. 0.0 = sim parity; friction_kc_joint is a per-joint multiplier on it.
+  friction_kc: 1.0
+  friction_kc_joint: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+  # Per-block OSC gain trims, each a scalar or a 3-vector. 1.0 is sim.
+  #
+  # kp_*_scale multiplies its block's stiffness; the damping ratio is then
+  # re-derived as sqrt(kp6/kp), which holds kp/kd -- and therefore the settling
+  # speed v = (kp/kd)*delta -- FIXED. A kp scale buys friction rejection, not
+  # speed.
+  #
+  # kd_*_scale multiplies its block's damping ratio directly, which is the one
+  # knob that does change kp/kd. Raise it to slow and damp an axis that
+  # oscillates, where more kp only makes it worse.
+  kp_pos_scale: [1.0, 1.0, 1.0]
+  kp_ori_scale: [1.0, 1.0, 1.0]
+  # 0.5 is the value single_arm_franka was already flying. The bimanual config
+  # used to hardcode 1.0 here; the two are one setting now, and this is the one
+  # with hardware behind it.
+  kd_pos_scale: [1.0, 1.0, 1.0]
+  kd_ori_scale: [1.0, 1.0, 1.0]
 
 gripper_accum_speed: 1.0
 
-limits:
-  joint_velocity_max: 2.0        # rad/s, L2-norm ceiling
-  ee_linear_velocity_max: 1.0    # m/s
-  ee_angular_velocity_max: 2.0   # rad/s
-
 worktable_brake:
+  # The ONLY workstation-side screen. A hard floor on the commanded OSC goal,
+  # nothing else: no velocity envelope, no gain coupling, no joint-space form.
+  # The goal is raised along world-up until the EE collision sphere's lowest
+  # point sits at or above world.worktable.height_m + distance_min_m.
+  #
   # Table height itself lives in world.yaml (worktable.height_m, world frame).
   #
   # The EE is modelled as a SPHERE, not a point, so a tilted gripper cannot
   # touch the table with its side while the TCP still reads as clear. The
-  # centre is given in the TOOL frame and rotates with the EE; the brake uses
-  # the sphere's lowest point, centre_world_z - radius_m.
+  # centre is given in the TOOL frame and rotates with the EE.
   #
   # center_tool_m [0,0,0] puts the sphere on the TCP itself. Push it along -z
   # to cover a gripper whose bulk sits behind the fingertips.
   ee_sphere:
     center_tool_m: [0.0, 0.0, -0.10]
     # 0.10 m is a deliberately conservative enclosure of the Franka Hand / WSG
-    # jaw assembly. It brakes early and costs workspace near the table; shrink
-    # it once the real jaw extent is measured.
+    # jaw assembly. It costs workspace near the table; shrink it once the real
+    # jaw extent is measured.
     radius_m: 0.10
   distance_min_m: 0.01
-  max_decel_mps2: 0.5
-  velocity_eps_mps: 1.0e-4
 
 franka:
   num_joints: 7
-  ee_delta_dims: 6
-  velocity_command_duration_ms: 100
-  joint_relative_dynamics: [1.0, 0.25, 1.0]
-  ee_delta_relative_dynamics: [1.0, 0.25, 1.0]
-  joint_stiffness: [350.0, 350.0, 300.0, 500.0, 350.0, 150.0, 150.0]
-  torque_threshold_nm: 100.0
-  force_threshold_n: 200.0
-  jacobian_cache_q_threshold_rad: 0.50
   request_timeout_s: 5.0
   rpyc_timeout_s: 10
   connect_timeout_s: 10.0
   first_state_timeout_s: 5.0
+  # Read ONLY by scripts/openpi_client_franka.py, the one remaining
+  # velocity-domain caller. The torque path is bounded by torque.limits and
+  # never sees these.
   # FR3 datasheet limits; joints 1-4 @ 2.175 rad/s, joints 5-7 @ 2.61 rad/s.
   max_joint_velocity_rad_s: [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
   max_joint_accel_rad_s2: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
@@ -83,6 +100,7 @@ torque:
     # robosuite's OperationalSpaceController config, from
     # multi-fast cfg/fast_default.yaml + osc_pose.json. Sim parity is DEFINED by
     # these, so they are not rig trims -- change them only alongside the sim.
+    # Rig trims live under `tuning:` above.
     #
     # impedance_mode "variable" takes kp and the damping ratio from the action
     # every step. Under "fixed" robosuite ignores gain actions entirely, so a
@@ -97,18 +115,12 @@ torque:
     # kp = default_kp * (kp_limits[1]/default_kp) ** a_kp. Do not add a separate
     # base here -- a second copy is how it silently drifts from the sim.
     nullspace_kp: 10.0
-    # Damped-least-squares floor on lambda_full, active only when
-    # uncouple_pos_ori is false (the coupled 6x6 goes singular). Caps lambda_full
-    # at 1/mu^2: 0.05 caps at 400 against a healthy 11 and never engaged before
-    # the torque clamp; 0.10 caps at 100, 0.15 at 44.
-    lambda_dls_mu: 0.05
-
-    joint_torque_factors: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
   delta:
     # osc_pose.json output_max/output_min: the per-step EE_DELTA envelope. Full
     # SpaceMouse deflection is exactly a normalized +/-1 policy action against
-    # these, so teleop and policy drive the controller in identical units.
+    # these, so teleop and policy drive the controller in identical units. This
+    # is osc.py's own input clip + output scale, not an extra safety layer.
     pos_max_m: 0.05
     rot_max_rad: 0.5
 
@@ -118,57 +130,45 @@ torque:
     # 0.5 rad error asks for ~0.3 Nm -- under breakaway, which is why home()
     # could not rotate the wrist. These are libfranka's joint_impedance_example
     # values (Nm/rad, Nms/rad).
-    kp: [300.0, 300.0, 300.0, 300.0, 400.0, 150.0, 100.0]
+    kp: [300.0, 300.0, 300.0, 300.0, 200.0, 150.0, 100.0]
     # Sized per joint as 2*zeta*sqrt(kp*M) at zeta ~ 0.7, NOT copied from the
     # libfranka example: those assume the proximal joints' inertia and on the
     # wrist are both discretely unstable and self-throttling against homing's
     # torque budget.
     kd: [35.0, 35.0, 35.0, 35.0, 20.0, 10.0, 10.0]
-    damping_ratio: 1.0
-    # Cap on each joint's velocity-loop pole kd/M (rad/s). Stiffness must stay
-    # un-weighted (see kp) but damping then inherits the same tiny inertia:
-    # kd/M is 600-1500 rad/s on joints 5-7, so -kd*dq alternates sign against the
-    # 500 Hz law and the wrist bang-bangs its clamp -- the homing vibration.
-    # 100 leaves joints 1-4 untouched and lands 5-7 at damping ratio 0.58-0.71.
+    damping_ratio: 0.8
+    # Cap on each joint's velocity-loop pole kd/M (rad/s). Part of the joint
+    # impedance law, not a safety screen: stiffness must stay un-weighted (see
+    # kp) but damping then inherits the same tiny inertia, and kd/M is 600-1500
+    # rad/s on joints 5-7, so -kd*dq alternates sign against the 500 Hz law and
+    # the wrist bang-bangs its clamp -- the homing vibration. 100 leaves joints
+    # 1-4 untouched and lands 5-7 at damping ratio 0.58-0.71.
     kd_pole_max_rad_s: 100.0
     # Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix so the
     # pole is this on every joint.
     velocity_kv: 25.0
 
   limits:
-    # FR3/Panda datasheet continuous joint torque limits (Nm).
+    # The ONLY bound on what reaches the joints. Applied in the response path of
+    # pylibfranka_control's loop, after the law and before the write: rate limit
+    # first, then clamp. Nothing else rescales tau.
+    #
+    # FR3/Panda datasheet continuous joint torque limits (Nm). This is osc.py's
+    # clip_torques against actuator_range.
     joint_torque_nm: [87.0, 87.0, 87.0, 87.0, 30.0, 25.0, 20.0]
-    tau_safety_factor: 0.8
-    # Nm/s. libfranka rejects torque steps above its own rate limit.
+    # Nm/s. libfranka rejects torque steps above its own rate limit and nothing
+    # enforces it for us the way franka::limitRate does in the C++ examples.
     max_torque_rate_nm_s: 1000.0
-    # Speed guard. Its envelope must stay OUTSIDE the one a +/-1 sim action
-    # produces (v = (kp/kd)*delta = 0.31 m/s / 3.06 rad/s at the default kp, and
-    # 3.06 rad/s runs the wrist at ~0.9 of rated) or it silently rescales the
-    # control law. tests/test_osc_stack.py pins that margin.
-    joint_velocity_rad_s: [2.62, 2.62, 2.62, 2.62, 3.26, 4.18, 5.26]
-    velocity_trip_fraction: 0.95
-    guard_hard_stop: 1.5
-    brake_kd: [40.0, 40.0, 40.0, 40.0, 20.0, 15.0, 10.0]
 
   friction:
     # Per-joint Coulomb breakaway (Nm) from scripts/measure_joint_friction.py.
-    # The feedforward cancels a plant term the sim does not have, so a non-zero
-    # assist is CLOSER to osc.py's motion, not further from it.
-    coulomb_nm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 10.0]
-    # Assist band, as a fraction of coulomb_nm: below this the joint is treated
-    # as not yet commanded to move.
-    tau_eps_fraction: 0.20
-    dq_eps_rad_s: 0.02   # below this a joint counts as stuck
-    kc_max: 3.0          # ceiling on the client-settable assist scale
-
-    friction_kc: 0.9
-    friction_kc_joint: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 10.0]
-
-    kp_ori_scale: [1.0, 1.0, 1.0]
-    kp_pos_scale: [1.5, 1.5, 1.5]
-
-    kd_ori_scale: [1.0, 1.0, 1.0]
-    kd_pos_scale: [0.8, 0.8, 0.8]
+    # The scale that multiplies this is tuning.friction_kc.
+    coulomb_nm: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    # Assist band, as a fraction of coulomb_nm. Sets the assist's incremental
+    # gain, 1 + kc/fraction -- 6x here -- and tau carries the measured dq, so
+    # the assist re-injects encoder noise at that gain. Widen the band to
+    # reduce it; do NOT filter the assist (see _friction_feedforward).
+    tau_eps_fraction: 0.05
 
   loop:
     # The OSC law runs at 500 Hz, not 1 kHz, because that is robosuite's substep
@@ -191,13 +191,11 @@ homing:
   gripper_norm: 1.0
   max_time_s: 3.0
   tol_rad: 0.05
-  tol_pos_m: 0.03
-  tol_rot_rad: null   # null -> tol_rad
   # The commanded goal LEADS the measured q rather than jumping to the target,
   # which bounds approach speed and lets it taper to zero on arrival. Re-deriving
   # the goal from the measured q each tick instead sawtooths the error by
   # v/rate -- a 25% torque ripple, felt as vibration.
-  max_qdot_rad_s: 0.6
+  max_qdot_rad_s: 1.0
   settle_qdot_rad_s: 0.05   # home() is not done until the arm is this still
   lead_margin: 1.5          # headroom so the stall clamp stays off the ramp
   # Fraction of each joint's torque clamp that homing may spend on

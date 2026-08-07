@@ -172,10 +172,6 @@ def main() -> None:
                    help="Joint homing: max per-joint error (rad). EE homing: default rot tolerance if --home-tol-rot-rad unset.")
     p.add_argument("--home-fps", type=int, default=None,
                    help="Homing control rate (Hz). Default: max(--fps, 60) in EE mode, else --fps.")
-    p.add_argument("--home-tol-m", type=float, default=fc.control("homing.tol_pos_m"),
-                   help="EE homing only: max position error (m) per arm")
-    p.add_argument("--home-tol-rot-rad", type=float, default=fc.control("homing.tol_rot_rad"),
-                   help="EE homing only: max axis-angle error (rad); defaults to --home-tol-rad")
 
     args = p.parse_args()
     init_logging()
@@ -234,9 +230,6 @@ def main() -> None:
                     fps=args.fps,
                     home_fps=args.home_fps,
                 )
-                if ControlMode(args.control_mode) != ControlMode.JOINT_POS:
-                    home_kw["tol_pos_m"] = args.home_tol_m
-                    home_kw["tol_rot_rad"] = args.home_tol_rot_rad
                 ok = robot.home(home_q_left=home_q_l, home_q_right=home_q_r, **home_kw)
                 if not ok:
                     logger.warning("Homing did not converge before episode %d; proceeding anyway",
