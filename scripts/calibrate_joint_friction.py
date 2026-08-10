@@ -198,8 +198,13 @@ def main() -> None:
         good = np.isfinite(factors)
         print("\n_FRICTION_COULOMB = np.array(["
               + ", ".join(f"{v:.2f}" if np.isfinite(v) else "nan" for v in raw) + "])")
-        print("friction_kc_joint = ("
-              + ", ".join(f"{v:.2f}" if np.isfinite(v) else "1.00" for v in factors) + ")")
+        # Symmetric: this pass measures one breakaway per joint, not one per
+        # rotation direction. Both vectors get the same value, which is exactly
+        # the old behaviour. Use measure_joint_friction.py --directional to
+        # split them.
+        sym = ", ".join(f"{v:.2f}" if np.isfinite(v) else "1.00" for v in factors)
+        print(f"friction_kc_joint_pos: [{sym}]")
+        print(f"friction_kc_joint_neg: [{sym}]")
         if good.any():
             print(f"\nfriction burden F/M spans {np.nanmin(raw[good] / _M_DIAG[good]):.1f} to "
                   f"{np.nanmax(raw[good] / _M_DIAG[good]):.1f} rad/s^2 -- that ratio, not the "

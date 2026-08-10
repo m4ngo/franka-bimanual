@@ -61,8 +61,14 @@ control rate. Nothing outside `config/` should hardcode any of them. See
 [config/README.md](config/README.md) for the file-by-file breakdown.
 
 **`control.yaml`'s `tuning:` block is where you tune.** Every per-rig hardware
-trim lives there and nowhere else — the delta fudges, `friction_kc` and its
-per-joint vector, and the four `kp_`/`kd_` `pos`/`ori` gain scales. Each is a
+trim lives there and nowhere else — the delta fudges, `friction_kc` with its
+`friction_kc_joint_pos`/`_neg` pair, and the four `kp_`/`kd_` `pos`/`ori` gain
+scales. **The friction assist is directional**: breakaway on this arm differs by
+which way a joint turns, so each joint carries two gains (14 numbers) selected by
+the sign of the *commanded torque* — not of `dq`, which would cancel the friction
+holding a still arm. Both vectors equal is exactly the old symmetric behaviour;
+measure the split with
+`scripts/measure_joint_friction.py --directional --gravity-flip-joint 3`. Each is a
 no-op at its sim-parity value, and both robot configs read them through
 `default_factory`, so the yaml is the only place any of them is written down.
 Everything under `torque:` is the *control law*, defined by the sim; do not
@@ -499,6 +505,13 @@ For code-level debugging:
 - `RuntimeError: Cannot resolve the torque block` on the NUC → the deploy did
   not write `nuc_control_config.py`. Re-run the deploy script; it fails the
   import check rather than letting the arm run on a stale gain.
+- **`set_tuning` fails with a numpy broadcast error naming (14,) and (7,)** →
+  the NUC predates the directional friction assist. Re-run
+  `scripts/deploy_nuc_server.sh <mario|luigi>`. `set_tuning` **raises** rather
+  than warning, unlike every other call in `RobotDriver`: goal pushes are
+  per-tick and best-effort, but this one is session configuration, and server
+  sessions outlive their client — a swallowed failure leaves the arm on an
+  earlier script's assist and the run measures a controller nobody configured.
 - Point cloud / EE geometry in the wrong place → check the frame convention
   before touching math: `robot_base_in_world` maps base → world directly.
   `python -m franka_config dump world` shows what the stack actually sees.

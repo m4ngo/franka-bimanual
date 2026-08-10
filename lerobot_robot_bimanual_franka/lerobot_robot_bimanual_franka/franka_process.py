@@ -142,11 +142,34 @@ class RobotDriver:
         self._push(self._root.set_mode, mode)
 
     def set_tuning(self, friction_kc: float | np.ndarray | tuple | None = None) -> None:
-        """Live server-side tuning. friction_kc=0 restores exact osc.py behaviour;
-        it is a scalar or a per-joint 7-vector."""
+        """Live server-side tuning. friction_kc=0 restores exact osc.py behaviour.
+
+        Scalar, a per-joint 7-vector, or a 2x7 (per joint per rotation
+        direction: [positive-commanded-torque, negative]). Flattened here
+        because brine only crosses flat tuples of native floats.
+
+        RAISES on failure, unlike every other call in this class. The goal
+        pushes are per-tick and best-effort -- a dropped one is corrected by the
+        next. This is session configuration, and server sessions are keyed by
+        robot_ip and outlive their client, so a swallowed failure leaves the arm
+        on whatever assist an earlier script set and the run measures a
+        controller nobody configured. That is the exact failure BimanualFranka's
+        "ALWAYS push" comment exists to prevent, and routing this through _push
+        silently defeated it.
+        """
         if friction_kc is not None and np.ndim(friction_kc) > 0:
             friction_kc = _t(friction_kc)
-        self._push(self._root.set_tuning, friction_kc)
+        try:
+            self._root.set_tuning(self.robot_ip, friction_kc)
+        except Exception as e:
+            n = np.size(friction_kc) if friction_kc is not None else 0
+            hint = ""
+            if "broadcast" in str(e) and n == 2 * NUM_JOINTS:
+                hint = (f" -- the server rejected a {n}-element friction_kc, which means "
+                        f"it predates the directional assist. Run "
+                        f"scripts/deploy_nuc_server.sh for this arm.")
+            raise RuntimeError(
+                f"set_tuning({self.robot_ip}) failed: {e}{hint}") from e
 
     def _push(self, rpc, *args) -> None:
         try:

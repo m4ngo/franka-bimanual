@@ -111,8 +111,18 @@ _ARM_ATTEMPTS = int(torque("loop.arm_attempts"))
 _ARM_BACKOFF_S = float(torque("loop.arm_backoff_s"))
 
 
-def _friction_feedforward(kc, tau, coriolis):
+def _friction_feedforward(kc_pos, kc_neg, tau, coriolis):
     """Assist the commanded torque past breakaway; zero command, zero assist.
+
+    DIRECTIONAL: breakaway on this arm differs by which way a joint turns, so
+    each joint carries two gains and the one applied is selected by the sign of
+    the commanded torque. `kc_pos` applies where (tau - coriolis) > 0.
+
+    Selecting on the commanded torque -- the same quantity the tanh takes -- is
+    what keeps this continuous. The gain switches exactly where tanh is zero, so
+    the product never jumps; only its slope changes. Selecting on dq instead
+    would both reintroduce a discontinuity at zero crossing AND cancel the
+    friction holding a still arm, which is the walking failure below.
 
     Never sign this by dq. EE_DELTA re-anchors its goal on the measured pose, so
     residual friction is the only thing holding the arm at zero command -- cancel
@@ -126,7 +136,9 @@ def _friction_feedforward(kc, tau, coriolis):
     it made the shake worse. The only safe lever is the gain itself
     (_FRICTION_TAU_EPS), or kc, which set_tuning can sweep live.
     """
-    return kc * _FRICTION_COULOMB * np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
+    band = np.tanh((tau - coriolis) / _FRICTION_TAU_EPS)
+    kc = np.where(band >= 0.0, kc_pos, kc_neg)
+    return kc * _FRICTION_COULOMB * band
 
 
 class ControlLoop:
@@ -258,9 +270,9 @@ class ControlLoop:
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
         # OSC only: home/hold have no sim counterpart and friction is what keeps
         # them quiet -- assisting there buzzes on the hold's own standing torque.
-        kc = goal[shm.G_FRICTION_KC]
-        if mode == shm.MODE_OSC and np.any(kc):
-            tau = tau + _friction_feedforward(kc, tau, coriolis)
+        kc_pos, kc_neg = goal[shm.G_FRICTION_KC_POS], goal[shm.G_FRICTION_KC_NEG]
+        if mode == shm.MODE_OSC and (np.any(kc_pos) or np.any(kc_neg)):
+            tau = tau + _friction_feedforward(kc_pos, kc_neg, tau, coriolis)
         return tau, q, dq, None
 
     def _goal(self):

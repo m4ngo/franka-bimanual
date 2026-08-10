@@ -240,14 +240,25 @@ class _ArmSession:
         self.ch.write_goal(G_MODE=shm.MODE_NAMES.get(mode, shm.MODE_HOLD))
 
     def set_tuning(self, friction_kc=None) -> None:
-        """The only live-tunable server-side knob. friction_kc is a scalar or a
-        per-joint 7-vector; 0 is exact osc.py."""
+        """The only live-tunable server-side knob. 0 is exact osc.py.
+
+        friction_kc accepts a scalar (all joints, both directions), a 7-vector
+        (per joint, symmetric), or a 2x7 / flat-14 (per joint per rotation
+        direction, [positive-torque row, negative-torque row]).
+        """
         if friction_kc is not None:
-            # Scalar broadcasts; a 7-vector sets each joint's own factor.
-            kc = np.broadcast_to(np.asarray(friction_kc, dtype=np.float64), (NUM_JOINTS,))
-            self.ch.write_goal(G_FRICTION_KC=kc)
-        logger.info("%s: tuning -> friction_kc=%s", self.robot_ip,
-                    np.array2string(self.ch.goal[shm.G_FRICTION_KC], precision=2))
+            kc = np.asarray(friction_kc, dtype=np.float64)
+            if kc.size == 2 * NUM_JOINTS:
+                kc = kc.reshape(2, NUM_JOINTS)
+            else:
+                # Scalar or 7-vector: same gain in both directions.
+                kc = np.broadcast_to(kc, (NUM_JOINTS,))
+                kc = np.stack([kc, kc])
+            self.ch.write_goal(G_FRICTION_KC_POS=kc[0], G_FRICTION_KC_NEG=kc[1])
+        g = self.ch.goal
+        logger.info("%s: tuning -> friction_kc +%s / -%s", self.robot_ip,
+                    np.array2string(g[shm.G_FRICTION_KC_POS], precision=2),
+                    np.array2string(g[shm.G_FRICTION_KC_NEG], precision=2))
 
     # ---- state ----
 

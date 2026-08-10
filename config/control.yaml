@@ -29,9 +29,23 @@ tuning:
 
   # Coulomb friction feedforward scale. The assist cancels a plant term the sim
   # does not have, so a non-zero value is CLOSER to osc.py's motion, not further
-  # from it. 0.0 = sim parity; friction_kc_joint is a per-joint multiplier on it.
+  # from it. 0.0 = sim parity.
   friction_kc: 1.0
-  friction_kc_joint: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  # Per-joint multipliers on friction_kc, SPLIT BY ROTATION DIRECTION -- 14
+  # numbers. Joint friction on this arm is directional: breakaway differs
+  # depending on which way the joint turns, and a single symmetric gain either
+  # under-assists the hard direction or over-assists the easy one.
+  #
+  # The direction is the sign of the COMMANDED TORQUE (tau - coriolis), which is
+  # what the assist already keys off. It is NOT the sign of dq -- signing by dq
+  # cancels the friction holding a still arm and makes it walk. So `_pos` is the
+  # gain applied when the controller is pushing the joint in its + direction.
+  #
+  # Measure with:  python scripts/measure_joint_friction.py --directional \
+  #                       --gravity-flip-joint 3 --yes
+  # Both vectors equal = the old symmetric behaviour exactly.
+  friction_kc_joint_pos: [1.0, 1.0, 2.0, 1.0, 2.5, 1.0, 1.0]
+  friction_kc_joint_neg: [1.0, 1.0, 2.0, 1.0, 2.5, 1.0, 1.0]
 
   # Per-block OSC gain trims, each a scalar or a 3-vector. 1.0 is sim.
   #
@@ -189,7 +203,7 @@ torque:
 
 homing:
   gripper_norm: 1.0
-  max_time_s: 3.0
+  max_time_s: 5.0
   tol_rad: 0.05
   # The commanded goal LEADS the measured q rather than jumping to the target,
   # which bounds approach speed and lets it taper to zero on arrival. Re-deriving
@@ -202,7 +216,7 @@ homing:
   # kp*lead + kd*qdot together. Both terms scale with speed, so this caps the
   # speed per joint; a saturated joint stops tracking the ramp and never
   # converges.
-  tau_fraction: 0.7
+  tau_fraction: 0.5
 
 observation:
   image_width: 224

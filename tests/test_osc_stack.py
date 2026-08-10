@@ -251,7 +251,7 @@ _SIM_PARITY_KNOBS = {
 }
 
 # Reach the control loop through make_session, not the robot config.
-_SESSION_KNOBS = {"friction_kc", "friction_kc_joint"}
+_SESSION_KNOBS = {"friction_kc", "friction_kc_joint_pos", "friction_kc_joint_neg"}
 
 # Transport, framing and perception: cannot reach the torque path. noise_*_scale
 # is control-path but gated by use_noise, which is pinned above.
@@ -323,7 +323,8 @@ def _goal_block(session, goal_pos, goal_quat, kp, kd, ns):
     g[_shm.G_KP] = kp
     g[_shm.G_KD] = kd
     g[_shm.G_NULLSPACE] = np.zeros(7) if ns is None else ns
-    g[_shm.G_FRICTION_KC] = t["friction_kc"]
+    g[_shm.G_FRICTION_KC_POS] = t["friction_kc"]
+    g[_shm.G_FRICTION_KC_NEG] = t["friction_kc"]
     return g
 
 
@@ -1034,21 +1035,21 @@ def test_friction_feedforward_cannot_drive_an_idle_arm():
     """
     kc = 0.9
     coriolis = np.full(7, 0.4)
-    assert np.allclose(srv._friction_feedforward(kc, coriolis.copy(), coriolis), 0.0), (
+    assert np.allclose(srv._friction_feedforward(kc, kc, coriolis.copy(), coriolis), 0.0), (
         "assist is nonzero with no control torque -- the arm can drive itself")
 
     # Direction follows the command, and it saturates so it can only ever assist.
     for sign in (+1.0, -1.0):
-        ff = srv._friction_feedforward(kc, coriolis + sign * 3.0, coriolis)
+        ff = srv._friction_feedforward(kc, kc, coriolis + sign * 3.0, coriolis)
         assert np.all(sign * ff > 0.0), "assist did not follow the commanded torque"
         assert np.all(np.abs(ff) <= kc * srv._FRICTION_COULOMB + 1e-12)
 
     # Enough authority to matter: a command at the friction floor must clear it.
     cmd = 0.3 * srv._FRICTION_COULOMB
-    total = cmd + srv._friction_feedforward(kc, coriolis + cmd, coriolis)
+    total = cmd + srv._friction_feedforward(kc, kc, coriolis + cmd, coriolis)
     assert np.all(total > srv._FRICTION_COULOMB * 0.9), "assist too weak to break away"
 
-    assert np.allclose(srv._friction_feedforward(0.0, coriolis + 3.0, coriolis), 0.0)
+    assert np.allclose(srv._friction_feedforward(0.0, 0.0, coriolis + 3.0, coriolis), 0.0)
 
 
 def test_joint_damping_pole_is_inside_the_law_rate():
@@ -1152,14 +1153,14 @@ def test_friction_assist_is_memoryless():
     lo = -3.0 * srv._FRICTION_COULOMB
 
     # Same input, same output, whatever came before it.
-    first = srv._friction_feedforward(kc, hi, coriolis)
+    first = srv._friction_feedforward(kc, kc, hi, coriolis)
     for _ in range(50):
-        srv._friction_feedforward(kc, lo, coriolis)
-    assert np.allclose(srv._friction_feedforward(kc, hi, coriolis), first), (
+        srv._friction_feedforward(kc, kc, lo, coriolis)
+    assert np.allclose(srv._friction_feedforward(kc, kc, hi, coriolis), first), (
         "the assist carries state across calls -- it must add no phase")
 
     # A reversal completes in one call rather than being approached over several.
-    assert np.allclose(srv._friction_feedforward(kc, lo, coriolis), -first), (
+    assert np.allclose(srv._friction_feedforward(kc, kc, lo, coriolis), -first), (
         "reversal is not instantaneous")
 
     # And the loop holds no assist state of its own.
@@ -1179,7 +1180,8 @@ def test_friction_assist_is_osc_only():
 
     g = np.zeros(_shm.GOAL_SIZE)
     g[_shm.G_CMD_SEQ] = 1.0
-    g[_shm.G_FRICTION_KC] = 0.9
+    g[_shm.G_FRICTION_KC_POS] = 0.9
+    g[_shm.G_FRICTION_KC_NEG] = 0.9
     g[_shm.G_JOINT_Q] = case["q"] + 0.05      # a standing hold error
     g[_shm.G_JOINT_KP], g[_shm.G_JOINT_RATIO] = 1.0, 1.0
     for mode in (_shm.MODE_JOINT, _shm.MODE_HOLD):
@@ -1189,10 +1191,202 @@ def test_friction_assist_is_osc_only():
         tau = session._compute_tau(state, g.copy())[0]
         session._last_cmd_seq = -1.0
         session._last_mode = None
-        g[_shm.G_FRICTION_KC] = 0.0
+        g[_shm.G_FRICTION_KC_POS] = 0.0
+        g[_shm.G_FRICTION_KC_NEG] = 0.0
         plain = session._compute_tau(state, g.copy())[0]
-        g[_shm.G_FRICTION_KC] = 0.9
+        g[_shm.G_FRICTION_KC_POS] = 0.9
+        g[_shm.G_FRICTION_KC_NEG] = 0.9
         assert np.allclose(tau, plain), f"friction assist leaked into mode {mode}"
+
+
+def test_friction_assist_is_directional():
+    """Each joint carries two gains, selected by the sign of the COMMANDED torque.
+
+    The hypothesis this exists for: breakaway on this arm differs by which way a
+    joint turns, so a single symmetric gain either under-assists the hard
+    direction or over-assists the easy one. Over-assist is negative damping, so
+    the two failures are not symmetric and one gain cannot avoid both.
+    """
+    coriolis = np.full(7, 0.4)
+    kc_pos = np.array([2.0, 0.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    kc_neg = np.array([0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+    drive = 10.0 * srv._FRICTION_TAU_EPS          # well past the tanh band
+
+    push = srv._friction_feedforward(kc_pos, kc_neg, coriolis + drive, coriolis)
+    pull = srv._friction_feedforward(kc_pos, kc_neg, coriolis - drive, coriolis)
+
+    # Joint 0: 2.0 pushing, 0.5 pulling -> a 4x asymmetry, correctly oriented.
+    assert push[0] > 0 and pull[0] < 0, "assist must follow the commanded direction"
+    assert np.isclose(abs(push[0]) / abs(pull[0]), 4.0, rtol=1e-6), (
+        f"expected the 2.0/0.5 gain split, got {abs(push[0]) / abs(pull[0]):.3f}")
+    # Joint 1: zero gain one way, full gain the other. A per-direction zero must
+    # be reachable -- that is what "this direction needs no help" looks like.
+    assert np.isclose(push[1], 0.0), "kc_pos=0 must give no assist in + direction"
+    assert abs(pull[1]) > 0.5 * srv._FRICTION_COULOMB[1]
+    # Joints 2-6 are symmetric here and must stay symmetric.
+    assert np.allclose(push[2:], -pull[2:]), "symmetric joints became asymmetric"
+
+
+def test_directional_assist_is_continuous_through_zero():
+    """Switching gain on the torque sign must not put a step at zero command.
+
+    The gain switches exactly where tanh() is zero, so the product is continuous
+    even though the two sides have different slopes. Selecting on dq instead
+    would switch where the assist is at full magnitude, which IS a step -- and
+    would also cancel the friction holding a still arm.
+    """
+    coriolis = np.zeros(7)
+    kc_pos, kc_neg = np.full(7, 3.0), np.full(7, 0.2)     # a 15x split
+    eps = 1e-9
+    lo = srv._friction_feedforward(kc_pos, kc_neg, np.full(7, -eps), coriolis)
+    hi = srv._friction_feedforward(kc_pos, kc_neg, np.full(7, +eps), coriolis)
+    assert np.max(np.abs(hi - lo)) < 1e-6, (
+        f"assist jumps by {np.max(np.abs(hi - lo)):.2e} Nm across zero command")
+    assert np.allclose(srv._friction_feedforward(kc_pos, kc_neg, coriolis, coriolis), 0.0), (
+        "zero command must still mean zero assist -- the anti-walk invariant")
+
+
+def test_symmetric_directional_gains_reproduce_the_scalar_assist():
+    """Equal gains both ways == the old single-gain behaviour, exactly.
+
+    This is what makes the 14 parameters a strict generalisation: the config
+    ships both vectors equal, so nothing changes until someone splits them.
+    """
+    rng = np.random.default_rng(17)
+    coriolis = rng.normal(0, 0.3, 7)
+    for kc_val in (0.0, 0.5, 1.0, 2.5):
+        kc = np.full(7, kc_val)
+        for _ in range(5):
+            tau = coriolis + rng.normal(0, 2.0, 7)
+            got = srv._friction_feedforward(kc, kc, tau, coriolis)
+            want = kc * srv._FRICTION_COULOMB * np.tanh(
+                (tau - coriolis) / srv._FRICTION_TAU_EPS)
+            assert np.allclose(got, want), f"symmetric gains diverged at kc={kc_val}"
+
+    # And the config ships them equal, so today's arm is unchanged.
+    import franka_config as fc_
+    assert np.allclose(fc_.control("tuning.friction_kc_joint_pos"),
+                       fc_.control("tuning.friction_kc_joint_neg")), (
+        "the shipped config splits the directions; that is a deliberate rig trim, "
+        "but it means the arm no longer matches the symmetric baseline")
+
+
+def test_directional_gains_reach_the_control_loop():
+    """The (2, 7) block survives config -> robot -> goal block -> assist.
+
+    A widened shm field is exactly the kind of change that silently half-lands:
+    the writer fills 14 floats and the reader still slices 7.
+    """
+    assert _shm.G_FRICTION_KC_POS.stop == _shm.G_FRICTION_KC_NEG.start
+    assert _shm.G_FRICTION_KC_NEG.stop <= _shm.G_RUNNING, "friction field overruns G_RUNNING"
+    assert _shm.G_RUNNING < _shm.GOAL_SIZE
+
+    case = make_case(np.random.default_rng(5))
+    pos = (2.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    neg = (0.25, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0)
+    robot = make_robot(case, friction_kc=1.0,
+                       friction_kc_joint_pos=pos, friction_kc_joint_neg=neg)
+    kc = robot.friction_kc
+    assert kc.shape == (2, 7), f"friction_kc is {kc.shape}, expected (2, 7)"
+    assert np.allclose(kc[0], pos) and np.allclose(kc[1], neg)
+
+    # And it lands in the goal block the loop reads, both rows distinct.
+    g = np.zeros(_shm.GOAL_SIZE)
+    g[_shm.G_FRICTION_KC_POS] = kc[0]
+    g[_shm.G_FRICTION_KC_NEG] = kc[1]
+    assert not np.allclose(g[_shm.G_FRICTION_KC_POS], g[_shm.G_FRICTION_KC_NEG])
+    return f"(2, 7) through config -> robot -> shm, pos[0]={kc[0][0]} neg[0]={kc[1][0]}"
+
+
+def test_directional_friction_estimator_and_its_confound():
+    """The measurement math behind `measure_joint_friction.py --directional`.
+
+    Synthesises sweeps with a KNOWN asymmetry and a KNOWN model bias and checks
+    the estimator recovers them -- including the negative result, which is the
+    important half: from a single pose the two are perfectly confounded and no
+    amount of averaging separates them. That is why the script needs
+    --gravity-flip-joint, and why its plain output is an upper bound.
+    """
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "_mjf", str(Path(__file__).resolve().parent.parent
+                    / "scripts" / "measure_joint_friction.py"))
+    mjf = importlib.util.module_from_spec(spec)
+    sys.modules["_mjf"] = mjf
+    spec.loader.exec_module(mjf)
+
+    F_pos, F_neg, bias = 1.30, 0.70, 0.25     # ground truth
+    sym_true, asym_true = 0.5 * (F_pos + F_neg), 0.5 * (F_pos - F_neg)
+
+    # One pose: tau_up = +F_pos + b, tau_dn = -F_neg + b
+    sym, half_sum = mjf.split_direction(F_pos + bias, -F_neg + bias)
+    assert np.isclose(sym, sym_true), "symmetric friction must be bias-free"
+    assert np.isclose(half_sum, asym_true + bias), "half-sum should carry asym + bias"
+
+    # Single pose -> not separable, and the estimate is asym+bias, an upper bound.
+    one = mjf.asymmetry_from_poses([half_sum], [+1.0])
+    assert one["separable"] is False
+    assert np.isclose(one["asymmetry"], asym_true + bias)
+    assert one["asymmetry"] > asym_true, "the confounded figure must overstate, not understate"
+
+    # Two poses with opposite gravity sign -> b flips, A does not, so both fall out.
+    s_flip = asym_true - bias
+    two = mjf.asymmetry_from_poses([half_sum, s_flip], [+1.0, -1.0])
+    assert two["separable"] is True
+    assert np.isclose(two["asymmetry"], asym_true), (
+        f"recovered asymmetry {two['asymmetry']:.4f}, expected {asym_true:.4f}")
+    assert np.isclose(two["bias"], bias), (
+        f"recovered bias {two['bias']:.4f}, expected {bias:.4f}")
+
+    # A genuinely symmetric joint under a large bias must NOT read as directional.
+    sym2, hs2 = mjf.split_direction(1.0 + 0.9, -1.0 + 0.9)
+    clean = mjf.asymmetry_from_poses([hs2, 0.0 - 0.9], [+1.0, -1.0])
+    assert np.isclose(clean["asymmetry"], 0.0, atol=1e-9), (
+        "a symmetric joint read as directional -- the bias leaked into the estimate")
+    return (f"recovered asym {two['asymmetry']:.2f}/bias {two['bias']:.2f} from two poses; "
+            f"one pose overstates as {one['asymmetry']:.2f}")
+
+
+def test_set_tuning_failure_is_fatal_not_a_warning():
+    """A failed tuning push must stop the run, not log and continue.
+
+    Server sessions are keyed by robot_ip and outlive their client, so a
+    swallowed set_tuning leaves the arm on whatever assist an earlier script
+    set. BimanualFranka.connect() pushes unconditionally precisely to stop that
+    -- but set_tuning used to route through _push, which downgrades every
+    exception to a warning, so the guard did nothing. A real sysid run then
+    continued against a stale NUC and would have measured a controller nobody
+    configured.
+
+    Every OTHER call in RobotDriver is best-effort on purpose: goal pushes are
+    per-tick and the next one corrects a dropped one. This one is not.
+    """
+    import inspect
+    from lerobot_robot_bimanual_franka import franka_process as fp
+
+    # The call, not the word: the docstring explains why _push is wrong here.
+    src = inspect.getsource(fp.RobotDriver.set_tuning)
+    assert "self._push(" not in src, (
+        "set_tuning routes through _push again, which swallows failures into a "
+        "warning and lets a run proceed against an unconfigured controller")
+
+    class _AngryRoot:
+        def set_tuning(self, *a):
+            raise ValueError("operands could not be broadcast together ... (14,) and (7,)")
+
+    d = object.__new__(fp.RobotDriver)
+    d.robot_ip, d._root = "1.2.3.4", _AngryRoot()
+    try:
+        d.set_tuning(friction_kc=np.ones((2, 7)))
+    except RuntimeError as e:
+        msg = str(e)
+    else:
+        raise AssertionError("set_tuning swallowed a server-side failure")
+    assert "1.2.3.4" in msg, "the error must name which arm failed"
+    assert "deploy_nuc_server" in msg, (
+        "a 14-element rejection means a stale NUC; the error should say so rather "
+        f"than surfacing a raw numpy broadcast message. Got: {msg}")
+    return "raises RuntimeError naming the arm and the redeploy"
 
 
 def test_torque_limit_and_rate_limit():

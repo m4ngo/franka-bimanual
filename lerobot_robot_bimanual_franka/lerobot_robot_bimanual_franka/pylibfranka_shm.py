@@ -42,8 +42,12 @@ G_NULLSPACE = slice(22, 29)
 G_JOINT_Q = slice(29, 36)
 G_JOINT_KP = 36
 G_JOINT_RATIO = 37
-G_FRICTION_KC = slice(38, 45)   # per joint: friction is a per-joint property
-G_RUNNING = 45       # server -> control: 0 asks the loop to stop
+# Friction assist gain, per joint AND per rotation direction: breakaway on this
+# arm differs by which way the joint turns. _POS applies when the commanded
+# torque is positive on that joint, _NEG when negative.
+G_FRICTION_KC_POS = slice(38, 45)
+G_FRICTION_KC_NEG = slice(45, 52)
+G_RUNNING = 52       # server -> control: 0 asks the loop to stop
 GOAL_SIZE = 56
 
 # ---- state block (written by the control process, read by the server) ----

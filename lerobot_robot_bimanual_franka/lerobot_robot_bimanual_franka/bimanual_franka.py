@@ -393,14 +393,28 @@ class BimanualFranka(Robot):
 
     @property
     def friction_kc(self) -> np.ndarray:
-        """Per-joint Coulomb assist scale: the scalar times the per-joint trim."""
-        return float(getattr(self.config, "friction_kc", 0.0)) * np.asarray(
-            getattr(self.config, "friction_kc_joint", (1.0,) * NUM_JOINTS), dtype=np.float64)
+        """Coulomb assist scale as (2, 7): the scalar times the per-joint trim,
+        split by rotation direction. Row 0 applies where the commanded torque on
+        that joint is positive, row 1 where it is negative -- breakaway on this
+        arm is directional, so one symmetric gain either under-assists the hard
+        direction or over-assists the easy one."""
+        scale = float(getattr(self.config, "friction_kc", 0.0))
+        default = (1.0,) * NUM_JOINTS
+        return scale * np.stack([
+            np.asarray(getattr(self.config, "friction_kc_joint_pos", default), dtype=np.float64),
+            np.asarray(getattr(self.config, "friction_kc_joint_neg", default), dtype=np.float64),
+        ])
 
     def set_friction_kc(self, kc) -> None:
-        """Push a new per-joint assist scale to the running control loops."""
-        self.robot_manager.set_tuning_all(
-            friction_kc=np.broadcast_to(np.asarray(kc, dtype=np.float64), (NUM_JOINTS,)))
+        """Push a new assist scale to the running control loops.
+
+        Scalar or (7,) sets both directions; (2, 7) sets them independently.
+        """
+        kc = np.asarray(kc, dtype=np.float64)
+        if kc.size != 2 * NUM_JOINTS:
+            kc = np.broadcast_to(kc, (NUM_JOINTS,))
+            kc = np.stack([kc, kc])
+        self.robot_manager.set_tuning_all(friction_kc=kc.reshape(2, NUM_JOINTS))
 
     @property
     def kp_gain(self) -> float:

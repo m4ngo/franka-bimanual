@@ -49,8 +49,15 @@ class SingleArmFrankaConfig(RobotConfig):
     # config/control.yaml's `tuning:` block. A literal default here would win
     # over the yaml and make it decoration -- see config/README.md.
     friction_kc: float = field(default_factory=lambda: fc.control("tuning.friction_kc"))
-    friction_kc_joint: tuple[float, ...] = field(
-        default_factory=lambda: tuple(fc.control("tuning.friction_kc_joint"))
+    # Per-joint assist trim, SPLIT BY ROTATION DIRECTION -- 14 numbers. `_pos`
+    # applies where the commanded torque on that joint is positive. Breakaway on
+    # this arm is directional; measure with
+    # `scripts/measure_joint_friction.py --directional`.
+    friction_kc_joint_pos: tuple[float, ...] = field(
+        default_factory=lambda: tuple(fc.control("tuning.friction_kc_joint_pos"))
+    )
+    friction_kc_joint_neg: tuple[float, ...] = field(
+        default_factory=lambda: tuple(fc.control("tuning.friction_kc_joint_neg"))
     )
     ee_translation_fudge: float = field(
         default_factory=lambda: fc.control("tuning.ee_translation_fudge")
