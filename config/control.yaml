@@ -381,5 +381,5 @@ gripper:
 
 noise:
   # Action noise injected by the follower when use_noise is set.
-  pos_scale_m: 0.01
+  pos_scale_m: 0.0025
   rot_scale_rad: 0.075

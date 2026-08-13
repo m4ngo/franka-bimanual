@@ -56,7 +56,8 @@ def init_gripper(ip):
     return _pf.Gripper(ip)
 
 def home_gripper(controller):
-    return bool(controller.homing())
+    controller.homing()
+    return bool(controller.move(0.04, 0.5))
 
 def grasp_gripper(controller, width_m, speed_m_s, force_n):
     # Wide epsilons: we want the fingers to close and hold, not to assert that
@@ -64,7 +65,7 @@ def grasp_gripper(controller, width_m, speed_m_s, force_n):
     return bool(controller.grasp(width_m, min(speed_m_s, _MAX_SPEED), force_n, 1.0, 1.0))
 
 def open_gripper(controller, speed_m_s):
-    return bool(controller.move(controller.read_once().max_width, min(speed_m_s, _MAX_SPEED)))
+    return bool(controller.move(0.04, min(speed_m_s, _MAX_SPEED)))
 
 def close_gripper(controller):
     return None
