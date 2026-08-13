@@ -165,6 +165,11 @@ class _ArmSession:
         # A client that never calls set_tuning gets zero friction assist, i.e.
         # exact osc.py behaviour.
         self.ch.goal[shm.G_MODE] = shm.MODE_HOLD
+        # Recoveries seen by control children that have already exited. The child
+        # counts from zero, so without this a fault bad enough to restart it ERASES
+        # its own evidence: delta_sweep read faults 0 across a run in which the loop
+        # logged 8 recoveries and a dozen reflexes, and reported the trial as clean.
+        self._recovery_base = 0
         logger.info("shm channel %s created for %s", self.ch.name, robot_ip)
 
     def start(self) -> None:
@@ -193,6 +198,8 @@ class _ArmSession:
 
     def stop(self) -> None:
         with self._lock:
+            # Bank the child's count before it dies and zeroes S_RECOVERY on restart.
+            self._recovery_base += int(self.ch.state[shm.S_RECOVERY])
             self.ch.set_running(False)
             if self.proc is not None:
                 try:
@@ -208,7 +215,18 @@ class _ArmSession:
 
     @property
     def recovery_count(self) -> int:
-        return int(self.ch.state[shm.S_RECOVERY])
+        """Monotonic across control-child restarts -- see _recovery_base."""
+        return self._recovery_base + int(self.ch.state[shm.S_RECOVERY])
+
+    def sim_clip_ticks(self) -> int:
+        """Law ticks on which SIM's ctrlrange clip bound -- the rotation-overshoot
+        measurement. Distinct from clamp_trips, which counts the REAL torque limit."""
+        return int(self.ch.state[shm.S_SIM_CLIP])
+
+    def torque_trips(self) -> int:
+        """Times MODE_TORQUE's travel window latched to hold. Kept off get_state's
+        bundle deliberately: only the friction scripts read it, and never per tick."""
+        return int(self.ch.state[shm.S_TORQUE_TRIP])
 
     # ---- goal setters: a seqlocked write, nothing more ----
 
@@ -236,8 +254,23 @@ class _ArmSession:
                            G_JOINT_Q=np.asarray(goal_dq, dtype=np.float64),
                            G_JOINT_RATIO=float(kd_scale))
 
+    def set_torque_goal(self, tau_ff, joint, hold_q, window_rad, dq_max=0.0) -> None:
+        """Feedforward torque on one joint. Both bounds are written with the goal so the
+        loop can enforce them without a round trip; see G_TAU_WINDOW / G_TAU_DQ_MAX."""
+        self.ch.write_goal(
+            G_MODE=shm.MODE_TORQUE,
+            G_TAU_FF=np.asarray(tau_ff, dtype=np.float64),
+            G_TAU_JOINT=float(int(joint)),
+            G_TAU_WINDOW=float(window_rad),
+            G_TAU_DQ_MAX=float(dq_max),
+            G_JOINT_Q=np.asarray(hold_q, dtype=np.float64),
+            G_JOINT_KP=1.0,
+            G_JOINT_RATIO=1.0,
+        )
+
     def set_mode(self, mode: str) -> None:
-        self.ch.write_goal(G_MODE=shm.MODE_NAMES.get(mode, shm.MODE_HOLD))
+        self.ch.write_goal(new_command=False,
+                           G_MODE=shm.MODE_NAMES.get(mode, shm.MODE_HOLD))
 
     def set_tuning(self, friction_kc=None) -> None:
         """The only live-tunable server-side knob. 0 is exact osc.py.
@@ -254,7 +287,8 @@ class _ArmSession:
                 # Scalar or 7-vector: same gain in both directions.
                 kc = np.broadcast_to(kc, (NUM_JOINTS,))
                 kc = np.stack([kc, kc])
-            self.ch.write_goal(G_FRICTION_KC_POS=kc[0], G_FRICTION_KC_NEG=kc[1])
+            self.ch.write_goal(new_command=False,
+                               G_FRICTION_KC_POS=kc[0], G_FRICTION_KC_NEG=kc[1])
         g = self.ch.goal
         logger.info("%s: tuning -> friction_kc +%s / -%s", self.robot_ip,
                     np.array2string(g[shm.G_FRICTION_KC_POS], precision=2),
@@ -268,7 +302,7 @@ class _ArmSession:
             return None, None, 0
         bundle = tuple(float(x) for x in np.concatenate([
             st[shm.S_Q], st[shm.S_DQ], st[shm.S_POS], st[shm.S_QUAT], st[shm.S_TWIST],
-            [st[shm.S_RECOVERY]], st[shm.S_TAU_CMD], st[shm.S_TAU_MEAS], st[shm.S_TAU_EXT],
+            [float(self.recovery_count)], st[shm.S_TAU_CMD], st[shm.S_TAU_MEAS], st[shm.S_TAU_EXT],
         ]))
         err = None if st[shm.S_ALIVE] == 1.0 else "control process not alive"
         return bundle, err, int(st[shm.S_STATE_SEQ])
@@ -337,6 +371,17 @@ class FrankaTorqueService(SlaveService):
         self._sessions[robot_ip].set_joint_velocity_goal(goal_dq, kd_scale)
         return True
 
+    def exposed_set_torque_goal(self, robot_ip, tau_ff, joint, hold_q, window_rad,
+                                dq_max=0.0) -> bool:
+        self._sessions[robot_ip].set_torque_goal(tau_ff, joint, hold_q, window_rad, dq_max)
+        return True
+
+    def exposed_torque_trips(self, robot_ip: str) -> int:
+        return self._sessions[robot_ip].torque_trips()
+
+    def exposed_sim_clip_ticks(self, robot_ip: str) -> int:
+        return self._sessions[robot_ip].sim_clip_ticks()
+
     def exposed_set_mode(self, robot_ip: str, mode: str) -> bool:
         self._sessions[robot_ip].set_mode(mode)
         return True
@@ -375,6 +420,9 @@ class FrankaTorqueService(SlaveService):
     set_osc_goal_flat = exposed_set_osc_goal_flat
     set_joint_goal = exposed_set_joint_goal
     set_joint_velocity_goal = exposed_set_joint_velocity_goal
+    set_torque_goal = exposed_set_torque_goal
+    torque_trips = exposed_torque_trips
+    sim_clip_ticks = exposed_sim_clip_ticks
     set_mode = exposed_set_mode
     set_tuning = exposed_set_tuning
     get_state = exposed_get_state

@@ -119,6 +119,9 @@ class RobotDriver:
         kd: np.ndarray,
         nullspace_q: np.ndarray | None = None,
     ) -> None:
+        # All-zero is the goal block's "no reference supplied" encoding -- the loop
+        # tests for it and keeps the reference it already has. It cannot collide with
+        # a real posture: q=0 is outside joint 4's range.
         ns = np.zeros(NUM_JOINTS) if nullspace_q is None else np.asarray(nullspace_q, dtype=np.float64)
         packed = np.concatenate([
             np.asarray(goal_pos, dtype=np.float64).ravel(),
@@ -137,6 +140,80 @@ class RobotDriver:
     def send_joint_velocity(self, vel: list[float], kd_scale: float = 1.0) -> None:
         """Joint-velocity setpoint, tracked by a server-side impedance law."""
         self._push(self._root.set_joint_velocity_goal, _t(vel), float(kd_scale))
+
+    def send_torque_goal(self, tau_ff: np.ndarray, joint: int, hold_q: np.ndarray,
+                         window_rad: float, dq_max: float = 0.0) -> None:
+        """Open-loop torque on ONE joint; the rest impedance-hold at `hold_q`.
+
+        Friction identification only. `window_rad` (travel) and `dq_max` (speed) are
+        both enforced by the CONTROL LOOP -- not advisory, and not enforceable from
+        here: 2 Nm on joint 7 is ~200 rad/s^2, a quarter radian inside one round trip
+        of this call.
+
+        PASS dq_max. The travel window alone does not protect the wrist: joint 7
+        passes its 2.61 rad/s datasheet limit after ~0.03 rad, so the robot faults on
+        joint_velocity_violation while a 0.25 rad window is still waiting. 0.0 means
+        unset and disables the speed check.
+
+        Re-sending bumps the command sequence, which re-arms a tripped window and
+        re-latches its origin, so a caller that keeps pushing the same torque after
+        a trip will keep re-releasing the joint. Read S_TORQUE_TRIP and stop.
+
+        RAISES, like set_tuning and unlike the other goal pushes. Those are per-tick
+        and best-effort because the next one corrects a dropped one. This one is not:
+        it is pushed once per torque step, so a swallowed failure means no torque was
+        ever applied and the staircase measures nothing while reporting cleanly.
+        """
+        try:
+            self._root.set_torque_goal(self.robot_ip, _t(tau_ff), int(joint),
+                                       _t(hold_q), float(window_rad), float(dq_max))
+        except AttributeError as e:
+            raise RuntimeError(
+                f"set_torque_goal({self.robot_ip}) failed: {e} -- this server predates "
+                f"MODE_TORQUE. Run scripts/deploy_nuc_server.sh for this arm; the shm "
+                f"goal block also grew, so the server and control child must be "
+                f"redeployed together.") from e
+        except Exception as e:
+            raise RuntimeError(f"set_torque_goal({self.robot_ip}) failed: {e}") from e
+
+    def torque_trips(self) -> int:
+        """Times MODE_TORQUE's window latched to hold. A blocking read, so keep it out
+        of the ramp's inner loop; check it once per torque step.
+
+        RAISES rather than returning 0 on failure: this is a motion DETECTOR, and a
+        silent 0 reads as "the joint never moved" -- which is the one answer that would
+        make the caller step the torque up again.
+        """
+        try:
+            return int(self._root.torque_trips(self.robot_ip))
+        except Exception as e:
+            raise RuntimeError(f"torque_trips({self.robot_ip}) failed: {e} -- if this "
+                               f"server predates MODE_TORQUE, run "
+                               f"scripts/deploy_nuc_server.sh for this arm") from e
+
+    def sim_clip_ticks(self) -> int:
+        """Law ticks on which SIM's ctrlrange clip bound. The rotation-overshoot
+        measurement: sim's wrist saturates at +/-12 Nm and the FR3's does not, so
+        whether that clip engages here decides whether the roll-off is reproduced.
+
+        RAISES rather than returning 0, for the same reason as torque_trips: a silent
+        0 reads as "the clip never engaged", which is precisely the finding this call
+        exists to establish, and an older server would fake it perfectly.
+        """
+        try:
+            return int(self._root.sim_clip_ticks(self.robot_ip))
+        except Exception as e:
+            raise RuntimeError(
+                f"sim_clip_ticks({self.robot_ip}) failed: {e} -- if this server "
+                f"predates the sim-clip counter, run scripts/deploy_nuc_server.sh") from e
+
+    def supports_torque_mode(self) -> bool:
+        """Preflight: does the deployed server know MODE_TORQUE? Checked before the
+        arm moves, so a stale NUC costs a message rather than a half-run."""
+        try:
+            return hasattr(self._root, "set_torque_goal")
+        except Exception:
+            return False
 
     def set_mode(self, mode: str) -> None:
         self._push(self._root.set_mode, mode)
@@ -216,6 +293,10 @@ class MultiRobotWrapper:
         """Cumulative recoverable-error recoveries per arm, as of the last state read."""
         return {n: d.recovery_count for n, d in self.drivers.items()}
 
+    def sim_clip_ticks(self, name: str) -> int:
+        """Law ticks on which SIM's ctrlrange clip bound on that arm."""
+        return self.drivers[name].sim_clip_ticks()
+
     def torque_snapshot(self, name: str) -> TorqueSnapshot:
         """(commanded, measured, external estimate) from that arm's last state read.
 
@@ -250,6 +331,18 @@ class MultiRobotWrapper:
     def move_joint_velocity_batch(self, vels: dict[str, list], asynchronous: bool = True,
                                   kd_scale: float = 1.0) -> None:
         self._gather(lambda n: self.drivers[n].send_joint_velocity(vels[n], kd_scale), list(vels))
+
+    def move_torque_goal(self, name: str, tau_ff, joint: int, hold_q, window_rad: float,
+                         dq_max: float = 0.0) -> None:
+        """Single-arm by design: MODE_TORQUE is a one-joint identification mode, and
+        there is no meaning to running it on both arms at once."""
+        self.drivers[name].send_torque_goal(tau_ff, joint, hold_q, window_rad, dq_max)
+
+    def torque_trips(self, name: str) -> int:
+        return self.drivers[name].torque_trips()
+
+    def supports_torque_mode(self, name: str) -> bool:
+        return self.drivers[name].supports_torque_mode()
 
     def set_mode_all(self, mode: str) -> None:
         self._gather(lambda n: self.drivers[n].set_mode(mode), list(self.drivers))

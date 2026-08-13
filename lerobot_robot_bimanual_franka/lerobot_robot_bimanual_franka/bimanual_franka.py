@@ -656,6 +656,13 @@ class BimanualFranka(Robot):
                         dtype=np.float64, count=4)
         ) + np.asarray(drot_cached, dtype=np.float64)
 
+        # The COMMANDED rotation, before noise. osc.py's "did the caller ask for a
+        # rotation" test is an exact compare against zero, and Gaussian noise is never
+        # exactly zero -- so with use_noise set, every step looked like a rotation
+        # command, goal_ori was re-anchored on the current pose each time, and nothing
+        # held the EE's orientation while it translated. Noise still perturbs the goal;
+        # it just no longer decides whether there is one.
+        drot_commanded = drot
         if use_noise:
             dpos = dpos + np.random.normal(0.0, noise_pos_scale, 3)
             drot = drot + Rotation.from_euler(
@@ -676,7 +683,7 @@ class BimanualFranka(Robot):
         # pure-translation command, so nothing holds the EE's orientation and it
         # tumbles as the arm translates. goal_pos, in contrast, IS rebuilt from
         # the current pose every step.
-        if arm not in self._osc_goal_ori or np.any(drot != 0.0):
+        if arm not in self._osc_goal_ori or np.any(drot_commanded != 0.0):
             self._osc_goal_ori[arm] = Rotation.from_rotvec(drot) * Rotation.from_quat(ee_quat_xyzw)
         return np.asarray(ee_pos, dtype=np.float64) + dpos, self._osc_goal_ori[arm].as_quat()
 

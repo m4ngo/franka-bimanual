@@ -27,8 +27,12 @@ from multiprocessing import shared_memory
 NUM_JOINTS = 7
 
 MODE_FLOAT, MODE_HOLD, MODE_JOINT, MODE_JOINT_VEL, MODE_OSC = 0.0, 1.0, 2.0, 3.0, 4.0
+# Open-loop feedforward torque on ONE joint, impedance hold on the rest. For
+# friction identification only: it is the one mode whose torque is not a function
+# of the measured state, so it does not self-limit -- see G_TAU_WINDOW.
+MODE_TORQUE = 5.0
 MODE_NAMES = {"float": MODE_FLOAT, "hold": MODE_HOLD, "joint": MODE_JOINT,
-              "joint_vel": MODE_JOINT_VEL, "osc": MODE_OSC}
+              "joint_vel": MODE_JOINT_VEL, "osc": MODE_OSC, "torque": MODE_TORQUE}
 
 # ---- goal block (written by the server, read by the control process) ----
 G_SEQ = 0            # seqlock counter; odd = write in progress
@@ -48,7 +52,28 @@ G_JOINT_RATIO = 37
 G_FRICTION_KC_POS = slice(38, 45)
 G_FRICTION_KC_NEG = slice(45, 52)
 G_RUNNING = 52       # server -> control: 0 asks the loop to stop
-GOAL_SIZE = 56
+# MODE_TORQUE only. G_TAU_FF is the feedforward torque; G_TAU_JOINT selects which
+# joint receives it (the rest are impedance-held at G_JOINT_Q); G_TAU_WINDOW is the
+# rad of travel past the goal q at which the loop LATCHES BACK TO MODE_HOLD.
+#
+# The window lives here, not in the caller, because open-loop torque does not
+# self-limit and the workstation cannot react fast enough: joint 7 has M ~ 0.01, so
+# 2 Nm is ~200 rad/s^2 -- 0.25 rad inside one 50 ms RPyC round trip. It is a mode
+# TRANSITION, not another bound on tau: _enforce_limits remains the only thing that
+# rescales what reaches the joints.
+G_TAU_FF = slice(53, 60)
+G_TAU_JOINT = 60     # index of the joint under test; <0 disables the mode
+G_TAU_WINDOW = 61    # rad
+# Velocity bound on the same transition, and NOT redundant with the travel window:
+# on the wrist the two are orders of magnitude apart. 0.7 Nm net on joint 7 is
+# ~100 rad/s^2, so it passes its 2.61 rad/s datasheet limit in ~25 ms having moved
+# only ~0.03 rad -- the robot's own joint_velocity_violation fires, and faults the
+# arm, long before a 0.25 rad travel window notices. A position bound cannot stand in
+# for a velocity bound on a low-inertia joint.
+G_TAU_DQ_MAX = 62    # rad/s
+# 56 -> 64: the block grew, so the server and the control child must be redeployed
+# TOGETHER. A half-updated pair reads these fields off the end of the old block.
+GOAL_SIZE = 64
 
 # ---- state block (written by the control process, read by the server) ----
 S_SEQ = 0
@@ -65,6 +90,18 @@ S_SUCCESS_RATE = 50
 S_CLAMP_TRIPS = 51   # ticks the law asked past the torque clamp
 S_ALIVE = 52         # 1 while the control loop is armed and ticking
 S_STATE_SEQ = 53     # bumped per published state; 0 = nothing published yet
+# MODE_TORQUE tripped its travel window and latched to hold. The caller cannot infer
+# this from q alone -- a joint that stopped because the window caught it looks the
+# same as one that never broke away -- and the difference decides whether a row is a
+# measurement.
+S_TORQUE_TRIP = 54
+# Law ticks on which SIM's +/-12 Nm wrist ctrlrange clip engaged (emulate_sim_plant
+# only). NOT limits.joint_torque_nm, which is the real hardware clamp and a different
+# question entirely: sim's rotation authority saturates where the FR3's does not, and
+# whether we reproduce that is what decides the rotation overshoot. Counted here
+# because it is invisible anywhere else -- the clip is inside run_controller, upstream
+# of _enforce_limits, and the torque that leaves is post-transform.
+S_SIM_CLIP = 55
 STATE_SIZE = 64
 
 _TOTAL = GOAL_SIZE + STATE_SIZE
@@ -101,9 +138,16 @@ class ShmChannel:
 
     @staticmethod
     def _write(block: np.ndarray, seq_index: int, fn) -> None:
+        # try/finally, because a raise inside fn would otherwise leave the counter
+        # odd forever and every subsequent _read returns None for the life of the
+        # process. Publishing a half-written block is the lesser failure: the reader
+        # holds its last good copy for one tick, where a latched-odd counter routes
+        # every tick through that fallback.
         block[seq_index] += 1          # odd: write in progress
-        fn(block)
-        block[seq_index] += 1          # even: consistent again
+        try:
+            fn(block)
+        finally:
+            block[seq_index] += 1      # even: consistent again
 
     @staticmethod
     def _read(block: np.ndarray, seq_index: int) -> np.ndarray | None:
@@ -119,12 +163,23 @@ class ShmChannel:
 
     # -- goal ---------------------------------------------------------------
 
-    def write_goal(self, **fields) -> None:
+    def write_goal(self, *, new_command: bool = True, **fields) -> None:
+        """Seqlocked write. ``new_command=False`` for session settings.
+
+        G_CMD_SEQ is what the loop latches a goal on, and it also re-arms the
+        stale-goal watchdog. A write that carries no new pose -- set_mode,
+        set_tuning -- must not bump it: doing so re-latches the whole OSC goal
+        from whatever G_POS/G_QUAT still hold and tells the watchdog a goal just
+        arrived, so a controller that had gone stale silently resumes driving
+        toward an old pose. The MODE field is read every tick regardless of the
+        sequence, so a mode change still takes effect without one.
+        """
         def _apply(b):
             for key, value in fields.items():
                 target = globals()[key]
                 b[target] = value
-            b[G_CMD_SEQ] += 1
+            if new_command:
+                b[G_CMD_SEQ] += 1
         self._write(self.goal, G_SEQ, _apply)
 
     def read_goal(self) -> np.ndarray | None:

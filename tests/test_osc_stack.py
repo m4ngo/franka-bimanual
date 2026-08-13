@@ -103,9 +103,11 @@ from lerobot_robot_bimanual_franka import pylibfranka_control as srv  # noqa: E4
 from lerobot_robot_bimanual_franka import pylibfranka_shm as _shm  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_jacobian import fk_chain, zero_jacobian  # noqa: E402
 from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
-    DAMPING_RATIO_LIMITS, DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, OSCTorqueController,
-    resolve_gains,
+    DAMPING_RATIO_LIMITS, DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, SIM_TORQUE_LIMITS,
+    OSCTorqueController, resolve_gains,
 )
+from lerobot_robot_bimanual_franka import sim_dynamics  # noqa: E402
+from lerobot_robot_bimanual_franka import osc_torque_controller as _osc_ctrl_mod  # noqa: E402
 
 RNG = np.random.default_rng(20260727)
 
@@ -145,7 +147,13 @@ class FakeModel:
         self._M, self._C = M, C
 
     def mass(self, _state):
-        return tuple(float(x) for x in self._M.flatten(order="F"))
+        # libfranka returns the LINK inertia; the loop adds torque.rotor_inertia_kg_m2
+        # back on (Model.mass omits the reflected rotor term -- 31x low on joint 7).
+        # So hand back case["M"] MINUS rotor, and every comparison below stays a
+        # statement about case["M"], which is the true plant inertia the law uses.
+        M = self._M.copy()
+        M[np.diag_indices(7)] -= srv._ROTOR_INERTIA
+        return tuple(float(x) for x in M.flatten(order="F"))
 
     def coriolis(self, _state):
         return tuple(float(x) for x in self._C)
@@ -284,7 +292,7 @@ def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     return robot
 
 
-def make_session(case, uncouple=True, friction_kc=0.0):
+def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False):
     """A real ControlLoop with only the fields the compute path touches.
 
     The loop now runs in its own process (pylibfranka_control), so the law under
@@ -303,6 +311,15 @@ def make_session(case, uncouple=True, friction_kc=0.0):
     s._stale = False
     s._last_J = None
     s._last_J_q = None
+    # Post-fault re-anchor flag and the torn-read fallback goal. Both are read on
+    # the compute path, so object.__new__ must seed them or every OSC test errors.
+    s._reanchor = False
+    s._last_goal = None
+    # Default off: every test below this line compares tau against robosuite fed the
+    # SAME mass matrix, which is the right assertion for the ported law and the wrong
+    # one for the emulation (there the two plants differ on purpose, and what must
+    # match is the joint ACCELERATION). test_sim_emulation_* cover that path.
+    s._emulate_sim = emulate_sim
     s._last_tau = np.zeros(7)
     s.clamp_trips = 0
     s.recovery_count = 0
@@ -1025,6 +1042,123 @@ def test_torque_limits_are_the_only_thing_that_rescales_tau():
     assert set(inspect.signature(_srv._ArmSession.set_tuning).parameters) == {
         "self", "friction_kc"}
 
+    # There is now exactly ONE np.clip on a torque inside the law, and it is the
+    # sim ctrlrange -- part of the reference dynamics, not a bound on the hardware.
+    # It is listed here rather than exempted silently: a second one appearing in
+    # run_controller is the same regression this test exists to catch.
+    law = inspect.getsource(_osc_ctrl_mod.OSCTorqueController.run_controller)
+    clips = [ln.strip() for ln in law.splitlines() if "np.clip" in ln]
+    assert clips == ["tau_sim = np.clip(task_torque + null_torque + b, "
+                     "-SIM_TORQUE_LIMITS, SIM_TORQUE_LIMITS)"], (
+        f"unexpected torque rescale inside the law: {clips}")
+    # ...and it must be the sim's range, not the arm's, or it has become a
+    # hardware limit wearing a parity label.
+    assert not np.array_equal(SIM_TORQUE_LIMITS, np.asarray(srv.JOINT_TORQUE_LIMITS))
+
+
+def test_bias_feedforward_is_a_plant_correction_not_a_command():
+    """torque.bias.joint_nm must add to tau without the assist treating it as command.
+
+    The bias replaces what franky's firmware velocity servo used to absorb. It is a
+    constant, so if the friction assist saw it as commanded torque the tanh would
+    saturate on it and summon a full Coulomb assist at zero command -- the exact
+    walking failure the nullspace subtraction already had to fix once.
+    """
+    rng = np.random.default_rng(11)
+    case = make_case(rng)
+    case["dq"] = np.zeros(7)
+    bias = np.array([0.3, 0.6, 0.4, -1.0, 0.05, -0.2, 0.2])
+    action = ee_delta_action([0, 0, 0], [0, 0, 0])
+
+    base = our_torque(make_robot(case), make_session(case, friction_kc=0.0), action, case)
+    old = srv._BIAS_NM
+    try:
+        srv._BIAS_NM = bias
+        off = our_torque(make_robot(case), make_session(case, friction_kc=0.0), action, case)
+        on = our_torque(make_robot(case), make_session(case, friction_kc=0.9), action, case)
+    finally:
+        srv._BIAS_NM = old
+
+    assert np.allclose(off - base, bias), (
+        "bias did not reach tau, or did not arrive as a plain addition")
+    # With kc on, the ONLY extra term may be the assist keyed off the task command --
+    # which is zero here. So the bias must not have changed what the assist does.
+    assert np.allclose(on, off), (
+        f"the friction assist reacted to the bias (delta {np.max(np.abs(on - off)):.3f} "
+        "Nm at zero command); it is being read as commanded torque")
+
+    # And it is OSC-only: joint impedance has a restoring force and no sim counterpart.
+    session = make_session(case, friction_kc=0.0)
+    g = _goal_block(session, np.zeros(3), np.array([0.0, 0, 0, 1]), np.zeros(6),
+                    np.zeros(6), case["q"])
+    g[_shm.G_MODE] = _shm.MODE_JOINT
+    g[_shm.G_JOINT_Q] = case["q"]
+    g[_shm.G_JOINT_KP] = 1.0
+    g[_shm.G_JOINT_RATIO] = 1.0
+    state = FakeState(case["q"], case["dq"], case["ee_pos"], case["R"])
+    plain = session._compute_tau(state, g.copy())[0]
+    try:
+        srv._BIAS_NM = bias
+        session._last_cmd_seq = -1.0
+        g[_shm.G_CMD_SEQ] += 1
+        withbias = session._compute_tau(state, g.copy())[0]
+    finally:
+        srv._BIAS_NM = old
+    assert np.allclose(plain, withbias), "bias leaked into a joint-impedance mode"
+
+
+def test_uncoupling_is_plumbed_to_the_control_loop():
+    """config's uncouple_pos_ori must REACH the loop, not sit next to it.
+
+    Structural, because the failure is invisible numerically: ControlLoop built its
+    OSC as `OSCTorqueController(num_joints=NUM_JOINTS)` while the constructor
+    defaulted to True, so the yaml could say false and the arm still ran uncoupled --
+    on both sides of a deploy, with the config dump printing the value that was being
+    ignored. Every test in this file passed throughout, because they construct the
+    controller directly and never exercise the loop's own wiring.
+    """
+    import inspect
+    src = inspect.getsource(srv.ControlLoop.__init__)
+    assert "uncouple_pos_ori=" in src, (
+        "ControlLoop.__init__ does not pass uncouple_pos_ori; it is inheriting the "
+        "constructor default and config/control.yaml cannot reach the control law")
+    import franka_config as fc_
+    from lerobot_robot_bimanual_franka.osc_torque_controller import (
+        DEFAULT_UNCOUPLE_POS_ORI)
+    assert DEFAULT_UNCOUPLE_POS_ORI == bool(fc_.control("torque.osc.uncouple_pos_ori"))
+
+
+def test_every_exposed_rpc_has_a_plain_name_alias():
+    """Structural, like the tau test: an exposed_ method without its alias is invisible.
+
+    FrankaTorqueService keeps its SlaveService base so FrankaGripper's
+    rpyc.classic.connect works, and SlaveService's allow_all_attrs _rpyc_getattr
+    looks a name up DIRECTLY -- it never strips rpyc's exposed_ prefix. So an RPC
+    added as exposed_foo alone resolves for nobody: the client asks for `foo`, the
+    server has only `exposed_foo`, and the AttributeError names the method the caller
+    asked for, which reads like a stale deploy rather than a missing alias. That cost
+    a NUC redeploy to diagnose. The alias block right below the methods is the fix,
+    and this is what stops the next one being forgotten.
+    """
+    import inspect
+
+    from lerobot_robot_bimanual_franka import pylibfranka_server as _srv
+
+    svc = _srv.FrankaTorqueService
+    missing = []
+    for name, _ in inspect.getmembers(svc, callable):
+        if not name.startswith("exposed_"):
+            continue
+        plain = name[len("exposed_"):]
+        if getattr(svc, plain, None) is not getattr(svc, name):
+            missing.append(plain)
+    # rpyc's own exposed_* helpers live on the base class and need no alias.
+    missing = [m for m in missing if not hasattr(_srv.SlaveService, "exposed_" + m)]
+    assert not missing, (
+        f"exposed RPCs with no plain-name alias: {missing}. Add `{missing[0]} = "
+        f"exposed_{missing[0]}` to FrankaTorqueService's alias block, or no client "
+        f"can call it.")
+
 
 def test_friction_feedforward_cannot_drive_an_idle_arm():
     """Zero commanded torque must mean zero assist -- the anti-walking invariant.
@@ -1042,14 +1176,64 @@ def test_friction_feedforward_cannot_drive_an_idle_arm():
     for sign in (+1.0, -1.0):
         ff = srv._friction_feedforward(kc, kc, coriolis + sign * 3.0, coriolis)
         assert np.all(sign * ff > 0.0), "assist did not follow the commanded torque"
-        assert np.all(np.abs(ff) <= kc * srv._FRICTION_COULOMB + 1e-12)
+        assert np.all(np.abs(ff) <= kc * srv._FRICTION_ASSIST_NM + 1e-12)
 
-    # Enough authority to matter: a command at the friction floor must clear it.
+    # The target is SIM's plant, not a frictionless one: at full assist the residual
+    # friction must land on mujoco's dof_frictionloss. Driving it to zero would
+    # overshoot the reference rather than match it.
+    deep = srv._friction_feedforward(1.0, 1.0, coriolis + 50.0, coriolis)
+    assert np.allclose(srv._FRICTION_COULOMB - deep, srv._SIM_FRICTIONLOSS, atol=1e-3), (
+        "full assist does not leave sim's own friction behind")
+
+    # Enough authority to matter: a command at the friction floor must clear what
+    # is left of breakaway once the assist has done its part.
     cmd = 0.3 * srv._FRICTION_COULOMB
     total = cmd + srv._friction_feedforward(kc, kc, coriolis + cmd, coriolis)
-    assert np.all(total > srv._FRICTION_COULOMB * 0.9), "assist too weak to break away"
+    assert np.all(total > srv._FRICTION_COULOMB - kc * srv._FRICTION_ASSIST_NM), (
+        "assist too weak to break away")
 
     assert np.allclose(srv._friction_feedforward(0.0, 0.0, coriolis + 3.0, coriolis), 0.0)
+
+
+def test_no_op_action_puts_no_force_on_the_ee_away_from_home():
+    """The same invariant, through the real path and away from the nullspace reference.
+
+    The test above passes tau == the bias exactly, which is only true while the arm
+    sits at its nullspace reference. Off it, the regulator contributes a standing
+    joint torque; it is EE-invariant, but the assist saturates at 5% of breakaway,
+    so an assist keyed off it is a near-full Coulomb vector that is NOT. That is
+    live EE force under a strictly zero delta, and because EE_DELTA re-anchors
+    goal_pos on the measured pose every step it integrates into drift instead of
+    settling to an offset -- the no-op drift after a teleop move.
+    """
+    rng = np.random.default_rng(3)
+    worst, exercised = 0.0, 0.0
+    for _ in range(6):
+        case = make_case(rng)
+        case["dq"] = np.zeros(7)                       # genuinely idle
+        for dev in (0.1, 0.25):
+            ref = case["q"] + dev * rng.normal(size=7) / np.sqrt(7)
+            taus = []
+            for kc in (0.0, 0.7):
+                robot = make_robot(case)
+                robot._home_q["r"] = ref
+                session = make_session(case, uncouple=False, friction_kc=kc)
+                taus.append(our_torque(robot, session, ee_delta_action([0, 0, 0], [0, 0, 0]), case))
+                exercised = max(exercised, np.linalg.norm(session.osc.nullspace_torque))
+
+            # EE wrench the two torques produce: F = Lambda J M^-1 (tau - coriolis).
+            J = srv.zero_jacobian(case["q"], ee_pos_base=case["ee_pos"])
+            Mi = np.linalg.inv(case["M"])
+            drive = np.linalg.inv(J @ Mi @ J.T) @ J @ Mi @ (taus[1] - taus[0])
+            worst = max(worst, float(np.linalg.norm(drive[:3])))
+
+    assert exercised > 0.5, (
+        f"nullspace torque only reached {exercised:.2f} Nm -- the case never left the "
+        "reference, so this asserts nothing")
+    assert worst < 1e-9, (
+        f"a zero delta drives the EE with {worst:.3f} N once the arm is off its "
+        "nullspace reference: the friction assist is riding the nullspace regulator. "
+        "Subtract it in _compute_tau before keying the assist off tau.")
 
 
 def test_joint_damping_pole_is_inside_the_law_rate():
@@ -1259,16 +1443,31 @@ def test_symmetric_directional_gains_reproduce_the_scalar_assist():
         for _ in range(5):
             tau = coriolis + rng.normal(0, 2.0, 7)
             got = srv._friction_feedforward(kc, kc, tau, coriolis)
-            want = kc * srv._FRICTION_COULOMB * np.tanh(
+            want = kc * srv._FRICTION_ASSIST_NM * np.tanh(
                 (tau - coriolis) / srv._FRICTION_TAU_EPS)
             assert np.allclose(got, want), f"symmetric gains diverged at kc={kc_val}"
 
-    # And the config ships them equal, so today's arm is unchanged.
+    # The config ships NO split -- both vectors are all ones. Every directional fit
+    # tried so far encoded a pose-dependent BIAS as friction: joint 1's asymmetry
+    # reverses sign across a q1 sweep, which gravity cannot do. Joints 1-6 must stay
+    # symmetric; a split appearing there is a bug, not a measurement.
     import franka_config as fc_
-    assert np.allclose(fc_.control("tuning.friction_kc_joint_pos"),
-                       fc_.control("tuning.friction_kc_joint_neg")), (
-        "the shipped config splits the directions; that is a deliberate rig trim, "
-        "but it means the arm no longer matches the symmetric baseline")
+    pos = np.asarray(fc_.control("tuning.friction_kc_joint_pos"), dtype=np.float64)
+    neg = np.asarray(fc_.control("tuning.friction_kc_joint_neg"), dtype=np.float64)
+    assert np.allclose(pos[:6], neg[:6]), (
+        f"the shipped config splits a joint other than 7 (pos={pos}, neg={neg}); only "
+        "joint 7's directional breakaway is measured well enough to license one")
+
+    # The invariant control.yaml states but nothing enforced until now. Above 1.0 the
+    # assist exceeds the breakaway it cancels, which is negative damping -- it has
+    # faulted joint 7 before. Note this bounds the PRODUCT: raising friction_kc is what
+    # silently pushed a per-joint gain over the line the last time this moved.
+    kc = float(fc_.control("tuning.friction_kc"))
+    worst = float(np.max(kc * np.maximum(pos, neg)))
+    assert worst <= 1.0 + 1e-9, (
+        f"friction_kc ({kc}) * kc_joint peaks at {worst:.2f} > 1.0: the assist drives "
+        "the joint instead of freeing it. Put the hard direction in "
+        "torque.friction.coulomb_nm and scale the easy one down instead.")
 
 
 def test_directional_gains_reach_the_control_loop():
@@ -1423,6 +1622,413 @@ def test_worktable_brake_never_commands_below_the_floor():
     # sphere sits, and the arm's base pose lifts it into world.
     bottom = robot.safety.sphere_bottom_world_z("r", goal_pos, goal_quat)
     assert bottom >= robot.safety.goal_z_floor - 1e-12
+
+
+# --------------------------------------------------------------------------
+# Sim-plant emulation
+#
+# Everything above compares tau against robosuite fed the SAME mass matrix, which
+# proves the law was ported correctly and proves nothing about whether running it
+# on the FR3's inertia reproduces robosuite. It does not, and cannot: osc.py's
+# uncouple_pos_ori discards the translation/rotation coupling block, and how much
+# that discards is a function of M. These tests cover the emulation, where the
+# quantity that must match is the joint ACCELERATION, not tau.
+# --------------------------------------------------------------------------
+
+class RefOSCSim(RefOSC):
+    """robosuite's controller on sim's plant: sim's M, sim's qfrc_bias."""
+
+    def __init__(self, case, M_sim, bias, **kw):
+        self._M_sim, self._bias = M_sim, bias
+        super().__init__(case, **kw)
+
+    def update(self, force=False):
+        super().update(force)
+        self.mass_matrix = np.array(self._M_sim)
+
+    @property
+    def torque_compensation(self):
+        # mujoco's qfrc_bias -- Coriolis AND gravity, unlike the hardware path.
+        return np.array(self._bias)
+
+
+def ref_sim_torque(case, M_sim, bias, dpos, drot, a_kp, a_kd, uncouple=True):
+    """robosuite's actuator command: run_controller, then SingleArm.control's clip."""
+    ctrl = RefOSCSim(
+        case, M_sim, bias, input_max=1, input_min=-1,
+        output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
+        output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
+        kp=150, damping_ratio=1, impedance_mode="variable",
+        kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
+        control_ori=True, control_delta=True, uncouple_pos_ori=uncouple,
+    )
+    ctrl.initial_joint = np.array(case["q"])
+    kp_raw = np.full(6, 150.0 * 10.0 ** a_kp)
+    damp_raw = np.full(6, 1.0 * 10.0 ** a_kd)
+    ctrl.set_goal(np.concatenate([damp_raw, kp_raw, dpos, drot]))
+    return np.clip(ctrl.run_controller(), -SIM_TORQUE_LIMITS, SIM_TORQUE_LIMITS)
+
+
+def test_sim_emulation_degenerates_to_the_ported_law():
+    """M_sim == M_real and no saturation -> bit-for-bit the law tested above.
+
+    This is what makes the emulation a generalisation rather than a replacement:
+    the 729-combination trajectory tests remain valid statements about it.
+    """
+    rng = np.random.default_rng(31)
+    worst = 0.0
+    for i in range(20):
+        case = make_case(rng)
+        osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=bool(i % 2))
+        osc.set_goal(case["ee_pos"] + rng.uniform(-0.01, 0.01, 3), case["R"],
+                     np.full(6, 150.0), np.full(6, 2.0 * np.sqrt(150.0)),
+                     initial_joint=case["q"])
+        kw = dict(ee_pos=case["ee_pos"], ee_ori_mat=case["R"],
+                  ee_pos_vel=(case["J"] @ case["dq"])[:3],
+                  ee_ori_vel=(case["J"] @ case["dq"])[3:],
+                  J_full=case["J"], q=case["q"], dq=case["dq"],
+                  mass_matrix=case["M"], coriolis=case["C"])
+        ported = osc.run_controller(**kw)
+        # Feed the arm's own M as "sim's": the transform collapses to M @ M^-1 and the
+        # bias cancels through clip(x + b) - b -- but only OUTSIDE saturation, so the
+        # claim is only meaningful where the clip is inactive.
+        b = rng.normal(0, 2.0, 7)
+        # Sim's passive joint damping is a PLANT term, not part of osc.py, so it has
+        # no counterpart in the ported law and is zeroed for the comparison. The
+        # claim under test is about the law collapsing, not about the plant model.
+        saved, _osc_ctrl_mod.SIM_JOINT_DAMPING = _osc_ctrl_mod.SIM_JOINT_DAMPING, np.zeros(7)
+        try:
+            emulated = osc.run_controller(**kw, mass_matrix_sim=case["M"], bias_sim=b)
+        finally:
+            _osc_ctrl_mod.SIM_JOINT_DAMPING = saved
+        if np.any(np.abs(ported - case["C"] + b) >= SIM_TORQUE_LIMITS):
+            continue                      # saturated: the two laws SHOULD differ here
+        worst = max(worst, _rel(emulated, ported))
+        assert _rel(emulated, ported) < 1e-9, f"trial {i}: rel err {_rel(emulated, ported):.2e}"
+    assert worst > 0.0, "every trial saturated; the degeneracy claim went untested"
+    return f"worst relative error {worst:.2e}, both uncouple settings"
+
+
+def test_sim_emulation_reproduces_robosuite_joint_acceleration():
+    """The headline assertion: same qddot as robosuite, on a DIFFERENT plant.
+
+    tau deliberately does not match -- the FR3 is 2-10x lighter, so reproducing
+    sim's motion takes proportionally less torque. What must match is what the
+    arm does with it.
+    """
+    rng = np.random.default_rng(32)
+    worst = 0.0
+    for i in range(40):
+        case = make_case(rng)
+        M_sim = sim_dynamics.mass_matrix(case["q"])
+        bias = sim_dynamics.bias(case["q"], case["dq"])
+        dpos = np.zeros(3) if i % 5 == 4 else rng.uniform(-1, 1, 3)
+        drot = np.zeros(3) if i % 3 == 0 else rng.uniform(-1, 1, 3)
+        a_kp, a_kd = rng.uniform(-1, 1), rng.uniform(-1, 1)
+        uncouple = bool(i % 2)
+
+        sess = make_session(case, uncouple=uncouple, emulate_sim=True)
+        ours = our_torque(make_robot(case), sess,
+                          ee_delta_action(dpos, drot, a_kp, a_kd), case)
+        ref = ref_sim_torque(case, M_sim, bias, dpos, drot, a_kp, a_kd, uncouple)
+
+        # Our controller adds real Coriolis (libfranka handles gravity); robosuite's
+        # command already contains its own bias, which its plant then subtracts.
+        # mujoco's plant equation, not just the controller output: ctrl minus the
+        # bias it already contains, minus the passive joint damping.
+        qdd_ours = np.linalg.solve(case["M"], ours - case["C"])
+        qdd_ref = np.linalg.solve(
+            M_sim, ref - bias - sim_dynamics.DAMPING_NMS_RAD * case["dq"])
+        worst = max(worst, _rel(qdd_ours, qdd_ref))
+        # 1e-6, not the 1e-5 used above: this path carries two pseudo-inverses and
+        # two solves against make_case's deliberately ill-conditioned random SPD M,
+        # so the floor is round-off rather than anything structural.
+        assert _rel(qdd_ours, qdd_ref) < 1e-6, f"trial {i}: rel err {_rel(qdd_ours, qdd_ref):.2e}"
+    return f"worst relative qddot error {worst:.2e} over 40 states, both uncouple settings"
+
+
+def test_sim_saturates_its_wrist_where_the_fr3_does_not():
+    """The empirical claim the ctrlrange clip exists for.
+
+    robosuite's rotation travel per step FALLS with command amplitude (0.24 at 0.05
+    -> 0.125 at 1.0) because its armature-inflated lambda drives joints 6/7 past
+    their +/-12 Nm ctrlrange. The FR3's lambda is ~10x smaller and never gets near
+    its own limit, so without reproducing sim's clip the real arm would overshoot
+    the reference exactly where the reference rolls off.
+    """
+    case = dict(q=REAL_Q, dq=np.zeros(7), M=REAL_M, C=np.zeros(7))
+    chain = fk_chain(REAL_Q)
+    case["ee_pos"], case["R"] = chain[7][:3, 3], chain[7][:3, :3]
+    case["J"] = zero_jacobian(REAL_Q, ee_pos_base=case["ee_pos"])
+    M_sim = sim_dynamics.mass_matrix(REAL_Q)
+    bias = sim_dynamics.bias(REAL_Q, np.zeros(7))
+
+    ctrl = RefOSCSim(
+        case, M_sim, bias, input_max=1, input_min=-1,
+        output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
+        output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
+        kp=150, damping_ratio=1, impedance_mode="variable",
+        kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
+        control_ori=True, control_delta=True, uncouple_pos_ori=True)
+    ctrl.initial_joint = np.array(REAL_Q)
+    ctrl.set_goal(np.concatenate([np.ones(6), np.full(6, 150.0),
+                                  np.zeros(3), [0.0, 0.0, 1.0]]))
+    unclipped = ctrl.run_controller()
+    wrist = float(np.max(np.abs(unclipped[5:])))
+    assert wrist > SIM_TORQUE_LIMITS[6], (
+        f"sim wrist demand {wrist:.1f} Nm is inside its {SIM_TORQUE_LIMITS[6]} Nm "
+        "ctrlrange -- the clip would be decorative and this test is wrong")
+
+    # The same command on the real plant, through the emulation.
+    sess = make_session(case, uncouple=True, emulate_sim=True)
+    ours = our_torque(make_robot(case), sess, ee_delta_action([0, 0, 0], [0, 0, 1.0]), case)
+    real_lim = np.asarray(srv.JOINT_TORQUE_LIMITS)
+    assert np.all(np.abs(ours) < real_lim), "emulated command exceeds the FR3 clamp"
+    return (f"sim wrist demand {wrist:.1f} Nm vs its {SIM_TORQUE_LIMITS[6]:.0f} Nm limit; "
+            f"real command peaks at {np.max(np.abs(ours)):.2f} Nm")
+
+
+def test_uncoupling_error_is_plant_dependent():
+    """Why the emulation exists at all; delete this and the change looks arbitrary.
+
+    uncouple_pos_ori=True replaces lambda_full's diagonal blocks with the
+    orientation-free / translation-free inertias. The ratio between them is a
+    property of M, so the SAME flag means different things on the two plants.
+    """
+    J = zero_jacobian(REAL_Q, ee_pos_base=fk_chain(REAL_Q)[7][:3, 3])
+    ratios = {}
+    for name, M in (("sim", sim_dynamics.mass_matrix(REAL_Q)), ("real", REAL_M)):
+        Mi = np.linalg.inv(M)
+        lam_f = np.linalg.pinv(J @ Mi @ J.T)
+        lam_p = np.linalg.pinv(J[:3] @ Mi @ J[:3].T)
+        lam_o = np.linalg.pinv(J[3:] @ Mi @ J[3:].T)
+        ratios[name] = np.concatenate([np.diag(lam_p), np.diag(lam_o)]) / np.diag(lam_f)
+    spread = ratios["real"] / ratios["sim"]
+    assert np.min(spread) < 0.5, (
+        f"uncoupling now costs the two plants the same ({np.round(spread, 3)}) -- if "
+        "that is real, emulate_sim_plant is no longer buying anything")
+    return (f"uncoupled/full sim {np.round(ratios['sim'], 3)}, "
+            f"real {np.round(ratios['real'], 3)}, real/sim {np.round(spread, 3)}")
+
+
+# --------------------------------------------------------------------------
+# Structural bugs in the goal path (plan item 3). Each of these was reachable
+# on hardware and invisible to every test above.
+# --------------------------------------------------------------------------
+
+def test_torn_goal_read_holds_the_last_good_goal():
+    """A torn read must not latch. Re-reading the block unlocked can pair a bumped
+    G_CMD_SEQ with a stale G_POS, and _compute_tau latches on the sequence."""
+    case = make_case(np.random.default_rng(11))
+    session = make_session(case)
+
+    class _TearingChannel:
+        """read_goal fails after the first call; goal keeps being written."""
+        def __init__(self, block):
+            self.goal = block
+            self.calls = 0
+
+        def read_goal(self):
+            self.calls += 1
+            return self.goal.copy() if self.calls == 1 else None
+
+    good = _goal_block(session, np.array([0.4, 0.0, 0.5]),
+                       np.array([0.0, 0.0, 0.0, 1.0]), np.full(6, 150.0),
+                       np.full(6, 24.5), case["q"])
+    session.ch = _TearingChannel(good)
+    first = session._goal()
+    # Now corrupt the block the way a torn write would: new sequence, garbage pose.
+    session.ch.goal[_shm.G_CMD_SEQ] += 1
+    session.ch.goal[_shm.G_POS] = [99.0, 99.0, 99.0]
+    held = session._goal()
+
+    assert held[_shm.G_CMD_SEQ] == first[_shm.G_CMD_SEQ], (
+        "torn read advanced the command sequence, so the loop will latch a "
+        "half-written goal")
+    assert np.allclose(held[_shm.G_POS], [0.4, 0.0, 0.5]), (
+        f"torn read leaked the corrupt pose {held[_shm.G_POS]}")
+
+
+def test_seqlock_survives_a_raising_writer():
+    """No try/finally left the counter odd forever, so every later read returned
+    None and the loop ran permanently on its torn-read fallback."""
+    ch = object.__new__(_shm.ShmChannel)
+    ch.goal = np.zeros(_shm.GOAL_SIZE)
+
+    def _boom(_b):
+        raise ValueError("write failed mid-update")
+
+    try:
+        _shm.ShmChannel._write(ch.goal, _shm.G_SEQ, _boom)
+    except ValueError:
+        pass
+    assert ch.goal[_shm.G_SEQ] % 2 == 0, (
+        "seqlock counter latched odd after a failed write; read_goal is now "
+        "permanently None")
+    assert _shm.ShmChannel._read(ch.goal, _shm.G_SEQ) is not None
+
+
+def test_session_settings_do_not_relatch_the_goal():
+    """set_mode / set_tuning carry no pose. Bumping G_CMD_SEQ re-latches the whole
+    OSC goal from stale G_POS and re-arms the stale-goal watchdog."""
+    ch = object.__new__(_shm.ShmChannel)
+    ch.goal = np.zeros(_shm.GOAL_SIZE)
+
+    ch.write_goal(G_MODE=_shm.MODE_OSC, G_POS=np.array([0.4, 0.0, 0.5]))
+    after_goal = ch.goal[_shm.G_CMD_SEQ]
+    assert after_goal > 0, "a real goal push must bump the command sequence"
+
+    ch.write_goal(new_command=False, G_MODE=_shm.MODE_HOLD)
+    ch.write_goal(new_command=False, G_FRICTION_KC_POS=np.ones(7),
+                  G_FRICTION_KC_NEG=np.ones(7))
+    assert ch.goal[_shm.G_CMD_SEQ] == after_goal, (
+        "a session setting bumped the command sequence")
+    # The mode itself still lands -- it is read every tick, not on the sequence.
+    assert ch.goal[_shm.G_MODE] == _shm.MODE_HOLD
+    assert np.allclose(ch.goal[_shm.G_FRICTION_KC_POS], 1.0)
+
+
+def test_server_settings_are_not_new_commands():
+    """Structural: the two settings RPCs must pass new_command=False. A numerical
+    test cannot see this -- re-latching the same goal produces the same tau."""
+    import inspect
+    import lerobot_robot_bimanual_franka.pylibfranka_server as _srvmod
+    for name in ("set_mode", "set_tuning"):
+        src = inspect.getsource(getattr(_srvmod._ArmSession, name))
+        assert "new_command=False" in src, (
+            f"_ArmSession.{name} bumps G_CMD_SEQ; it carries no pose, so it will "
+            "re-latch the OSC goal and re-arm the stale-goal watchdog")
+
+
+def test_missing_nullspace_reference_disables_the_term():
+    """zeros(7) is the block's "unset" encoding, not a posture. Treating it as one
+    pulls every joint toward the arm-straight-up configuration."""
+    case = make_case(np.random.default_rng(12))
+    session = make_session(case)
+    ctrl = session.osc
+    assert ctrl.initial_joint is None, "a fresh controller must have no reference"
+
+    state = FakeState(case["q"], case["dq"], case["ee_pos"], case["R"])
+    goal_quat = Rotation.from_matrix(case["R"]).as_quat()
+    g = _goal_block(session, case["ee_pos"] + np.array([0.02, 0.0, 0.0]),
+                    goal_quat, np.full(6, 150.0), np.full(6, 24.5), None)
+    session._compute_tau(state, g)
+    assert ctrl.initial_joint is None, (
+        "an all-zero G_NULLSPACE was adopted as a nullspace reference")
+    assert np.allclose(ctrl.nullspace_torque, 0.0), (
+        "nullspace torque is nonzero with no reference set")
+
+    # A real reference still lands, and still produces a nullspace term.
+    g2 = _goal_block(session, case["ee_pos"] + np.array([0.02, 0.0, 0.0]),
+                     goal_quat, np.full(6, 150.0), np.full(6, 24.5), case["q"])
+    session._compute_tau(state, g2)
+    assert np.allclose(ctrl.initial_joint, case["q"])
+
+
+def test_kp_clip_carries_kd_with_it():
+    """osc.py derives kd from the CLIPPED kp. Clipping kp alone silently changes
+    the damping ratio for any caller that is not resolve_gains."""
+    ctrl = OSCTorqueController(num_joints=7)
+    ratio = 1.7
+    kp_raw = np.array([500.0, 500.0, 500.0, 5000.0, 5000.0, 5000.0])
+    kd_raw = 2.0 * np.sqrt(kp_raw) * ratio            # consistent with the RAW kp
+    ctrl.set_goal(np.zeros(3), np.eye(3), kp_raw, kd_raw)
+
+    assert np.allclose(ctrl.kp, np.clip(kp_raw, *KP_LIMITS))
+    got = ctrl.kd / (2.0 * np.sqrt(ctrl.kp))
+    assert np.allclose(got, ratio), (
+        f"damping ratio drifted to {np.round(got, 3)} where KP_LIMITS bit; "
+        "kd must be re-derived from the clipped kp")
+    # And it is exactly a no-op where the clip did not bite.
+    inside = np.full(6, 150.0)
+    ctrl.set_goal(np.zeros(3), np.eye(3), inside, 2.0 * np.sqrt(inside))
+    assert np.allclose(ctrl.kd, 2.0 * np.sqrt(inside))
+
+
+def test_action_noise_does_not_defeat_the_orientation_hold():
+    """The "did the caller ask for a rotation" test is an exact compare against
+    zero, so Gaussian noise made every step look like a rotation command and
+    nothing held the EE's orientation while it translated."""
+    case = make_case(np.random.default_rng(13))
+    robot = make_robot(case, use_noise=True, noise_pos_scale=1e-3,
+                       noise_rot_scale=1e-3)
+    # Establish the held orientation, then translate only.
+    robot.send_action(ee_delta_action([0.0, 0.0, 0.0], [0.0, 0.0, 0.3]))
+    held = robot.robot_manager.osc_goals[-1]["r"][1]
+    for _ in range(4):
+        robot.send_action(ee_delta_action([0.4, 0.0, 0.0], [0.0, 0.0, 0.0]))
+    after = robot.robot_manager.osc_goals[-1]["r"][1]
+    # Same rotation up to quaternion double cover.
+    err = Rotation.from_quat(after) * Rotation.from_quat(held).inv()
+    assert err.magnitude() < 1e-12, (
+        f"goal orientation moved {err.magnitude():.3e} rad across pure-translation "
+        "steps with use_noise set; the hold is being re-anchored every step")
+
+
+def test_publish_rate_bounds_the_ee_delta_anchor():
+    """EE_DELTA rebuilds goal = ee_pos + delta from the last PUBLISHED state, so
+    the publish period is the floor on anchor staleness -- no re-read can beat it.
+    It must also stay aligned to the law tick, or _publish misses its Jacobian
+    cache on every call."""
+    import franka_config as fc
+    pub = int(fc.control("torque.loop.publish_decimation"))
+    ctrl = int(fc.control("torque.loop.control_decimation"))
+    assert pub % ctrl == 0, (
+        f"publish_decimation {pub} is not a multiple of control_decimation {ctrl}; "
+        "publish no longer lands on a law tick")
+    # The anchor cost is REPORTED, not bounded. Lowering it means publishing faster,
+    # and the 1 kHz loop cannot currently afford that -- 2 was tried and reverted
+    # (see the note in control.yaml). Asserting a tight bound here would just make
+    # this test fail for the RT loop's reasons, which is not what it is watching.
+    eaten = 0.15 * (pub / 1000.0) / DELTA_POS_MAX
+    assert eaten < 0.10, (
+        f"publish_decimation {pub} lets the EE_DELTA anchor eat {eaten:.1%} of a "
+        "full-scale delta before the goal is composed; past ~10% the anchor is a "
+        "bigger error than anything the gain sweep is chasing")
+    return f"publish {1000 / pub:.0f} Hz, anchor eats {eaten:.1%} of a full delta"
+
+
+def test_sim_clip_counter_tracks_the_sim_ctrlrange_not_the_hardware_clamp():
+    """The rotation-overshoot measurement, and it must count the RIGHT clip.
+
+    delta_sweep's sat_frac read 0.000 on every axis and amplitude and was taken as
+    "sim's saturation is not being reproduced". It measures limits.joint_torque_nm
+    ([87,87,87,87,30,25,20]) -- the real hardware clamp -- which indeed never fires
+    and says nothing about sim's [.., 12, 12] wrist ctrlrange. Two different limits,
+    two different questions; this pins the one item 1 actually asks about.
+    """
+    case = make_case(np.random.default_rng(21))
+    q = case["q"]
+    J = zero_jacobian(q, ee_pos_base=case["ee_pos"])
+    M_sim, b_sim = sim_dynamics.mass_and_bias(q, np.zeros(7))
+    ctrl = OSCTorqueController(num_joints=7)
+    ctrl.initial_joint = q.copy()
+
+    def run(goal_ori, kp):
+        ctrl.sim_clip_ticks = 0
+        ctrl.set_goal(case["ee_pos"], goal_ori, np.full(6, kp),
+                      2.0 * np.sqrt(np.full(6, kp)), q)
+        for _ in range(5):
+            ctrl.run_controller(
+                ee_pos=case["ee_pos"], ee_ori_mat=case["R"], ee_pos_vel=np.zeros(3),
+                ee_ori_vel=np.zeros(3), J_full=J, q=q, dq=np.zeros(7),
+                mass_matrix=case["M"], coriolis=np.zeros(7),
+                mass_matrix_sim=M_sim, bias_sim=b_sim)
+        return ctrl.sim_clip_ticks
+
+    assert run(case["R"], 150.0) == 0, "clip counted on a zero-error goal"
+    big = (Rotation.from_rotvec([0.0, 0.0, DELTA_ROT_MAX])
+           * Rotation.from_matrix(case["R"])).as_matrix()
+    fired = run(big, 1500.0)
+    assert fired == 5, f"sim ctrlrange never bound on a full-scale yaw at kp_max ({fired}/5)"
+
+    # And it is genuinely the sim limit: the same command is nowhere near the
+    # hardware clamp, which is what sat_frac was watching.
+    hw = np.asarray(_osc_ctrl_mod.JOINT_TORQUE_LIMITS, dtype=np.float64)
+    assert np.all(SIM_TORQUE_LIMITS[5:] < hw[5:]), (
+        "sim's wrist ctrlrange is no longer tighter than the hardware clamp; the "
+        "premise of the rotation roll-off is gone")
+    return (f"sim wrist ctrlrange {SIM_TORQUE_LIMITS[5:]} vs hardware clamp {hw[5:]}")
 
 
 def main() -> int:

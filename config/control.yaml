@@ -1,91 +1,69 @@
-# Every control-loop constant for the FR3 stack: gains, tuning trims, limits,
-# rates, and wire-level dynamics. Nothing here should be duplicated in Python.
-#
-# There is exactly ONE bound on what reaches the joints (torque.limits) and ONE
-# geometric screen on what the workstation may command (worktable_brake). If you
-# find yourself adding a third, it belongs in one of those two.
+# Every control-loop constant for the FR3 stack. Nothing here may be duplicated
+# in Python. Exactly one bound on what reaches the joints (torque.limits) and one
+# geometric screen on what may be commanded (worktable_brake); do not add a third.
 
 version: 2
 
 rates:
-  # Single global control rate (Hz) for teleop, recording, rollout, sysid,
-  # and residual runs.
-  control_fps: 20
-  # Camera stream rate; the D415e only accepts 6/15/30/60/90.
-  camera_stream_fps: 30
-  # Homing loop rate; null falls back to control_fps.
-  home_fps: null
+  control_fps: 20           # teleop, recording, rollout, sysid, residual runs
+  camera_stream_fps: 30     # the D415e only accepts 6/15/30/60/90
+  home_fps: null            # null falls back to control_fps
 
-# The per-rig hardware trims -- the only knobs meant to be swept. Every one of
-# them is a deliberate deviation from the sim, and every one is a no-op at the
-# value listed as sim parity. Both robot configs read these directly, so a
-# dataclass literal for any of them is a bug (see config/README.md).
+# Per-rig hardware trims -- the only knobs meant to be swept. Each is a no-op at its
+# sim-parity value. Read via default_factory; a dataclass literal for any is a bug.
 tuning:
-  # Sim-to-real scaling applied to EE_DELTA actions before they reach the OSC
-  # controller. 1.0 = exactly what the policy emits, which is what sim parity is
-  # defined at (tests/test_osc_stack.py pins these).
+  # EE_DELTA scaling before the OSC. 1.0 = what the policy emits = sim parity.
   ee_translation_fudge: 1.0
   ee_rotation_fudge: 1.0
 
-  # Coulomb friction feedforward scale. The assist cancels a plant term the sim
-  # does not have, so a non-zero value is CLOSER to osc.py's motion, not further
-  # from it. 0.0 = sim parity.
-  friction_kc: 1.0
-  # Per-joint multipliers on friction_kc, SPLIT BY ROTATION DIRECTION -- 14
-  # numbers. Joint friction on this arm is directional: breakaway differs
-  # depending on which way the joint turns, and a single symmetric gain either
-  # under-assists the hard direction or over-assists the easy one.
-  #
-  # The direction is the sign of the COMMANDED TORQUE (tau - coriolis), which is
-  # what the assist already keys off. It is NOT the sign of dq -- signing by dq
-  # cancels the friction holding a still arm and makes it walk. So `_pos` is the
-  # gain applied when the controller is pushing the joint in its + direction.
-  #
-  # Measure with:  python scripts/measure_joint_friction.py --directional \
-  #                       --gravity-flip-joint 3 --yes
-  # Both vectors equal = the old symmetric behaviour exactly.
-  friction_kc_joint_pos: [1.0, 1.0, 2.0, 1.0, 2.5, 1.0, 1.0]
-  friction_kc_joint_neg: [1.0, 1.0, 2.0, 1.0, 2.5, 1.0, 1.0]
+  # Coulomb assist scale against torque.friction.coulomb_nm; the two only mean
+  # anything as a PRODUCT, so re-tune this whenever coulomb_nm changes. 1.0 cancels
+  # breakaway exactly and leaves nothing holding the arm at zero command, which is
+  # why it is a ceiling and not a target -- see the drift note below.
+  # 0.5, MEASURED not chosen. sysid/measure_vibration.py drives a yaw reversal and
+  # reads the >25 Hz band (above the 20 Hz policy staircase, so nothing commanded can
+  # live there). Ringing is flat from 0 to 0.5 and then goes BROADBAND across all seven
+  # joints at 1.0 -- worst-joint |dq| 0.0079 / 0.0074 / 0.0154 rad/s at kc 0 / 0.5 / 1.0.
+  # 0.5 already gives 1.8x the torque modulation of kc=0, i.e. most of the deadband fill
+  # for none of the excitation. There is NO vibration at any kc at a held pose; the loop
+  # is only excited by motion, so tune this against a reversal, never against a hold.
+  friction_kc: 0.2
+  # Split by the sign of COMMANDED TORQUE, not of dq: signing by dq cancels the
+  # friction holding a still arm and the arm walks. Equal vectors = symmetric.
+  # ALL ONES until the asymmetry is measured with --gravity-flip-joint. Every
+  # single-pose split tried so far encoded a pose-dependent BIAS as friction and
+  # fought the arm elsewhere: the yaw imbalance a joint-7 split corrected at the sim
+  # pose (+14 -> -5) read +21 at folded, and roll/pitch flip sign between those poses
+  # with a symmetric assist anyway.
+  # INVARIANT: friction_kc * kc_joint <= 1.0, enforced by tests/test_osc_stack.py.
+  # coulomb_nm lives on the NUC, these do not -- redeploy after changing it.
+  friction_kc_joint_pos: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+  friction_kc_joint_neg: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
-  # Per-block OSC gain trims, each a scalar or a 3-vector. 1.0 is sim.
-  #
-  # kp_*_scale multiplies its block's stiffness; the damping ratio is then
-  # re-derived as sqrt(kp6/kp), which holds kp/kd -- and therefore the settling
-  # speed v = (kp/kd)*delta -- FIXED. A kp scale buys friction rejection, not
-  # speed.
-  #
-  # kd_*_scale multiplies its block's damping ratio directly, which is the one
-  # knob that does change kp/kd. Raise it to slow and damp an axis that
-  # oscillates, where more kp only makes it worse.
+  # Per-block OSC gain trims, scalar or 3-vector. 1.0 is sim.
+  # kp_*: stiffness only -- kd is re-derived to hold the ratio, so settling speed is
+  # fixed and this buys friction rejection, not speed.
+  # kd_*: the damping ratio itself. Above 1.0 it slows the block and costs sim match.
+  # BOUNDED BY THE MOST NEAR-SINGULAR POSE IN THE ENVELOPE, not by the pose you tune
+  # at: the OSC commands lambda*(kp*e), and ||lambda|| is 3.2x larger at full
+  # extension than at the sim pose (sigma_min(J) 0.088 vs 0.161). kp_ori_scale 2.0
+  # measured well at the sim pose and faulted repeatedly at extension, in probes and
+  # in teleop. Re-check `--poses all`, never `--poses sim` alone, after raising these.
   kp_pos_scale: [1.0, 1.0, 1.0]
   kp_ori_scale: [1.0, 1.0, 1.0]
-  # 0.5 is the value single_arm_franka was already flying. The bimanual config
-  # used to hardcode 1.0 here; the two are one setting now, and this is the one
-  # with hardware behind it.
   kd_pos_scale: [1.0, 1.0, 1.0]
   kd_ori_scale: [1.0, 1.0, 1.0]
-
 gripper_accum_speed: 1.0
 
 worktable_brake:
-  # The ONLY workstation-side screen. A hard floor on the commanded OSC goal,
-  # nothing else: no velocity envelope, no gain coupling, no joint-space form.
-  # The goal is raised along world-up until the EE collision sphere's lowest
-  # point sits at or above world.worktable.height_m + distance_min_m.
-  #
-  # Table height itself lives in world.yaml (worktable.height_m, world frame).
-  #
-  # The EE is modelled as a SPHERE, not a point, so a tilted gripper cannot
-  # touch the table with its side while the TCP still reads as clear. The
-  # centre is given in the TOOL frame and rotates with the EE.
-  #
-  # center_tool_m [0,0,0] puts the sphere on the TCP itself. Push it along -z
-  # to cover a gripper whose bulk sits behind the fingertips.
+  # The only workstation-side screen: raises the commanded OSC goal along world-up
+  # until the EE sphere's lowest point clears world.worktable.height_m + distance_min_m.
+  # No velocity envelope, no gain coupling, no joint-space form.
   ee_sphere:
+    # TOOL-frame centre, so it rotates with the gripper and a tilt cannot graze the
+    # table while the TCP still reads clear.
     center_tool_m: [0.0, 0.0, -0.10]
-    # 0.10 m is a deliberately conservative enclosure of the Franka Hand / WSG
-    # jaw assembly. It costs workspace near the table; shrink it once the real
-    # jaw extent is measured.
+    # Conservative enclosure of the Franka Hand / WSG jaws; shrink once measured.
     radius_m: 0.10
   distance_min_m: 0.01
 
@@ -95,108 +73,255 @@ franka:
   rpyc_timeout_s: 10
   connect_timeout_s: 10.0
   first_state_timeout_s: 5.0
-  # Read ONLY by scripts/openpi_client_franka.py, the one remaining
-  # velocity-domain caller. The torque path is bounded by torque.limits and
-  # never sees these.
-  # FR3 datasheet limits; joints 1-4 @ 2.175 rad/s, joints 5-7 @ 2.61 rad/s.
+  # Read only by scripts/openpi_client_franka.py; the torque path never sees these.
   max_joint_velocity_rad_s: [2.175, 2.175, 2.175, 2.175, 2.61, 2.61, 2.61]
   max_joint_accel_rad_s2: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
   joint_velocity_safety_factor: 0.9
   joint_accel_safety_factor: 0.75
 
-# Everything the torque stack runs on. Read on the workstation through
-# franka_config; the NUC gets the same values because deploy_nuc_server.sh
-# resolves this block into nuc_control_config.py and copies it next to the
-# server (the NUC env is numpy + pylibfranka only). Change a number here and
-# REDEPLOY -- the workstation copy is not what runs the 1 kHz loop.
+# deploy_nuc_server.sh resolves this block into nuc_control_config.py on the NUC.
+# Change a number and REDEPLOY -- the workstation copy is not what runs the loop.
 torque:
   osc:
-    # robosuite's OperationalSpaceController config, from
-    # multi-fast cfg/fast_default.yaml + osc_pose.json. Sim parity is DEFINED by
-    # these, so they are not rig trims -- change them only alongside the sim.
-    # Rig trims live under `tuning:` above.
-    #
-    # impedance_mode "variable" takes kp and the damping ratio from the action
-    # every step. Under "fixed" robosuite ignores gain actions entirely, so a
-    # gain sweep would move the real arm and leave the sim reference untouched.
+    # robosuite's OSC config (multi-fast cfg/fast_default.yaml + osc_pose.json).
+    # Sim parity is DEFINED by these, so they are not rig trims -- change them only
+    # alongside the sim. Rig trims live under `tuning:`.
+    # "variable" takes kp and the damping ratio from the action every step; under
+    # "fixed" robosuite ignores gain actions and a gain sweep would move only real.
     impedance_mode: variable
     default_kp: 150.0
     kp_limits: [0.0, 1500.0]
     default_damping_ratio: 1.0
     damping_ratio_limits: [0.0, 10.0]
-    # The action->gain remap is DERIVED from the four above, matching
-    # multi-fast/utils/envs/libero.py: exp_scale = limit_max / default, so
-    # kp = default_kp * (kp_limits[1]/default_kp) ** a_kp. Do not add a separate
-    # base here -- a second copy is how it silently drifts from the sim.
+    # The action->gain remap is DERIVED from the four above (utils/envs/libero.py).
+    # Do not add a separate base here; a second copy is how it drifts from sim.
     nullspace_kp: 10.0
+    # osc_pose.json's value, and now literally sim's: with emulate_sim_plant the
+    # uncoupling is applied to SIM's mass matrix, which is the only way it can mean
+    # what it means in sim.
+    #
+    # true drops the translation/rotation cross-coupling when forming the wrench,
+    # using (Jv M^-1 Jv^T)^-1 -- the apparent inertia with orientation FREE. How much
+    # that discards depends on M, and that is the whole problem: measured at the
+    # sysid anchor, lambda_uncoupled/lambda_full on +x is 0.497 for sim and 0.145 for
+    # the FR3, on ry 0.304 vs 0.071. So against the FR3's own M, true costs 3.4x more
+    # +x authority than it costs sim (the observed "X goes tiny") while false is a
+    # DIFFERENT law from the one the policies were trained on (the observed "wrist
+    # breaks"). Neither can match sim; both readings were correct.
+    uncouple_pos_ori: true
+
+    # Evaluate the law on robosuite's Panda plant model (sim_dynamics.py) and realise
+    # the joint acceleration it produces on the FR3, instead of running the law
+    # against the FR3's own inertia. See osc_torque_controller.run_controller.
+    # false = the previously shipped behaviour, kept so the change is A/B-testable
+    # on hardware rather than argued about.
+    emulate_sim_plant: true
+
+    # mujoco ctrlrange on robosuite's Panda actuators. REFERENCE dynamics, not a
+    # hardware bound -- sim saturates its wrist here and the FR3 does not, which is
+    # why sim's rotation travel per step falls with amplitude while the real arm's
+    # rises. Read only when emulate_sim_plant; the real bound stays limits.joint_torque_nm.
+    sim_ctrlrange_nm: [80.0, 80.0, 80.0, 80.0, 80.0, 12.0, 12.0]
+
+    # mujoco dof_damping. Passive, so it acts outside the ctrlrange clip. Sim's
+    # dof_frictionloss (0.1 Nm/joint) is the other half of its plant and is handled
+    # on the real side instead -- see friction.coulomb_nm.
+    sim_joint_damping_nms_rad: [0.1, 0.1, 0.1, 0.1, 0.1, 0.01, 0.01]
 
   delta:
-    # osc_pose.json output_max/output_min: the per-step EE_DELTA envelope. Full
-    # SpaceMouse deflection is exactly a normalized +/-1 policy action against
-    # these, so teleop and policy drive the controller in identical units. This
-    # is osc.py's own input clip + output scale, not an extra safety layer.
+    # osc_pose.json output_max/output_min: osc.py's own input clip and output scale,
+    # not an extra safety layer. Full SpaceMouse deflection is a normalized +/-1 action.
     pos_max_m: 0.05
     rot_max_rad: 0.5
 
   joint_impedance:
-    # JOINT_POS, home() and hold. Per-joint stiffness, NOT a scalar through the
-    # mass matrix: tau = M @ (kp*e) collapses on the wrist where M ~ 0.01, so a
-    # 0.5 rad error asks for ~0.3 Nm -- under breakaway, which is why home()
-    # could not rotate the wrist. These are libfranka's joint_impedance_example
-    # values (Nm/rad, Nms/rad).
+    # JOINT_POS, home() and hold. Per-joint stiffness, NOT a scalar through the mass
+    # matrix: tau = M @ (kp*e) collapses on the wrist where M ~ 0.01, which is why
+    # home() could not rotate it. libfranka joint_impedance_example values.
     kp: [300.0, 300.0, 300.0, 300.0, 200.0, 150.0, 100.0]
-    # Sized per joint as 2*zeta*sqrt(kp*M) at zeta ~ 0.7, NOT copied from the
-    # libfranka example: those assume the proximal joints' inertia and on the
-    # wrist are both discretely unstable and self-throttling against homing's
-    # torque budget.
+    # 2*zeta*sqrt(kp*M) at zeta ~ 0.7, not the libfranka example values: those assume
+    # the proximal joints' inertia and are discretely unstable on the wrist.
     kd: [35.0, 35.0, 35.0, 35.0, 20.0, 10.0, 10.0]
     damping_ratio: 0.8
-    # Cap on each joint's velocity-loop pole kd/M (rad/s). Part of the joint
-    # impedance law, not a safety screen: stiffness must stay un-weighted (see
-    # kp) but damping then inherits the same tiny inertia, and kd/M is 600-1500
-    # rad/s on joints 5-7, so -kd*dq alternates sign against the 500 Hz law and
-    # the wrist bang-bangs its clamp -- the homing vibration. 100 leaves joints
-    # 1-4 untouched and lands 5-7 at damping ratio 0.58-0.71.
+    # Cap on each joint's velocity-loop pole kd/M. Part of the law, not a screen:
+    # stiffness stays un-weighted but damping then inherits the same tiny inertia, and
+    # kd/M of 600-1500 rad/s makes -kd*dq alternate sign against the 500 Hz law.
     kd_pole_max_rad_s: 100.0
-    # Velocity-mode bandwidth (rad/s), applied THROUGH the mass matrix so the
-    # pole is this on every joint.
+    # Velocity-mode bandwidth, applied through M so the pole is this on every joint.
     velocity_kv: 25.0
 
+  # Reflected rotor inertia, ADDED to libfranka's mass matrix. Not a tuning knob and
+  # not a sim-parity constant -- a property of the arm that libfranka's model omits.
+  #
+  # Model.mass() returns the rigid-body inertia of the LINKS only. Measured against
+  # sysid/joint_id.py's open-loop torque fit at the sysid anchor (which sees the true
+  # effective joint inertia), the model reads low on every joint:
+  #
+  #   joint          1      2      3      4      5      6      7
+  #   Model.mass  1.161  1.814  1.240  1.181  0.028  0.042  0.002
+  #   measured    1.936  2.573  1.744  1.338  0.118  0.127  0.062
+  #   ratio        0.60   0.71   0.71   0.88   0.23   0.33   0.032
+  #
+  # The difference clusters by motor family -- 0.50-0.78 on the four proximal joints,
+  # 0.060-0.090 on the three wrist ones -- which is what a reflected rotor inertia
+  # looks like and is not what fit noise looks like. Joint 7 is the extreme case and
+  # is physically consistent: the 1.43 kg hand's COM sits on the joint-7 axis, so its
+  # LINK contribution really is ~I_total[8]=0.0017, and essentially all of the true
+  # 0.062 is rotor.
+  #
+  # This matters because the OSC commands tau = M * qddot: an M that is 31x low on
+  # joint 7 asks for 31x too little yaw torque, which is why rz was the deadest axis.
+  # Re-derive with: joint_id.py --backend real, minus Model.mass() at the same q.
+  #
+  # 2026-08-12: RE-MEASURED AT TWO POSES AND AT 500 Hz PUBLISH. The pose-independence
+  # test the derivation depends on -- rotor is a property of the motor, so the
+  # difference must be the same everywhere -- SPLITS THE ARM IN TWO:
+  #
+  #   joint            1      2      3      4  |     5      6      7
+  #   anchor      0.8310 0.4071 0.5875 0.3556  | 0.0838 0.0921 0.0866
+  #   pose B      1.2715 1.6507 1.0530 -0.0667 | 0.0711 0.1234 0.0860
+  #   disagree       42%   121%    57%    292% |   16%    29%    0.7%
+  #
+  # j5-j7 hold (j7 to 0.7% across two very different poses, and its Model.mass term is
+  # bit-exactly pose-invariant, so it is the cleanest number in the stack). Those three
+  # are updated here from the mean of the two poses -- the shipped values were 30-43%
+  # LOW on j7, i.e. we were under-commanding wrist torque.
+  #
+  # j1-j4 DO NOT HOLD, and j4 comes out NEGATIVE at pose B, which is impossible. The
+  # single-pose subtraction there is absorbing the held neighbours' reaction, which is
+  # large and pose-dependent on the proximal joints and nearly vanishes on the light
+  # wrist links. Their values below are the ORIGINAL single-pose estimates, kept only
+  # because no trustworthy replacement exists yet -- they are not measurements, and a
+  # method that does not hold one joint against the others is needed to fix them.
+  #
+  # The old wrist numbers came from a 100 Hz publish, where the wrist launch transient
+  # is shorter than a few samples: j7's two rotation directions disagreed 43% there and
+  # 5% at 500 Hz. Do not re-measure the wrist below torque.loop.publish_decimation: 2.
+  rotor_inertia_kg_m2: [0.775, 0.760, 0.504, 0.157, 0.0774, 0.1078, 0.0863]
+
   limits:
-    # The ONLY bound on what reaches the joints. Applied in the response path of
-    # pylibfranka_control's loop, after the law and before the write: rate limit
-    # first, then clamp. Nothing else rescales tau.
-    #
-    # FR3/Panda datasheet continuous joint torque limits (Nm). This is osc.py's
-    # clip_torques against actuator_range.
+    # The ONLY bound on what reaches the joints: rate limit, then clamp, in the
+    # response path. Nothing else rescales tau.
     joint_torque_nm: [87.0, 87.0, 87.0, 87.0, 30.0, 25.0, 20.0]
-    # Nm/s. libfranka rejects torque steps above its own rate limit and nothing
-    # enforces it for us the way franka::limitRate does in the C++ examples.
-    max_torque_rate_nm_s: 1000.0
+    # libfranka rejects torque steps above its own rate limit and nothing enforces
+    # it for us the way franka::limitRate does in the C++ examples.
+    #
+    # 800, not libfranka's own 1000: at 1000 there is ZERO margin, and the limiter
+    # sizes its step as rate*dt with dt taken from the tick that just arrived -- so a
+    # late tick BUYS a bigger allowed jump, which is exactly backwards. That was
+    # survivable while the OSC commanded 1-2 Nm on rotation; with emulate_sim_plant
+    # it commands up to 20x that, and the arm answered with repeated
+    # controller_torque_discontinuity reflexes at amp >= 0.7.
+    max_torque_rate_nm_s: 800.0
+
+  collision:
+    # libfranka reflex thresholds, set at arming. Factory values are tuned for
+    # hand-guiding and fire on our own commanded force. Not a torque bound.
+    # SAFETY COST: a real collision is caught later and harder.
+    lower_torque_nm: [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
+    upper_torque_nm: [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
+    # [Fx,Fy,Fz,Mx,My,Mz]. These drive cartesian_reflex, and at the libfranka example
+    # values (20 N / 25 Nm) it fired 40 times in 13 s once the arm started actually
+    # tracking -- libfranka infers the external wrench, our unmodelled joint friction
+    # lands in that estimate, and a moving arm crosses 20 N without touching anything.
+    # Read the evidence before raising further: clamp trips 0 and success rate 1.000
+    # say nothing was being pushed against, which is what distinguishes this from a
+    # real contact.
+    # 40 -> 70 (2026-08-12). Two feedforward terms were added that libfranka's
+    # observer cannot see and therefore books as contact: rotor_inertia_kg_m2, whose
+    # torque J_rotor*qddot appears exactly during acceleration, and a friction assist
+    # ~1.8x larger than before. At 40 N this fired 6 times in one 10 s sysid episode
+    # (cartesian_reflex), and each recovery froze the published state for ~8 policy
+    # steps -- the "buzzing" was those, not a gain.
+    # Same evidence bar as the 20 -> 40 raise above: clamp trips 0 and success rate
+    # 0.98-1.00 say nothing was being pushed against. The SAFETY COST is real and
+    # unchanged -- a true collision is caught later and harder.
+    lower_force_n: [70.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+    upper_force_n: [70.0, 70.0, 70.0, 70.0, 70.0, 70.0]
+
+  bias:
+    # Standing joint torque libfranka's model does not account for, ADDED by the loop
+    # (so it is -tau_ext_hat_filtered; sysid/identify_bias.py prints it already flipped).
+    #
+    # Why this exists at all: osc.py is a pure PD law, F = kp*e + kd*edot, with no
+    # integral term anywhere. PD has a non-zero steady-state error against a static
+    # disturbance by construction, and EE_DELTA re-anchors goal_pos on the MEASURED
+    # pose every step, so that standing error never becomes a restoring force -- it
+    # moves the goal instead, turning a bounded offset into a constant drift.
+    # The franky velocity stack never showed this because it commanded joint VELOCITY
+    # and Franka's firmware servo closed an inner loop with integral action, absorbing
+    # exactly this term before it reached the task-space law. Torque control deleted
+    # that servo; this replaces what it was doing.
+    #
+    # Same justification as friction_kc: it cancels a term sim lacks, so nonzero is
+    # CLOSER to osc.py, not further. Zeros = no-op = today's behaviour.
+    # OSC only -- JOINT_POS/home/hold run joint impedance at kp=300, where a 1 Nm bias
+    # is a 0.003 rad offset and there IS a restoring force.
+    # Identify with sysid/identify_bias.py; verify with delta_sweep.py --sag. If the
+    # drift gets WORSE, the sign is flipped.
+    # ZEROED pending a signed measurement. -tau_ext put +0.43 Nm on joint 4, whose
+    # range is [-3.07, -0.07], so positive drives the elbow toward straight -- the arm
+    # extended outward and up under teleop. The sign cannot be argued from tau_ext's
+    # definition, because unmodelled joint friction lands in that estimate too; it has
+    # to come from the sag test. See the A/B in sysid/SYSID.md.
+    joint_nm: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
   friction:
-    # Per-joint Coulomb breakaway (Nm) from scripts/measure_joint_friction.py.
-    # The scale that multiplies this is tuning.friction_kc.
-    coulomb_nm: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    # Assist band, as a fraction of coulomb_nm. Sets the assist's incremental
-    # gain, 1 + kc/fraction -- 6x here -- and tau carries the measured dq, so
-    # the assist re-injects encoder noise at that gain. Widen the band to
-    # reduce it; do NOT filter the assist (see _friction_feedforward).
-    tau_eps_fraction: 0.05
+    # Per-joint Coulomb breakaway at home_poses/home_pose, from
+    # measure_joint_friction.py. Repeatable to +/-0.07 Nm except joint 4 (+/-0.22).
+    # Symmetric breakaway per joint. 5-7 re-measured 2026-08-11 (--method torque,
+    # spread 0.05-0.075); 1-4 are the earlier measurement.
+    coulomb_nm: [1.20, 1.70, 1.45, 1.70, 0.95, 0.80, 0.45]
+    # mujoco dof_frictionloss on robosuite's Panda. The assist targets
+    # coulomb_nm - this, because the goal is to match sim's plant, not to make the
+    # arm frictionless: sim is not frictionless either, and on the real wrist
+    # (M ~ 0.06 kg m^2) 0.1 Nm is 1.6 rad/s^2 of difference. Verified against the
+    # live mujoco model by tests/test_sim_dynamics.py.
+    sim_frictionloss_nm: [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # Assist band as a fraction of coulomb_nm; sets the incremental gain
+    # 1 + friction_kc/this on measured dq. Widen to cut noise; never filter the assist.
+    #
+    # 0.05 made this a sign function: a command at 10% of breakaway drew tanh(2)=96%
+    # of the full assist, and the incremental gain on measured dq was 21x at
+    # friction_kc 1.0. That was survivable only while the assist sat SATURATED on the
+    # nullspace regulator. Once _compute_tau stopped feeding that term in, the resting
+    # operating point became the tanh zero-crossing -- maximum gain -- and the arm
+    # walked under a zero-delta teleop.
+    # 0.30 gives gain 4.3x and makes the assist proportional where it must be: 10% of
+    # breakaway now draws 38%, while a breakaway-sized command still draws tanh(3.3)
+    # = 99.7%, so the rotation authority this bought is kept.
+    tau_eps_fraction: 0.30
 
   loop:
-    # The OSC law runs at 500 Hz, not 1 kHz, because that is robosuite's substep
-    # rate: control_decimation ticks of the 1 kHz loop per law update.
+    # The OSC law runs at 500 Hz because that is robosuite's substep rate.
     control_decimation: 2
-    publish_decimation: 10
-    # The server holds the current pose if no goal arrives for this long, so a
-    # dead policy loop parks the arm instead of latching the last goal.
+    # This is the FLOOR on how old the EE_DELTA anchor can be: send_action rebuilds
+    # goal = ee_pos + delta from the last published state, so at 100 Hz the anchor
+    # carries up to 10 ms of motion -- ~1.5 mm at 0.15 m/s, ~3% of a full-scale 0.05 m
+    # delta -- and no re-read can shrink it, because the publisher has nothing newer.
+    #
+    # 500 Hz. Tried once at 100 Hz-era law cost and reverted -- the loop came back at
+    # success rate 0.970-0.990 because _publish runs in the slack right after the law,
+    # and the law then spent ~730 us of the 1 ms period. After the law was cut to
+    # ~530 us (np.cross dispatch, sim_dynamics + orientation_error + zero_jacobian)
+    # the margin went 153 -> ~380 us and this became affordable: publish costs ~100 us
+    # per call, so 500 Hz spends ~50 us/ms of it.
+    #
+    # It is also REQUIRED for wrist system identification, not just for the EE_DELTA
+    # anchor: joints 5-7 carry ~0.05-0.16 kg m^2, and their launch transient under a
+    # torque step is shorter than a few sample periods at 100 Hz. joint_id's wrist fits
+    # at 100 Hz disagreed 31-43% between rotation directions on a quantity that cannot
+    # depend on direction at all. Set joint_id --fps at or above this.
+    #
+    # Must stay a multiple of control_decimation, so publish lands on a law tick and
+    # _publish's Jacobian hits the cache instead of always missing it.
+    publish_decimation: 2
+    # A dead policy loop parks the arm instead of latching the last goal.
     stale_goal_timeout_s: 0.5
     gil_switch_interval_s: 5.0e-5
-    # Cores the RT child may be pinned to; it picks whichever of these takes the
-    # fewest device interrupts. 0-1 are reserved for the RPyC and gripper
-    # servers -- SCHED_FIFO wins the CPU but does not stop their socket work
-    # from landing NET_RX softirqs on the loop's core.
+    # The RT child picks whichever of these takes the fewest device interrupts.
+    # 0-1 are reserved for the RPyC and gripper servers: SCHED_FIFO wins the CPU but
+    # does not stop their socket work landing NET_RX softirqs on the loop's core.
     rt_cpu_candidates: [2, 3, 4, 5, 6, 7]
     arm_attempts: 6
     arm_backoff_s: 0.3
@@ -205,17 +330,19 @@ homing:
   gripper_norm: 1.0
   max_time_s: 5.0
   tol_rad: 0.05
-  # The commanded goal LEADS the measured q rather than jumping to the target,
-  # which bounds approach speed and lets it taper to zero on arrival. Re-deriving
-  # the goal from the measured q each tick instead sawtooths the error by
-  # v/rate -- a 25% torque ripple, felt as vibration.
-  max_qdot_rad_s: 1.0
-  settle_qdot_rad_s: 0.05   # home() is not done until the arm is this still
-  lead_margin: 1.5          # headroom so the stall clamp stays off the ramp
-  # Fraction of each joint's torque clamp that homing may spend on
-  # kp*lead + kd*qdot together. Both terms scale with speed, so this caps the
-  # speed per joint; a saturated joint stops tracking the ramp and never
-  # converges.
+  # The goal LEADS the measured q rather than jumping to the target. Re-deriving it
+  # from the measured q each tick sawtooths the error into a ~25% torque ripple.
+  # Caps homing speed and, because the lead ramps to it, homing acceleration. The
+  # homing-only lever: joint_impedance.kp/kd would also work but are shared with
+  # JOINT_POS, hold and MODE_TORQUE, and kd is separately capped by kd_pole_max_rad_s.
+  # Note this cannot fix cartesian_reflex trips on its own -- Coulomb friction is
+  # speed-INDEPENDENT, so the friction share of libfranka's inferred external wrench
+  # is the same at 0.5 rad/s as at 1.0. Lowering it only removes the inertial share.
+  max_qdot_rad_s: 0.5
+  settle_qdot_rad_s: 0.05
+  lead_margin: 1.5
+  # Fraction of each joint's clamp that kp*lead + kd*qdot may spend together; both
+  # scale with speed, so this caps speed per joint. A saturated joint never converges.
   tau_fraction: 0.5
 
 observation:
@@ -223,10 +350,14 @@ observation:
   image_height: 224
   image_channels: 3
   camera_read_timeout_ms: 5.0
-  # Age past which get_observation()'s kinematic snapshot is re-read instead of
-  # reused by the following send_action. EE_DELTA anchors its goal on the
-  # measured pose, so a stale anchor silently subtracts whatever the arm
-  # travelled in between from the commanded delta.
+  # Age past which get_observation()'s kinematic snapshot is re-read. EE_DELTA anchors
+  # on the measured pose, so a stale anchor eats part of the commanded delta.
+  #
+  # In practice this ALWAYS trips and send_action always re-reads: get_observation
+  # caches the snapshot before reading six cameras, so it is tens of ms old by the time
+  # send_action sees it. That is the correct outcome -- the value is a bound worth
+  # keeping, not an optimisation that fires -- but it means the cache is not what makes
+  # the anchor fresh. torque.loop.publish_decimation is; see the note there.
   kin_cache_max_age_s: 0.005
   depth_point_count: 2048
   # Half-extent of the world-axis-aligned box crop centred on the EE.

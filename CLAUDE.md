@@ -168,10 +168,14 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   — the `Robot` subclass. Holds a `MultiRobotWrapper`, two grippers, six
   cameras, and an `ActionSafetyScreen`. `get_observation()` reads cameras in a
   thread pool while batch-querying both arms' kinematic state in parallel;
-  it caches that snapshot so the immediate `send_action()` skips a redundant
-  RPyC round-trip (past `observation.kin_cache_max_age_s` it re-reads instead —
-  EE_DELTA anchors on the measured pose, so a stale anchor silently eats part
-  of the commanded delta).
+  it caches that snapshot for the immediate `send_action()`, bounded by
+  `observation.kin_cache_max_age_s`. **In practice that bound always trips and
+  `send_action` always re-reads**: the snapshot is taken before six camera
+  reads, so it is tens of ms old by the time `send_action` sees it. The cache is
+  therefore not what keeps the EE_DELTA anchor fresh — `torque.loop.publish_decimation`
+  is, because the anchor can never be newer than the last published state.
+  EE_DELTA anchors on the measured pose, so a stale anchor silently eats part of
+  the commanded delta.
 - [franka_process.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_process.py)
   — the RPyC client. Ships *goals*, not per-tick commands: `send_osc_goal`,
   `send_joint_goal` and `send_joint_velocity` are non-blocking pushes, and
@@ -373,8 +377,7 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `osc_check/check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
 | `osc_check/check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
-| `sweep_sim_match.py` | Search `friction_kc` + the delta fudges against a sim reference | EE |
-| `../sysid/sweep_gains.py` | Search the OSC gain scales (per axis) against one sim trajectory; rejects trials that saturate the torque clamp | EE |
+| `../sysid/tune.py` | Match real to a sim reference: sweep gains/fudges/`friction_kc`, scored on per-step task response | EE |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all six packages | — |

@@ -111,6 +111,11 @@ def zero_jacobian(q: np.ndarray, ee_pos_base: np.ndarray | None = None) -> np.nd
     z = chain[:7, :3, 2]           # joint k screw axis = z of frame k+1
     o = chain[:7, :3, 3]           # origin of frame k+1
     J = np.empty((6, 7), dtype=np.float64)
-    J[:3, :] = np.cross(z, o_e - o).T
+    # np.cross spelled out: same three products, ~3 us cheaper, and this runs on
+    # every tick of the 500 Hz law.
+    r = o_e - o
+    J[0] = z[:, 1] * r[:, 2] - z[:, 2] * r[:, 1]
+    J[1] = z[:, 2] * r[:, 0] - z[:, 0] * r[:, 2]
+    J[2] = z[:, 0] * r[:, 1] - z[:, 1] * r[:, 0]
     J[3:, :] = z.T
     return J

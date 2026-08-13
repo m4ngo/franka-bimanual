@@ -28,7 +28,7 @@ FPS = fc.camera_stream_fps()  # native stream FPS requested from the camera
 # Overlay reference image (path relative to workspace). Set to None to disable.
 OVERLAY_PATH: str | None = "frames/sim-ref.png"
 # Initial global overlay alpha in [0, 1]
-OVERLAY_ALPHA = 0.0
+OVERLAY_ALPHA = 0.5
 
 WARMUP_FRAMES = 15
 FRAME_TIMEOUT_MS = 5000

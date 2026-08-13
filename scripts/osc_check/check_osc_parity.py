@@ -148,14 +148,22 @@ for trial in range(3):
     initial_joint = rng.normal(0, 0.5, 7)
     kp, kd = ours.resolve_gains(rng.uniform(-1, 1), rng.uniform(-1, 1))
 
-    ctrl = ours.OSCTorqueController(num_joints=7)
-    ctrl.set_goal(goal_pos, goal_ori, kp, kd, initial_joint)
-    ours_tau = ctrl.run_controller(ee_pos, ee_mat, twist[:3], twist[3:], J, q, dq, M, C)
+    # BOTH settings of the uncoupling flag, and the reference is given the same one.
+    # osc_pose.json ships true; this rig runs false (config/control.yaml explains why).
+    # Comparing our false against robosuite's hardcoded true measures the flag, not the
+    # law -- it fails by ~1e3 Nm and leaves this script red for a config choice, which
+    # is exactly how a genuine regression would get missed.
+    for uncoupling in (True, False):
+        ctrl = ours.OSCTorqueController(num_joints=7, uncouple_pos_ori=uncoupling)
+        ctrl.set_goal(goal_pos, goal_ori, kp, kd, initial_joint)
+        ours_tau = ctrl.run_controller(ee_pos, ee_mat, twist[:3], twist[3:], J, q, dq, M, C)
 
-    # torque_compensation on hardware is Coriolis only: libfranka adds gravity.
-    rs_tau = robosuite_run_controller(goal_pos, goal_ori, ee_pos, ee_mat, twist[:3], twist[3:],
-                                      J, q, dq, M, C, kp, kd, initial_joint)
-    check(f"tau (trial {trial}, kp={kp[0]:.0f})", ours_tau, rs_tau, tol=1e-9)
+        # torque_compensation on hardware is Coriolis only: libfranka adds gravity.
+        rs_tau = robosuite_run_controller(goal_pos, goal_ori, ee_pos, ee_mat, twist[:3],
+                                          twist[3:], J, q, dq, M, C, kp, kd, initial_joint,
+                                          uncoupling=uncoupling)
+        check(f"tau (trial {trial}, kp={kp[0]:.0f}, uncouple={uncoupling})",
+              ours_tau, rs_tau, tol=1e-9)
 
 print("\n== delta envelope (osc.py scale_action bound) ==")
 dp, dr = ours.clip_delta(np.array([0.9, -0.02, 0.001]), np.array([2.0, -0.1, 0.3]))

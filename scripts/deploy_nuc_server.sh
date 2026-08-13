@@ -61,6 +61,7 @@ python -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$GENERATED"
 echo "==> copying server to $HOST"
 scp -q "$SRC/pylibfranka_server.py" "$SRC/pylibfranka_control.py" "$SRC/pylibfranka_shm.py" \
     "$SRC/osc_torque_controller.py" "$SRC/franka_jacobian.py" "$SRC/torque_config.py" \
+    "$SRC/sim_dynamics.py" \
     "$HOST:~/"
 scp -q "$GENERATED" "$HOST:~/nuc_control_config.py"
 
@@ -100,16 +101,19 @@ ssh "$HOST" "chmod +x ~/run_server.sh"
 echo "==> import check"
 ssh "$HOST" "source ~/pylibfranka_env/bin/activate && python3 -c '
 import ast, sys
-for f in (\"pylibfranka_server.py\", \"pylibfranka_control.py\", \"pylibfranka_shm.py\", \"osc_torque_controller.py\", \"franka_jacobian.py\", \"torque_config.py\", \"nuc_control_config.py\"):
+for f in (\"pylibfranka_server.py\", \"pylibfranka_control.py\", \"pylibfranka_shm.py\", \"osc_torque_controller.py\", \"franka_jacobian.py\", \"torque_config.py\", \"sim_dynamics.py\", \"nuc_control_config.py\"):
     ast.parse(open(f).read())
 import pylibfranka, rpyc, numpy
 print(\"pylibfranka\", pylibfranka.__version__ if hasattr(pylibfranka, \"__version__\") else \"ok\", \"rpyc\", rpyc.__version__)
-import osc_torque_controller, franka_jacobian, pylibfranka_shm
+import osc_torque_controller, franka_jacobian, pylibfranka_shm, sim_dynamics
 # Importing these proves the generated config resolved: torque_config raises
 # rather than falling back to a stale gain, so a bad deploy fails HERE and not
 # mid-trajectory on the arm.
 print(\"osc_torque_controller ok: kp\", osc_torque_controller.DEFAULT_KP,
-      \"tau\", osc_torque_controller.JOINT_TORQUE_LIMITS)
+      \"tau\", osc_torque_controller.JOINT_TORQUE_LIMITS,
+      \"sim_ctrlrange\", osc_torque_controller.SIM_TORQUE_LIMITS)
+import numpy as _np
+print(\"sim_dynamics ok: M_sim diag at zero\", _np.round(_np.diag(sim_dynamics.mass_matrix(_np.zeros(7))), 4))
 '"
 
 if [[ "$RESTART" == "1" ]]; then
@@ -123,6 +127,11 @@ if [[ "$RESTART" == "1" ]]; then
   # stdout keeps the channel open, so ssh never returns even though the daemon
   # itself is fully detached.
   echo "==> starting server"
+  # Keep the previous log. The redirect below truncates, and every deploy is exactly
+  # the moment you most want the BEFORE health lines: "success rate 1.000, recoveries
+  # 0, clamp trips 0" is only meaningful against what the same arm did on the last
+  # build, and that comparison was impossible while each deploy erased it.
+  ssh -n "$HOST" "[ -s ~/pylibfranka_server.log ] && cp ~/pylibfranka_server.log ~/pylibfranka_server.log.prev || true"
   ssh -n "$HOST" "(cd ~ && setsid ./run_server.sh) </dev/null >~/pylibfranka_server.log 2>&1 &"
   sleep 3
   ssh -n "$HOST" "tail -5 ~/pylibfranka_server.log; pgrep -af '[p]ylibfranka_server.py' || { echo 'SERVER NOT RUNNING' >&2; exit 1; }"

@@ -1,155 +1,242 @@
-# SysID Pipeline (real-robot side)
+# SysID: matching the real FR3 to the sim controller
 
-Reference for working on the sim2real system-identification pipeline from this
-repo / the robot workstation. The sim side (fitting, validation, diagnostics)
-lives in **multi-fast** — `SYSID_UPDATE.md` there is the design document and
-plan of record; this file covers what runs *here* and the contracts between
-the two repos.
+Procedure for closing the sim2real gap on this rig. The sim side (fitting,
+validation, adoption into training configs) lives in **multi-fast**; this file
+is the real-side plan of record and the contract between the two.
 
-## Big picture
+## What we are matching
 
-We fit the sim controller (robosuite OSC_POSE) so that sim-trained policies
-transfer to the FR3. The pipeline: collect matched excitation data on both
-plants → fit sim `(kp, damping_ratio)` → validate on a held-out metric →
-adopt into training configs. Three comparison modes with distinct roles:
+Policies are trained against robosuite's `OSC_POSE` in `impedance_mode=variable`.
+`config/control.yaml`'s `torque:` block **is** that controller's config, ported 1:1
+(`osc_torque_controller.py`, checked by `scripts/osc_check/check_osc_parity.py`).
+So the law is not in question. What differs is the **plant**: the FR3 carries
+Coulomb friction and an undeclared payload that mujoco does not, and mujoco carries
+a fictitious armature inertia the FR3 does not.
 
-| Mode | Mechanic | Role |
+That shapes the whole procedure. The gap is **a deadband, not a gain**, and the two
+are not interchangeable: a deadband is an offset in the travel-vs-command line and
+no scalar fudge can represent it. Every knob under `tuning:` is a no-op at its
+sim-parity value; the job is to find which of them the evidence actually licenses.
+
+## The stack, in one paragraph
+
+EE pose deltas → `BimanualFranka.send_action` (EE_DELTA) → `clip_delta`, then the
+`tuning:` fudges → OSC goal pushed over RPyC at 20 Hz → the NUC's
+`pylibfranka_control.py` runs `OSCTorqueController.run_controller` at **500 Hz**
+(robosuite's substep rate) → torque rate-limit + clamp → libfranka at 1 kHz.
+`send_action` is robosuite's `set_goal`; the NUC runs `run_controller`. **The goal
+is re-anchored on the measured pose every policy step** (`goal = ee_pos + delta`),
+never accumulated — which is why a static tracking error becomes a *velocity* drift
+rather than a bounded offset, and why residual-force measurements below read as
+rates.
+
+Older revisions of this file described a franky `JointVelocityMotion` stack with an
+`OSCVelocityController` and a `_patch_jacobian` workaround. **That stack is gone**
+— franky has no torque interface. Anything referring to velocity-kp, `OSC_BASE_KP`
+= 5.0, or an inert `kd` channel is stale.
+
+## The ladder
+
+Four measurements, each answering one question, ordered so each removes a confound
+from the next. Running them out of order is the main way this goes wrong: a gain
+fitted over an uncompensated payload absorbs the payload, and a deadband fitted
+over a drifting arm measures the drift.
+
+Everything writes to `~/sysid/outputs/<stamp>_<tag>/` (outside the repo).
+`--yes` skips the "workspace clear?" prompt. **Clear the workspace** — all of these
+move the arm.
+
+### 0. Make the plant honest — payload, then residual drift
+
+An under-declared payload is a *pose-dependent* bias force. It masquerades as a
+gain error, because it grows with reach, and it corrupts every measurement below.
+
+```
+python sysid/identify_payload.py --selftest        # conventions check, no hardware
+python sysid/identify_payload.py --yes
+```
+
+Fits `m` and the flange-frame COM `c` out of libfranka's own `tau_ext_hat_filtered`,
+plus a per-joint constant `b` absorbing friction and cable torque. Pose dependence is
+what separates the two: the payload term moves with the elbow, `b` does not, and the
+q1 sweep is the control (rotating about gravity leaves every gravity torque
+invariant, so anything moving with q1 is cable, not payload). Declare the result to
+the arm, then confirm it is nulled:
+
+```
+python sysid/delta_sweep.py --backend real --sag --yes
+```
+
+`SAG RATE` positive = falling = declared mass too low. Drive it to zero.
+
+Then confirm nothing **configuration-dependent** is left — this is the check that
+catches residuals the anchor cannot see, because `--sag` resets to `q0`, which is
+also the OSC's nullspace reference, where the nullspace regulator is identically
+zero:
+
+```
+python sysid/delta_sweep.py --backend real --sag --sag-offset-steps 10 --axes 0 --yes
+```
+
+`SPEED` should not grow with `dev_rad`. If it does, something in the torque path
+depends on being off the reference and is leaking into task space — fix that before
+fitting anything, or the fit will absorb it. (One such bug is fixed: the Coulomb
+assist was keyed off the total commanded torque, which includes the nullspace
+regulator, so being off the anchor bought 0.3–2.2 N of EE force under a strictly
+zero delta. See `_friction_feedforward` and
+`test_no_op_action_puts_no_force_on_the_ee_away_from_home`.)
+
+### 0.5. The standing torque — `identify_bias.py`
+
+`osc.py` is a pure PD law with no integral term, so it cannot reject a static
+disturbance, and EE_DELTA re-anchors `goal_pos` on the measured pose every step —
+which turns that standing error into a drift velocity rather than a bounded offset.
+The franky velocity stack never showed this because Franka's firmware servo closed an
+inner loop with integral action and absorbed the term before it reached the task-space
+law. `torque.bias.joint_nm` replaces what that servo was doing.
+
+```
+python sysid/identify_bias.py --selftest
+python sysid/identify_bias.py --yes [--grid wide]
+```
+
+**The sign has to be measured, not derived.** `tau_ext_hat_filtered` looks like it
+should give it directly, but unmodelled joint friction lands in that estimate too, so
+the residual at rest is not cleanly the disturbance. Deriving it got joint 4 backwards
+once — `+0.43 Nm` against a `[-3.07, -0.07]` range drove the elbow toward straight and
+the arm extended outward and up under teleop.
+
+Settle it with three sag runs, redeploying between each (the field is NUC-side):
+
+```
+# zeros -> the baseline; then the printed vector; then the same vector negated
+python sysid/delta_sweep.py --backend real --sag --yes
+python sysid/delta_sweep.py --backend real --sag --sag-offset-steps 10 --axes 0 --yes
+```
+
+Lowest `SPEED` wins, and the offset run is the discriminating one: the bias is a
+constant, so a correct one lowers drift everywhere while a sign error shows up worst
+where the arm has the most authority to run away.
+
+### 1. Per-joint plant — `joint_id.py`
+
+One joint at a time under **open-loop torque**, every other joint impedance-held
+(`MODE_TORQUE`). tau is the independent variable, so nothing here depends on a
+servo gain and the identical protocol runs against mujoco and against the arm.
+
+**Anchor the real run first**; sim is free to be moved to match, real is not:
+
+```
+python sysid/joint_id.py --backend real --yes            # prints the q it used
+PYTHONPATH=franka_config multi-fast/.venv/bin/python \
+    sysid/joint_id.py --backend sim --q <those 7 numbers>
+python sysid/joint_id.py --compare <sim_dir> <real_dir>
+```
+
+Read the **`dead r/s`** column, not `tc r/s`. `dead = tau_c/M` is the commanded
+acceleration lost to friction; it is the ratio that transfers, because a joint can
+carry more friction than sim and still track it if it carries proportionally more
+inertia. Expect `M real/sim < 1` (sim's armature inflates inertia); that is a known
+property of the sim, not a fit error.
+
+The sim backend is also the estimator's self-test: mujoco's M and frictionloss are
+known exactly, so a sim run that fails to recover them means the fit is wrong and
+the real numbers are not worth reading.
+
+### 2. Task level — `delta_sweep.py`
+
+`joint_id` measures the plant; this measures the thing the policy actually drives.
+Per axis it holds a constant normalized EE_DELTA of magnitude `a` for N steps and
+records travel, sweeping `a` over the range real task actions occupy.
+
+```
+python sysid/delta_sweep.py --backend real --yes
+PYTHONPATH=franka_config multi-fast/.venv/bin/python sysid/delta_sweep.py --backend sim
+python sysid/delta_sweep.py --compare <sim_dir> <real_dir>
+```
+
+Both backends run their own shipped config — that is the question being asked, so
+neither side is normalised to the other. The **shape** of travel against amplitude
+is the point, and the compare prints the verdict per axis:
+
+| Reading | Meaning | Knob |
 |---|---|---|
-| Absolute replay | Both plants track the same goal trajectory | Fit objective (well-posed ID input) |
-| Teleport (k-step) | Sim re-synced to real's `(q, q̇)` every k steps, replay k deltas | Validation (k=1 primary; error-vs-k curve) |
-| Open-loop replay | Same delta sequence from the same init | Monitor / stress test only |
+| ratio flat, ≈1.0 | matched | none |
+| ratio flat, ≠1.0 | pure gain error | `kp_pos_scale` / `kp_ori_scale` |
+| ratio falls as a→0 | deadband — friction | `friction_kc` (≤ 1.0) |
 
-This repo produces the real-side data for all three; `sysid/sysid.py` is the
-collection entry point. Analysis happens in multi-fast
-(`scripts/sysid/fit_sim_controller.py`), which consumes the run directories
-produced here directly.
+The second table fits `travel = k*(commanded - d)` and reports `d` and `k`
+separately. **`d` is what a fudge cannot represent**: it is an offset, not a gain.
+`k_real/k_sim` is the only part a scalar can fix. This is the measurement that tells
+you whether `ee_translation_fudge` can ever be the right answer — usually it is not,
+and a fudge tuned on one trajectory is only correct at whichever amplitude happened
+to dominate it.
 
-## Control stack in one paragraph
+### 3. Trajectory level — `tune.py`
 
-Policy-side EE pose deltas → `BimanualFranka.send_action` (EE_DELTA mode) →
-`OSCVelocityController.compute_qdot`: goal re-anchored on the measured pose
-each tick (`goal = measured ∘ delta`), pure-P velocity law
-(`v = kp · pose_error`), DLS pseudo-inverse to joint velocities + nullspace
-bias → franky `JointVelocityMotion` (100 ms window, Ruckig-ramped, accel
-factor 0.25) → firmware joint impedance. Full trace: `CONTROL_STACK.md`.
-Numbers that matter here: translation deltas are multiplied by
-`_EE_TRANSLATION_FUDGE_FACTOR` (1.2) inside `send_action`; the ×0.9 rotation
-fudge acts as an error scale inside `compute_qdot` (not a goal transform);
-the `kp` action field maps to velocity-kp `10^kp × OSC_BASE_KP` (5.0); the
-`kd` action field is inert (`_KD_GAIN_BASE = 1.0`). These constants are
-snapshotted into every `run.json` AND pinned by multi-fast's
-`scripts/sysid/test_controller_parity.py` — **retuning them requires updating
-that pin and `cfg/sysid/fit_controller.yaml`** (`translation_fudge`), or
-subsequent fits silently assume the wrong plant.
-
-## sysid.py modes
-
-### track (primary collection mode)
+Scores the arm against a sim reference trajectory and sweeps knobs:
 
 ```
-python sysid/sysid.py --mode track --track-spec sysid/specs/sweep_full.json \
-    --hold-s 5 [--kp 0.0] [--dry-run]
+python sysid/tune.py sysid/data.hdf5 --yes                        # score as configured
+python sysid/tune.py sysid/data.hdf5 --sweep friction_kc=0.5,0.7,1.0 --yes
+python sysid/tune.py sysid/data.hdf5 --score-only ~/sysid/outputs/<run>/
 ```
 
-Closed-loop reference tracking: a pose-space reference path (sine/circle
-offsets, physical units, anchored at the measured pose after homing to the
-spec's `init_qpos`) is pursued by commanding
-`dpos = (ref[t] − measured) / fudge` each tick — the divide makes the
-post-fudge goal land exactly on the reference. Self-correcting: tracking
-error cannot compound. `--track-abort-m` (default 0.15 m) aborts an episode
-on tracking runaway. `--hold-s N` prepends a constant-reference HOLD episode
-(static-offset calibration tier).
+Objective is the **per-step task response ratio**, real/sim — not accumulated
+endpoint error, which measures horizon rather than plant (once the plants diverge
+the same deltas resolve to different goals, and on a position circle it exceeds the
+frozen-arm floor).
 
-Spec JSON: `init_qpos` (7,), optional `ramp_s` (amplitude ease-in/out,
-episodes start and end at rest), and `tracks`: per-episode
-`{kind: sine|circle, axes, amp, freq_hz, duration_s}`. Axes 0–2 = position
-offsets in **meters**, 3–5 = rotation rotvec offsets in **radians** (base
-frame); circles take an `[u, v]` pair. Peak commanded speed = 2π·f·amp —
-keep well under the NUC speed guard (1.2 m/s, 6.0 rad/s), which is what bounds
-the torque path -- `safety.py`'s velocity clamps do not apply here. Checked-in specs:
-`specs/smoke.json` (gentle 2-episode hardware smoke), `specs/sweep_full.json`
-(full grid, ~12 min/run incl. homing; designed ≤ 63%/78% of the clamps).
+`TASK` and `NULLSPACE` are scored separately because the OSC controls 6 DOF at `kp`
+and the 7th at `nullspace_kp`, 15× weaker — different plants. **A nullspace ratio
+near 1 with a low task ratio rules out a global torque deficit**, and makes per-joint
+ratios misleading: a nullspace-heavy joint reads high while every task direction
+reads low. That combination points at task-space authority (`uncouple_pos_ori`,
+`lambda`), not at friction.
 
-### replay (legacy / open-loop mode)
+### Also available
 
-```
-python sysid/sysid.py <sim_sweep.hdf5> [--kp 0.0]
-```
+- `scripts/osc_check/check_osc_axes.py` — commanded-vs-measured per OSC axis, the
+  ground truth for "are the axes right". Results are **only comparable at the same
+  pose** (`lambda_pos` rotates with the arm); use `--poses sim` and `--repeat`.
+- `scripts/measure_joint_friction.py --method torque --directional` — per-joint
+  breakaway feeding `torque.friction.coulomb_nm`.
+- `sysid/sysid.py` — the older bulk collection entry point (`--mode track` against
+  `specs/*.json`, or open-loop replay of a multi-fast sweep file) for the multi-fast
+  fitting pipeline. `--dry-run` exercises it with no hardware.
 
-Open-loop replay of a multi-fast `collect_osc_sweeps.py` dataset
-(normalized delta actions, scaled here by 0.05 m / 0.5 rad per unit).
-Produces the open-loop monitor data. Comparison HTML + `errors.json` are
-generated in this mode only.
+## Where the knobs live
 
-### --dry-run
+`config/control.yaml`'s **`tuning:` block is the only place to tune.** Everything
+under `torque:` is the control law, defined by the sim — changing it to fix the rig
+makes the arm stop being the thing the policy was trained on.
 
-Either mode against a kinematic mock (`_MockController`) — no hardware, no
-lerobot/franky imports (they're lazy). Exercises spec parsing, homing calls,
-the real-time-paced loop, logging, flushes, and all file outputs. Run this
-after any change to sysid.py, and once on the workstation venv before a
-hardware session.
+- `ee_translation_fudge`, `ee_rotation_fudge` — delta scale. 1.0 = sim.
+- `friction_kc` — Coulomb assist scale. **Invariant: `friction_kc * kc_joint ≤ 1.0`.**
+  Above 1.0 the assist drives the joint instead of freeing it — negative damping,
+  which has faulted joint 7. Past 1.0 is an authority deficit; use `kp_*_scale`.
+- `friction_kc_joint_pos` / `_neg` — directional split, selected by the sign of the
+  **commanded torque**, not of `dq` (signing by `dq` cancels the friction holding a
+  still arm and the arm walks). Currently all ones: the directional hypothesis was
+  tested and rejected — the joint-1 asymmetry is cable torque, not friction.
+- `kp_pos_scale` / `kp_ori_scale` — stiffness only; `kd` is re-derived to hold the
+  ratio, so this buys friction rejection, not settling speed.
+- `kd_pos_scale` / `kd_ori_scale` — the damping ratio itself. Above 1.0 costs sim match.
 
-## Output contract (what multi-fast consumes)
+## Gotchas
 
-Run directory: `<out_root>/<timestamp>_<tag>/` with `run.json` (mode, args,
-constants snapshot, input sha256, episode status) and one HDF5 per episode
-(`data/episode_0`), flushed atomically every `--flush-every` steps.
-
-Datasets (per step): `action` (7: dpos_m(3) **pre-fudge** + delta_quat
-xyzw(4)), `action_norm` (replay mode only), `eef_goal_pos`/`eef_goal_quat`
-(the goal the controller pursued, post-fudge — the absolute-replay reference),
-`eef_pos`/`eef_quat` (measured, **base frame**, quats xyzw), `qpos`/`qvel`,
-`eef_lin_vel`/`eef_ang_vel` (firmware `O_dP_EE_d`; older data used
-`O_dP_EE_c`), `fault_count` (cumulative reflex recoveries — analysis should
-drop episodes where it increments), `t_sim` (wall-clock since episode start),
-`tau_cmd` (zeros).
-
-Conventions the fit relies on:
-- **Pre-action logging**: row t is the state the tick-t action was issued
-  from (state read → action sent → row appended). Sim recordings are
-  post-action; multi-fast's loader shifts accordingly (`state_convention`).
-- **`quat_encoding` attr**: `"exact"` on this branch. Legacy runs (absent
-  attr) used the small-angle `[drot/2, 1]` encoding (~2% angle shortfall at
-  0.5 rad); the loader recovers the executed rotation either way.
-- Episode attrs carry the fudge factors, gains, fps, and mode, so a file
-  stays interpretable away from its run.json.
-
-Analysis: rsync the run dir to the dev box and run
-`uv run python scripts/sysid/fit_sim_controller.py fit.real_dir=<run_dir>`
-in multi-fast — defaults match this format (`metric_quat`, base frame,
-recorded goals preferred). One fit per gain condition; don't mix `--kp`
-settings in one `real_dir`.
-
-## Session runbook
-
-1. `--dry-run` with `specs/smoke.json` (venv/imports/file-output check).
-2. Hardware smoke: `--mode track --track-spec sysid/specs/smoke.json
-   --hold-s 5`. Sanity: HOLD episode static offset small and steady;
-   sine episodes track with ~cm lag; `fault_count` stays 0.
-3. Full collection, one run per gain condition (values mirror the sim-side
-   grid in multi-fast `cfg/sysid/collect.yaml`):
-   `--track-spec sysid/specs/sweep_full.json --hold-s 5 --kp {-0.5, 0.0, 0.5}`.
-4. Optional validation-set collection: replay task-rollout action sequences
-   (multi-fast `collect_task_rollouts.py` output) in replay mode.
-5. Rsync run dirs to the dev box; fit; read the `validation:` block and
-   per-frequency diagnostics in `fit_results.yaml` before adopting params.
-
-## Gotchas / invariants
-
-- **Orientation drifts by design** under zero rotation commands: this stack
-  re-anchors its goal on the measured pose every tick, so orientation has no
-  absolute anchor (sim's OSC latches its ori goal on bit-exact-zero rot
-  deltas instead — a real semantic difference for translation-only motion).
-  The fit's `real_ori_drift_max_deg` diagnostic quantifies the wander; if it
-  comes out large, the fix under discussion is an opt-in orientation-hold
-  mode, not a change to the delta semantics.
-- franky's `zero_jacobian` is broken on this build; `_patch_jacobian`
-  recomputes it analytically. Don't "simplify" that away.
-- Keyboard early-stop (right-arrow / Ctrl-C) needs a tty; under
-  nohup/pipes the loop runs headless (flushes still protect the data).
-- The reference generator here is a vendored copy of multi-fast
-  `utils/sysid/sweeps.py:reference_pose_offsets` — keep in sync on changes
-  (exact parity is not load-bearing: the pursued goals are dual-logged, and
-  the fit consumes the recording, not a regeneration).
-- 20 Hz pacing is sleep-based; `t_sim` records actual wall-clock per tick,
-  so rate jitter is measurable after the fact.
+- **A gain change reaches the arm only after `scripts/deploy_nuc_server.sh <mario|luigi>`.**
+  The workstation copy is not what runs the loop. `coulomb_nm` lives on the NUC;
+  `friction_kc*` do not, so changing one without redeploying multiplies them out of step.
+- **Both plants must sit at the same q** or the comparison means nothing. Anchor real,
+  match sim with `--q`.
+- **One condition per run directory.** Don't mix gain settings in one `real_dir`.
+- `--arm` is a **key prefix in a `config/rig.yaml` profile, not a side**:
+  `single_arm_franka` maps `r` to the physical *left* arm. Every script prints which
+  it resolved to before connecting.
+- A run with `fault_count`/recoveries incrementing is not a measurement; the scripts
+  warn, and those rows should be dropped.
+- Anything that rescales tau outside `_enforce_limits` is a regression, and
+  `test_torque_limits_are_the_only_thing_that_rescales_tau` is structural for that
+  reason — a reintroduced guard passes every numerical test, because it only fires
+  outside their range.
