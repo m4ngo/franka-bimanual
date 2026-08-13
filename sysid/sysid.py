@@ -59,6 +59,15 @@ Episodes are flushed incrementally (atomic tmp+rename, --flush-every steps)
 so a crash or Ctrl-C mid-episode keeps the data collected so far.
 A comparison HTML visualization is written alongside the HDF5 (replay mode).
 One MP4 video per camera is written alongside the HDF5 (e.g. <stem>_cam_3_wrist.mp4).
+
+Replay mode additionally writes a single aggregated ``aggregate_sim_format.hdf5``
+alongside the per-episode files, structured EXACTLY like the input sim file
+(``f[group_key][episode_key][field]`` → (T, D), same group key and episode
+keys as the source), but populated with real robot data. Its ``action`` field
+is a verbatim copy of the replayed episode's ``action_norm`` — the actual
+normalized action the controller received each tick, not the realized
+metric displacement — so the file can be fed back into sim as a real-data
+sweep for further sysid.
 """
 
 import argparse
@@ -622,6 +631,64 @@ def save_sysid_hdf5(recorded: dict[str, np.ndarray], path: str, attrs: dict | No
         logger.info("saved %d steps to %s", next(iter(recorded.values())).shape[0], path)
 
 
+def save_sim_format_hdf5(
+    episode_pairs: list[tuple[str, dict[str, np.ndarray], dict]],
+    path: str,
+    group_key: str,
+) -> None:
+    """Write an aggregated HDF5 in the EXACT sim layout (group -> episode ->
+    field), populated with REAL recorded data, so the file is a drop-in
+    replacement for the sim-generated input file and can be fed back into sim
+    for further sysid.
+
+    Structure mirrors the input sim file precisely: f[group_key][episode_key][field],
+    with the same episode keys the sim file used.
+
+    Replay mode ONLY. The ``action`` field written here is a verbatim copy of
+    each episode's recorded ``action_norm`` — the actual normalized action
+    the controller received that tick (read straight from the sim input file,
+    since replay is open-loop) — NOT the realized metric displacement that
+    the flat per-episode files store under ``action``. This is deliberate:
+    the aggregate's ``action`` must encode-match the sim file's ``action``
+    field exactly, unit for unit.
+
+    All other fields (eef_pos, eef_quat, qpos, qvel, eef_goal_pos, ...) are
+    the real recorded robot state/response for that tick, carried through
+    unchanged.
+
+    episode_pairs: list of (episode_name, recorded_dict, episode_attrs).
+        recorded_dict is exactly what _run_episode returns for a replay-mode
+        episode (must contain "action_norm"). episode_attrs are stamped onto
+        each episode group (mode, stop_reason, timestamps, gains, etc.) so
+        the file is self-describing even if separated from run.json.
+    """
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with h5py.File(tmp, "w") as f:
+        grp = f.create_group(group_key)
+        for name, recorded, attrs in episode_pairs:
+            if "action_norm" not in recorded:
+                raise ValueError(
+                    f"episode {name!r} has no action_norm; save_sim_format_hdf5 "
+                    "is replay-mode only"
+                )
+            ep = grp.create_group(name)
+            for field, arr in recorded.items():
+                if field in ("action", "action_norm"):
+                    continue  # both folded into the explicit "action" (=action_norm) write below
+                ep.create_dataset(field, data=arr, compression="gzip", compression_opts=4)
+            ep.create_dataset("action", data=recorded["action_norm"],
+                            compression="gzip", compression_opts=4)
+
+            for key, val in (attrs or {}).items():
+                if val is not None:
+                    ep.attrs[key] = val
+    os.replace(tmp, path)
+    logger.info("saved aggregate sim-format dataset (%d episodes) to %s",
+                len(episode_pairs), path)
+
+
 # ---------------------------------------------------------------------------
 # Run metadata
 # ---------------------------------------------------------------------------
@@ -806,7 +873,8 @@ def main() -> None:
     if args.mode == "replay":
         tag = args.tag or Path(args.traj_file).resolve().parent.name
         with h5py.File(args.traj_file, "r") as f:
-            episode_names = list(f[list(f.keys())[0]].keys())
+            sim_group_key = list(f.keys())[0]
+            episode_names = list(f[sim_group_key].keys())
         track_init_qpos, track_episodes = None, []
     else:
         tag = args.tag or Path(args.track_spec).resolve().stem
@@ -814,6 +882,7 @@ def main() -> None:
             args.track_spec, args.fps, args.hold_s
         )
         episode_names = [name for name, _ in track_episodes]
+        sim_group_key = None  # track mode never writes the sim-format aggregate
     out_root = Path(args.out_root).expanduser()
     run_dir = out_root / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{tag}"
 
@@ -841,6 +910,7 @@ def main() -> None:
     controller = None
     all_errors: list[dict] = []
     episode_pairs: list[tuple[str, dict, dict]] = []
+    sim_format_pairs: list[tuple[str, dict, dict]] = []
     try:
         # Connect robot (or mock)
         if args.dry_run:
@@ -972,6 +1042,16 @@ def main() -> None:
                 all_errors.append(compute_trajectory_errors(traj, recorded, name=output))
                 save_errors_json(all_errors, str(run_dir / "errors.json"))
                 episode_pairs.append((name, traj, recorded))
+
+                # Aggregate sim-format accumulator (replay mode only): keyed
+                # by the SAME episode name the sim file used, "action" will be
+                # taken verbatim from this episode's action_norm at write time.
+                sim_format_pairs.append((name, recorded, {
+                    **episode_attrs,
+                    "stop_reason": stop_reason,
+                    "steps": n_rec,
+                    "expected_steps": n_steps,
+                }))
             meta["episodes_completed"].append(name)
 
         if episode_pairs:
@@ -979,6 +1059,16 @@ def main() -> None:
                 save_aggregate_html(episode_pairs, str(run_dir / "aggregate.html"), fps=args.fps)
             except Exception:
                 logger.exception("aggregate visualization failed")
+
+        if sim_format_pairs:
+            try:
+                save_sim_format_hdf5(
+                    sim_format_pairs,
+                    str(run_dir / "aggregate_sim_format.hdf5"),
+                    group_key=sim_group_key,
+                )
+            except Exception:
+                logger.exception("aggregate sim-format HDF5 write failed")
 
         # End-of-run verdict line (also derivable from run.json episode_summaries).
         summaries = meta.get("episode_summaries", [])
