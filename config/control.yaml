@@ -197,7 +197,7 @@ torque:
   # The old wrist numbers came from a 100 Hz publish, where the wrist launch transient
   # is shorter than a few samples: j7's two rotation directions disagreed 43% there and
   # 5% at 500 Hz. Do not re-measure the wrist below torque.loop.publish_decimation: 2.
-  rotor_inertia_kg_m2: [0.775, 0.760, 0.504, 0.157, 0.0774, 0.1078, 0.0863]
+  rotor_inertia_kg_m2: [0.775, 0.760, 0.704, 0.757, 0.0774, 0.1078, 0.0863]
 
   limits:
     # The ONLY bound on what reaches the joints: rate limit, then clamp, in the
