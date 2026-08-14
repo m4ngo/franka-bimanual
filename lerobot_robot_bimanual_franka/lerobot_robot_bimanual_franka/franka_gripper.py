@@ -48,9 +48,9 @@ class FrankaGripper:
             """
 import pylibfranka as _pf
 
-# Franka Hand tops out at 0.1 m/s; libfranka raises on anything above it,
+# Franka Hand tops out at 0.5 m/s; libfranka raises on anything above it,
 # where franky silently accepted the same value.
-_MAX_SPEED = 0.1
+_MAX_SPEED = 0.5
 
 def init_gripper(ip):
     return _pf.Gripper(ip)
@@ -62,7 +62,8 @@ def home_gripper(controller):
 def grasp_gripper(controller, width_m, speed_m_s, force_n):
     # Wide epsilons: we want the fingers to close and hold, not to assert that
     # an object of a known width ended up between them.
-    return bool(controller.grasp(width_m, min(speed_m_s, _MAX_SPEED), force_n, 1.0, 1.0))
+    return bool(controller.grasp(width_m, 1.0, force_n, 1.0, 1.0))
+    # return bool(controller.move(0.002, min(speed_m_s, _MAX_SPEED)))
 
 def open_gripper(controller, speed_m_s):
     return bool(controller.move(0.04, min(speed_m_s, _MAX_SPEED)))
