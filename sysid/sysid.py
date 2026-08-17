@@ -29,6 +29,8 @@ Replay input HDF5 (sim layout): f[group][episode][field] → (T, D):
     eef_pos (T, 3) – reference EE position (used for error visualisation only)
     qpos    (T, 7) – joint angles used to initialise the home pose
 
+Replay input can also be a LeRobotDataset (see --lerobot-repo-id below).
+
 Fields recorded in the output HDF5 (both modes):
     action        (T, 7) – [dpos(3), drot_quat(4)] — position delta in metres
                            (pre-fudge, as sent) and rotation delta quaternion
@@ -61,13 +63,15 @@ A comparison HTML visualization is written alongside the HDF5 (replay mode).
 One MP4 video per camera is written alongside the HDF5 (e.g. <stem>_cam_3_wrist.mp4).
 
 Replay mode additionally writes a single aggregated ``aggregate_sim_format.hdf5``
-alongside the per-episode files, structured EXACTLY like the input sim file
-(``f[group_key][episode_key][field]`` → (T, D), same group key and episode
-keys as the source), but populated with real robot data. Its ``action`` field
-is a verbatim copy of the replayed episode's ``action_norm`` — the actual
-normalized action the controller received each tick, not the realized
-metric displacement — so the file can be fed back into sim as a real-data
-sweep for further sysid.
+alongside the per-episode files. For sim-HDF5 input it is structured EXACTLY
+like the input file (``f[group_key][episode_key][field]`` → (T, D), same
+group key and episode keys as the source). For LeRobotDataset input, which
+has no single source group key to mirror, the group key is fixed to
+``"data"`` instead (the ``aggregate_sim_format_group_key`` run.json field
+records which). Its ``action`` field is a verbatim copy of the replayed
+episode's ``action_norm`` — the actual normalized action the controller
+received each tick, not the realized metric displacement — so the file can
+be fed back into sim as a real-data sweep for further sysid.
 """
 
 import argparse
@@ -168,6 +172,105 @@ def parse_traj(filename: str, index: int) -> tuple[str, dict[str, np.ndarray]]:
         for field in episode:
             traj[field] = episode[field][:]
     return (key, traj)
+
+
+# ---------------------------------------------------------------------------
+# LeRobotDataset trajectory source
+# ---------------------------------------------------------------------------
+#
+# A LeRobotDataset episode is loaded and reshaped into exactly the dict shape
+# parse_traj() returns from a sim HDF5 (an "action" (T,7) normalized delta
+# array, plus "eef_pos"/"qpos" for homing and error visualisation), so
+# _run_episode() and the rest of the replay path need no branching on the
+# trajectory source.
+#
+# lerobot is only imported inside this function (like the robot stack, via
+# _robot_stack) so --dry-run and HDF5-replay runs keep working on machines
+# without lerobot installed.
+
+class LeRobotTrajSource:
+    """Duck-types the (filename, index) parse_traj() interface over a
+    LeRobotDataset so main()'s replay loop is agnostic to the input format.
+
+    ``state_key``/``action_key`` select which dataset feature maps onto the
+    sysid "qpos"/"action" fields; both default to the LeRobot convention
+    ("observation.state", "action"). If the dataset's action is not already
+    in the normalized [dx,dy,dz,rx,ry,rz,gripper] convention _run_episode
+    expects (units of _POS_SCALE / _ROT_SCALE), pass --lerobot-action-scale
+    to rescale it (see _load_lerobot_episode).
+    """
+
+    def __init__(self, repo_id: str, root: str | None, episodes: list[int] | None,
+                state_key: str, action_key: str, action_is_normalized: bool):
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ImportError as e:
+            raise ImportError(
+                "LeRobotDataset replay requires the `lerobot` package "
+                "(pip install lerobot)."
+            ) from e
+        self._LeRobotDataset = LeRobotDataset
+        self.repo_id = repo_id
+        self.root = root
+        self.state_key = state_key
+        self.action_key = action_key
+        self.action_is_normalized = action_is_normalized
+        # Metadata-only load (no episodes filter) just to enumerate episode
+        # indices/names; per-episode data is loaded lazily in __getitem__ so
+        # a long sweep doesn't hold every episode's frames in memory at once.
+        meta_ds = LeRobotDataset(repo_id, root=root)
+        all_indices = list(range(meta_ds.meta.total_episodes))
+        self.episode_indices = episodes if episodes is not None else all_indices
+        self.fps = float(meta_ds.meta.fps)
+
+    def __len__(self) -> int:
+        return len(self.episode_indices)
+
+    def __getitem__(self, index: int) -> tuple[str, dict[str, np.ndarray]]:
+        ep_index = self.episode_indices[index]
+        ds = self._LeRobotDataset(self.repo_id, root=self.root, episodes=[ep_index])
+        n = len(ds)
+        if n == 0:
+            raise ValueError(f"episode {ep_index} of {self.repo_id!r} has no frames")
+
+        actions = np.stack([np.asarray(ds[i][self.action_key]) for i in range(n)]).astype(np.float64)
+        if actions.shape[1] < 7:
+            # Pad a held-constant gripper column if the dataset action has no
+            # gripper dim (e.g. 6-DoF pose-delta-only actions).
+            pad = np.ones((n, 7 - actions.shape[1]), dtype=np.float64)
+            actions = np.concatenate([actions, pad], axis=1)
+        elif actions.shape[1] > 7:
+            actions = actions[:, :7]
+
+        if not self.action_is_normalized:
+            actions = _normalize_lerobot_action(actions)
+
+        state = np.stack([np.asarray(ds[i][self.state_key]) for i in range(n)]).astype(np.float64)
+        # qpos (for homing) is the leading 7 state dims (or fewer, padded with
+        # zeros) by convention; eef_pos is best-effort (zeros if unavailable,
+        # since it is used only for error-visualisation overlay, not control).
+        qpos = state[:, :7] if state.shape[1] >= 7 else np.pad(state, ((0, 0), (0, 7 - state.shape[1])))
+        eef_pos = np.zeros((n, 3), dtype=np.float64)
+        for cand in ("observation.eef_pos", "eef_pos", "observation.ee_pos"):
+            if cand in ds[0]:
+                eef_pos = np.stack([np.asarray(ds[i][cand]) for i in range(n)]).astype(np.float64)[:, :3]
+                break
+
+        name = f"episode_{ep_index:06d}"
+        return name, {"action": actions.astype(np.float32), "qpos": qpos.astype(np.float32),
+                      "eef_pos": eef_pos.astype(np.float32)}
+
+
+def _normalize_lerobot_action(actions: np.ndarray) -> np.ndarray:
+    """Rescale a metric [dpos(3) m, drot(3) rad, gripper] action into the
+    normalized [dpos/_POS_SCALE, drot/_ROT_SCALE, gripper] convention
+    _run_episode expects in ``action_norm`` (see module docstring's
+    _POS_SCALE/_ROT_SCALE). Only used when --lerobot-action-scale is passed,
+    i.e. the dataset stores metric deltas rather than pre-normalized ones."""
+    out = actions.copy()
+    out[:, 0:3] = actions[:, 0:3] / 0.05   # _POS_SCALE
+    out[:, 3:6] = actions[:, 3:6] / 0.5    # _ROT_SCALE
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -642,7 +745,9 @@ def save_sim_format_hdf5(
     for further sysid.
 
     Structure mirrors the input sim file precisely: f[group_key][episode_key][field],
-    with the same episode keys the sim file used.
+    with the same episode keys the sim file used. For LeRobotDataset input the
+    caller passes a synthetic group_key ("data") since there is no single
+    source group key to mirror; episode keys still match what was replayed.
 
     Replay mode ONLY. The ``action`` field written here is a verbatim copy of
     each episode's recorded ``action_norm`` — the actual normalized action
@@ -765,7 +870,17 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
     constants["control.yaml tuning"] = dict(fc.control("tuning"))
     kp_gain = 10.0 ** args.kp
     osc_base_kp = constants["bimanual_franka"]["OSC_BASE_KP"]
-    input_file = args.traj_file if args.mode == "replay" else args.track_spec
+    if args.mode == "replay":
+        input_file = args.lerobot_repo_id if args.lerobot_repo_id else args.traj_file
+    else:
+        input_file = args.track_spec
+    # LeRobotDataset inputs are identified by repo_id (+ optional local root),
+    # not a single local file, so they have no sha256 to pin the run to.
+    input_file_sha256 = None
+    input_file_resolved = input_file
+    if args.mode != "replay" or not args.lerobot_repo_id:
+        input_file_resolved = str(Path(input_file).resolve())
+        input_file_sha256 = _sha256(input_file)
     return {
         "status": "running",
         "mode": args.mode,
@@ -774,8 +889,8 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
         "hostname": socket.gethostname(),
         "argv": sys.argv,
         "args": vars(args),
-        "input_file": str(Path(input_file).resolve()),
-        "input_file_sha256": _sha256(input_file),
+        "input_file": input_file_resolved,
+        "input_file_sha256": input_file_sha256,
         "episodes": episode_names,
         "episodes_completed": [],
         "derived_gains": {
@@ -808,7 +923,8 @@ def main() -> None:
         description="Drive the Franka (open-loop replay or closed-loop reference tracking) and record the response."
     )
     parser.add_argument("traj_file", nargs="?", default=None,
-                        help="Input HDF5 trajectory file to replay (replay mode)")
+                        help="Input HDF5 trajectory file to replay (replay mode). "
+                             "Omit and use --lerobot-repo-id instead to replay a LeRobotDataset.")
     parser.add_argument("--mode", choices=("replay", "track"), default="replay",
                         help="replay: open-loop sim-action replay; track: closed-loop "
                              "reference tracking from --track-spec (see module docstring)")
@@ -848,6 +964,24 @@ def main() -> None:
     parser.add_argument("--tag", default=None,
                         help="Run-directory suffix; defaults to the reference dataset's "
                              "parent directory name")
+    parser.add_argument("--lerobot-repo-id", default=None,
+                        help="Replay mode: repo_id (or local dataset name) of a LeRobotDataset "
+                             "to replay instead of --traj_file, e.g. 'lerobot/aloha_sim_insertion'.")
+    parser.add_argument("--lerobot-root", default=None,
+                        help="Local root directory of the LeRobotDataset, if not on the Hub cache "
+                             "(passed through to LeRobotDataset(root=...)).")
+    parser.add_argument("--lerobot-episodes", default=None,
+                        help="Comma-separated episode indices to replay, e.g. '0,2,5'. "
+                             "Defaults to all episodes in the dataset.")
+    parser.add_argument("--lerobot-state-key", default="observation.state",
+                        help="LeRobotDataset feature key used for qpos/homing.")
+    parser.add_argument("--lerobot-action-key", default="action",
+                        help="LeRobotDataset feature key used for the replayed action.")
+    parser.add_argument("--lerobot-action-scale", action="store_true",
+                        help="Set if the LeRobotDataset action is metric (m, rad) rather than "
+                             "already normalized to [-1, 1] in units of _POS_SCALE/_ROT_SCALE; "
+                             "the loader will rescale it into the normalized convention "
+                             "_run_episode expects.")
     args = parser.parse_args()
 
     # INFO: the only DEBUG emitters in this pipeline are the camera drivers
@@ -855,8 +989,10 @@ def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logger.setLevel(logging.INFO)
 
-    if args.mode == "replay" and not args.traj_file:
-        parser.error("replay mode requires a traj_file")
+    if args.mode == "replay" and not (args.traj_file or args.lerobot_repo_id):
+        parser.error("replay mode requires a traj_file or --lerobot-repo-id")
+    if args.mode == "replay" and args.traj_file and args.lerobot_repo_id:
+        parser.error("pass either traj_file or --lerobot-repo-id, not both")
     if args.mode == "track" and not args.track_spec:
         parser.error("track mode requires --track-spec")
 
@@ -867,10 +1003,29 @@ def main() -> None:
     trans_fudge = float(getattr(bf, "_EE_TRANSLATION_FUDGE_FACTOR", 1.2))
 
     # Run directory: <out_root>/<timestamp>_<tag>. The tag defaults to the
-    # input's parent directory name (replay: datasets live one per directory,
-    # so it carries the sim condition, e.g. kp_actn0.50_damp_actn0.50) or the
-    # spec stem (track).
-    if args.mode == "replay":
+    # input's parent directory name (replay from HDF5: datasets live one per
+    # directory, so it carries the sim condition, e.g.
+    # kp_actn0.50_damp_actn0.50; replay from LeRobotDataset: the repo_id's
+    # final path component) or the spec stem (track).
+    lerobot_traj_source = None
+    sim_group_key = None  # only set (and aggregate written) for HDF5 replay input
+    if args.mode == "replay" and args.lerobot_repo_id:
+        episode_filter = None
+        if args.lerobot_episodes:
+            episode_filter = [int(x) for x in args.lerobot_episodes.split(",") if x.strip()]
+        lerobot_traj_source = LeRobotTrajSource(
+            args.lerobot_repo_id, args.lerobot_root, episode_filter,
+            args.lerobot_state_key, args.lerobot_action_key,
+            action_is_normalized=not args.lerobot_action_scale,
+        )
+        tag = args.tag or args.lerobot_repo_id.rstrip("/").split("/")[-1]
+        episode_names = [f"episode_{i:06d}" for i in lerobot_traj_source.episode_indices]
+        track_init_qpos, track_episodes = None, []
+        # LeRobotDataset input has no single sim group key to mirror (unlike
+        # HDF5 sim input), so use the same "data" key save_sysid_hdf5 already
+        # writes per-episode files under, and note it wasn't the source's key.
+        sim_group_key = "data"
+    elif args.mode == "replay":
         tag = args.tag or Path(args.traj_file).resolve().parent.name
         with h5py.File(args.traj_file, "r") as f:
             sim_group_key = list(f.keys())[0]
@@ -924,8 +1079,16 @@ def main() -> None:
             logger.info("robot connected")
 
         for i in range(0, len(episode_names)):
-            # Load the episode: replay parses the sim file, track uses the spec.
-            if args.mode == "replay":
+            # Load the episode: replay parses the sim file or a LeRobotDataset
+            # episode, track uses the spec.
+            if args.mode == "replay" and lerobot_traj_source is not None:
+                logger.info("loading episode %d/%d from LeRobotDataset %s",
+                           i + 1, len(lerobot_traj_source), args.lerobot_repo_id)
+                name, traj = lerobot_traj_source[i]
+                ref = None
+                n_steps = len(traj["action"])
+                home_q = traj["qpos"][0].astype(np.float64) if "qpos" in traj else None
+            elif args.mode == "replay":
                 logger.info("loading trajectory from %s", args.traj_file)
                 name, traj = parse_traj(args.traj_file, i)
                 ref = None
@@ -1034,8 +1197,9 @@ def main() -> None:
                 name, n_rec, n_steps, summary["max_fault_count"], stop_reason, lag_str)
 
             # Visualization + error stats (replay mode only: they compare
-            # against the sim reference trajectory; track-mode analysis lives
-            # in multi-fast's fit pipeline, which consumes the logged goals).
+            # against the sim/LeRobot reference trajectory; track-mode
+            # analysis lives in multi-fast's fit pipeline, which consumes the
+            # logged goals).
             if args.mode == "replay":
                 viz_out = str(run_dir / f"{i}_{output}.html")
                 save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
@@ -1043,15 +1207,16 @@ def main() -> None:
                 save_errors_json(all_errors, str(run_dir / "errors.json"))
                 episode_pairs.append((name, traj, recorded))
 
-                # Aggregate sim-format accumulator (replay mode only): keyed
-                # by the SAME episode name the sim file used, "action" will be
-                # taken verbatim from this episode's action_norm at write time.
-                sim_format_pairs.append((name, recorded, {
-                    **episode_attrs,
-                    "stop_reason": stop_reason,
-                    "steps": n_rec,
-                    "expected_steps": n_steps,
-                }))
+                # Aggregate sim-format accumulator (replay-from-HDF5 only: it
+                # mirrors a single sim group key, which a LeRobotDataset input
+                # has no equivalent of).
+                if sim_group_key is not None:
+                    sim_format_pairs.append((name, recorded, {
+                        **episode_attrs,
+                        "stop_reason": stop_reason,
+                        "steps": n_rec,
+                        "expected_steps": n_steps,
+                    }))
             meta["episodes_completed"].append(name)
 
         if episode_pairs:
@@ -1069,6 +1234,11 @@ def main() -> None:
                 )
             except Exception:
                 logger.exception("aggregate sim-format HDF5 write failed")
+        elif args.mode == "replay" and lerobot_traj_source is not None and episode_pairs:
+            logger.info(
+                "skipping aggregate_sim_format.hdf5: input was a LeRobotDataset "
+                "(--lerobot-repo-id), which has no single sim group key to mirror"
+            )
 
         # End-of-run verdict line (also derivable from run.json episode_summaries).
         summaries = meta.get("episode_summaries", [])

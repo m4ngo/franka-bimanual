@@ -29,4 +29,5 @@ lerobot-train \
   --batch_size="$3" \
   --steps="$4" \
   --eval_freq=5000 \
-  --num_workers=8
+  --num_workers=12 \
+  --config_path=$6

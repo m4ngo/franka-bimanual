@@ -233,6 +233,19 @@ class ArvCamera(Camera):
         # If the requested output size differs from the sensor size, downsample
         # in software (preserve the full frame then resize). This avoids camera
         # ROI/cropping behavior on the device.
+        if self._height and self._width:
+            # Centre-crop to the output aspect first, matching lerobot_camera_framos.
+            # The sensor grants 1920x1200 whatever square ROI is asked for, so a bare
+            # resize to a square output squashes the frame by 1.6x.
+            h, w = frame.shape[:2]
+            desired_ratio = self._width / self._height
+            if abs(w / h - desired_ratio) > 1e-6:
+                if w / h > desired_ratio:
+                    crop_w = int(round(h * desired_ratio))
+                    frame = frame[:, (w - crop_w) // 2 : (w - crop_w) // 2 + crop_w]
+                else:
+                    crop_h = int(round(w / desired_ratio))
+                    frame = frame[(h - crop_h) // 2 : (h - crop_h) // 2 + crop_h, :]
         if (self._height and self._width) and (
             frame.shape[0] != self._height or frame.shape[1] != self._width
         ):

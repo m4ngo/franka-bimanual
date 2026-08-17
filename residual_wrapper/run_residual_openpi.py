@@ -62,19 +62,19 @@ def main() -> None:
     parser.add_argument("--prompt", required=True,
                         help="Language instruction sent to pi05_libero with "
                              "every observation, e.g. 'pick up the black bowl'")
-    parser.add_argument("--image-key", default="cam_6_scene",
+    parser.add_argument("--image-key", default="cam_2",
                         help="obs dict key holding the scene/exterior camera "
                              "image fed to pi05_libero as observation/image")
-    parser.add_argument("--wrist-image-key", default="cam_3_wrist",
-                        choices=("cam_3_wrist", "cam_4_wrist"),
+    parser.add_argument("--wrist-image-key", default="cam_5",
+                        #choices=("cam_3_wrist", "cam_4_wrist"),
                         help="obs dict key holding the wrist camera image fed "
                              "to pi05_libero as observation/wrist_image "
                              "(rig has two wrist cams; pick one — pi05_libero "
                              "takes a single wrist view)")
-    parser.add_argument("--base-kp", type=float, default=0.3,
+    parser.add_argument("--base-kp", type=float, default=0.0,
                         help="Gain forwarded on the base policy's own action "
                              "channel (OpenPI has no notion of gains)")
-    parser.add_argument("--base-kd", type=float, default=0.05,
+    parser.add_argument("--base-kd", type=float, default=0.00,
                         help="Gain forwarded on the base policy's own action "
                              "channel (OpenPI has no notion of gains)")
     parser.add_argument(

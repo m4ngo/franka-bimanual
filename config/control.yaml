@@ -27,7 +27,7 @@ tuning:
   # 0.5 already gives 1.8x the torque modulation of kc=0, i.e. most of the deadband fill
   # for none of the excitation. There is NO vibration at any kc at a held pose; the loop
   # is only excited by motion, so tune this against a reversal, never against a hold.
-  friction_kc: 0.2
+  friction_kc: 0.05
   # Split by the sign of COMMANDED TORQUE, not of dq: signing by dq cancels the
   # friction holding a still arm and the arm walks. Equal vectors = symmetric.
   # ALL ONES until the asymmetry is measured with --gravity-flip-joint. Every
@@ -52,7 +52,7 @@ tuning:
   kp_pos_scale: [1.0, 1.0, 1.0]
   kp_ori_scale: [1.0, 1.0, 1.0]
   kd_pos_scale: [1.0, 1.0, 1.0]
-  kd_ori_scale: [1.0, 1.0, 1.0]
+  kd_ori_scale: [0.8, 0.8, 0.8]
 gripper_accum_speed: 1.0
 
 worktable_brake:
@@ -89,7 +89,7 @@ torque:
     # "variable" takes kp and the damping ratio from the action every step; under
     # "fixed" robosuite ignores gain actions and a gain sweep would move only real.
     impedance_mode: variable
-    default_kp: 150.0
+    default_kp: 125.0
     kp_limits: [0.0, 1500.0]
     default_damping_ratio: 1.0
     damping_ratio_limits: [0.0, 10.0]
@@ -218,8 +218,8 @@ torque:
     # libfranka reflex thresholds, set at arming. Factory values are tuned for
     # hand-guiding and fire on our own commanded force. Not a torque bound.
     # SAFETY COST: a real collision is caught later and harder.
-    lower_torque_nm: [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
-    upper_torque_nm: [20.0, 20.0, 18.0, 18.0, 16.0, 14.0, 12.0]
+    lower_torque_nm: [30.0, 30.0, 24.0, 24.0, 20.0, 18.0, 16.0]
+    upper_torque_nm: [30.0, 30.0, 24.0, 24.0, 20.0, 18.0, 16.0]
     # [Fx,Fy,Fz,Mx,My,Mz]. These drive cartesian_reflex, and at the libfranka example
     # values (20 N / 25 Nm) it fired 40 times in 13 s once the arm started actually
     # tracking -- libfranka infers the external wrench, our unmodelled joint friction
@@ -361,7 +361,7 @@ observation:
   kin_cache_max_age_s: 0.005
   depth_point_count: 2048
   # Half-extent of the world-axis-aligned box crop centred on the EE.
-  depth_crop_radius_m: 0.3
+  depth_crop_radius_m: 0.4
 
 gripper:
   wsg:

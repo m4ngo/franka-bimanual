@@ -41,8 +41,15 @@ from typing import Optional
 
 import numpy as np
 
-from env_wrapper import _STATE_OBS_KEYS
-from env_wrapper_openpi_ext import joint_deltas_to_ee_chunk
+import franka_config as fc
+
+from env_wrapper import (
+    _PANDA_FINGER_MAX_M,
+    current_ee_pose,
+    ee_pose_to_world,
+    to_sim_world_pose,
+)
+from env_wrapper_openpi_ext import ee_deltas_to_ee_chunk, quat2axisangle
 
 logger = logging.getLogger(__name__)
 
@@ -75,8 +82,9 @@ class OpenPIBasePolicy:
         host: str = "localhost",
         port: int = 8000,
         prompt: str = "",
-        image_key: str = "cam_6_scene",
-        wrist_image_key: str = "cam_3_wrist",
+        image_key: str = "cam_2",
+        wrist_image_key: str = "cam_1",
+        arm_name: str = "left",
         default_kp: float = 0.3,
         default_kd: float = 0.05,
     ) -> None:
@@ -119,6 +127,10 @@ class OpenPIBasePolicy:
         self.wrist_image_key = wrist_image_key
         self.default_kp = default_kp
         self.default_kd = default_kd
+        self.arm_name = arm_name
+        base_pose = fc.robot_base_in_world(arm_name)
+        self._r_base_in_world = base_pose.rotation
+        self._t_base_in_world = base_pose.translation
         logger.info("OpenPIBasePolicy connected to %s:%d (prompt=%r)", host, port, prompt)
 
     def set_prompt(self, prompt: str) -> None:
@@ -137,8 +149,10 @@ class OpenPIBasePolicy:
         Args:
             obs: raw obs dict as passed to base_policy.infer() in
                 run_residual.py (i.e. obs_no_depth = strip_depth(obs));
-                must contain r_joint_1..7, r_gripper, and the two camera
-                images under self.image_key / self.wrist_image_key.
+                must contain the joint/gripper obs keys needed by
+                current_ee_pose() (r_joint_1..7, r_gripper) for FK,
+                plus the two camera images under
+                self.image_key / self.wrist_image_key.
 
         Returns:
             (T, 10) numpy array -- [dx, dy, dz, dqx, dqy, dqz, dqw,
@@ -146,8 +160,26 @@ class OpenPIBasePolicy:
             policy_wrapper.BasePolicy.infer() returns, ready for
             process_chunk()/build_action() unchanged.
         """
-        current_q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)], dtype=np.float64)
-        state = np.array([obs[k] for k in _STATE_OBS_KEYS], dtype=np.float32)  # (8,)
+        # LIBERO proprio convention: EE position (3) + axis-angle orientation (3)
+        # + two-finger gripper qpos in metres (2) = 8, NOT joint angles + 1
+        # gripper scalar. pi05_libero was trained on robosuite's OSC_POSE state,
+        # which reports orientation as axis-angle and the gripper as symmetric
+        # (g, -g) finger positions -- current_ee_pose()/split_gripper() already
+        # produce exactly this for the residual pipeline's sim-convention proprio,
+        # so we reuse them here instead of _STATE_OBS_KEYS (joint space).
+        # robot0_eef_pos is a WORLD-frame quantity in robosuite; franka_fk is
+        # base-frame, and the base sits 0.66 m out and 0.912 m up, which is ~6
+        # sigma of the checkpoint's own state stats on x.
+        ee_pose = current_ee_pose(obs, sim_convention=True)  # (8,) xyz+quat(xyzw)+grip
+        ee_pose = to_sim_world_pose(
+            ee_pose_to_world(ee_pose, self._r_base_in_world, self._t_base_in_world)
+        )
+        print(ee_pose)
+        axis_angle = quat2axisangle(ee_pose[3:7])
+        g = float(ee_pose[7]) * _PANDA_FINGER_MAX_M
+        state = np.concatenate([
+            ee_pose[:3], axis_angle, [g, -g],
+        ]).astype(np.float32)  # (8,) -> [x,y,z,rx,ry,rz, g_left_m, g_right_m]
 
         observation = {
             "observation/image": _format_libero_image(obs[self.image_key]),
@@ -159,10 +191,10 @@ class OpenPIBasePolicy:
         result = self.client.infer(observation)
         openpi_chunk = np.asarray(result["actions"], dtype=np.float32)
 
-        return joint_deltas_to_ee_chunk(
+        return ee_deltas_to_ee_chunk(
             openpi_chunk,
-            current_q,
             current_gripper=float(obs["r_gripper"]),
             kp=self.default_kp,
             kd=self.default_kd,
+            arm_name=self.arm_name
         )
