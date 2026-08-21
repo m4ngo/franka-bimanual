@@ -74,6 +74,18 @@ DEFAULT_NULLSPACE_KP = float(torque("osc.nullspace_kp"))
 # osc.py's uncoupling switch, applied to SIM's mass matrix when emulating.
 DEFAULT_UNCOUPLE_POS_ORI = bool(torque("osc.uncouple_pos_ori"))
 
+# Singularity conditioning on lambda_full. 0.0 is np.linalg.pinv's own default, i.e.
+# exactly the previously shipped behaviour; see config/control.yaml for the measurement
+# and for why this is not a limit layer.
+LAMBDA_RCOND = float(torque("osc.lambda_rcond"))
+# Cancel the rotation->translation leak uncoupling leaves behind. Only read when
+# uncouple_pos_ori is true; false = osc.py exactly. See run_controller.
+CROSS_COUPLING_COMPENSATION = bool(torque("osc.cross_coupling_compensation"))
+LAMBDA_LENGTH_SCALE = float(torque("osc.lambda_length_scale_m"))
+# diag(1, 1, 1, L, L, L): makes the 6x6 unit-consistent so one rcond means the same
+# thing at every pose. Held as a vector because the scaling is applied by broadcasting.
+_LAMBDA_SCALE = np.array([1.0, 1.0, 1.0] + [LAMBDA_LENGTH_SCALE] * 3)
+
 # mujoco ctrlrange on robosuite's Panda actuators -- part of the REFERENCE dynamics,
 # not a hardware bound: sim's rotation authority saturates here long before the FR3's
 # does, which is why sim's rotation travel per step FALLS with command amplitude
@@ -218,21 +230,73 @@ def _lambda_inverse(lambda_inv: np.ndarray) -> np.ndarray:
     return np.linalg.pinv(lambda_inv)
 
 
+def _lambda_inverse_full(lambda_inv: np.ndarray, rcond: float) -> tuple[np.ndarray, int]:
+    """`_lambda_inverse` for the 6x6, with the singular-value truncation
+    control_utils only claims to do. Returns (lambda_full, directions dropped).
+
+    LAMBDA_RCOND 0.0 is `_lambda_inverse` bit-for-bit, which is what every parity
+    test asserts against; see config/control.yaml for why the default is not 0.
+
+    The scaling is not cosmetic. rcond is relative to the largest singular value,
+    and J's angular rows carry 1/m against its linear ones, so `J M^-1 J^T` mixes
+    kg with kg m^2 and reads cond 77 at home_pose where nothing is singular at
+    all. Scaling the angular block by LAMBDA_LENGTH_SCALE first makes one rcond
+    mean the same thing at every pose; `S pinv(S A S) S` is exactly `pinv(A)`
+    wherever nothing is truncated, since S is diagonal and invertible.
+    """
+    if rcond <= 0.0:
+        return np.linalg.pinv(lambda_inv), 0
+    scaled = _LAMBDA_SCALE[:, None] * lambda_inv * _LAMBDA_SCALE[None, :]
+    # One SVD, not two: np.linalg.pinv takes its own, and asking for the singular
+    # values separately to count the truncation cost ~9 us of the law's ~1 ms.
+    # This is pinv spelled out -- V diag(1/s) U^T with the small s zeroed.
+    u, sv, vh = np.linalg.svd(scaled)
+    keep = sv >= rcond * sv[0]
+    dropped = int(np.count_nonzero(~keep))
+    inv = (vh.T * np.where(keep, 1.0 / sv, 0.0)) @ u.T
+    return _LAMBDA_SCALE[:, None] * inv * _LAMBDA_SCALE[None, :], dropped
+
+
 def opspace_matrices(
     mass_matrix: np.ndarray, J_full: np.ndarray, J_pos: np.ndarray, J_ori: np.ndarray,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """control_utils.opspace_matrices, verbatim (see _lambda_inverse on the
-    pinv/inv path)."""
+    lambda_rcond: float = 0.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
+    """control_utils.opspace_matrices, verbatim except for the 6x6's conditioning
+    (see `_lambda_inverse_full`; at LAMBDA_RCOND 0.0 this is verbatim).
+
+    The 3x3 blocks are left on the plain pinv on purpose: each inverts a 3x7
+    Jacobian's Gram matrix, so it keeps four DOF of redundancy and measures cond
+    3-17 over the whole envelope, against up to ~950 for the 6x6. They are also
+    single-unit, so there is nothing for a length scale to fix.
+
+    ``lambda_rcond`` defaults to 0.0 -- robosuite exactly -- so a caller that does
+    not opt in cannot be silently conditioned. The control loop passes
+    ``torque.osc.lambda_rcond`` by name; the parity harness passes nothing.
+
+    The truncation count is returned rather than logged: this runs at 500 Hz on
+    the NUC, and the caller accumulates it into a counter the workstation can read.
+
+    Returns one element more than control_utils does -- the coupling block
+    ``Jv M^-1 Jw^T`` -- because ``cross_coupling_compensation`` needs it and it is
+    free here. Existing positional unpackings of the first four are unaffected.
+    """
     mass_matrix_inv = np.linalg.inv(mass_matrix)
     Mi_Jt = mass_matrix_inv @ J_full.T
 
-    lambda_full = _lambda_inverse(J_full @ Mi_Jt)
+    lambda_full, dropped = _lambda_inverse_full(J_full @ Mi_Jt, lambda_rcond)
     lambda_pos = _lambda_inverse(J_pos @ mass_matrix_inv @ J_pos.T)
     lambda_ori = _lambda_inverse(J_ori @ mass_matrix_inv @ J_ori.T)
+    # Jv M^-1 Jw^T: the translation/rotation coupling block that uncoupling DISCARDS.
+    # Returned rather than recomputed by the caller because mass_matrix_inv is already
+    # here, and it takes no inverse of its own -- which is the whole reason the
+    # compensation below can be bounded where lambda_full is not.
+    coupling = J_pos @ mass_matrix_inv @ J_ori.T
 
+    # Jbar carries the same truncation, which is the point: an unbounded nullspace
+    # projector is the other half of the near-singular torque spike.
     Jbar = Mi_Jt @ lambda_full
     nullspace_matrix = np.eye(J_full.shape[-1]) - Jbar @ J_full
-    return lambda_full, lambda_pos, lambda_ori, nullspace_matrix
+    return lambda_full, lambda_pos, lambda_ori, nullspace_matrix, dropped, coupling
 
 
 def nullspace_torques(
@@ -276,10 +340,19 @@ class OSCTorqueController:
         num_joints: int = 7,
         uncouple_pos_ori: bool = DEFAULT_UNCOUPLE_POS_ORI,
         nullspace_kp: float = DEFAULT_NULLSPACE_KP,
+        lambda_rcond: float = LAMBDA_RCOND,
+        cross_coupling_compensation: bool = CROSS_COUPLING_COMPENSATION,
     ) -> None:
         self.num_joints = int(num_joints)
         self.uncoupling = bool(uncouple_pos_ori)
         self.nullspace_kp = float(nullspace_kp)
+        # Per-instance for the same reason uncoupling is: the parity harness must be
+        # able to pin it at 0.0, or it compares a conditioned law against robosuite's
+        # unconditioned one and reports the deviation as a controller regression.
+        self.lambda_rcond = float(lambda_rcond)
+        # Pinned off in the parity harness for the same reason as lambda_rcond:
+        # robosuite has no such term, so a nonzero default would read as a regression.
+        self.cross_coupling_compensation = bool(cross_coupling_compensation)
 
         self.goal_pos = np.zeros(3)
         self.goal_ori = np.eye(3)
@@ -298,6 +371,12 @@ class OSCTorqueController:
         # observable downstream: the clip is applied to tau_sim, and what leaves the
         # law is M_real @ qddot, which carries no mark of having been clipped.
         self.sim_clip_ticks = 0
+        # Law ticks on which lambda_full's conditioning dropped a direction. Counted
+        # for the same reason as sim_clip_ticks: the truncation is invisible downstream
+        # -- what leaves the law is a torque, which carries no mark of it -- and a
+        # conditioning term nobody can see is the failure mode that got the previous
+        # six envelopes deleted. Nonzero here means the arm is near a singularity.
+        self.lambda_trunc_ticks = 0
 
     def reset_goal(self, ee_pos: np.ndarray, ee_ori_mat: np.ndarray) -> None:
         """osc.py reset_goal: park the goal on the current pose (zero error)."""
@@ -382,13 +461,42 @@ class OSCTorqueController:
         model = np.asarray(mass_matrix_sim) if emulate else mass_matrix
 
         J_pos, J_ori = J_full[:3, :], J_full[3:, :]
-        lambda_full, lambda_pos, lambda_ori, nullspace_matrix = opspace_matrices(
-            model, J_full, J_pos, J_ori
+        lambda_full, lambda_pos, lambda_ori, nullspace_matrix, dropped, coupling = (
+            opspace_matrices(model, J_full, J_pos, J_ori, lambda_rcond=self.lambda_rcond)
         )
+        if dropped:
+            self.lambda_trunc_ticks += 1
 
         if self.uncoupling:
+            task_force = desired_force
+            if self.cross_coupling_compensation:
+                # Cancel the rotation -> translation leak that uncoupling leaves behind,
+                # WITHOUT inverting the 6x6. Writing J M^-1 J^T as [[A, B], [B^T, C]]
+                # with A = lambda_pos^-1 and C = lambda_ori^-1, the realised task
+                # acceleration is (J M^-1 J^T) @ wrench, so:
+                #
+                #   uncoupled  W = [Lp f ; Lo t]        -> accel_pos = f + B Lo t
+                #   here       W = [Lp (f - B Lo t) ; Lo t] -> accel_pos = f   exactly
+                #
+                # since A Lp = I. That is the SAME position behaviour uncouple_pos_ori
+                # =false buys, reached through the two 3x3 inverses (cond 3-38) instead
+                # of the 6x6 (cond up to ~950), and B itself is inverted nowhere.
+                #
+                # It is deliberately ONE-SIDED. Cancelling both directions at once IS
+                # the 6x6 inverse -- the symmetric form needs the Schur complement
+                # A - B C^-1 B^T, which is precisely the object that goes singular. So
+                # translation still disturbs orientation here; goal_ori is latched
+                # across steps and holds it with real stiffness, while goal_pos is
+                # re-anchored on the measured pose every step and therefore cannot.
+                #
+                # The price is rotation speed: the compensating force has a moment
+                # about the EE, so realised angular acceleration becomes
+                # (I - B^T Lp B Lo) t -- a median 0.88 of commanded over the envelope.
+                # That is honest physics, not loss: it is largest exactly where holding
+                # the EE point through a rotation is genuinely hard.
+                task_force = desired_force - coupling @ (lambda_ori @ desired_torque)
             decoupled_wrench = np.concatenate(
-                [lambda_pos @ desired_force, lambda_ori @ desired_torque]
+                [lambda_pos @ task_force, lambda_ori @ desired_torque]
             )
         else:
             decoupled_wrench = lambda_full @ np.concatenate([desired_force, desired_torque])

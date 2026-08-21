@@ -107,6 +107,7 @@ from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
     OSCTorqueController, resolve_gains,
 )
 from lerobot_robot_bimanual_franka import sim_dynamics  # noqa: E402
+from lerobot_robot_bimanual_franka import franka_process as _fp  # noqa: E402
 from lerobot_robot_bimanual_franka import osc_torque_controller as _osc_ctrl_mod  # noqa: E402
 
 RNG = np.random.default_rng(20260727)
@@ -292,7 +293,8 @@ def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     return robot
 
 
-def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False):
+def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False,
+                 lambda_rcond=0.0, cross_coupling=False):
     """A real ControlLoop with only the fields the compute path touches.
 
     The loop now runs in its own process (pylibfranka_control), so the law under
@@ -303,7 +305,20 @@ def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False):
     s.robot_ip = "test"
     s.ch = None
     s.model = FakeModel(case["M"], case["C"])
-    s.osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=uncouple)
+    # lambda_rcond PINNED AT 0.0, for the reason _SIM_PARITY_KNOBS exists: robosuite
+    # has no conditioning term, so a nonzero default here would have every parity test
+    # comparing a conditioned law against an unconditioned one. The harness's mass
+    # matrix makes that worse than it sounds -- make_case builds `A @ A.T + 1.2 I`,
+    # not a mass matrix, and its lambda_full is far worse conditioned than a real
+    # arm's (median smallest normalised singular value 0.0090 against 0.0289), so a
+    # conditioning that engages at 2.9% of physical poses engages at 12.7% of these.
+    # test_lambda_conditioning_* below drive it deliberately instead.
+    # cross_coupling is pinned off for the same reason: it is a term robosuite does
+    # not have at all, so with it on every parity case would compare two different
+    # laws. test_cross_coupling_* below drive it deliberately.
+    s.osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=uncouple,
+                                lambda_rcond=lambda_rcond,
+                                cross_coupling_compensation=cross_coupling)
     s.joint = srv.JointImpedanceController(num_joints=7)
     s._last_cmd_seq = -1.0
     s._goal_ts = 0.0
@@ -2029,6 +2044,234 @@ def test_sim_clip_counter_tracks_the_sim_ctrlrange_not_the_hardware_clamp():
         "sim's wrist ctrlrange is no longer tighter than the hardware clamp; the "
         "premise of the rotation roll-off is gone")
     return (f"sim wrist ctrlrange {SIM_TORQUE_LIMITS[5:]} vs hardware clamp {hw[5:]}")
+
+
+# --------------------------------------------------------------------------
+# lambda_full conditioning (torque.osc.lambda_rcond). Pinned at 0.0 everywhere
+# above, so these are the only tests that exercise it. They use a PHYSICAL mass
+# matrix throughout -- make_case's synthetic SPD matrix is far worse conditioned
+# than a real arm's and would make any rcond look either free or ruinous.
+# --------------------------------------------------------------------------
+
+_HOME_Q = np.array([0.0, -0.161037389, 0.0, -2.44459747, 0.0, 2.22675220, 0.7853981634])
+_RCOND = 0.005
+
+
+def _wrench_at(q, drot, rcond, cross=False):
+    """Joint torque the law asks for at q under a rotation delta, on sim's plant."""
+    T = fk_chain(q)[7]
+    J = zero_jacobian(q, ee_pos_base=T[:3, 3])
+    M = sim_dynamics.mass_matrix(q)
+    osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=bool(cross),
+                              lambda_rcond=rcond, cross_coupling_compensation=cross)
+    osc.set_goal(T[:3, 3], Rotation.from_rotvec(drot).as_matrix() @ T[:3, :3],
+                 np.full(6, 125.0), np.full(6, 2 * np.sqrt(125.0)))
+    tau = osc.run_controller(
+        ee_pos=T[:3, 3], ee_ori_mat=T[:3, :3], ee_pos_vel=np.zeros(3),
+        ee_ori_vel=np.zeros(3), J_full=J, q=q, dq=np.zeros(7), mass_matrix=M,
+        coriolis=np.zeros(7), use_nullspace=False)
+    return tau, osc.lambda_trunc_ticks
+
+
+def _worst_conditioned_pose():
+    """The near-singular pose the conditioning exists for, found the same way the
+    arm finds it -- by wandering the envelope, not by construction."""
+    rng = np.random.default_rng(7)
+    scale = np.concatenate([np.ones(3), np.full(3, 0.15)])
+    best, best_q = np.inf, None
+    for _ in range(400):
+        q = _HOME_Q + rng.normal(0, 0.35, 7)
+        J = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
+        A = J @ np.linalg.inv(sim_dynamics.mass_matrix(q)) @ J.T
+        sv = np.linalg.svd(scale[:, None] * A * scale[None, :], compute_uv=False)
+        if sv[-1] / sv[0] < best:
+            best, best_q = sv[-1] / sv[0], q
+    return best_q, best
+
+
+def test_lambda_conditioning_is_a_no_op_where_the_arm_is_well_conditioned():
+    """The whole claim to not being a seventh envelope: it cannot move the tuning,
+    the sim match or a gain sweep anywhere the arm actually works."""
+    for drot in ([0.0, 0.0, DELTA_ROT_MAX], [DELTA_ROT_MAX, 0.0, 0.0],
+                 [0.2, -0.4, 0.3], [0.0, 0.0, 0.0]):
+        off, _ = _wrench_at(_HOME_Q, np.asarray(drot), 0.0)
+        on, ticks = _wrench_at(_HOME_Q, np.asarray(drot), _RCOND)
+        assert ticks == 0, f"conditioning engaged at home_pose on drot={drot}"
+        assert np.allclose(off, on, rtol=0, atol=1e-12), (
+            f"drot={drot}: conditioning changed tau at a healthy pose by "
+            f"{np.max(np.abs(off - on)):.3e} Nm")
+    also, _ = _wrench_at(REAL_Q, np.array([0.0, 0.0, DELTA_ROT_MAX]), _RCOND)
+    base, _ = _wrench_at(REAL_Q, np.array([0.0, 0.0, DELTA_ROT_MAX]), 0.0)
+    assert np.allclose(base, also, rtol=0, atol=1e-12), "sysid anchor is not a no-op"
+    return f"bit-identical at home_pose and the sysid anchor, rcond {_RCOND}"
+
+
+def test_lambda_conditioning_bounds_the_near_singular_torque():
+    """uncouple_pos_ori=false inverts a 6x6 built from a 6x7 Jacobian -- ONE degree
+    of redundancy -- where the uncoupled path inverts two 3x3s with four. Near a
+    singularity that difference is the whole fault: the law asks for kilonewton-metres,
+    the sim ctrlrange truncates it per joint so the acceleration no longer points
+    where it was asked, and the unmodelled rotor torque J_rotor*qddot lands in
+    libfranka's external-torque estimate and trips the joint reflex on every joint.
+    """
+    q, sv = _worst_conditioned_pose()
+    drot = np.array([0.0, 0.0, DELTA_ROT_MAX])
+    off, off_ticks = _wrench_at(q, drot, 0.0)
+    on, on_ticks = _wrench_at(q, drot, _RCOND)
+    assert off_ticks == 0 and on_ticks == 1, (off_ticks, on_ticks)
+    assert np.abs(off).max() > 500.0, (
+        f"the near-singular blow-up this guards is gone ({np.abs(off).max():.0f} Nm); "
+        "if that is real, lambda_rcond is no longer buying anything")
+    assert np.abs(on).max() < np.abs(off).max() / 5.0, (
+        f"conditioning only cut {np.abs(off).max():.0f} -> {np.abs(on).max():.0f} Nm")
+
+    # And it stays inside the ONE limit layer rather than leaning on it: the
+    # conditioned demand must not need the clamp, which is what saturating on
+    # several joints at once does to the torque direction.
+    hw = np.asarray(_osc_ctrl_mod.JOINT_TORQUE_LIMITS, dtype=np.float64)
+    assert np.sum(np.abs(off) > hw) >= 2, "unconditioned demand no longer saturates"
+    return (f"sigma_min-scaled sv {sv:.5f}: peak demand {np.abs(off).max():.0f} -> "
+            f"{np.abs(on).max():.0f} Nm, joints past the clamp "
+            f"{np.sum(np.abs(off) > hw)} -> {np.sum(np.abs(on) > hw)}")
+
+
+def test_lambda_conditioning_is_never_silent():
+    """The objection that deleted the previous six envelopes was that a change
+    stopped mattering somewhere with nothing in the log to say where. The count is
+    the answer, so it has to reach the workstation."""
+    q, _ = _worst_conditioned_pose()
+    _, ticks = _wrench_at(q, np.array([0.0, 0.0, DELTA_ROT_MAX]), _RCOND)
+    assert ticks == 1, ticks
+    assert _shm.S_LAMBDA_TRUNC < _shm.STATE_SIZE, "counter does not fit the state block"
+    assert _shm.S_LAMBDA_TRUNC not in {
+        _shm.S_SIM_CLIP, _shm.S_CLAMP_TRIPS, _shm.S_TORQUE_TRIP, _shm.S_RECOVERY,
+        _shm.S_SUCCESS_RATE, _shm.S_ALIVE, _shm.S_STATE_SEQ, _shm.S_SEQ,
+    }, "S_LAMBDA_TRUNC collides with another state slot"
+    for name in ("lambda_trunc_ticks",):
+        assert hasattr(srv.OSCTorqueController, "__init__")
+        assert hasattr(_fp.RobotDriver, name), f"RobotDriver.{name} missing"
+        assert hasattr(_fp.MultiRobotWrapper, name), f"MultiRobotWrapper.{name} missing"
+    return f"slot {_shm.S_LAMBDA_TRUNC}, readable through RobotDriver.lambda_trunc_ticks"
+
+
+
+# --------------------------------------------------------------------------
+# torque.osc.cross_coupling_compensation. Pinned off everywhere above, because
+# robosuite has no such term at all.
+# --------------------------------------------------------------------------
+
+def _task_accel(q, F, T, uncouple, cross):
+    """Realised task-space acceleration, which is (J M^-1 J^T) @ wrench.
+
+    Formed from the controller's own wrench rather than re-derived, so a change to
+    how the wrench is built cannot pass this by being wrong in both places.
+    """
+    J = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
+    M = sim_dynamics.mass_matrix(q)
+    Mi = np.linalg.inv(M)
+    osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=uncouple,
+                              lambda_rcond=0.0, cross_coupling_compensation=cross)
+    osc.goal_pos, osc.goal_ori = np.zeros(3), np.eye(3)
+    osc.kp, osc.kd = np.ones(6), np.zeros(6)
+    lf, lp, lo, _, _, B = _osc_ctrl_mod.opspace_matrices(M, J, J[:3], J[3:])
+    if uncouple:
+        f = F - B @ (lo @ T) if cross else F
+        W = np.concatenate([lp @ f, lo @ T])
+    else:
+        W = lf @ np.concatenate([F, T])
+    return (J @ Mi @ J.T) @ W
+
+
+def test_cross_coupling_compensation_cancels_the_rotation_to_translation_leak():
+    """The reason it exists: under plain uncoupling a pure roll/pitch/yaw walks the
+    flange, because the wrench discards B = Jv M^-1 Jw^T. Compensated, the residual
+    linear acceleration is zero to machine precision -- the same thing
+    uncouple_pos_ori=false buys, without its 6x6 inverse."""
+    rng = np.random.default_rng(31)
+    leak_true = leak_cross = 0.0
+    for _ in range(200):
+        q = _HOME_Q + rng.normal(0, 0.35, 7)
+        T = rng.normal(0, 40.0, 3)
+        leak_true = max(leak_true, np.linalg.norm(_task_accel(q, np.zeros(3), T, True, False)[:3]))
+        leak_cross = max(leak_cross, np.linalg.norm(_task_accel(q, np.zeros(3), T, True, True)[:3]))
+    assert leak_true > 1.0, (
+        f"plain uncoupling no longer leaks rotation into translation ({leak_true:.3f} "
+        "m/s^2); if that is real this setting is pointless")
+    assert leak_cross < 1e-9, f"compensated leak {leak_cross:.3e} m/s^2 is not zero"
+    return (f"rotation-only command leaks {leak_true:.1f} m/s^2 uncompensated, "
+            f"{leak_cross:.1e} compensated (200 poses)")
+
+
+def test_cross_coupling_compensation_inverts_nothing_ill_conditioned():
+    """The whole point of preferring it to uncouple_pos_ori=false. The compensation
+    uses lambda_pos, lambda_ori and B; B takes no inverse, and the two 3x3s keep four
+    DOF of redundancy. So at the poses where the 6x6 blows up, this does not."""
+    q, _ = _worst_conditioned_pose()
+    R = fk_chain(q)[7][:3, :3]
+    T = 125.0 * _osc_ctrl_mod.orientation_error(
+        Rotation.from_rotvec([0.0, 0.0, DELTA_ROT_MAX]).as_matrix() @ R, R)
+    J = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
+    Mi = np.linalg.inv(sim_dynamics.mass_matrix(q))
+
+    peak = {}
+    for lbl, unc, cross in (("false", False, False), ("true", True, False),
+                            ("true+comp", True, True)):
+        lf, lp, lo, _, _, B = _osc_ctrl_mod.opspace_matrices(
+            sim_dynamics.mass_matrix(q), J, J[:3], J[3:])
+        if unc:
+            f = -B @ (lo @ T) if cross else np.zeros(3)
+            W = np.concatenate([lp @ f, lo @ T])
+        else:
+            W = lf @ np.concatenate([np.zeros(3), T])
+        peak[lbl] = np.abs(J.T @ W).max()
+
+    assert peak["false"] > 500.0, (
+        f"the 6x6 no longer blows up here ({peak['false']:.0f} Nm)")
+    assert peak["true+comp"] < peak["true"] * 1.5, (
+        f"compensation cost more torque than plain uncoupling "
+        f"({peak['true+comp']:.0f} vs {peak['true']:.0f} Nm)")
+    assert peak["true+comp"] < peak["false"] / 5.0, (
+        f"compensation is no cheaper than the 6x6 ({peak['true+comp']:.0f} vs "
+        f"{peak['false']:.0f} Nm)")
+    return (f"peak demand at a near-singular pose: uncouple=false {peak['false']:.0f} Nm, "
+            f"true {peak['true']:.0f} Nm, true+comp {peak['true+comp']:.0f} Nm")
+
+
+def test_cross_coupling_compensation_is_one_sided_by_construction():
+    """Documents the limit rather than hiding it.
+
+    Cancelling BOTH directions is the 6x6 inverse: the symmetric form needs the
+    Schur complement A - B C^-1 B^T, which is the object that goes singular. So
+    translation still disturbs orientation here, and rotation comes out slower than
+    commanded -- realised angular acceleration is (I - B^T Lp B Lo) t.
+
+    That slowdown is bounded, and by the same Schur complement that forbids the
+    symmetric form. J M^-1 J^T is PSD, so C - B^T A^-1 B >= 0, hence
+    B^T Lp B <= Lo^-1, hence Lo^(1/2) B^T Lp B Lo^(1/2) <= I. The eigenvalues of
+    (I - B^T Lp B Lo) therefore lie in [0, 1]: the compensation can slow a rotation
+    or stall it, but it can never reverse one or speed one up. Asserted on the
+    eigenvalues rather than on ||a||/||t||, which is NOT bounded by 1 -- the
+    similarity above is not orthogonal, so a Euclidean ratio above 1 is expected
+    for some t and says nothing about the sign.
+    """
+    rng = np.random.default_rng(32)
+    lo_hi, ori_leak, worst_stall = 1.0, 0.0, 1.0
+    for _ in range(200):
+        q = _HOME_Q + rng.normal(0, 0.35, 7)
+        J = zero_jacobian(q, ee_pos_base=fk_chain(q)[7][:3, 3])
+        M = sim_dynamics.mass_matrix(q)
+        _, lp, lo, _, _, B = _osc_ctrl_mod.opspace_matrices(M, J, J[:3], J[3:])
+        ev = np.linalg.eigvals(np.eye(3) - B.T @ lp @ B @ lo).real
+        lo_hi = min(lo_hi, ev.min())
+        worst_stall = min(worst_stall, ev.min())
+        assert ev.max() <= 1.0 + 1e-9, f"eigenvalue {ev.max():.6f} > 1: compensation adds rotation"
+        assert ev.min() >= -1e-9, f"eigenvalue {ev.min():.6f} < 0: compensation reverses rotation"
+        F = rng.normal(0, 6.0, 3)
+        ori_leak = max(ori_leak, np.linalg.norm(_task_accel(q, F, np.zeros(3), True, True)[3:]))
+    assert ori_leak > 1e-6, "translation no longer disturbs orientation; this is two-sided"
+    return (f"rotation retention eigenvalues in [{worst_stall:.3f}, 1] over 200 poses; "
+            f"translation->orientation leak retained (one-sided)")
+
 
 
 def main() -> int:

@@ -83,6 +83,27 @@ def _poses_from_qs(qs: list[np.ndarray]) -> np.ndarray:
     return np.array([_fk_pose(q) for q in qs], dtype=np.float32)
 
 
+# F_T_EE with the hand: the -45 deg z the DH chain's flange step omits.
+_FLANGE_TO_EE = Rotation.from_euler("z", -45.0, degrees=True)
+
+
+def ee_path_from_qpos(qpos: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """(T, 7) joint angles -> (position (T, 3), quaternion (T, 4) xyzw).
+
+    The pose the robot itself reports for those joints — robot base frame, and
+    the same convention as a recorded ``eef_pos``/``eef_quat`` (``O_T_EE``).
+    Lets a reference that observes joints only supply the EE path and rotation
+    series the comparison plots and ``compute_trajectory_errors`` need.
+    """
+    chains = np.array([franka_fk_chain(np.asarray(q, dtype=np.float64))[7]
+                       for q in np.asarray(qpos)])
+    if len(chains) == 0:
+        return np.zeros((0, 3)), np.zeros((0, 4))
+    pos = chains[:, :3, 3]
+    quat = (Rotation.from_matrix(chains[:, :3, :3]) * _FLANGE_TO_EE).as_quat()
+    return pos, quat
+
+
 def _normalized_quats(quats_xyzw: np.ndarray) -> np.ndarray:
     q = np.asarray(quats_xyzw, dtype=np.float64)
     return q / np.linalg.norm(q, axis=1, keepdims=True).clip(1e-9)

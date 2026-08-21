@@ -102,6 +102,11 @@ S_TORQUE_TRIP = 54
 # because it is invisible anywhere else -- the clip is inside run_controller, upstream
 # of _enforce_limits, and the torque that leaves is post-transform.
 S_SIM_CLIP = 55
+# Law ticks on which lambda_full's conditioning dropped a direction (osc.lambda_rcond).
+# Nonzero means the arm is working near a singularity, where the 6x6 operational-space
+# inertia is the term that blows up. Fits inside the existing block, so unlike the
+# G_TAU_* additions this one does not force a paired server/child redeploy.
+S_LAMBDA_TRUNC = 56
 STATE_SIZE = 64
 
 _TOTAL = GOAL_SIZE + STATE_SIZE

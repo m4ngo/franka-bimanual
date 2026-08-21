@@ -223,6 +223,12 @@ class _ArmSession:
         measurement. Distinct from clamp_trips, which counts the REAL torque limit."""
         return int(self.ch.state[shm.S_SIM_CLIP])
 
+    def lambda_trunc_ticks(self) -> int:
+        """Law ticks on which osc.lambda_rcond dropped a direction of lambda_full.
+        Distinct from sim_clip_ticks and from clamp_trips: those are saturation, this
+        is the arm being near a singularity."""
+        return int(self.ch.state[shm.S_LAMBDA_TRUNC])
+
     def torque_trips(self) -> int:
         """Times MODE_TORQUE's travel window latched to hold. Kept off get_state's
         bundle deliberately: only the friction scripts read it, and never per tick."""
@@ -382,6 +388,9 @@ class FrankaTorqueService(SlaveService):
     def exposed_sim_clip_ticks(self, robot_ip: str) -> int:
         return self._sessions[robot_ip].sim_clip_ticks()
 
+    def exposed_lambda_trunc_ticks(self, robot_ip: str) -> int:
+        return self._sessions[robot_ip].lambda_trunc_ticks()
+
     def exposed_set_mode(self, robot_ip: str, mode: str) -> bool:
         self._sessions[robot_ip].set_mode(mode)
         return True
@@ -423,6 +432,7 @@ class FrankaTorqueService(SlaveService):
     set_torque_goal = exposed_set_torque_goal
     torque_trips = exposed_torque_trips
     sim_clip_ticks = exposed_sim_clip_ticks
+    lambda_trunc_ticks = exposed_lambda_trunc_ticks
     set_mode = exposed_set_mode
     set_tuning = exposed_set_tuning
     get_state = exposed_get_state

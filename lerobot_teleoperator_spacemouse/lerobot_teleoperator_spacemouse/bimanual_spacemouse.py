@@ -49,11 +49,19 @@ class BimanualSpaceMouse(Teleoperator):
         self.left_arm = _make_spacemouse(config, "left", config.left_arm_config)
         self.right_arm = _make_spacemouse(config, "right", config.right_arm_config)
 
+    # Action channels that are NOT per-arm. BimanualFranka.send_action reads these
+    # unprefixed (they select one OSC gain schedule for the whole controller), so
+    # prefixing them the way the pose keys are prefixed emits l_kp/r_kp and leaves
+    # action["kp"] missing -- a KeyError on the first step of every bimanual run.
+    _SHARED_KEYS = ("kp", "kd")
+
     @property
     def action_features(self) -> dict[str, type]:
+        left, right = self.left_arm.action_features, self.right_arm.action_features
         return {
-            **{f"l_{k}": v for k, v in self.left_arm.action_features.items()},
-            **{f"r_{k}": v for k, v in self.right_arm.action_features.items()},
+            **{f"l_{k}": v for k, v in left.items() if k not in self._SHARED_KEYS},
+            **{f"r_{k}": v for k, v in right.items() if k not in self._SHARED_KEYS},
+            **{k: left[k] for k in self._SHARED_KEYS if k in left},
         }
 
     @property
@@ -125,9 +133,13 @@ class BimanualSpaceMouse(Teleoperator):
 
         left = self.left_arm.get_action()
         right = self.right_arm.get_action()
+        # The gain channels are the controller's, not an arm's -- see _SHARED_KEYS.
+        # Taken from the left device; both report the same constant 0.0, and a
+        # bimanual rig has one OSC gain schedule, so there is nothing to reconcile.
         return {
-            **{f"l_{k}": v for k, v in left.items()},
-            **{f"r_{k}": v for k, v in right.items()},
+            **{f"l_{k}": v for k, v in left.items() if k not in self._SHARED_KEYS},
+            **{f"r_{k}": v for k, v in right.items() if k not in self._SHARED_KEYS},
+            **{k: left[k] for k in self._SHARED_KEYS if k in left},
         }
 
     def send_feedback(self, feedback: dict[str, float]) -> None:

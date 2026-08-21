@@ -154,7 +154,12 @@ for trial in range(3):
     # law -- it fails by ~1e3 Nm and leaves this script red for a config choice, which
     # is exactly how a genuine regression would get missed.
     for uncoupling in (True, False):
-        ctrl = ours.OSCTorqueController(num_joints=7, uncouple_pos_ori=uncoupling)
+        # lambda_rcond pinned at 0.0: robosuite has no conditioning term, so leaving
+        # it at the config default would report torque.osc.lambda_rcond as a parity
+        # failure. tests/test_osc_stack.py::test_lambda_conditioning_* covers it.
+        ctrl = ours.OSCTorqueController(num_joints=7, uncouple_pos_ori=uncoupling,
+                                        lambda_rcond=0.0,
+                                        cross_coupling_compensation=False)
         ctrl.set_goal(goal_pos, goal_ori, kp, kd, initial_joint)
         ours_tau = ctrl.run_controller(ee_pos, ee_mat, twist[:3], twist[3:], J, q, dq, M, C)
 

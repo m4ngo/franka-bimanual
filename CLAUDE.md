@@ -211,7 +211,10 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   stays numpy-only with no *unguarded* package-relative imports — the one import
   it has (`torque_config`) uses the same relative/flat try-except the other NUC
   modules use. Verify changes with `scripts/osc_check/check_osc_parity.py`, which diffs it
-  against robosuite's real modules.
+  against robosuite's real modules. `lambda_rcond` is pinned at 0.0 there and in
+  `tests/test_osc_stack.py`'s `make_session`, for the same reason
+  `_SIM_PARITY_KNOBS` exists — robosuite has no conditioning term, so a nonzero
+  default would report it as a controller regression on every case.
 - [torque_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/torque_config.py)
   — resolves `control.yaml`'s `torque:` block on either side of the RPyC link.
   See "Getting config onto the NUC" above.
@@ -413,6 +416,25 @@ connects cleanly and then does nothing.
   torque safety factor — and the cost was that a gain change stopped mattering
   somewhere with nothing in the log to say where. Bound the command or bound
   the torque; do not silently scale things in between.
+  `torque.osc.cross_coupling_compensation` is likewise not a layer — it *adds* a
+  term rather than bounding one. Uncoupling discards `B = Jv M⁻¹ Jwᵀ`, so a pure
+  rotation walks the flange (up to 60.8 m/s² of linear acceleration); the
+  compensation puts `−B Λ_ori t` back into the force channel, which cancels it
+  exactly because `A Λ_pos = I`. It is **one-sided** on purpose: cancelling both
+  directions is the 6×6 inverse, since the symmetric form needs the Schur
+  complement `A − Bᵀ A⁻¹ B`, which is the thing that goes singular. The asymmetry
+  is the right one — `goal_ori` is latched across steps and resists with real
+  stiffness, `goal_pos` is re-anchored on the measured pose every step and cannot.
+  `torque.osc.lambda_rcond` is **not** a third layer and must not be deleted as
+  one: it conditions the pinv the law already takes — `control_utils` says "zero
+  out small singular values for stability" while `np.linalg.pinv`'s default rcond
+  never zeroes anything — and it is counted, not silent
+  (`RobotDriver.lambda_trunc_ticks`). It matters only with
+  `uncouple_pos_ori: false`, where `lambda_full` inverts a 6x6 built from a 6x7
+  Jacobian (one DOF of redundancy, cond up to ~950) instead of two 3x3s (four DOF,
+  cond 3-17). At a σ_min(J)=0.03 pose a full-scale wrist rotation asked 4974 Nm
+  unconditioned and 125 Nm at rcond 0.005, and peak |dq| went 4.7x → 1.4x the
+  datasheet joint-velocity limit. At home_pose the two are bit-identical.
 - **Pure (action, state) → action transforms in `safety.py`.** Don't push
   side effects into `ActionSafetyScreen`; it is intended to be a pre-dispatch
   shaping layer.
@@ -503,6 +525,24 @@ For code-level debugging:
 - `communication_constraints_violation` → the RT loop missed its 1 kHz deadline.
   Check the server is running under `chrt -f 80` and that nothing else is
   saturating the cores in `torque.loop.rt_cpu_candidates`.
+- A pure roll/pitch/yaw walks the flange off its position → that is what
+  `uncouple_pos_ori: true` does on its own, and `cross_coupling_compensation`
+  is the fix. Do **not** reach for `uncouple_pos_ori: false`; it fixes the same
+  leak by inverting the 6×6 and brings back the fault below.
+- Rotation feels sluggish since enabling `cross_coupling_compensation` → expected,
+  and bounded: realised angular acceleration is `(I − Bᵀ Λ_pos B Λ_ori) t`, whose
+  eigenvalues are provably in [0, 1] (measured 0.044–1.0 over 200 poses). Median
+  retention is 0.88; raise `tuning.kp_ori_scale` to ~1.15. Do not chase the worst
+  case — a low eigenvalue means that pose genuinely cannot hold the flange through
+  that rotation, and forcing it is what `uncouple_pos_ori: false` did.
+- Wrist rotation is violent and every joint reflexes, but only at some poses →
+  `uncouple_pos_ori: false` near a singularity. Read
+  `RobotDriver.lambda_trunc_ticks`: nonzero means `torque.osc.lambda_rcond` is
+  holding `lambda_full` together and the pose has little rotation authority;
+  zero while the arm still faults means the gains, not the conditioning. The
+  fault is usually `joint_reflex` rather than a torque clamp, because the
+  unmodelled `rotor_inertia_kg_m2 * qddot` lands in libfranka's external-torque
+  estimate — which is why it fires on the proximal joints, not the wrist.
 - A gain change had no effect → you did not re-run `deploy_nuc_server.sh`. The
   NUC runs its own copy of `control.yaml`'s `torque:` block.
 - `RuntimeError: Cannot resolve the torque block` on the NUC → the deploy did

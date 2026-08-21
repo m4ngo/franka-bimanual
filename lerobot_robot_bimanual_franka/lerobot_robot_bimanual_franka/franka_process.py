@@ -176,6 +176,24 @@ class RobotDriver:
         except Exception as e:
             raise RuntimeError(f"set_torque_goal({self.robot_ip}) failed: {e}") from e
 
+    def lambda_trunc_ticks(self) -> int:
+        """Law ticks on which torque.osc.lambda_rcond dropped a direction of
+        lambda_full, i.e. ticks spent near enough a singularity that the 6x6
+        operational-space inertia had to be conditioned.
+
+        Read this whenever uncouple_pos_ori is false and the arm faults during
+        rotation: it is the difference between "the gains are too high" and "this
+        pose has no rotation authority". Returns 0 on an older server rather than
+        raising -- unlike torque_trips, a missing counter here is not mistaken for
+        a measurement, it just means the conditioning is not deployed yet.
+        """
+        try:
+            return int(self._root.lambda_trunc_ticks(self.robot_ip))
+        except Exception:
+            logger.warning("lambda_trunc_ticks(%s) unavailable -- run "
+                           "scripts/deploy_nuc_server.sh for this arm", self.robot_ip)
+            return 0
+
     def torque_trips(self) -> int:
         """Times MODE_TORQUE's window latched to hold. A blocking read, so keep it out
         of the ramp's inner loop; check it once per torque step.
@@ -296,6 +314,10 @@ class MultiRobotWrapper:
     def sim_clip_ticks(self, name: str) -> int:
         """Law ticks on which SIM's ctrlrange clip bound on that arm."""
         return self.drivers[name].sim_clip_ticks()
+
+    def lambda_trunc_ticks(self, name: str) -> int:
+        """Law ticks on which lambda_full's conditioning bound on that arm."""
+        return self.drivers[name].lambda_trunc_ticks()
 
     def torque_snapshot(self, name: str) -> TorqueSnapshot:
         """(commanded, measured, external estimate) from that arm's last state read.

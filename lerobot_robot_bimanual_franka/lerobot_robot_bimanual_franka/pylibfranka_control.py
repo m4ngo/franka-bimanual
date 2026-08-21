@@ -212,7 +212,8 @@ class ControlLoop:
         # uncoupling no matter what the yaml said -- silently, on both sides of a
         # deploy. Anything the law reads must arrive here by name.
         self.osc = OSCTorqueController(num_joints=NUM_JOINTS,
-                                       uncouple_pos_ori=bool(torque("osc.uncouple_pos_ori")))
+                                       uncouple_pos_ori=bool(torque("osc.uncouple_pos_ori")),
+                                       lambda_rcond=float(torque("osc.lambda_rcond")))
         self.joint = JointImpedanceController(num_joints=NUM_JOINTS)
         self.control = None
         self.recovery_count = 0
@@ -469,6 +470,7 @@ class ControlLoop:
             shm.S_CLAMP_TRIPS: float(self.clamp_trips),
             shm.S_TORQUE_TRIP: float(self.torque_trips),
             shm.S_SIM_CLIP: float(self.osc.sim_clip_ticks),
+            shm.S_LAMBDA_TRUNC: float(self.osc.lambda_trunc_ticks),
             shm.S_ALIVE: 1.0,
         })
 

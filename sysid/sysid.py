@@ -29,7 +29,10 @@ Replay input HDF5 (sim layout): f[group][episode][field] → (T, D):
     eef_pos (T, 3) – reference EE position (used for error visualisation only)
     qpos    (T, 7) – joint angles used to initialise the home pose
 
-Replay input can also be a LeRobotDataset (see --lerobot-repo-id below).
+Replay input can also be a LeRobotDataset (see --lerobot-repo-id below). Such
+a dataset observes joints only, so its reference eef_pos/eef_quat -- the EE
+path and rotation series every comparison plot and error stat is measured
+against -- are forward kinematics of the reference qpos.
 
 Fields recorded in the output HDF5 (both modes):
     action        (T, 7) – [dpos(3), drot_quat(4)] — position delta in metres
@@ -99,7 +102,13 @@ sys.path.insert(0, str(_HERE.parent / "residual_wrapper"))
 
 from types import SimpleNamespace  # noqa: E402
 
-from _viz import compute_trajectory_errors, save_aggregate_html, save_comparison_html, save_errors_json  # noqa: E402
+from _viz import (  # noqa: E402
+    compute_trajectory_errors,
+    ee_path_from_qpos,
+    save_aggregate_html,
+    save_comparison_html,
+    save_errors_json,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -180,13 +189,18 @@ def parse_traj(filename: str, index: int) -> tuple[str, dict[str, np.ndarray]]:
 #
 # A LeRobotDataset episode is loaded and reshaped into exactly the dict shape
 # parse_traj() returns from a sim HDF5 (an "action" (T,7) normalized delta
-# array, plus "eef_pos"/"qpos" for homing and error visualisation), so
-# _run_episode() and the rest of the replay path need no branching on the
-# trajectory source.
+# array, plus "qpos" for homing and "eef_pos"/"eef_quat" for error
+# visualisation), so _run_episode() and the rest of the replay path need no
+# branching on the trajectory source.
 #
-# lerobot is only imported inside this function (like the robot stack, via
+# lerobot is only imported inside __init__ (like the robot stack, via
 # _robot_stack) so --dry-run and HDF5-replay runs keep working on machines
-# without lerobot installed.
+# without lerobot installed. The whole sweep is fetched there in one go;
+# __getitem__ then only slices the loaded table.
+
+_EEF_POS_KEYS = ("observation.eef_pos", "eef_pos", "observation.ee_pos")
+_EEF_QUAT_KEYS = ("observation.eef_quat", "eef_quat", "observation.ee_quat")
+
 
 class LeRobotTrajSource:
     """Duck-types the (filename, index) parse_traj() interface over a
@@ -198,42 +212,63 @@ class LeRobotTrajSource:
     in the normalized [dx,dy,dz,rx,ry,rz,gripper] convention _run_episode
     expects (units of _POS_SCALE / _ROT_SCALE), pass --lerobot-action-scale
     to rescale it (see _load_lerobot_episode).
+
+    The reference "eef_pos"/"eef_quat" come from an EE feature when the dataset
+    carries one and from FK of the reference qpos otherwise -- see
+    _viz.ee_path_from_qpos for the frame.
     """
 
     def __init__(self, repo_id: str, root: str | None, episodes: list[int] | None,
                 state_key: str, action_key: str, action_is_normalized: bool):
         try:
-            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset, LeRobotDatasetMetadata
         except ImportError as e:
             raise ImportError(
                 "LeRobotDataset replay requires the `lerobot` package "
                 "(pip install lerobot)."
             ) from e
-        self._LeRobotDataset = LeRobotDataset
         self.repo_id = repo_id
         self.root = root
         self.state_key = state_key
         self.action_key = action_key
         self.action_is_normalized = action_is_normalized
-        # Metadata-only load (no episodes filter) just to enumerate episode
-        # indices/names; per-episode data is loaded lazily in __getitem__ so
-        # a long sweep doesn't hold every episode's frames in memory at once.
-        meta_ds = LeRobotDataset(repo_id, root=root)
-        all_indices = list(range(meta_ds.meta.total_episodes))
-        self.episode_indices = episodes if episodes is not None else all_indices
-        self.fps = float(meta_ds.meta.fps)
+
+        # Enumerate from meta/ alone: constructing a LeRobotDataset here would
+        # fetch the frames too, before the episode filter is known.
+        meta = LeRobotDatasetMetadata(repo_id, root=root)
+        self.episode_indices = (episodes if episodes is not None
+                                else list(range(meta.total_episodes)))
+        self.fps = float(meta.fps)
+
+        # One download up front covering every episode of the sweep. Per-episode
+        # construction re-ran snapshot_download between trajectories, and its
+        # cache check counts the videos, so each one refetched mp4s that sysid
+        # never reads (it replays with_cameras=False).
+        logger.info("loading %d episode(s) of %s (videos skipped)",
+                    len(self.episode_indices), repo_id)
+        self._ds = LeRobotDataset(repo_id, root=root, episodes=self.episode_indices,
+                                  download_videos=False)
+        # Columns straight off the Arrow table: indexing the dataset per frame
+        # decodes every camera stream to reach state/action (~58 ms/frame here).
+        self._hf = self._ds.hf_dataset.with_format("numpy")
+        self._episode_of_row = np.asarray(self._hf["episode_index"])
 
     def __len__(self) -> int:
         return len(self.episode_indices)
 
+    def _episode_rows(self, ep_index: int) -> dict[str, np.ndarray]:
+        """Every column of one episode, sliced out of the loaded table."""
+        rows = np.flatnonzero(self._episode_of_row == ep_index)
+        if len(rows) == 0:
+            raise ValueError(f"episode {ep_index} of {self.repo_id!r} has no frames")
+        return self._hf[int(rows[0]):int(rows[-1]) + 1]
+
     def __getitem__(self, index: int) -> tuple[str, dict[str, np.ndarray]]:
         ep_index = self.episode_indices[index]
-        ds = self._LeRobotDataset(self.repo_id, root=self.root, episodes=[ep_index])
-        n = len(ds)
-        if n == 0:
-            raise ValueError(f"episode {ep_index} of {self.repo_id!r} has no frames")
+        rows = self._episode_rows(ep_index)
 
-        actions = np.stack([np.asarray(ds[i][self.action_key]) for i in range(n)]).astype(np.float64)
+        actions = np.asarray(rows[self.action_key], dtype=np.float64)
+        n = len(actions)
         if actions.shape[1] < 7:
             # Pad a held-constant gripper column if the dataset action has no
             # gripper dim (e.g. 6-DoF pose-delta-only actions).
@@ -245,20 +280,44 @@ class LeRobotTrajSource:
         if not self.action_is_normalized:
             actions = _normalize_lerobot_action(actions)
 
-        state = np.stack([np.asarray(ds[i][self.state_key]) for i in range(n)]).astype(np.float64)
+        state = np.asarray(rows[self.state_key], dtype=np.float64)
         # qpos (for homing) is the leading 7 state dims (or fewer, padded with
-        # zeros) by convention; eef_pos is best-effort (zeros if unavailable,
-        # since it is used only for error-visualisation overlay, not control).
+        # zeros) by convention.
         qpos = state[:, :7] if state.shape[1] >= 7 else np.pad(state, ((0, 0), (0, 7 - state.shape[1])))
-        eef_pos = np.zeros((n, 3), dtype=np.float64)
-        for cand in ("observation.eef_pos", "eef_pos", "observation.ee_pos"):
-            if cand in ds[0]:
-                eef_pos = np.stack([np.asarray(ds[i][cand]) for i in range(n)]).astype(np.float64)[:, :3]
-                break
+
+        # Reference EE path and rotation series: a missing one silently blanks
+        # the comparison plots and error stats rather than failing them.
+        eef_pos = self._feature_series(rows, _EEF_POS_KEYS, 3)
+        eef_quat = self._feature_series(rows, _EEF_QUAT_KEYS, 4)
+        if eef_pos is None or eef_quat is None:
+            if state.shape[1] >= 7:
+                # This stack's datasets observe joints only; FK is the reference pose.
+                fk_pos, fk_quat = ee_path_from_qpos(qpos)
+                eef_pos = fk_pos if eef_pos is None else eef_pos
+                eef_quat = fk_quat if eef_quat is None else eef_quat
+            else:
+                logger.warning(
+                    "%s: state key %r has %d dims (<7 joints), so no reference EE "
+                    "path or rotation error can be drawn for episode %d",
+                    self.repo_id, self.state_key, state.shape[1], ep_index)
+                eef_pos = np.zeros((n, 3)) if eef_pos is None else eef_pos
 
         name = f"episode_{ep_index:06d}"
-        return name, {"action": actions.astype(np.float32), "qpos": qpos.astype(np.float32),
-                      "eef_pos": eef_pos.astype(np.float32)}
+        traj = {"action": actions.astype(np.float32), "qpos": qpos.astype(np.float32),
+                "eef_pos": eef_pos.astype(np.float32)}
+        if eef_quat is not None:
+            traj["eef_quat"] = eef_quat.astype(np.float32)
+        return name, traj
+
+    @staticmethod
+    def _feature_series(rows: dict, keys: tuple[str, ...], dim: int) -> np.ndarray | None:
+        """First of ``keys`` the episode carries, as (T, dim); None if none."""
+        for key in keys:
+            if key in rows:
+                arr = np.asarray(rows[key], dtype=np.float64)
+                if arr.ndim == 2 and arr.shape[1] >= dim:
+                    return arr[:, :dim]
+        return None
 
 
 def _normalize_lerobot_action(actions: np.ndarray) -> np.ndarray:
@@ -1203,9 +1262,31 @@ def main() -> None:
             if args.mode == "replay":
                 viz_out = str(run_dir / f"{i}_{output}.html")
                 save_comparison_html(traj, recorded, viz_out, fps=args.fps, frame_stride=args.viz_stride)
-                all_errors.append(compute_trajectory_errors(traj, recorded, name=output))
+                errors = compute_trajectory_errors(traj, recorded, name=output)
+                all_errors.append(errors)
                 save_errors_json(all_errors, str(run_dir / "errors.json"))
                 episode_pairs.append((name, traj, recorded))
+
+                # Real-vs-reference error in run.json, so a broken replay shows
+                # without opening the HTML.
+                pos_e = errors["position_error_m"]
+                rot_e = errors["rotation_error_rad"]
+                summary["ref_error"] = {
+                    "position_mm": {k: round(pos_e[k] * 1e3, 2) for k in ("mean", "max")},
+                    "rotation_deg": (None if rot_e is None else
+                                     {k: round(np.degrees(rot_e[k]), 2) for k in ("mean", "max")}),
+                }
+                _write_run_json(run_dir, meta)
+                ref_str = "ref err pos mean %.1f / max %.1f mm" % (
+                    summary["ref_error"]["position_mm"]["mean"],
+                    summary["ref_error"]["position_mm"]["max"])
+                if summary["ref_error"]["rotation_deg"] is not None:
+                    ref_str += ", rot mean %.1f / max %.1f deg" % (
+                        summary["ref_error"]["rotation_deg"]["mean"],
+                        summary["ref_error"]["rotation_deg"]["max"])
+                else:
+                    ref_str += ", rot n/a (reference has no eef_quat)"
+                logger.info("episode %s: %s", name, ref_str)
 
                 # Aggregate sim-format accumulator (replay-from-HDF5 only: it
                 # mirrors a single sim group key, which a LeRobotDataset input

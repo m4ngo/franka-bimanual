@@ -13,7 +13,7 @@ rates:
 # sim-parity value. Read via default_factory; a dataclass literal for any is a bug.
 tuning:
   # EE_DELTA scaling before the OSC. 1.0 = what the policy emits = sim parity.
-  ee_translation_fudge: 1.0
+  ee_translation_fudge: 1.15
   ee_rotation_fudge: 1.0
 
   # Coulomb assist scale against torque.friction.coulomb_nm; the two only mean
@@ -52,7 +52,7 @@ tuning:
   kp_pos_scale: [1.0, 1.0, 1.0]
   kp_ori_scale: [1.0, 1.0, 1.0]
   kd_pos_scale: [1.0, 1.0, 1.0]
-  kd_ori_scale: [0.8, 0.8, 0.8]
+  kd_ori_scale: [1.0, 1.0, 1.0]
 gripper_accum_speed: 1.0
 
 worktable_brake:
@@ -108,7 +108,79 @@ torque:
     # +x authority than it costs sim (the observed "X goes tiny") while false is a
     # DIFFERENT law from the one the policies were trained on (the observed "wrist
     # breaks"). Neither can match sim; both readings were correct.
+    # TRUE, with cross_coupling_compensation below. false was tried on hardware to fix
+    # the rotation leak and did fix it, at the cost of inverting the 6x6 near
+    # singularities: 4974 Nm demanded, |dq| at 4.7x the datasheet limit, every joint
+    # reflexing, and the arm drifting after the stick was released. The compensation
+    # buys the same position hold out of the 3x3 blocks instead.
     uncouple_pos_ori: true
+
+    # Cancel the rotation -> translation leak that uncouple_pos_ori: true leaves
+    # behind. Read ONLY when uncoupling is true; false = osc.py exactly.
+    #
+    # THE PROBLEM. Write J M^-1 J^T as [[A, B], [B^T, C]], with A = lambda_pos^-1,
+    # C = lambda_ori^-1 and B = Jv M^-1 Jw^T the coupling block. Realised task
+    # acceleration is (J M^-1 J^T) @ wrench, so
+    #   uncouple true   W = [Lp f ; Lo t]        -> accel = [f + B Lo t ; B^T Lp f + t]
+    #   uncouple false  W = Lambda_full [f ; t]  -> accel = [f ; t]
+    # Both give the commanded acceleration ON axis -- uncoupling does NOT cost on-axis
+    # authority, whatever the note above says. The only difference is the cross terms:
+    # true leaves them uncancelled, which is why a pure roll/pitch/yaw walks the flange,
+    # and false cancels them by inverting the 6x6, which is why it faults. Measured over
+    # 301 poses, a rotation-only command leaks up to 60.8 m/s^2 of linear acceleration
+    # under true and exactly 0 under false.
+    #
+    # THIS SETTING is the third option: W = [Lp (f - B Lo t) ; Lo t]. Since A Lp = I the
+    # leak cancels EXACTLY, and nothing but the two 3x3 blocks is ever inverted.
+    # Measured, held full-scale wrist yaw:
+    #                          home EE drift   near-singular peak tau   noise gain
+    #   uncouple true              0.021 m               80 Nm           4.5-25 Nm
+    #   uncouple false             0.002 m             4974 Nm         182-376 Nm
+    #   true + this                0.002 m               45 Nm          4.7-25 Nm
+    # "noise gain" is 1 cm/s of EE-velocity noise -> commanded torque, i.e. what the arm
+    # does with the stick centred. It is the drift-after-stopping failure, and it is the
+    # clearest single reason not to run uncouple_pos_ori: false.
+    #
+    # IT IS ONE-SIDED, and that is not laziness. Cancelling both directions at once IS
+    # the 6x6 inverse: the symmetric form needs the Schur complement A - B C^-1 B^T,
+    # which is exactly the object that goes singular. So translation still disturbs
+    # orientation. That asymmetry is the right one here -- goal_ori is LATCHED across
+    # steps and resists with real stiffness, while goal_pos is re-anchored on the
+    # measured pose every step and so has no restoring force at all.
+    #
+    # PRICE: rotation speed. The compensating force has a moment about the EE, so
+    # realised angular acceleration becomes (I - B^T Lp B Lo) t -- median 0.88 of
+    # commanded over the envelope, 0.53 at the 10th percentile, 0.18 worst. Raise
+    # tuning.kp_ori_scale to ~1.15 to recover the median; do NOT chase the worst case,
+    # which is exactly where holding the flange through a rotation is genuinely hard.
+    cross_coupling_compensation: true
+
+    # Singularity conditioning on the operational-space inertia. 0.0 = np.linalg.pinv's
+    # own default = exactly the previously shipped behaviour, so this is a no-op until set.
+    #
+    # WHY IT IS NOT A SEVENTH ENVELOPE. It does not rescale a goal, a delta or a torque --
+    # it makes the inverse the law already takes well-posed. control_utils.opspace_matrices
+    # says "take the inverses, but zero out small singular values for stability", but
+    # np.linalg.pinv's default rcond is ~1e-15, so nothing is ever zeroed and near-singular
+    # directions are amplified rather than dropped. This makes the code do what that comment
+    # says. Truncated ticks are counted and readable (RobotDriver.lambda_trunc_ticks), so
+    # unlike the six envelopes that were removed it can never act silently.
+    #
+    # It only matters with uncouple_pos_ori: false. lambda_pos/lambda_ori inverse 3x3 blocks
+    # of a 3x7 Jacobian -- four DOF of redundancy, cond 3-17 across the envelope -- while
+    # lambda_full inverts a 6x6 built from a 6x7 Jacobian, one DOF of redundancy, cond up to
+    # ~950. Measured at a sigma_min(J)=0.030 pose under a full-scale wrist rotation, the law
+    # asked 622 Nm with rcond 0 and 126 Nm with 0.01, and peak |dq| went 2.3x -> 1.0x the
+    # datasheet joint-velocity limit. At home_pose the two are bit-identical: this cannot
+    # move the tuning or the sim match anywhere the arm is well conditioned.
+    lambda_rcond: 0.005
+    # J's angular rows are 1/m relative to its linear rows, so J M^-1 J^T mixes kg and
+    # kg m^2 and its condition number is inflated by the unit mix alone (cond 77 at
+    # home_pose, where nothing is singular). rcond is relative to the largest singular
+    # value, so it can only mean the same thing at every pose once that mix is removed:
+    # the 6x6 is scaled by diag(1,1,1,L,L,L) before the pinv and unscaled after. Roughly
+    # the arm's EE-to-wrist distance; the result is insensitive to it within ~2x.
+    lambda_length_scale_m: 0.15
 
     # Evaluate the law on robosuite's Panda plant model (sim_dynamics.py) and realise
     # the joint acceleration it produces on the FR3, instead of running the law
@@ -121,7 +193,7 @@ torque:
     # hardware bound -- sim saturates its wrist here and the FR3 does not, which is
     # why sim's rotation travel per step falls with amplitude while the real arm's
     # rises. Read only when emulate_sim_plant; the real bound stays limits.joint_torque_nm.
-    sim_ctrlrange_nm: [80.0, 80.0, 80.0, 80.0, 80.0, 12.0, 12.0]
+    sim_ctrlrange_nm: [80.0, 80.0, 80.0, 80.0, 40.0, 12.0, 12.0]
 
     # mujoco dof_damping. Passive, so it acts outside the ctrlrange clip. Sim's
     # dof_frictionloss (0.1 Nm/joint) is the other half of its plant and is handled
@@ -381,5 +453,5 @@ gripper:
 
 noise:
   # Action noise injected by the follower when use_noise is set.
-  pos_scale_m: 0.0025
-  rot_scale_rad: 0.075
+  pos_scale_m: 0.00
+  rot_scale_rad: 0.0
