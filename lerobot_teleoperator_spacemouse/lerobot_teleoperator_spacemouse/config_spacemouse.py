@@ -42,10 +42,15 @@ class SpaceMouseLeaderFields:
     deadzone: float = field(default_factory=lambda: _sm("deadzone"))
 
     prefix: str = ""
+    # False emits the integrated absolute pose (EE_POS); True emits the per-tick
+    # delta (EE_DELTA). The integrator runs either way -- see SpaceMouse.get_action.
     use_delta: bool = False
-    # use_noise: bool = False
-    noise_pos_scale: float = field(default_factory=lambda: _sm("noise_pos_scale"))
-    noise_rot_scale: float = field(default_factory=lambda: _sm("noise_rot_scale"))
+
+    # How far the integrated target may lead the arm's measured pose before it is
+    # held back. EE_POS only, and only once a pose source is bound; see
+    # SpaceMouse.bind_pose_source and config/teleop.yaml.
+    max_lead_m: float = field(default_factory=lambda: _sm("max_lead_m"))
+    max_lead_rad: float = field(default_factory=lambda: _sm("max_lead_rad"))
 
     # Initial EE Cartesian position [x, y, z] in metres. Override with
     # SpaceMouse.seed_state() to sync to the arm's actual EE on startup.
@@ -65,11 +70,12 @@ class SpaceMouseLeaderFields:
         default_factory=lambda: tuple(_sm("rotation_signs"))
     )
 
-    # Gripper travel limits (mm). Right button → open, left button → close.
-    gripper_min_mm: float = field(default_factory=lambda: _sm("gripper_min_mm"))
-    gripper_max_mm: float = field(default_factory=lambda: _sm("gripper_max_mm"))
+    # Latched gripper targets, normalized [0, 1] against full travel -- the same
+    # units the follower's action schema uses. Right button → open, left → close.
+    gripper_closed_norm: float = field(default_factory=lambda: _sm("gripper_closed_norm"))
+    gripper_open_norm: float = field(default_factory=lambda: _sm("gripper_open_norm"))
     # Gripper target on connect, before any button press.
-    initial_gripper_mm: float = field(default_factory=lambda: _sm("initial_gripper_mm"))
+    initial_gripper_norm: float = field(default_factory=lambda: _sm("initial_gripper_norm"))
 
     @classmethod
     def for_side(cls, side: str, **overrides) -> "SpaceMouseLeaderFields":

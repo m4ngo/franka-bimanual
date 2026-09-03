@@ -24,7 +24,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 # Reuse the controller suite's robosuite loader, pylibfranka stub and fixtures.
 from test_osc_stack import (  # noqa: E402
-    DELTA_POS_MAX, DELTA_ROT_MAX, ControlMode, RefOSC, make_case, make_robot,
+    DAMPING_RATIO_LIMITS, DEFAULT_DAMPING_RATIO, DEFAULT_KP, DELTA_POS_MAX, DELTA_ROT_MAX,
+    KP_LIMITS, ControlMode, RefOSC, make_case, make_robot,
     make_session, our_torque, ref_torque, _rel,
 )
 
@@ -186,9 +187,9 @@ def test_spacemouse_sequence_matches_robosuite_including_orientation_hold():
     ref = RefOSC(case, input_max=1, input_min=-1,
                  output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                  output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                 kp=150, damping_ratio=1, impedance_mode="variable",
-                 kp_limits=(0, 1500), damping_ratio_limits=(0, 10))
-    kp_raw, damp_raw = np.full(6, 150.0), np.full(6, 1.0)
+                 kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                 kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS)
+    kp_raw, damp_raw = np.full(6, DEFAULT_KP), np.full(6, DEFAULT_DAMPING_RATIO)
 
     # push / twist / release / push again / release
     seq = [(0.0, 0.6, 0.0, 0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 0.0, 0.0, 0.7),
@@ -296,10 +297,30 @@ def test_each_device_axis_lands_on_the_expected_base_axis():
 
 
 def test_gripper_buttons_latch_and_open_wins():
-    assert make_teleop(_FakeState(buttons=(1, 0))).get_action()["r_gripper"] < 0
-    assert make_teleop(_FakeState(buttons=(0, 1))).get_action()["r_gripper"] > 0
-    assert make_teleop(_FakeState(buttons=(1, 1))).get_action()["r_gripper"] > 0
-    assert make_teleop(_FakeState()).get_action()["r_gripper"] == 0.0
+    """The emitted gripper value is an ABSOLUTE normalized target that LATCHES.
+
+    Absolute because that is what the follower's action schema, its observation and
+    every other leader use, so a recorded episode replays as itself. Latching is
+    what makes absolute possible from momentary buttons -- and it has to live here,
+    on the only leader with momentary buttons, not in BimanualFranka.send_action
+    where it also integrated GELLO's already-absolute position and pinned it open.
+    """
+    cfg = SpaceMouseConfig(prefix="r_")
+    closed, opened = cfg.gripper_closed_norm, cfg.gripper_open_norm
+    assert 0.0 <= closed < opened <= 1.0, "targets must be normalized to [0, 1]"
+
+    assert make_teleop(_FakeState(buttons=(1, 0))).get_action()["r_gripper"] == closed
+    assert make_teleop(_FakeState(buttons=(0, 1))).get_action()["r_gripper"] == opened
+    # Open wins, so a fumbled double-press cannot crush the gripper.
+    assert make_teleop(_FakeState(buttons=(1, 1))).get_action()["r_gripper"] == opened
+
+    # No button held keeps the last target rather than commanding a neutral value:
+    # releasing the button must not release the grasp.
+    tel = make_teleop(_FakeState(buttons=(1, 0)))
+    assert tel.get_action()["r_gripper"] == closed
+    tel._device = _FakeDevice(_FakeState())
+    assert tel.get_action()["r_gripper"] == closed, "released button dropped the grasp"
+    return f"closed={closed:g} open={opened:g}, latched across a release"
 
 
 def test_absolute_mode_integrates_the_same_deltas():
@@ -326,8 +347,55 @@ def test_absolute_mode_integrates_the_same_deltas():
         assert np.allclose(np.abs(np.dot(got_r.as_quat(), rot.as_quat())), 1.0, atol=1e-9)
 
 
+def test_ee_pos_target_cannot_run_away_from_the_arm():
+    """EE_POS integrator anti-windup, and why EE_POS needs it when EE_DELTA does not.
+
+    In EE_DELTA the goal is rebuilt from the MEASURED pose every step, so it leads
+    the arm by exactly one clipped delta no matter how long the stick is held. In
+    EE_POS the target IS the leader's integrator: it advances translation_scale per
+    tick whether or not the arm follows, so against a stalled arm it ran away at
+    translation_scale*fps (1.0 m/s at the defaults) and the OSC's kp*error grew
+    without bound. bind_pose_source caps the lead; nothing else does.
+    """
+    cfg = SpaceMouseConfig(prefix="r_", use_delta=False, deadzone=0.0)
+    arm, quat = np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])
+
+    tel = SpaceMouse(cfg)
+    tel._device = _FakeDevice(_FakeState(y=1.0))
+    tel.seed_state(arm, quat)
+    tel.bind_pose_source(lambda: (arm, quat))          # worst case: the arm never moves
+
+    for _ in range(200):                                # 10 s of held full deflection
+        act = tel.get_action()
+    lead = np.linalg.norm(np.array([act["r_x"], act["r_y"], act["r_z"]]) - arm)
+    assert lead <= cfg.max_lead_m + 1e-9, (
+        f"EE_POS target ran {lead:.2f} m ahead of a stalled arm (cap {cfg.max_lead_m})")
+
+    tel_r = SpaceMouse(cfg)
+    tel_r._device = _FakeDevice(_FakeState(yaw=1.0))
+    tel_r.seed_state(arm, quat)
+    tel_r.bind_pose_source(lambda: (arm, quat))
+    for _ in range(200):
+        act = tel_r.get_action()
+    ang = np.linalg.norm(Rotation.from_quat(
+        [act["r_qx"], act["r_qy"], act["r_qz"], act["r_qw"]]).as_rotvec())
+    assert ang <= cfg.max_lead_rad + 1e-9, f"orientation target ran {ang:.2f} rad ahead"
+
+    # Unbound, the integrator is deliberately still free: EE_DELTA carries it only
+    # as state and never emits it, so clamping there would be a limit layer on a
+    # value nothing reads.
+    free = SpaceMouse(SpaceMouseConfig(prefix="r_", use_delta=True, deadzone=0.0))
+    free._device = _FakeDevice(_FakeState(y=1.0))
+    free.seed_state(arm, quat)
+    for _ in range(200):
+        d = free.get_action()
+    step = np.linalg.norm([d["r_x"], d["r_y"], d["r_z"]])
+    assert np.isclose(step, DELTA_POS_MAX), "EE_DELTA step size changed"
+    return f"lead capped at {lead:.3f} m / {ang:.3f} rad; EE_DELTA step {step:g} m"
+
+
 def test_gains_channel_is_neutral():
-    """kp/kd of 0.0 means the sim defaults (150, critically damped)."""
+    """kp/kd of 0.0 means the configured defaults, critically damped."""
     act = make_teleop(_FakeState()).get_action()
     assert act["kp"] == 0.0 and act["kd"] == 0.0
 

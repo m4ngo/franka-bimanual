@@ -1,0 +1,27 @@
+{
+  "notes": "panda_control step5c (gen_excitation_traj.py --amp-yaw 0 --amp-roll 0), the excitation behind their v2 fit. panda_v3.json's two-band position sweep with orientation held at the anchor, so it excites the arm without the yaw/roll terms that drive J1 and J5/J7. Per-axis bands are module constants in panda_traj.py: x (0.15, 0.70), y (0.20, 0.90), z (0.30, 1.10) Hz. The stated amplitude is the LOW band's -- sin + 0.2*sin peaks at 1.2x it. Ramp-IN only, so the episode ends mid-swing.",
+  "name": "step5c",
+  "kind": "v3_step5d",
+  "init_qpos": [
+    0.0,
+    -0.15,
+    0.0,
+    -1.7,
+    0.0,
+    1.55,
+    0.785
+  ],
+  "duration_s": 12.0,
+  "params": {
+    "amp_x": 0.1,
+    "amp_y": 0.1,
+    "amp_z": 0.08,
+    "amp_yaw": 0.0,
+    "amp_roll": 0.0,
+    "high_band_ratio": 0.2,
+    "amp_ramp_s": 2.0
+  },
+  "track_abort_m": 0.05,
+  "track_abort_rad": 0.3,
+  "track_abort_note": "panda_control's step5c/step5d collector values. Orientation is held, so the rotation abort cannot bind."
+}

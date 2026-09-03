@@ -49,8 +49,10 @@ from lerobot.utils.utils import init_logging, log_say
 
 # Importing the plugin packages triggers their @register_subclass decorators.
 from lerobot_robot_bimanual_franka import ControlMode, SingleArmFranka, SingleArmFrankaConfig
-from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig
-from lerobot_teleoperator_spacemouse import SpaceMouseConfig
+
+# The mode -> (control mode, leader units) table, shared with the teleop driver so
+# a recording cannot pair a leader with a control mode it does not speak.
+from teleop_single_arm import MODES, build_leader, seed_leader
 
 logger = logging.getLogger(__name__)
 
@@ -142,23 +144,11 @@ def _build_teleop(mode: str, teleop_id: str, device: str | None = None):
             f"rig profile {_PROFILE!r} has no teleop_device; set one in config/rig.yaml "
             "or pass --teleop-device."
         )
-    gello_port = fc.teleop(f"gello.devices.{device}.port")
-    spacemouse_path = fc.teleop(f"spacemouse.devices.{device}.hidraw_path")
-    if mode == "gello":
-        cfg = GelloConfig(id=teleop_id, side=_ARM_KEY, port=gello_port, use_noise=True)
-    elif mode == "gello_ee":
-        cfg = GelloEEConfig(id=teleop_id, side=_ARM_KEY, port=gello_port, use_noise=True)
-    elif mode == "spacemouse":
-        # translation/rotation scale come from config/teleop.yaml defaults.
-        cfg = SpaceMouseConfig(
-            id=teleop_id,
-            hidraw_path=spacemouse_path,
-            prefix=f"{_ARM_KEY}_",
-            use_delta=True,
-        )
-    else:
-        raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello', 'gello_ee', or 'spacemouse'.")
-    return make_teleoperator_from_config(cfg)
+    # use_noise on the GELLO leaders is recording-only jitter (Gello.NOISE_SCALE on
+    # each joint), deliberately not applied during plain teleop.
+    return make_teleoperator_from_config(
+        build_leader(mode, device, teleop_id, use_noise=mode.startswith("gello"))
+    )
 
 
 def _build_dataset(args, robot, teleop_proc, robot_obs_proc) -> LeRobotDataset:
@@ -216,15 +206,19 @@ def main() -> None:
     p.add_argument("--num-episodes", type=int, required=True)
     p.add_argument("--task", required=True, help="single_task description")
     p.add_argument("--policy", default=None, help="HF repo for a pretrained policy; omit for teleop recording")
-    p.add_argument("--control-mode", default=fc.profile(_PROFILE).control_mode,
-                   choices=("JOINT_POS", "EE_POS", "EE_DELTA"), help="Robot control mode")
+    p.add_argument("--control-mode", default=None,
+                   choices=("JOINT_POS", "EE_POS", "EE_DELTA"),
+                   help="Robot control mode. Defaults to the one --teleop-mode implies; "
+                        "only set this for --policy runs, where there is no leader to "
+                        "imply it. Overriding it against a leader is how a 5 cm per-tick "
+                        "delta gets recorded as an absolute goal pose.")
     p.add_argument("--depth", type=_str2bool, default=True,
                    help="Enable depth point-cloud observations (default: true)")
     p.add_argument(
         "--teleop-mode",
         default="gello_ee",
-        choices=("gello", "gello_ee", "spacemouse"),
-        help="Teleop type (ignored when --policy is set)",
+        choices=sorted(MODES),
+        help="Leader and the control mode it speaks (ignored when --policy is set)",
     )
     p.add_argument("--teleop-device", default=_TELEOP_DEVICE,
                    help="Which physical leader the operator holds (teleop.yaml devices). "
@@ -278,7 +272,13 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(control_mode=ControlMode(args.control_mode), depth=args.depth, noise=args.noise)
+    if args.control_mode is not None:
+        control_mode = ControlMode(args.control_mode)
+    elif args.policy:
+        control_mode = ControlMode(fc.profile(_PROFILE).control_mode)
+    else:
+        control_mode = MODES[args.teleop_mode][0]
+    robot = _build_robot(control_mode=control_mode, depth=args.depth, noise=args.noise)
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id, args.teleop_device)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
@@ -307,6 +307,9 @@ def main() -> None:
     robot.connect()
     if teleop is not None:
         teleop.connect()
+        # An integrating leader must start from the arm's real pose, or step one
+        # commands teleop.initial_pos as an absolute goal. No-op for GELLO.
+        seed_leader(teleop, robot)
 
     listener, events = init_keyboard_listener()
     stdin_kb = _StdinKeyboardThread(events)

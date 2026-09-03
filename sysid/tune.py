@@ -36,7 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from lerobot_robot_bimanual_franka import ControlMode, SingleArmFranka, SingleArmFrankaConfig
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 from lerobot_robot_bimanual_franka.osc_torque_controller import (
-    DELTA_POS_MAX, DELTA_ROT_MAX, JOINT_TORQUE_LIMITS,
+    DAMPING_EXP_SCALE, DEFAULT_DAMPING_RATIO, DEFAULT_KP, DELTA_POS_MAX, DELTA_ROT_MAX,
+    JOINT_TORQUE_LIMITS, KP_EXP_SCALE,
 )
 
 ARM = "r"
@@ -72,8 +73,15 @@ def load_ref(path: str, index: int) -> dict:
             except (TypeError, ValueError):
                 cfg = {}
     # Invert the exponential remap so real runs the gains sim was generated with.
-    ref["kp_action"] = float(np.log10(float(cfg.get("kp", 150.0)) / 150.0))
-    ref["kd_action"] = float(np.log10(float(cfg.get("damping_ratio", 1.0))))
+    # Against THIS stack's own default, not a literal 150: the map is
+    # kp = DEFAULT_KP * KP_EXP_SCALE ** a, so with default_kp 125 and a reference
+    # recorded at 150 the action is log(150/125)/log(10), not 0. A hardcoded 150
+    # here silently ran the arm 17% soft against every sim reference.
+    sim_kp = float(cfg.get("kp", DEFAULT_KP))
+    sim_ratio = float(cfg.get("damping_ratio", DEFAULT_DAMPING_RATIO))
+    ref["kp_action"] = float(np.log(sim_kp / DEFAULT_KP) / np.log(KP_EXP_SCALE))
+    ref["kd_action"] = float(
+        np.log(sim_ratio / DEFAULT_DAMPING_RATIO) / np.log(DAMPING_EXP_SCALE))
     return ref
 
 

@@ -1,0 +1,29 @@
+{
+  "notes": "panda_control v4 chirp (gen_chirp_traj.py), the README's recommended Franka operating point. Linear chirp 0.1->0.7 Hz on all six Cartesian DOF, phase-staggered at k*pi/3, asymmetric 2 s up / 3 s down linear envelope, returns to the anchor at t=T. Amplitudes are UR5e's, with f1 lowered 3.0 -> 0.7 Hz for the Franka. At full amplitude this exceeds panda_control's own peak conventions (0.30 m/s, 0.50 rad/s) by design, and max|rot_offset| reaches ~0.61 rad; excite_panda.py's probe scales the amplitudes down to fit our EE_DELTA envelope, which brings both back inside.",
+  "kind": "v4_chirp",
+  "init_qpos": [
+    0.0,
+    -0.15,
+    0.0,
+    -1.7,
+    0.0,
+    1.55,
+    0.785
+  ],
+  "duration_s": 8.0,
+  "params": {
+    "f0": 0.1,
+    "f1": 0.7,
+    "amp_x": 0.1,
+    "amp_y": 0.1,
+    "amp_z": 0.15,
+    "amp_rx": 0.5,
+    "amp_ry": 0.25,
+    "amp_rz": 0.5,
+    "ramp_up_s": 2.0,
+    "ramp_down_s": 3.0
+  },
+  "track_abort_m": 0.15,
+  "track_abort_rad": 0.8,
+  "track_abort_note": "panda_control relaxes these for the chirp (README: error_delta_pos 0.05 -> 0.15, error_delta_rot 0.30 -> 0.80) because the reference itself reaches ~0.61 rad of rotation offset and a soft kp lags it. At 0.30 the episode aborts mid-run."
+}

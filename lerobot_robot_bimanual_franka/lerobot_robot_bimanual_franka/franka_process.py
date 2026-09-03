@@ -209,22 +209,6 @@ class RobotDriver:
                                f"server predates MODE_TORQUE, run "
                                f"scripts/deploy_nuc_server.sh for this arm") from e
 
-    def sim_clip_ticks(self) -> int:
-        """Law ticks on which SIM's ctrlrange clip bound. The rotation-overshoot
-        measurement: sim's wrist saturates at +/-12 Nm and the FR3's does not, so
-        whether that clip engages here decides whether the roll-off is reproduced.
-
-        RAISES rather than returning 0, for the same reason as torque_trips: a silent
-        0 reads as "the clip never engaged", which is precisely the finding this call
-        exists to establish, and an older server would fake it perfectly.
-        """
-        try:
-            return int(self._root.sim_clip_ticks(self.robot_ip))
-        except Exception as e:
-            raise RuntimeError(
-                f"sim_clip_ticks({self.robot_ip}) failed: {e} -- if this server "
-                f"predates the sim-clip counter, run scripts/deploy_nuc_server.sh") from e
-
     def supports_torque_mode(self) -> bool:
         """Preflight: does the deployed server know MODE_TORQUE? Checked before the
         arm moves, so a stale NUC costs a message rather than a half-run."""
@@ -310,10 +294,6 @@ class MultiRobotWrapper:
     def recovery_counts(self) -> dict[str, int]:
         """Cumulative recoverable-error recoveries per arm, as of the last state read."""
         return {n: d.recovery_count for n, d in self.drivers.items()}
-
-    def sim_clip_ticks(self, name: str) -> int:
-        """Law ticks on which SIM's ctrlrange clip bound on that arm."""
-        return self.drivers[name].sim_clip_ticks()
 
     def lambda_trunc_ticks(self, name: str) -> int:
         """Law ticks on which lambda_full's conditioning bound on that arm."""

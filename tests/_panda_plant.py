@@ -1,25 +1,8 @@
-"""robosuite's Panda mass matrix, M_sim(q), computed without mujoco.
+"""robosuite Panda plant model -- a TEST FIXTURE, not part of the control stack.
 
-The OSC law's wrench is `lambda * (kp*e - kd*edot)` with `lambda` built from the
-MASS MATRIX. robosuite's Panda carries a fictitious armature (5/(i+1) N m s^2/rad)
-and placeholder link inertias, so its M is 2-10x the FR3's and NOT block-diagonal in
-the same way. That matters because `uncouple_pos_ori=True` -- which every sim
-reference and every trained policy used -- DISCARDS the translation/rotation coupling
-block, and how much that throws away is a function of M. Measured at the sim anchor,
-`lambda_uncoupled/lambda_full` on +x is 0.497 in sim and 0.145 on the FR3. Running
-robosuite's law against the FR3's own M therefore cannot reproduce robosuite, at any
-gain. This module supplies the other M so it can.
-
-Deployed to the NUC alongside the controller: numpy only, no package-relative
-imports, no config reads. The constants below ARE robosuite's Panda model (v1.4.0
-`models/assets/robots/panda/robot.xml` + `grippers/panda_gripper.xml`), transcribed;
-`tests/test_sim_dynamics.py` regenerates them from the live robosuite install and
-fails on any drift, so they are checked, not trusted.
-
-Method is the kinetic-energy form, `M = sum_b (m_b Jv_b^T Jv_b + Jw_b^T I_b Jw_b)`,
-not CRBA -- it is one einsum, it is obviously correct from `T = 0.5 qdot^T M qdot`,
-and it matches robosuite's own `mass_matrix` to 1.2e-14 over 1000 random q spanning
-the full joint range.
+Kept only to give the conditioning and cross-coupling tests a pose-varying 7-DOF
+mass matrix. The real stack runs on libfranka's Model.mass(); it no longer
+emulates this plant, and nothing outside tests/ may import this.
 """
 
 from __future__ import annotations

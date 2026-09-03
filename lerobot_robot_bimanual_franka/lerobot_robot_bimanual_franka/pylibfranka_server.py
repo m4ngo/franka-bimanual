@@ -218,15 +218,10 @@ class _ArmSession:
         """Monotonic across control-child restarts -- see _recovery_base."""
         return self._recovery_base + int(self.ch.state[shm.S_RECOVERY])
 
-    def sim_clip_ticks(self) -> int:
-        """Law ticks on which SIM's ctrlrange clip bound -- the rotation-overshoot
-        measurement. Distinct from clamp_trips, which counts the REAL torque limit."""
-        return int(self.ch.state[shm.S_SIM_CLIP])
-
     def lambda_trunc_ticks(self) -> int:
         """Law ticks on which osc.lambda_rcond dropped a direction of lambda_full.
-        Distinct from sim_clip_ticks and from clamp_trips: those are saturation, this
-        is the arm being near a singularity."""
+        Distinct from clamp_trips: that is saturation, this is the arm being near a
+        singularity."""
         return int(self.ch.state[shm.S_LAMBDA_TRUNC])
 
     def torque_trips(self) -> int:
@@ -385,9 +380,6 @@ class FrankaTorqueService(SlaveService):
     def exposed_torque_trips(self, robot_ip: str) -> int:
         return self._sessions[robot_ip].torque_trips()
 
-    def exposed_sim_clip_ticks(self, robot_ip: str) -> int:
-        return self._sessions[robot_ip].sim_clip_ticks()
-
     def exposed_lambda_trunc_ticks(self, robot_ip: str) -> int:
         return self._sessions[robot_ip].lambda_trunc_ticks()
 
@@ -431,7 +423,6 @@ class FrankaTorqueService(SlaveService):
     set_joint_velocity_goal = exposed_set_joint_velocity_goal
     set_torque_goal = exposed_set_torque_goal
     torque_trips = exposed_torque_trips
-    sim_clip_ticks = exposed_sim_clip_ticks
     lambda_trunc_ticks = exposed_lambda_trunc_ticks
     set_mode = exposed_set_mode
     set_tuning = exposed_set_tuning

@@ -149,7 +149,7 @@ for trial in range(3):
     kp, kd = ours.resolve_gains(rng.uniform(-1, 1), rng.uniform(-1, 1))
 
     # BOTH settings of the uncoupling flag, and the reference is given the same one.
-    # osc_pose.json ships true; this rig runs false (config/control.yaml explains why).
+    # osc_pose.json ships true, and so does this rig (config/control.yaml explains why).
     # Comparing our false against robosuite's hardcoded true measures the flag, not the
     # law -- it fails by ~1e3 Nm and leaves this script red for a config choice, which
     # is exactly how a genuine regression would get missed.

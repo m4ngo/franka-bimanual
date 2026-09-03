@@ -1,0 +1,27 @@
+{
+  "notes": "panda_control step5b (src/step5b_cart_pose.cpp), the excitation behind their v1 fit. A single slow z-sine with orientation held at the anchor. Reached here through the v3_step5d builder with every other amplitude zeroed and high_band_ratio 0, which leaves the z low band alone: 0.30 Hz from panda_traj.POS_FREQS, against upstream's 0.25 Hz -- the band is a module constant, not a spec parameter. Ramp-IN only, so the episode ends mid-swing.",
+  "name": "step5b",
+  "kind": "v3_step5d",
+  "init_qpos": [
+    0.0,
+    -0.15,
+    0.0,
+    -1.7,
+    0.0,
+    1.55,
+    0.785
+  ],
+  "duration_s": 12.0,
+  "params": {
+    "amp_x": 0.0,
+    "amp_y": 0.0,
+    "amp_z": 0.08,
+    "amp_yaw": 0.0,
+    "amp_roll": 0.0,
+    "high_band_ratio": 0.0,
+    "amp_ramp_s": 2.0
+  },
+  "track_abort_m": 0.05,
+  "track_abort_rad": 0.3,
+  "track_abort_note": "panda_control's step5c/step5d collector values. Orientation is held, so the rotation abort cannot bind."
+}

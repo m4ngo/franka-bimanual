@@ -36,14 +36,31 @@ spacemouse:
   translation_signs: [1, 1, 1]
   # Yaw is inverted on this puck; the controller itself is correctly signed.
   rotation_signs: [1, 1, -1]
-  noise_pos_scale: 0.05
-  noise_rot_scale: 0.03
+  # Anti-windup on the integrated target, EE_POS (use_delta: false) only.
+  #
+  # In EE_DELTA the goal is rebuilt from the MEASURED pose every step, so it can
+  # never lead the arm by more than one clipped delta (0.05 m). In EE_POS the
+  # target is the leader's own integrator and has no such reference: a held stick
+  # advances it 0.05 m per tick at 20 Hz whether or not the arm is keeping up, so
+  # against a stalled arm the goal ran 1 m/s away and kp*error grew without bound.
+  # These cap how far the target may lead the arm, which is what bounds the
+  # commanded force. Raise for a more responsive lead, lower for a softer one; at
+  # the delta envelope itself (0.05 / 0.5) EE_POS becomes EE_DELTA.
+  max_lead_m: 0.05
+  max_lead_rad: 0.5
   # Seeded from the arm by seed_state(); these only matter before the first read.
   initial_pos: [0.5, 0.0, 0.5]
   initial_quat_wxyz: [1.0, 0.0, 0.0, 0.0]
-  gripper_min_mm: -1.0
-  gripper_max_mm: 1.0
-  initial_gripper_mm: 0.9
+  # Gripper target the buttons LATCH, normalized [0, 1] against the gripper's full
+  # travel -- the same units the follower's action schema and its observation use,
+  # so a recorded SpaceMouse episode replays as itself. Left button -> closed,
+  # right -> open, open wins, neither -> hold the last target. These were named
+  # `gripper_*_mm` and held -1.0/1.0, which are not millimetres: they were a
+  # per-tick delta the follower integrated, and that integration is what left GELLO
+  # (which emits an absolute [0, 1] position) pinned open.
+  gripper_closed_norm: 0.0
+  gripper_open_norm: 1.0
+  initial_gripper_norm: 0.9
   devices:
     left: {hidraw_path: /dev/hidraw2}
     right: {hidraw_path: /dev/hidraw3}

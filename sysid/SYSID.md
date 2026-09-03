@@ -204,6 +204,15 @@ reads low. That combination points at task-space authority (`uncouple_pos_ori`,
 - `sysid/sysid.py` — the older bulk collection entry point (`--mode track` against
   `specs/*.json`, or open-loop replay of a multi-fast sweep file) for the multi-fast
   fitting pipeline. `--dry-run` exercises it with no hardware.
+- `sysid/excite_panda.py` — panda_control's v3/v4 excitation trajectories
+  (`sysid/panda_traj.py` is their generators, ported verbatim). Drives each once and
+  writes the SAME run in both action spaces, to `<run>/ee_delta/` and `<run>/ee_pose/`
+  — separate directories because `load_real_dir` globs `*.hdf5` and takes the format
+  from its caller, not from the file. A probe pass scales the amplitudes until the
+  tracking error fits the ±0.05 m / ±0.5 rad delta envelope; without it the two
+  spaces stop being equivalent wherever the clip bites. `--selftest` checks the port
+  off-hardware, `--verify <run>` checks the equivalence through the real
+  `OSCGoalBuilder`.
 
 ## Where the knobs live
 

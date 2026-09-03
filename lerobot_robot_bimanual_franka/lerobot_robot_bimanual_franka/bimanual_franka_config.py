@@ -15,9 +15,13 @@ _VALID_ARMS: tuple[str, ...] = tuple(fc.profile(PROFILE).arms)
 
 
 class ControlMode(str, Enum):
-    JOINT_POS = "JOINT_POS"  # joint position setpoints → joint velocity PD
-    EE_POS    = "EE_POS"     # absolute EE pose setpoints → Cartesian velocity PD
-    EE_DELTA  = "EE_DELTA"   # EE delta commands applied directly as Cartesian velocity
+    """What an action means. All three land on torque -- there is no velocity
+    domain left in this stack (the descriptions that said otherwise predate the
+    franky driver's removal). The NUC runs the law; these select which one."""
+
+    JOINT_POS = "JOINT_POS"  # joint setpoints → server-side joint impedance
+    EE_POS    = "EE_POS"     # absolute EE pose → OSC goal, used directly
+    EE_DELTA  = "EE_DELTA"   # per-step EE delta → OSC goal, re-anchored on the measured pose
 
 
 def _arm_field(key: str, suffix: str):

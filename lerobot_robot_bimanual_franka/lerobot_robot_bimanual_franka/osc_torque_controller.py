@@ -59,10 +59,9 @@ KP_LIMITS = tuple(float(v) for v in torque("osc.kp_limits"))
 DEFAULT_DAMPING_RATIO = float(torque("osc.default_damping_ratio"))
 DAMPING_RATIO_LIMITS = tuple(float(v) for v in torque("osc.damping_ratio_limits"))
 
-# utils/envs/libero.py: exp_scale = limit_max / default, gains = exp_scale ** action * default.
-# DERIVED, never configured separately -- a second copy silently drifts from sim.
-KP_EXP_SCALE = KP_LIMITS[1] / DEFAULT_KP
-DAMPING_EXP_SCALE = DAMPING_RATIO_LIMITS[1] / DEFAULT_DAMPING_RATIO
+# utils/envs/libero.py:132: gains = default * gain_exp_base ** action, one pinned
+# base for both channels. NOT limit_max/default -- see config/control.yaml.
+KP_EXP_SCALE = DAMPING_EXP_SCALE = float(torque("osc.gain_exp_base"))
 
 # osc_pose.json output_max/output_min: the per-step delta envelope in metres/radians.
 DELTA_POS_MAX = float(torque("delta.pos_max_m"))
@@ -85,17 +84,6 @@ LAMBDA_LENGTH_SCALE = float(torque("osc.lambda_length_scale_m"))
 # diag(1, 1, 1, L, L, L): makes the 6x6 unit-consistent so one rcond means the same
 # thing at every pose. Held as a vector because the scaling is applied by broadcasting.
 _LAMBDA_SCALE = np.array([1.0, 1.0, 1.0] + [LAMBDA_LENGTH_SCALE] * 3)
-
-# mujoco ctrlrange on robosuite's Panda actuators -- part of the REFERENCE dynamics,
-# not a hardware bound: sim's rotation authority saturates here long before the FR3's
-# does, which is why sim's rotation travel per step FALLS with command amplitude
-# (0.24 -> 0.125). Applied inside the law, upstream of _enforce_limits, and only when
-# emulating. Distinct from limits.joint_torque_nm, which bounds the real joints.
-SIM_TORQUE_LIMITS = np.asarray(torque("osc.sim_ctrlrange_nm"), dtype=np.float64)
-
-# mujoco dof_damping on the same joints -- the rest of sim's plant. Checked against
-# the live model by tests/test_sim_dynamics.py.
-SIM_JOINT_DAMPING = np.asarray(torque("osc.sim_joint_damping_nms_rad"), dtype=np.float64)
 
 # FR3/Panda datasheet continuous joint torque limits (Nm).
 JOINT_TORQUE_LIMITS = tuple(float(v) for v in torque("limits.joint_torque_nm"))
@@ -366,16 +354,11 @@ class OSCTorqueController:
         # Last tick's nullspace contribution, split out for the friction assist.
         self._no_nullspace = np.zeros(self.num_joints)
         self.nullspace_torque = self._no_nullspace
-        # Law ticks on which sim's ctrlrange clip bound. The whole rotation-overshoot
-        # question is whether sim's saturation is reproduced here, and that is not
-        # observable downstream: the clip is applied to tau_sim, and what leaves the
-        # law is M_real @ qddot, which carries no mark of having been clipped.
-        self.sim_clip_ticks = 0
-        # Law ticks on which lambda_full's conditioning dropped a direction. Counted
-        # for the same reason as sim_clip_ticks: the truncation is invisible downstream
-        # -- what leaves the law is a torque, which carries no mark of it -- and a
-        # conditioning term nobody can see is the failure mode that got the previous
-        # six envelopes deleted. Nonzero here means the arm is near a singularity.
+        # Law ticks on which lambda_full's conditioning dropped a direction. The
+        # truncation is invisible downstream -- what leaves the law is a torque, which
+        # carries no mark of it -- and a conditioning term nobody can see is the
+        # failure mode that got the previous six envelopes deleted. Nonzero here means
+        # the arm is near a singularity.
         self.lambda_trunc_ticks = 0
 
     def reset_goal(self, ee_pos: np.ndarray, ee_ori_mat: np.ndarray) -> None:
@@ -418,36 +401,9 @@ class OSCTorqueController:
         mass_matrix: np.ndarray,
         coriolis: np.ndarray,
         use_nullspace: bool = True,
-        mass_matrix_sim: np.ndarray | None = None,
-        bias_sim: np.ndarray | None = None,
     ) -> np.ndarray:
-        """osc.py's run_controller, optionally evaluated on SIM's plant model.
-
-        With ``mass_matrix_sim=None`` this is the law as ported: robosuite's PD,
-        robosuite's lambda built from the arm's own M, ``+coriolis`` instead of
-        ``+qfrc_bias``. Every existing parity test exercises that path.
-
-        With ``mass_matrix_sim`` supplied it emulates robosuite end to end. The
-        reason it must is that osc.py's ``uncouple_pos_ori`` -- true in
-        ``osc_pose.json``, in ``data.hdf5`` and in every trained policy -- DISCARDS
-        the translation/rotation coupling block, and how much that discards is a
-        function of M. At the sysid anchor ``lambda_uncoupled/lambda_full`` on +x is
-        0.497 for sim's armature-inflated plant and 0.145 for the FR3. So running
-        osc.py's law against the FR3's own M is not osc.py; it is a different
-        controller that happens to share the source. Neither uncouple setting can
-        fix that, which is why sweeping the tuning block never converged.
-
-        The emulation forms sim's actuator command exactly -- including the
-        ``qfrc_bias`` that ``Controller.run_controller`` adds and the ctrlrange clip
-        that ``SingleArm.control`` applies on top of it -- turns it into the joint
-        acceleration sim would have produced, and realises THAT on the real arm:
-
-            qddot = M_sim^-1 (clip(tau_law + bias_sim) - bias_sim)
-            tau   = M_real qddot + coriolis_real
-
-        Joint acceleration, not task acceleration, so sim's nullspace motion is
-        reproduced too. Identical to the ported law when the two M agree, which is
-        what makes it a strict generalisation rather than a replacement.
+        """osc.py's run_controller: robosuite's PD, robosuite's lambda built from
+        the arm's own M, ``+coriolis`` instead of ``+qfrc_bias``.
         """
         position_error = self.goal_pos - ee_pos
         vel_pos_error = -ee_pos_vel
@@ -457,12 +413,9 @@ class OSCTorqueController:
         vel_ori_error = -ee_ori_vel
         desired_torque = ori_error * self.kp[3:6] + vel_ori_error * self.kd[3:6]
 
-        emulate = mass_matrix_sim is not None
-        model = np.asarray(mass_matrix_sim) if emulate else mass_matrix
-
         J_pos, J_ori = J_full[:3, :], J_full[3:, :]
         lambda_full, lambda_pos, lambda_ori, nullspace_matrix, dropped, coupling = (
-            opspace_matrices(model, J_full, J_pos, J_ori, lambda_rcond=self.lambda_rcond)
+            opspace_matrices(mass_matrix, J_full, J_pos, J_ori, lambda_rcond=self.lambda_rcond)
         )
         if dropped:
             self.lambda_trunc_ticks += 1
@@ -504,45 +457,18 @@ class OSCTorqueController:
         task_torque = J_full.T @ decoupled_wrench
         null_torque = (
             nullspace_torques(
-                model, nullspace_matrix, self.initial_joint, q, dq,
+                mass_matrix, nullspace_matrix, self.initial_joint, q, dq,
                 joint_kp=self.nullspace_kp,
             )
             if use_nullspace and self.initial_joint is not None
             else self._no_nullspace
         )
 
-        if not emulate:
-            # +coriolis, not +qfrc_bias: libfranka already compensates gravity.
-            # Published, not just summed: the friction assist must be able to
-            # subtract it again (pylibfranka_control._compute_tau).
-            self.nullspace_torque = null_torque
-            return task_torque + coriolis + null_torque
-
-        # robosuite clips at the ACTUATOR, i.e. after run_controller has already
-        # added torque_compensation. Outside saturation the bias cancels exactly, so
-        # this only bites on sim's +/-12 Nm wrist limit -- which is exactly where the
-        # large-rotation reference trajectories live.
-        b = np.zeros(self.num_joints) if bias_sim is None else np.asarray(bias_sim)
-        tau_sim = np.clip(task_torque + null_torque + b, -SIM_TORQUE_LIMITS, SIM_TORQUE_LIMITS)
-        # Read the clip off its OUTPUT rather than naming its input: |tau_sim| lands
-        # exactly on the limit iff the clip bound. Keeping the line above byte-identical
-        # matters -- test_torque_limits_are_the_only_thing_that_rescales_tau whitelists
-        # it by exact text, and that exactness is the point of the test.
-        if np.any(np.abs(tau_sim) >= SIM_TORQUE_LIMITS):
-            self.sim_clip_ticks += 1
-
-        # mujoco's dof_damping is PASSIVE -- it acts on the plant, not through ctrl,
-        # so it sits outside the clip. Small (0.1 N m s/rad against tens of Nm) but
-        # exact and free. Sim's dof_frictionloss is deliberately NOT modelled here:
-        # it is a constraint, not a sign function, and -0.1*sign(dq) would chatter at
-        # rest. It is accounted for on the other side instead, by aiming the real
-        # friction feedforward at coulomb_nm - frictionloss rather than at zero.
-        qddot = np.linalg.solve(model, tau_sim - b - SIM_JOINT_DAMPING * dq)
-        # The nullspace share is published unclipped: the friction assist consumes it
-        # as an estimate of what is bias rather than command, and splitting a
-        # saturated total is not defined.
-        self.nullspace_torque = mass_matrix @ np.linalg.solve(model, null_torque)
-        return mass_matrix @ qddot + coriolis
+        # +coriolis, not +qfrc_bias: libfranka already compensates gravity.
+        # Published, not just summed: the friction assist must be able to
+        # subtract it again (pylibfranka_control._compute_tau).
+        self.nullspace_torque = null_torque
+        return task_torque + coriolis + null_torque
 
 
 class JointImpedanceController:

@@ -95,13 +95,7 @@ S_STATE_SEQ = 53     # bumped per published state; 0 = nothing published yet
 # same as one that never broke away -- and the difference decides whether a row is a
 # measurement.
 S_TORQUE_TRIP = 54
-# Law ticks on which SIM's +/-12 Nm wrist ctrlrange clip engaged (emulate_sim_plant
-# only). NOT limits.joint_torque_nm, which is the real hardware clamp and a different
-# question entirely: sim's rotation authority saturates where the FR3's does not, and
-# whether we reproduce that is what decides the rotation overshoot. Counted here
-# because it is invisible anywhere else -- the clip is inside run_controller, upstream
-# of _enforce_limits, and the torque that leaves is post-transform.
-S_SIM_CLIP = 55
+# 55 is free -- it held S_SIM_CLIP, removed with the sim-plant emulation.
 # Law ticks on which lambda_full's conditioning dropped a direction (osc.lambda_rcond).
 # Nonzero means the arm is working near a singularity, where the 6x6 operational-space
 # inertia is the term that blows up. Fits inside the existing block, so unlike the

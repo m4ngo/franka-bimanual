@@ -201,19 +201,12 @@ class RealBackend:
         invisible in the endpoint displacement.
 
         `saturated` is the REAL hardware clamp (limits.joint_torque_nm). It is NOT the
-        sim ctrlrange clip, and reading it as such is what made this instrument lie:
-        sat_frac read 0.000 across every axis and amplitude, which is true of the
-        hardware clamp and says nothing about sim's +/-12 Nm wrist limit -- the clip
-        whose engagement decides the rotation roll-off. That one is counted inside
-        run_controller and comes back through sim_clip_ticks().
+        hardware clamp only.
         """
         tau = np.asarray(self.robot.robot_manager.torque_snapshot(self.key)[0],
                          dtype=np.float64)
         lim = np.asarray(fc.control("torque.limits.joint_torque_nm"), dtype=np.float64)
         return tau, bool(np.any(np.abs(tau) >= 0.99 * lim))
-
-    def sim_clip_ticks(self) -> int:
-        return self.robot.robot_manager.sim_clip_ticks(self.key)
 
     def faults(self):
         return int(self.robot.robot_manager.recovery_counts().get(self.key, 0))
@@ -240,10 +233,6 @@ def sweep(backend, q0, cfg, out=None) -> dict:
             time.sleep(cfg.settle_s) if backend.name == "real" else None
             p0, R0 = backend.pose()
             path, sat, taumax, taken = [], 0, 0.0, 0
-            # Monotonic counter on the NUC, so take a difference over the trial rather
-            # than a rate per step -- the clip is evaluated at 500 Hz and the sweep
-            # steps at 20 Hz, so per-step polling would miss most of it.
-            clip0 = backend.sim_clip_ticks() if hasattr(backend, "sim_clip_ticks") else 0
             for _ in range(cfg.steps):
                 t0 = time.perf_counter()
                 # Cap the excursion. A tracking arm covers 240 mm in 20 full-amplitude
@@ -297,11 +286,6 @@ def sweep(backend, q0, cfg, out=None) -> dict:
                              # short by the travel cap otherwise under-reports how
                              # much of it ran against the clamp.
                              sat_frac=sat / taken, tau_max=taumax,
-                             # SIM's ctrlrange clip, which is a different question from
-                             # sat_frac: whether the reference's own saturation is being
-                             # reproduced. Law ticks, so ~25 per sweep step at 500 Hz.
-                             sim_clip_ticks=(backend.sim_clip_ticks() - clip0)
-                             if hasattr(backend, "sim_clip_ticks") else None,
                              path=path))
             unit = "mm" if axis < 3 else "mrad"
             k = 1e3
@@ -465,24 +449,6 @@ def compare(sim_dir, real_dir):
     print("\nd is what a fudge cannot represent: it is an offset, not a gain.")
     print("k is the gain, and k_real/k_sim is the only part a scalar can fix.")
 
-    # Sim's rotation authority rolls off because its +/-12 Nm wrist ctrlrange
-    # saturates; the FR3's does not. We apply that same clip inside run_controller, so
-    # if these are zero where sim's travel is falling, the roll-off is NOT being
-    # reproduced and no gain will fix the shape. Distinct from sat_frac above, which
-    # watches the real hardware clamp and reads 0.000 whatever happens.
-    any_clip = any(row.get("sim_clip_ticks") is not None
-                   for ax in r["sweep"] for row in r["sweep"][ax])
-    if any_clip:
-        print("\nsim ctrlrange clip engagement (law ticks per trial, real backend):\n")
-        print(f"{'axis':<6}" + "".join(f"{a:>8.2f}" for a in amps))
-        print("-" * (6 + 8 * len(amps)))
-        for ax in r["sweep"]:
-            m = {row["amp"]: row.get("sim_clip_ticks") for row in r["sweep"][ax]}
-            print(f"{ax:<6}" + "".join(
-                f"{m[a]:>8d}" if m.get(a) is not None else f"{'-':>8}" for a in amps))
-        print("\n0 at the top amplitudes = sim saturates there and we do not.")
-    else:
-        print("\nsim_clip_ticks not recorded in this run (pre-dates the counter).")
 
 
 def main():

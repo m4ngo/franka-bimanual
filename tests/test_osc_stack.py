@@ -103,10 +103,11 @@ from lerobot_robot_bimanual_franka import pylibfranka_control as srv  # noqa: E4
 from lerobot_robot_bimanual_franka import pylibfranka_shm as _shm  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_jacobian import fk_chain, zero_jacobian  # noqa: E402
 from lerobot_robot_bimanual_franka.osc_torque_controller import (  # noqa: E402
-    DAMPING_RATIO_LIMITS, DELTA_POS_MAX, DELTA_ROT_MAX, KP_LIMITS, SIM_TORQUE_LIMITS,
+    DAMPING_EXP_SCALE, DAMPING_RATIO_LIMITS, DEFAULT_DAMPING_RATIO, DEFAULT_KP,
+    DELTA_POS_MAX, DELTA_ROT_MAX, KP_EXP_SCALE, KP_LIMITS,
     OSCTorqueController, resolve_gains,
 )
-from lerobot_robot_bimanual_franka import sim_dynamics  # noqa: E402
+import _panda_plant as sim_dynamics  # noqa: E402  test fixture, see tests/_panda_plant.py
 from lerobot_robot_bimanual_franka import franka_process as _fp  # noqa: E402
 from lerobot_robot_bimanual_franka import osc_torque_controller as _osc_ctrl_mod  # noqa: E402
 
@@ -293,7 +294,7 @@ def make_robot(case, mode=ControlMode.EE_DELTA, safety=False, **cfg_kw):
     return robot
 
 
-def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False,
+def make_session(case, uncouple=True, friction_kc=0.0,
                  lambda_rcond=0.0, cross_coupling=False):
     """A real ControlLoop with only the fields the compute path touches.
 
@@ -330,11 +331,6 @@ def make_session(case, uncouple=True, friction_kc=0.0, emulate_sim=False,
     # the compute path, so object.__new__ must seed them or every OSC test errors.
     s._reanchor = False
     s._last_goal = None
-    # Default off: every test below this line compares tau against robosuite fed the
-    # SAME mass matrix, which is the right assertion for the ported law and the wrong
-    # one for the emulation (there the two plants differ on purpose, and what must
-    # match is the joint ACCELERATION). test_sim_emulation_* cover that path.
-    s._emulate_sim = emulate_sim
     s._last_tau = np.zeros(7)
     s.clamp_trips = 0
     s.recovery_count = 0
@@ -411,14 +407,14 @@ def ref_torque(case, dpos_norm, drot_norm, a_kp, a_kd, uncouple=True, absolute=N
         case, input_max=1, input_min=-1,
         output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
         output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-        kp=150, damping_ratio=1, impedance_mode="variable",
-        kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
+        kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+        kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS,
         control_ori=True, control_delta=absolute is None, uncouple_pos_ori=uncouple,
     )
     ctrl.initial_joint = np.array(case["q"])
     # The libero wrapper's exponential remap is what produces robosuite's raw gains.
-    kp_raw = np.full(6, 150.0 * 10.0 ** a_kp)
-    damp_raw = np.full(6, 1.0 * 10.0 ** a_kd)
+    kp_raw = np.full(6, DEFAULT_KP * KP_EXP_SCALE ** a_kp)
+    damp_raw = np.full(6, DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** a_kd)
     if absolute is None:
         ctrl.set_goal(np.concatenate([damp_raw, kp_raw, dpos_norm, drot_norm]))
     else:
@@ -447,48 +443,98 @@ def test_gains_match_the_sim_wrapper():
     """resolve_gains == libero.py exponential remap + osc.py's clip."""
     for a_kp, a_kd in [(-1, -1), (-0.5, 0.3), (0, 0), (0.5, -0.5), (1, 1), (0.2, 0.9)]:
         kp, kd = resolve_gains(a_kp, a_kd)
-        ref_kp = np.clip(150.0 * 10.0 ** a_kp, 0, 1500)
-        ref_ratio = np.clip(1.0 * 10.0 ** a_kd, 0, 10)
+        ref_kp = np.clip(DEFAULT_KP * KP_EXP_SCALE ** a_kp, 0, 1500)
+        ref_ratio = np.clip(DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** a_kd, 0, 10)
         assert np.allclose(kp, ref_kp), (a_kp, kp, ref_kp)
         assert np.allclose(kd, 2 * np.sqrt(ref_kp) * ref_ratio), (a_kd, kd)
 
 
-def test_gain_constants_match_the_sim_controller_config():
-    """The remap's constants come from the sim's own controller block.
+def _sim_controller_block():
+    """The sim's resolved controller gains, or None if multi-fast is absent.
 
-    resolve_gains hardcodes kp=150, kp_limits=[0,1500], damping=1,
-    damping_limits=[0,10] and derives exp_scale = limit_max / default the way
-    libero.py's wrapper does. Those numbers live in cfg/fast_default.yaml, not
-    osc_pose.json (whose "fixed" / kp_limits [0,300] are overridden), so read
-    them back rather than trusting the comment.
+    cfg/fast_default.yaml's controller block interpolates its gains out of the
+    selected plant preset (`kp: ${plant.kp}`), so the values have to be followed
+    into cfg/plant/<default>.yaml. The limits and the gain-map base stay literal
+    in the controller block itself.
     """
     import re
-    cfg = _REPO / "multi-fast" / "cfg" / "fast_default.yaml"
-    if not cfg.exists():
-        return "skipped: multi-fast not checked out"
+    root = _REPO / "multi-fast" / "cfg"
+    cfg, plant = root / "fast_default.yaml", root / "plant" / "default.yaml"
+    if not (cfg.exists() and plant.exists()):
+        return None
     block = re.search(r"^controller:\n((?:[ \t]+.*\n|\n)+)", cfg.read_text(), re.M)
     assert block, "no controller: block in fast_default.yaml"
-    text = block.group(1)
 
-    def num(key):
-        m = re.search(rf"^\s+{key}:\s*(\[.*?\]|[-\d.eE+]+)", text, re.M)
-        assert m, f"{key} missing from the controller block"
-        return eval(m.group(1))  # noqa: S307 -- a float or a 2-list of floats
+    def num(text, key, required=True):
+        m = re.search(rf"^\s*{key}:\s*(\[.*?\]|[-\d.eE+]+)", text, re.M)
+        assert m or not required, f"{key} missing from the sim controller/plant config"
+        return eval(m.group(1)) if m else None  # noqa: S307 -- a float or list of floats
 
-    kp, kp_lim = num("kp"), num("kp_limits")
-    damping, damping_lim = num("damping"), num("damping_limits")
+    text, plant_text = block.group(1), plant.read_text()
+    return dict(
+        kp=num(plant_text, "kp"),
+        damping=num(plant_text, "damping"),
+        kp_limits=num(text, "kp_limits"),
+        damping_limits=num(text, "damping_limits"),
+        gain_exp_base=num(text, "gain_exp_base"),
+    )
+
+
+def test_gain_constants_match_the_sim_controller_config():
+    """The remap's SHAPE comes from the sim's own controller block.
+
+    The limits and the exponential base define what a gain action means, so they
+    must match the sim exactly. The base is the one that bit: libero.py pins it
+    (`gain_exp_base`, default 10.0) and explicitly does NOT derive it from
+    kp_limits[1]/kp, because a plant fit is allowed to move the default kp off 150
+    and a gain action must keep meaning "log10 multiplier on the default". Deriving
+    it here re-coupled the two, so default_kp 150 -> 125 silently took the base
+    10 -> 12.
+
+    default_kp itself is deliberately allowed to differ; see
+    test_default_kp_matches_the_sim_plant.
+    """
+    sim = _sim_controller_block()
+    if sim is None:
+        return "skipped: multi-fast not checked out"
 
     from lerobot_robot_bimanual_franka.osc_torque_controller import (
-        DAMPING_EXP_SCALE, DAMPING_RATIO_LIMITS, DEFAULT_DAMPING_RATIO, DEFAULT_KP, KP_EXP_SCALE,
+        DAMPING_EXP_SCALE, DAMPING_RATIO_LIMITS, DEFAULT_DAMPING_RATIO, KP_EXP_SCALE,
     )
-    assert DEFAULT_KP == kp, f"kp {DEFAULT_KP} vs sim {kp}"
-    assert tuple(KP_LIMITS) == tuple(kp_lim), f"kp_limits {KP_LIMITS} vs sim {kp_lim}"
-    assert DEFAULT_DAMPING_RATIO == damping, f"damping {DEFAULT_DAMPING_RATIO} vs sim {damping}"
-    assert tuple(DAMPING_RATIO_LIMITS) == tuple(damping_lim)
-    # libero.py: exp_scale = limits[1] / default, applied as scale ** action.
-    assert np.isclose(KP_EXP_SCALE, kp_lim[1] / kp)
-    assert np.isclose(DAMPING_EXP_SCALE, damping_lim[1] / damping)
-    return f"kp={kp} {kp_lim}, damping={damping} {damping_lim}, exp_scale={KP_EXP_SCALE:g}"
+    assert tuple(KP_LIMITS) == tuple(sim["kp_limits"]), f"kp_limits {KP_LIMITS} vs sim {sim['kp_limits']}"
+    assert tuple(DAMPING_RATIO_LIMITS) == tuple(sim["damping_limits"])
+    assert DEFAULT_DAMPING_RATIO == sim["damping"], (
+        f"damping ratio {DEFAULT_DAMPING_RATIO} vs sim {sim['damping']}")
+    base = sim["gain_exp_base"]
+    assert np.isclose(KP_EXP_SCALE, base), f"kp exp base {KP_EXP_SCALE} vs sim {base}"
+    assert np.isclose(DAMPING_EXP_SCALE, base), f"kd exp base {DAMPING_EXP_SCALE} vs sim {base}"
+    return (f"limits {sim['kp_limits']}/{sim['damping_limits']}, "
+            f"gain_exp_base={base:g} (pinned, not derived)")
+
+
+def test_default_kp_matches_the_sim_plant():
+    """The ONE place the real arm's default stiffness is compared to the sim's.
+
+    Deliberately its own test. default_kp is the only value under `torque:` that
+    is a property of this arm rather than a copy of the sim's, so a deviation has
+    to be visible -- but it must not surface as thirteen controller regressions,
+    because the controller is not what deviated. Everything else in the gain path
+    is pinned by test_gain_constants_match_the_sim_controller_config.
+    """
+    sim = _sim_controller_block()
+    if sim is None:
+        return "skipped: multi-fast not checked out"
+    from lerobot_robot_bimanual_franka.osc_torque_controller import DEFAULT_KP
+
+    sim_kp = sim["kp"]
+    assert np.isscalar(sim_kp), (
+        f"the sim plant's kp is a {type(sim_kp).__name__} ({sim_kp}); this stack's "
+        "default_kp is a scalar, so a per-axis plant fit cannot be represented -- "
+        "carry the split in tuning.kp_pos_scale / kp_ori_scale instead")
+    if np.isclose(DEFAULT_KP, sim_kp):
+        return f"kp={DEFAULT_KP:g}, matches the sim plant"
+    return (f"DEVIATION (declared): default_kp={DEFAULT_KP:g} vs sim plant {sim_kp:g}. "
+            f"A policy trained at {sim_kp:g} is driven at {DEFAULT_KP / sim_kp:.2f}x here.")
 
 
 def test_gain_channels_sweep_against_robosuite():
@@ -511,14 +557,19 @@ def test_gain_channels_sweep_against_robosuite():
             assert err < 1e-5, f"a_kp={a_kp} a_kd={a_kd}: rel err {err:.2e}"
             worst = max(worst, err)
 
-    # The endpoints land exactly on the sim's clip limits, so a policy that
-    # saturates its gain channel gets the same stiffness the sim would give.
+    # The endpoints are the pinned exponential map, then the sim's clip -- in that
+    # order. They coincide with the clip limit only when default_kp * base happens
+    # to equal it, which is NOT an invariant: the base is pinned at 10 and a plant
+    # fit is free to move the default, so asserting saturation here was asserting
+    # that the base is kp_limits[1]/default_kp -- the very coupling that drifted.
     kp_hi, kd_hi = resolve_gains(1.0, 1.0)
     kp_lo, _ = resolve_gains(-1.0, 0.0)
-    assert np.allclose(kp_hi, KP_LIMITS[1]), f"a_kp=+1 gave {kp_hi[0]}, not {KP_LIMITS[1]}"
-    assert np.allclose(kp_lo, 150.0 / 10.0)
-    assert np.allclose(kd_hi, 2 * np.sqrt(KP_LIMITS[1]) * 10.0)
-    return f"35 (a_kp, a_kd) pairs, worst rel err {worst:.2e}"
+    kp_hi_want = min(DEFAULT_KP * KP_EXP_SCALE, KP_LIMITS[1])
+    assert np.allclose(kp_hi, kp_hi_want), f"a_kp=+1 gave {kp_hi[0]}, not {kp_hi_want}"
+    assert np.allclose(kp_lo, DEFAULT_KP / KP_EXP_SCALE)
+    assert np.allclose(kd_hi, 2 * np.sqrt(kp_hi_want) * DAMPING_RATIO_LIMITS[1])
+    return (f"35 (a_kp, a_kd) pairs, worst rel err {worst:.2e}; "
+            f"a_kp=+1 -> kp {kp_hi_want:g} (limit {KP_LIMITS[1]:g})")
 
 
 def test_kd_scales_damp_without_stiffening():
@@ -553,7 +604,7 @@ def test_kd_scales_damp_without_stiffening():
     kp, kd = resolve_gains(0.0, 0.0, kd_pos_scale=(1.0, 2.0, 3.0))
     assert np.allclose(kd[:3] / kd0[:3], [1.0, 2.0, 3.0])
     _, kd_max = resolve_gains(0.0, 1.0, kd_pos_scale=100.0)   # ratio already at the cap
-    assert np.allclose(kd_max[:3], 2 * np.sqrt(150.0) * DAMPING_RATIO_LIMITS[1]), (
+    assert np.allclose(kd_max[:3], 2 * np.sqrt(DEFAULT_KP) * DAMPING_RATIO_LIMITS[1]), (
         "a kd scale escaped the sim's damping_ratio_limits")
     return "damping-only, per axis, clipped at the sim's damping_ratio_limits"
 
@@ -563,8 +614,8 @@ def test_delta_scaling_matches_scale_action():
     ref = RefOSC(make_case(np.random.default_rng(0)), input_max=1, input_min=-1,
                  output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                  output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                 kp=150, damping_ratio=1, impedance_mode="variable",
-                 kp_limits=(0, 1500), damping_ratio_limits=(0, 10))
+                 kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                 kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS)
     from lerobot_robot_bimanual_franka.osc_torque_controller import clip_delta
     rng = np.random.default_rng(5)
     for _ in range(50):
@@ -695,9 +746,9 @@ def test_each_axis_goal_pose_matches_robosuite():
             ref = RefOSC(case, input_max=1, input_min=-1,
                          output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                          output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                         kp=150, damping_ratio=1, impedance_mode="variable",
-                         kp_limits=(0, 1500), damping_ratio_limits=(0, 10))
-            ref.set_goal(np.concatenate([np.full(6, 1.0), np.full(6, 150.0), dpos, drot]))
+                         kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                         kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS)
+            ref.set_goal(np.concatenate([np.full(6, DEFAULT_DAMPING_RATIO), np.full(6, DEFAULT_KP), dpos, drot]))
 
             assert np.allclose(goal_p, ref.goal_pos, atol=1e-12), (
                 f"{AXIS_LABELS[axis]} sign={sign:+.0f}: goal_pos {goal_p} vs {ref.goal_pos}")
@@ -733,10 +784,10 @@ def test_each_axis_moves_the_commanded_direction():
         accel = case["J"] @ np.linalg.inv(case["M"]) @ (tau - case["C"])
 
         if axis < 3:
-            want = np.concatenate([dpos * DELTA_POS_MAX * 150.0, np.zeros(3)])
+            want = np.concatenate([dpos * DELTA_POS_MAX * DEFAULT_KP, np.zeros(3)])
         else:
             goal_R = Rotation.from_rotvec(drot * DELTA_ROT_MAX).as_matrix() @ case["R"]
-            want = np.concatenate([np.zeros(3), 150.0 * rs_orientation_error(goal_R, case["R"])])
+            want = np.concatenate([np.zeros(3), DEFAULT_KP * rs_orientation_error(goal_R, case["R"])])
         assert np.allclose(accel, want, rtol=1e-6, atol=1e-6), (
             f"{AXIS_LABELS[axis]}: accel {np.round(accel, 3)} vs expected {np.round(want, 3)}")
 
@@ -796,8 +847,8 @@ def test_ee_delta_trajectory_over_all_axis_combinations():
     ref = RefOSC(case, input_max=1, input_min=-1,
                  output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                  output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                 kp=150, damping_ratio=1, impedance_mode="variable",
-                 kp_limits=(0, 1500), damping_ratio_limits=(0, 10))
+                 kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                 kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS)
     ref.initial_joint = case["q"].copy()
 
     levels = (-1.0, 0.0, 1.0)
@@ -810,7 +861,7 @@ def test_ee_delta_trajectory_over_all_axis_combinations():
     worst_goal_ori = 0.0
     for step, (dpos, drot) in enumerate(combos):
         a_kp, a_kd = float(rng.uniform(-0.3, 0.3)), float(rng.uniform(-0.3, 0.3))
-        kp_raw, damp_raw = np.full(6, 150.0 * 10.0 ** a_kp), np.full(6, 1.0 * 10.0 ** a_kd)
+        kp_raw, damp_raw = np.full(6, DEFAULT_KP * KP_EXP_SCALE ** a_kp), np.full(6, DEFAULT_DAMPING_RATIO * DAMPING_EXP_SCALE ** a_kd)
 
         ours = our_torque(robot, session, ee_delta_action(dpos, drot, a_kp, a_kd), case)
         ref.set_goal(np.concatenate([damp_raw, kp_raw, dpos, drot]))
@@ -844,8 +895,8 @@ def test_ee_delta_trajectory_uncoupled_variant():
     ref = RefOSC(case, input_max=1, input_min=-1,
                  output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                  output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                 kp=150, damping_ratio=1, impedance_mode="variable",
-                 kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
+                 kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                 kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS,
                  uncouple_pos_ori=False)
     ref.initial_joint = case["q"].copy()
 
@@ -858,7 +909,7 @@ def test_ee_delta_trajectory_uncoupled_variant():
     worst = 0.0
     for step, (dpos, drot) in enumerate(combos):
         ours = our_torque(robot, session, ee_delta_action(dpos, drot), case)
-        ref.set_goal(np.concatenate([np.full(6, 1.0), np.full(6, 150.0), dpos, drot]))
+        ref.set_goal(np.concatenate([np.full(6, DEFAULT_DAMPING_RATIO), np.full(6, DEFAULT_KP), dpos, drot]))
         theirs = ref.run_controller()
         err = _rel(ours, theirs)
         worst = max(worst, err)
@@ -888,9 +939,9 @@ def test_goal_orientation_held_across_zero_rotation_steps():
     ref = RefOSC(case, input_max=1, input_min=-1,
                  output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
                  output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-                 kp=150, damping_ratio=1, impedance_mode="variable",
-                 kp_limits=(0, 1500), damping_ratio_limits=(0, 10))
-    kp_raw, damp_raw = np.full(6, 150.0), np.full(6, 1.0)
+                 kp=DEFAULT_KP, damping_ratio=DEFAULT_DAMPING_RATIO, impedance_mode="variable",
+                 kp_limits=KP_LIMITS, damping_ratio_limits=DAMPING_RATIO_LIMITS)
+    kp_raw, damp_raw = np.full(6, DEFAULT_KP), np.full(6, DEFAULT_DAMPING_RATIO)
 
     seq = [([0.3, 0, 0], [0, 0, 0.4]), ([0.3, 0, 0], [0, 0, 0]),
            ([0, 0.2, 0], [0, 0, 0]), ([0, 0, 0.1], [0.2, 0, 0]), ([0, 0, 0], [0, 0, 0])]
@@ -971,6 +1022,54 @@ def test_every_hardware_knob_is_pinned():
     assert robot.config.use_noise is False
 
 
+def test_ee_delta_goal_survives_a_round_trip_through_an_ee_pos_action():
+    """An EE_DELTA goal, written as an EE_POS action, must command that same goal.
+
+    This is what scripts/replay_dataset.py --mode ee_pose relies on to relabel a
+    delta dataset without changing what reaches the NUC. Two links have to hold:
+    the EE_POS path must pass an absolute pose through untouched (it normalises
+    the quaternion and adds a zero residual, both no-ops), and the FK the relabel
+    uses to recover the anchor from recorded joint angles must be the same FK the
+    control loop anchors on -- the repo carries two implementations.
+    """
+    from lerobot_robot_bimanual_franka.ee_goals import OSCGoalBuilder, delta_rotvec
+    from lerobot_robot_bimanual_franka.franka_fk import franka_fk
+
+    rng = np.random.default_rng(4)
+    worst_fk_p = worst_fk_o = 0.0
+    for _ in range(200):
+        q = rng.uniform(-2.5, 2.5, 7)
+        p_fk, quat_fk = franka_fk(q)
+        T = fk_chain(q)[7]
+        worst_fk_p = max(worst_fk_p, float(np.max(np.abs(p_fk - T[:3, 3]))))
+        worst_fk_o = max(worst_fk_o, 1.0 - abs(float(np.dot(
+            quat_fk, Rotation.from_matrix(T[:3, :3]).as_quat()))))
+    assert worst_fk_p < 1e-12 and worst_fk_o < 1e-12, (
+        f"franka_fk and fk_chain disagree ({worst_fk_p:.1e} m, {worst_fk_o:.1e}); the "
+        "relabel would anchor on a different pose than the control loop")
+
+    builder = OSCGoalBuilder(1.0, 1.0, False, 0.0, 0.0)
+    worst = 0.0
+    for step in range(300):
+        q = rng.uniform(-2.0, 2.0, 7)
+        ee_pos, ee_quat = franka_fk(q)
+        if step == 0:
+            builder.reset("r", ee_quat)
+        dpos = rng.uniform(-DELTA_POS_MAX, DELTA_POS_MAX, 3)
+        drot = rng.uniform(-DELTA_ROT_MAX, DELTA_ROT_MAX, 3)
+        if step % 4 == 0:
+            drot = np.zeros(3)          # exercise the latched-orientation branch too
+        dquat = Rotation.from_rotvec(drot).as_quat()
+        gp, gq = builder.from_delta("r", dpos, delta_rotvec(dquat), ee_pos, ee_quat)
+
+        # The EE_POS path, as _osc_goal runs it with no cache_delta residual.
+        rp, rq = OSCGoalBuilder.absolute(gp, gq)
+        rp, rq = OSCGoalBuilder.offset((rp, rq), np.zeros(3), np.zeros(3))
+        worst = max(worst, float(np.max(np.abs(rp - gp))), 1.0 - abs(float(np.dot(rq, gq))))
+    assert worst < 1e-12, f"round trip lost {worst:.2e}"
+    return f"FK {worst_fk_p:.1e} m, round trip {worst:.1e} over 300 steps"
+
+
 def test_defaults_are_exact_parity():
     """Pin the deliberate deviations from osc.py.
 
@@ -1008,7 +1107,7 @@ def test_defaults_are_exact_parity():
     assert np.allclose((kp_tuned / kd_tuned) * kd_scale6, kp_sim / kd_sim), (
         "a gain scale changed the slew rate by something other than kd_*_scale")
     kp, kd = resolve_gains(0.0, 0.0)
-    assert np.allclose(kp, 150.0) and np.allclose(kd, 2 * np.sqrt(150.0))
+    assert np.allclose(kp, DEFAULT_KP) and np.allclose(kd, 2 * np.sqrt(DEFAULT_KP))
 
 
 def test_hardware_knobs_only_perturb_when_enabled():
@@ -1057,18 +1156,11 @@ def test_torque_limits_are_the_only_thing_that_rescales_tau():
     assert set(inspect.signature(_srv._ArmSession.set_tuning).parameters) == {
         "self", "friction_kc"}
 
-    # There is now exactly ONE np.clip on a torque inside the law, and it is the
-    # sim ctrlrange -- part of the reference dynamics, not a bound on the hardware.
-    # It is listed here rather than exempted silently: a second one appearing in
-    # run_controller is the same regression this test exists to catch.
+    # No torque may be rescaled inside the law at all: _enforce_limits is the only
+    # place that is allowed to, and it runs in the response path.
     law = inspect.getsource(_osc_ctrl_mod.OSCTorqueController.run_controller)
     clips = [ln.strip() for ln in law.splitlines() if "np.clip" in ln]
-    assert clips == ["tau_sim = np.clip(task_torque + null_torque + b, "
-                     "-SIM_TORQUE_LIMITS, SIM_TORQUE_LIMITS)"], (
-        f"unexpected torque rescale inside the law: {clips}")
-    # ...and it must be the sim's range, not the arm's, or it has become a
-    # hardware limit wearing a parity label.
-    assert not np.array_equal(SIM_TORQUE_LIMITS, np.asarray(srv.JOINT_TORQUE_LIMITS))
+    assert clips == [], f"unexpected torque rescale inside the law: {clips}"
 
 
 def test_bias_feedforward_is_a_plant_correction_not_a_command():
@@ -1193,12 +1285,11 @@ def test_friction_feedforward_cannot_drive_an_idle_arm():
         assert np.all(sign * ff > 0.0), "assist did not follow the commanded torque"
         assert np.all(np.abs(ff) <= kc * srv._FRICTION_ASSIST_NM + 1e-12)
 
-    # The target is SIM's plant, not a frictionless one: at full assist the residual
-    # friction must land on mujoco's dof_frictionloss. Driving it to zero would
-    # overshoot the reference rather than match it.
+    # The target is the measured breakaway itself: at full assist the residual
+    # friction is zero. friction_kc is the ceiling that keeps it below that.
     deep = srv._friction_feedforward(1.0, 1.0, coriolis + 50.0, coriolis)
-    assert np.allclose(srv._FRICTION_COULOMB - deep, srv._SIM_FRICTIONLOSS, atol=1e-3), (
-        "full assist does not leave sim's own friction behind")
+    assert np.allclose(deep, srv._FRICTION_COULOMB, atol=1e-3), (
+        "full assist does not cancel the measured breakaway")
 
     # Enough authority to matter: a command at the friction floor must clear what
     # is left of breakaway once the assist has done its part.
@@ -1308,32 +1399,37 @@ def test_homing_speed_budget_reaches_every_joint():
     5 s default max_time_s: homing reported 'failed to converge' while looking
     converged, because it genuinely had not arrived.
     """
+    from lerobot_robot_bimanual_franka import homing
     from lerobot_robot_bimanual_franka.osc_torque_controller import (
-        DEFAULT_JOINT_KD, DEFAULT_JOINT_KP, JOINT_TORQUE_LIMITS,
+        DEFAULT_JOINT_KP, JOINT_TORQUE_LIMITS,
     )
-    qdot_max = np.minimum(
-        bfmod.HOME_MAX_QDOT,
-        bfmod.HOME_TAU_FRACTION * np.asarray(JOINT_TORQUE_LIMITS)
-        / (bfmod.HOME_IMPEDANCE_KD * (1.0 + bfmod.HOME_LEAD_MARGIN)))
+    # Read the SHIPPED budget rather than re-deriving the formula: a second copy of
+    # it here is what let the two drift while both looked right.
+    qdot_max = homing.speed_budget()
 
-    assert np.all(qdot_max >= 0.4 * bfmod.HOME_MAX_QDOT), (
+    assert np.all(qdot_max >= 0.4 * homing.MAX_QDOT), (
         f"a joint is throttled to {np.round(qdot_max, 3)} rad/s; the wrist cannot home")
 
     # The ramp's lead has to clear breakaway friction, or the joint never starts.
-    max_lead = bfmod.HOME_LEAD_MARGIN * qdot_max * DEFAULT_JOINT_KD / DEFAULT_JOINT_KP
-    tau_at_lead = DEFAULT_JOINT_KP * max_lead
+    tau_at_lead = DEFAULT_JOINT_KP * homing.max_lead()
     assert np.all(tau_at_lead > srv._FRICTION_COULOMB), (
         f"stall lead is under breakaway: {np.round(tau_at_lead, 2)} Nm "
         f"vs {srv._FRICTION_COULOMB} Nm")
     # ...without asking for more torque than the joint has.
-    assert np.all(tau_at_lead <= np.asarray(JOINT_TORQUE_LIMITS) * bfmod.HOME_TAU_FRACTION + 1e-9)
+    assert np.all(tau_at_lead <= np.asarray(JOINT_TORQUE_LIMITS) * homing.TAU_FRACTION + 1e-9)
 
-    # And a full-scale move fits inside the default timeout with margin.
+    # And a full-scale move fits inside the default timeout with margin. Joint 5 is
+    # the binding one at 0.30 rad/s -- its 30 Nm clamp against kd 20 -- so 1 rad
+    # genuinely needs 3.3 s and homing.max_time_s has to leave room for it.
+    import franka_config as fc_
+
+    max_time_s = fc_.control("homing.max_time_s")
     slowest = float(np.min(qdot_max))
-    assert 1.0 / slowest < 0.6 * 5.0, (
-        f"a 1 rad move takes {1.0 / slowest:.1f}s against the 5 s default max_time_s")
+    assert 1.0 / slowest < 0.6 * max_time_s, (
+        f"a 1 rad move takes {1.0 / slowest:.1f}s against the "
+        f"{max_time_s:g} s default max_time_s")
     return (f"qdot_max {np.round(qdot_max, 3)} rad/s, "
-            f"1 rad worst case {1.0 / slowest:.1f}s")
+            f"1 rad worst case {1.0 / slowest:.1f}s of {max_time_s:g}s")
 
 
 def test_friction_assist_is_memoryless():
@@ -1667,165 +1763,6 @@ class RefOSCSim(RefOSC):
         return np.array(self._bias)
 
 
-def ref_sim_torque(case, M_sim, bias, dpos, drot, a_kp, a_kd, uncouple=True):
-    """robosuite's actuator command: run_controller, then SingleArm.control's clip."""
-    ctrl = RefOSCSim(
-        case, M_sim, bias, input_max=1, input_min=-1,
-        output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
-        output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-        kp=150, damping_ratio=1, impedance_mode="variable",
-        kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
-        control_ori=True, control_delta=True, uncouple_pos_ori=uncouple,
-    )
-    ctrl.initial_joint = np.array(case["q"])
-    kp_raw = np.full(6, 150.0 * 10.0 ** a_kp)
-    damp_raw = np.full(6, 1.0 * 10.0 ** a_kd)
-    ctrl.set_goal(np.concatenate([damp_raw, kp_raw, dpos, drot]))
-    return np.clip(ctrl.run_controller(), -SIM_TORQUE_LIMITS, SIM_TORQUE_LIMITS)
-
-
-def test_sim_emulation_degenerates_to_the_ported_law():
-    """M_sim == M_real and no saturation -> bit-for-bit the law tested above.
-
-    This is what makes the emulation a generalisation rather than a replacement:
-    the 729-combination trajectory tests remain valid statements about it.
-    """
-    rng = np.random.default_rng(31)
-    worst = 0.0
-    for i in range(20):
-        case = make_case(rng)
-        osc = OSCTorqueController(num_joints=7, uncouple_pos_ori=bool(i % 2))
-        osc.set_goal(case["ee_pos"] + rng.uniform(-0.01, 0.01, 3), case["R"],
-                     np.full(6, 150.0), np.full(6, 2.0 * np.sqrt(150.0)),
-                     initial_joint=case["q"])
-        kw = dict(ee_pos=case["ee_pos"], ee_ori_mat=case["R"],
-                  ee_pos_vel=(case["J"] @ case["dq"])[:3],
-                  ee_ori_vel=(case["J"] @ case["dq"])[3:],
-                  J_full=case["J"], q=case["q"], dq=case["dq"],
-                  mass_matrix=case["M"], coriolis=case["C"])
-        ported = osc.run_controller(**kw)
-        # Feed the arm's own M as "sim's": the transform collapses to M @ M^-1 and the
-        # bias cancels through clip(x + b) - b -- but only OUTSIDE saturation, so the
-        # claim is only meaningful where the clip is inactive.
-        b = rng.normal(0, 2.0, 7)
-        # Sim's passive joint damping is a PLANT term, not part of osc.py, so it has
-        # no counterpart in the ported law and is zeroed for the comparison. The
-        # claim under test is about the law collapsing, not about the plant model.
-        saved, _osc_ctrl_mod.SIM_JOINT_DAMPING = _osc_ctrl_mod.SIM_JOINT_DAMPING, np.zeros(7)
-        try:
-            emulated = osc.run_controller(**kw, mass_matrix_sim=case["M"], bias_sim=b)
-        finally:
-            _osc_ctrl_mod.SIM_JOINT_DAMPING = saved
-        if np.any(np.abs(ported - case["C"] + b) >= SIM_TORQUE_LIMITS):
-            continue                      # saturated: the two laws SHOULD differ here
-        worst = max(worst, _rel(emulated, ported))
-        assert _rel(emulated, ported) < 1e-9, f"trial {i}: rel err {_rel(emulated, ported):.2e}"
-    assert worst > 0.0, "every trial saturated; the degeneracy claim went untested"
-    return f"worst relative error {worst:.2e}, both uncouple settings"
-
-
-def test_sim_emulation_reproduces_robosuite_joint_acceleration():
-    """The headline assertion: same qddot as robosuite, on a DIFFERENT plant.
-
-    tau deliberately does not match -- the FR3 is 2-10x lighter, so reproducing
-    sim's motion takes proportionally less torque. What must match is what the
-    arm does with it.
-    """
-    rng = np.random.default_rng(32)
-    worst = 0.0
-    for i in range(40):
-        case = make_case(rng)
-        M_sim = sim_dynamics.mass_matrix(case["q"])
-        bias = sim_dynamics.bias(case["q"], case["dq"])
-        dpos = np.zeros(3) if i % 5 == 4 else rng.uniform(-1, 1, 3)
-        drot = np.zeros(3) if i % 3 == 0 else rng.uniform(-1, 1, 3)
-        a_kp, a_kd = rng.uniform(-1, 1), rng.uniform(-1, 1)
-        uncouple = bool(i % 2)
-
-        sess = make_session(case, uncouple=uncouple, emulate_sim=True)
-        ours = our_torque(make_robot(case), sess,
-                          ee_delta_action(dpos, drot, a_kp, a_kd), case)
-        ref = ref_sim_torque(case, M_sim, bias, dpos, drot, a_kp, a_kd, uncouple)
-
-        # Our controller adds real Coriolis (libfranka handles gravity); robosuite's
-        # command already contains its own bias, which its plant then subtracts.
-        # mujoco's plant equation, not just the controller output: ctrl minus the
-        # bias it already contains, minus the passive joint damping.
-        qdd_ours = np.linalg.solve(case["M"], ours - case["C"])
-        qdd_ref = np.linalg.solve(
-            M_sim, ref - bias - sim_dynamics.DAMPING_NMS_RAD * case["dq"])
-        worst = max(worst, _rel(qdd_ours, qdd_ref))
-        # 1e-6, not the 1e-5 used above: this path carries two pseudo-inverses and
-        # two solves against make_case's deliberately ill-conditioned random SPD M,
-        # so the floor is round-off rather than anything structural.
-        assert _rel(qdd_ours, qdd_ref) < 1e-6, f"trial {i}: rel err {_rel(qdd_ours, qdd_ref):.2e}"
-    return f"worst relative qddot error {worst:.2e} over 40 states, both uncouple settings"
-
-
-def test_sim_saturates_its_wrist_where_the_fr3_does_not():
-    """The empirical claim the ctrlrange clip exists for.
-
-    robosuite's rotation travel per step FALLS with command amplitude (0.24 at 0.05
-    -> 0.125 at 1.0) because its armature-inflated lambda drives joints 6/7 past
-    their +/-12 Nm ctrlrange. The FR3's lambda is ~10x smaller and never gets near
-    its own limit, so without reproducing sim's clip the real arm would overshoot
-    the reference exactly where the reference rolls off.
-    """
-    case = dict(q=REAL_Q, dq=np.zeros(7), M=REAL_M, C=np.zeros(7))
-    chain = fk_chain(REAL_Q)
-    case["ee_pos"], case["R"] = chain[7][:3, 3], chain[7][:3, :3]
-    case["J"] = zero_jacobian(REAL_Q, ee_pos_base=case["ee_pos"])
-    M_sim = sim_dynamics.mass_matrix(REAL_Q)
-    bias = sim_dynamics.bias(REAL_Q, np.zeros(7))
-
-    ctrl = RefOSCSim(
-        case, M_sim, bias, input_max=1, input_min=-1,
-        output_max=(DELTA_POS_MAX,) * 3 + (DELTA_ROT_MAX,) * 3,
-        output_min=(-DELTA_POS_MAX,) * 3 + (-DELTA_ROT_MAX,) * 3,
-        kp=150, damping_ratio=1, impedance_mode="variable",
-        kp_limits=(0, 1500), damping_ratio_limits=(0, 10),
-        control_ori=True, control_delta=True, uncouple_pos_ori=True)
-    ctrl.initial_joint = np.array(REAL_Q)
-    ctrl.set_goal(np.concatenate([np.ones(6), np.full(6, 150.0),
-                                  np.zeros(3), [0.0, 0.0, 1.0]]))
-    unclipped = ctrl.run_controller()
-    wrist = float(np.max(np.abs(unclipped[5:])))
-    assert wrist > SIM_TORQUE_LIMITS[6], (
-        f"sim wrist demand {wrist:.1f} Nm is inside its {SIM_TORQUE_LIMITS[6]} Nm "
-        "ctrlrange -- the clip would be decorative and this test is wrong")
-
-    # The same command on the real plant, through the emulation.
-    sess = make_session(case, uncouple=True, emulate_sim=True)
-    ours = our_torque(make_robot(case), sess, ee_delta_action([0, 0, 0], [0, 0, 1.0]), case)
-    real_lim = np.asarray(srv.JOINT_TORQUE_LIMITS)
-    assert np.all(np.abs(ours) < real_lim), "emulated command exceeds the FR3 clamp"
-    return (f"sim wrist demand {wrist:.1f} Nm vs its {SIM_TORQUE_LIMITS[6]:.0f} Nm limit; "
-            f"real command peaks at {np.max(np.abs(ours)):.2f} Nm")
-
-
-def test_uncoupling_error_is_plant_dependent():
-    """Why the emulation exists at all; delete this and the change looks arbitrary.
-
-    uncouple_pos_ori=True replaces lambda_full's diagonal blocks with the
-    orientation-free / translation-free inertias. The ratio between them is a
-    property of M, so the SAME flag means different things on the two plants.
-    """
-    J = zero_jacobian(REAL_Q, ee_pos_base=fk_chain(REAL_Q)[7][:3, 3])
-    ratios = {}
-    for name, M in (("sim", sim_dynamics.mass_matrix(REAL_Q)), ("real", REAL_M)):
-        Mi = np.linalg.inv(M)
-        lam_f = np.linalg.pinv(J @ Mi @ J.T)
-        lam_p = np.linalg.pinv(J[:3] @ Mi @ J[:3].T)
-        lam_o = np.linalg.pinv(J[3:] @ Mi @ J[3:].T)
-        ratios[name] = np.concatenate([np.diag(lam_p), np.diag(lam_o)]) / np.diag(lam_f)
-    spread = ratios["real"] / ratios["sim"]
-    assert np.min(spread) < 0.5, (
-        f"uncoupling now costs the two plants the same ({np.round(spread, 3)}) -- if "
-        "that is real, emulate_sim_plant is no longer buying anything")
-    return (f"uncoupled/full sim {np.round(ratios['sim'], 3)}, "
-            f"real {np.round(ratios['real'], 3)}, real/sim {np.round(spread, 3)}")
-
-
 # --------------------------------------------------------------------------
 # Structural bugs in the goal path (plan item 3). Each of these was reachable
 # on hardware and invisible to every test above.
@@ -2003,49 +1940,6 @@ def test_publish_rate_bounds_the_ee_delta_anchor():
     return f"publish {1000 / pub:.0f} Hz, anchor eats {eaten:.1%} of a full delta"
 
 
-def test_sim_clip_counter_tracks_the_sim_ctrlrange_not_the_hardware_clamp():
-    """The rotation-overshoot measurement, and it must count the RIGHT clip.
-
-    delta_sweep's sat_frac read 0.000 on every axis and amplitude and was taken as
-    "sim's saturation is not being reproduced". It measures limits.joint_torque_nm
-    ([87,87,87,87,30,25,20]) -- the real hardware clamp -- which indeed never fires
-    and says nothing about sim's [.., 12, 12] wrist ctrlrange. Two different limits,
-    two different questions; this pins the one item 1 actually asks about.
-    """
-    case = make_case(np.random.default_rng(21))
-    q = case["q"]
-    J = zero_jacobian(q, ee_pos_base=case["ee_pos"])
-    M_sim, b_sim = sim_dynamics.mass_and_bias(q, np.zeros(7))
-    ctrl = OSCTorqueController(num_joints=7)
-    ctrl.initial_joint = q.copy()
-
-    def run(goal_ori, kp):
-        ctrl.sim_clip_ticks = 0
-        ctrl.set_goal(case["ee_pos"], goal_ori, np.full(6, kp),
-                      2.0 * np.sqrt(np.full(6, kp)), q)
-        for _ in range(5):
-            ctrl.run_controller(
-                ee_pos=case["ee_pos"], ee_ori_mat=case["R"], ee_pos_vel=np.zeros(3),
-                ee_ori_vel=np.zeros(3), J_full=J, q=q, dq=np.zeros(7),
-                mass_matrix=case["M"], coriolis=np.zeros(7),
-                mass_matrix_sim=M_sim, bias_sim=b_sim)
-        return ctrl.sim_clip_ticks
-
-    assert run(case["R"], 150.0) == 0, "clip counted on a zero-error goal"
-    big = (Rotation.from_rotvec([0.0, 0.0, DELTA_ROT_MAX])
-           * Rotation.from_matrix(case["R"])).as_matrix()
-    fired = run(big, 1500.0)
-    assert fired == 5, f"sim ctrlrange never bound on a full-scale yaw at kp_max ({fired}/5)"
-
-    # And it is genuinely the sim limit: the same command is nowhere near the
-    # hardware clamp, which is what sat_frac was watching.
-    hw = np.asarray(_osc_ctrl_mod.JOINT_TORQUE_LIMITS, dtype=np.float64)
-    assert np.all(SIM_TORQUE_LIMITS[5:] < hw[5:]), (
-        "sim's wrist ctrlrange is no longer tighter than the hardware clamp; the "
-        "premise of the rotation roll-off is gone")
-    return (f"sim wrist ctrlrange {SIM_TORQUE_LIMITS[5:]} vs hardware clamp {hw[5:]}")
-
-
 # --------------------------------------------------------------------------
 # lambda_full conditioning (torque.osc.lambda_rcond). Pinned at 0.0 everywhere
 # above, so these are the only tests that exercise it. They use a PHYSICAL mass
@@ -2144,7 +2038,7 @@ def test_lambda_conditioning_is_never_silent():
     assert ticks == 1, ticks
     assert _shm.S_LAMBDA_TRUNC < _shm.STATE_SIZE, "counter does not fit the state block"
     assert _shm.S_LAMBDA_TRUNC not in {
-        _shm.S_SIM_CLIP, _shm.S_CLAMP_TRIPS, _shm.S_TORQUE_TRIP, _shm.S_RECOVERY,
+        _shm.S_CLAMP_TRIPS, _shm.S_TORQUE_TRIP, _shm.S_RECOVERY,
         _shm.S_SUCCESS_RATE, _shm.S_ALIVE, _shm.S_STATE_SEQ, _shm.S_SEQ,
     }, "S_LAMBDA_TRUNC collides with another state slot"
     for name in ("lambda_trunc_ticks",):

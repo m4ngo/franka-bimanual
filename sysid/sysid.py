@@ -129,6 +129,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
         from lerobot_robot_bimanual_franka import (
             bimanual_franka as bf,
             franka_process as fp,
+            homing as hm,
             osc_torque_controller as osc,
             safety as sf,
         )
@@ -137,7 +138,7 @@ def _robot_stack(allow_missing: bool = False) -> SimpleNamespace | None:
             return None
         raise
     _ROBOT_STACK = SimpleNamespace(
-        start_controller=start_controller, bf=bf, fp=fp, osc=osc, safety=sf, cfg=cfg,
+        start_controller=start_controller, bf=bf, fp=fp, hm=hm, osc=osc, safety=sf, cfg=cfg,
     )
     return _ROBOT_STACK
 
@@ -862,10 +863,16 @@ def save_sim_format_hdf5(
 # shows up as null in the JSON instead of crashing the run. Module attrs on
 # the lazily-imported robot stack; all-null under --dry-run off-workstation.
 _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
+    # The delta fudges and the gain bases are NOT listed here any more: they used
+    # to be re-exported by bimanual_franka, which made them a second copy of
+    # `control.yaml tuning` and of the osc group below. Both are snapshotted at
+    # their one source instead.
     "bf": (
-        "_EE_TRANSLATION_FUDGE_FACTOR", "_EE_ROTATION_FUDGE_FACTOR",
-        "OSC_BASE_KP", "OSC_BASE_DAMPING_RATIO", "_KP_GAIN_BASE", "_KD_GAIN_BASE",
-        "JOINT_IMPEDANCE_KP", "HOME_IMPEDANCE_KP", "HOME_MAX_QDOT",
+        "IMAGE_CHANNELS",
+    ),
+    "hm": (
+        "MAX_QDOT", "SETTLE_QDOT", "LEAD_MARGIN", "TAU_FRACTION",
+        "IMPEDANCE_KP", "IMPEDANCE_KD",
     ),
     "osc": (
         "IMPEDANCE_MODE",
@@ -882,7 +889,7 @@ _METADATA_CONSTANT_NAMES: dict[str, tuple[str, ...]] = {
 }
 _METADATA_MODULE_LABELS = {
     "bf": "bimanual_franka", "osc": "osc_torque_controller",
-    "safety": "safety", "fp": "franka_process",
+    "hm": "homing", "safety": "safety", "fp": "franka_process",
 }
 
 # The NUC-side law cannot be imported here (no pylibfranka), so pin the run to a
@@ -913,6 +920,11 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def _osc_const(stack, name: str, default):
+    """One controller constant off the live module, or `default` off-workstation."""
+    return getattr(getattr(stack, "osc", None), name, default)
+
+
 def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
                           stack: SimpleNamespace | None) -> dict:
     """Everything needed to interpret a run directory later, gathered up front."""
@@ -927,8 +939,13 @@ def _collect_run_metadata(args: argparse.Namespace, episode_names: list[str],
     # Read from the config rather than scraped off the dataclass: every field
     # there is a default_factory, so the class carries no readable attribute.
     constants["control.yaml tuning"] = dict(fc.control("tuning"))
-    kp_gain = 10.0 ** args.kp
-    osc_base_kp = constants["bimanual_franka"]["OSC_BASE_KP"]
+    # Base and default both from the osc snapshot above, never a literal: the map
+    # is kp = default_kp * gain_exp_base ** a_kp, and hardcoding either here is how
+    # the recorded "effective_kp" stops describing what the arm actually ran.
+    osc_consts = constants["osc_torque_controller"]
+    osc_base_kp = osc_consts["DEFAULT_KP"]
+    exp_base = osc_consts["KP_EXP_SCALE"]
+    kp_gain = exp_base ** args.kp if exp_base is not None else None
     if args.mode == "replay":
         input_file = args.lerobot_repo_id if args.lerobot_repo_id else args.traj_file
     else:
@@ -1058,8 +1075,9 @@ def main() -> None:
     stack = _robot_stack(allow_missing=args.dry_run)
     if stack is None:
         logger.warning("robot stack unavailable — dry run against defaults")
-    bf = getattr(stack, "bf", None)
-    trans_fudge = float(getattr(bf, "_EE_TRANSLATION_FUDGE_FACTOR", 1.2))
+    # Straight from config: bimanual_franka no longer re-exports these, and a
+    # getattr fallback here was a second definition of a tuning constant.
+    trans_fudge = float(fc.control("tuning.ee_translation_fudge"))
 
     # Run directory: <out_root>/<timestamp>_<tag>. The tag defaults to the
     # input's parent directory name (replay from HDF5: datasets live one per
@@ -1113,11 +1131,11 @@ def main() -> None:
         "kd": args.kd,
         "fps": args.fps,
         "gripper_norm": args.gripper_norm,
-        "kp_gain": 10.0 ** args.kp,
+        "kp_gain": _osc_const(stack, "KP_EXP_SCALE", 1.0) ** args.kp,
         "ee_translation_fudge_factor": trans_fudge,
-        "ee_rotation_fudge_factor": getattr(bf, "_EE_ROTATION_FUDGE_FACTOR", None),
-        "osc_base_kp": getattr(bf, "OSC_BASE_KP", None),
-        "max_qdot": getattr(getattr(stack, "osc", None), "DEFAULT_MAX_QDOT", None),
+        "ee_rotation_fudge_factor": float(fc.control("tuning.ee_rotation_fudge")),
+        "osc_base_kp": _osc_const(stack, "DEFAULT_KP", None),
+        "max_qdot": getattr(getattr(stack, "hm", None), "MAX_QDOT", None),
         "dry_run": bool(args.dry_run),
     }
 

@@ -24,12 +24,21 @@ and conventions:
   see the note there on why they differ).
 
 With ``use_delta=False`` the same deltas are integrated into an absolute pose
-for the EE_POS path instead. Call :pymeth:`seed_state` first so that pose starts
-at the arm's real EE rather than ``config.initial_pos``.
+for the EE_POS path instead. The integrator runs in BOTH modes, so this class
+always holds a live target pose; ``use_delta`` only selects which of the two --
+the step or the target -- goes on the wire.
 
-The ``gripper`` value is latched from the two buttons: left = close
-(``gripper_min_mm``), right = open (``gripper_max_mm``); open wins if both are
-pressed, so a fumbled double-press cannot crush the gripper.
+**Seed the target before the first :pymeth:`get_action`.** In EE_POS mode the
+emitted pose IS the OSC goal, so an unseeded integrator commands
+``config.initial_pos`` on step one and the arm jumps there. ``lerobot-teleoperate``
+has no hook for this, which is why ``scripts/teleop_single_arm.py`` drives the
+loop instead and calls :pymeth:`seed_state` between connect and the first step.
+
+The ``gripper`` value is a target position normalized to [0, 1] against the
+gripper's full travel -- the follower's own action units -- LATCHED by the two
+buttons: left = close (``gripper_closed_norm``), right = open
+(``gripper_open_norm``), open wins if both are pressed so a fumbled double-press
+cannot crush the gripper, and neither pressed holds the last target.
 """
 
 import logging
@@ -116,20 +125,23 @@ class SpaceMouse(Teleoperator):
         super().__init__(config)
         self.config = config
 
-        if config.gripper_min_mm > config.gripper_max_mm:
+        if config.gripper_closed_norm > config.gripper_open_norm:
             raise ValueError(
-                "SpaceMouseConfig requires gripper_min_mm <= gripper_max_mm "
-                f"(got {config.gripper_min_mm} > {config.gripper_max_mm})."
+                "SpaceMouseConfig requires gripper_closed_norm <= gripper_open_norm "
+                f"(got {config.gripper_closed_norm} > {config.gripper_open_norm})."
             )
 
         self._device: pyspacemouse.SpaceMouseDevice | None = None
-        # self._gripper_target_mm: float = float(config.initial_gripper_mm)
+        self._gripper_target: float = float(config.initial_gripper_norm)
 
         self.cur_pos: np.ndarray = np.asarray(config.initial_pos, dtype=np.float64)
         self.cur_rot: Rotation = Rotation.from_quat(config.initial_rot)  # stored as xyzw
 
         self._prefix = config.prefix
         self._use_delta = config.use_delta
+        # Set by bind_pose_source(); returns the arm's measured EE pose so the
+        # integrator can be held back from running away from it.
+        self._pose_source = None
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -148,6 +160,46 @@ class SpaceMouse(Teleoperator):
         """
         self.cur_pos = np.asarray(pos, dtype=np.float64).copy()
         self.cur_rot = Rotation.from_quat(rot_xyzw)
+
+    def bind_pose_source(self, source) -> None:
+        """Supply a callable returning the arm's measured ``(pos, quat_xyzw)``.
+
+        Anti-windup for the EE_POS integrator, and the reason EE_POS is safe to
+        offer at all. ``cur_pos``/``cur_rot`` advance by up to one full delta per
+        tick regardless of whether the arm follows, so with the arm slowed or
+        stalled the target runs away at ``translation_scale * fps`` -- 1.0 m/s at
+        the defaults -- and the OSC's ``kp * error`` grows with it until the torque
+        clamp. Bounding the lead bounds that force.
+
+        EE_DELTA needs none of this: ``BimanualFranka`` rebuilds the goal from the
+        MEASURED pose every step, so the lead is structurally one clipped delta.
+
+        ``source`` may return None when no state is available yet, in which case
+        the target is left alone for that tick.
+        """
+        self._pose_source = source
+
+    def _limit_lead(self) -> None:
+        """Hold the integrated target within max_lead of the arm's real pose."""
+        if self._pose_source is None:
+            return
+        measured = self._pose_source()
+        if measured is None:
+            return
+        pos, quat_xyzw = measured
+
+        lead = self.cur_pos - np.asarray(pos, dtype=np.float64)
+        dist = float(np.linalg.norm(lead))
+        if dist > self.config.max_lead_m:
+            self.cur_pos = pos + lead * (self.config.max_lead_m / dist)
+
+        measured_rot = Rotation.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
+        rotvec = (self.cur_rot * measured_rot.inv()).as_rotvec()
+        angle = float(np.linalg.norm(rotvec))
+        if angle > self.config.max_lead_rad:
+            self.cur_rot = (
+                Rotation.from_rotvec(rotvec * (self.config.max_lead_rad / angle)) * measured_rot
+            )
 
     # ------------------------------------------------------------------
     # Teleoperator interface
@@ -177,7 +229,7 @@ class SpaceMouse(Teleoperator):
         # get_action() can poll the latest state without ever stalling the
         # control loop.
         self._device = pyspacemouse.open_by_path(self.config.hidraw_path)
-        # self._gripper_target_mm = float(self.config.initial_gripper_mm)
+        self._gripper_target = float(self.config.initial_gripper_norm)
         logger.info("%s connected on %s", self, self.config.hidraw_path)
 
     def disconnect(self) -> None:
@@ -219,17 +271,19 @@ class SpaceMouse(Teleoperator):
                 break
             last_t = state.t
 
-        # Buttons: index 0 = left (close), index 1 = right (open). If both
-        # are pressed in the same sample we prefer "open" so an accidental
-        # double-press doesn't crush the gripper.
+        # Buttons: index 0 = left (close), index 1 = right (open). If both are
+        # pressed in the same sample we prefer "open" so an accidental
+        # double-press doesn't crush the gripper. The target LATCHES: neither
+        # pressed holds the last one, which is what makes the emitted value an
+        # absolute position rather than a per-tick nudge the follower has to
+        # integrate. That integration used to live in BimanualFranka.send_action
+        # and applied to every leader, including the ones already emitting an
+        # absolute position.
         buttons = list(state.buttons)
-        delta = 0.0
         if len(buttons) >= 2 and buttons[1]:
-            # self._gripper_target_mm = float(self.config.gripper_max_mm)
-            delta = float(self.config.gripper_max_mm)
+            self._gripper_target = float(self.config.gripper_open_norm)
         elif buttons and buttons[0]:
-            # self._gripper_target_mm = float(self.config.gripper_min_mm)
-            delta = float(self.config.gripper_min_mm)
+            self._gripper_target = float(self.config.gripper_closed_norm)
 
         # Raw device axes, normalized to [-1, 1] by pyspacemouse. These ARE the
         # normalized policy action once the deadzone rescale is applied.
@@ -257,15 +311,15 @@ class SpaceMouse(Teleoperator):
         # set_goal_orientation composes delta onto the current orientation.
         self.cur_pos = self.cur_pos + delta_pos
         self.cur_rot = delta_rot * self.cur_rot
+        # Then held back to within max_lead of the arm, so a stick the arm cannot
+        # follow stops winding the target up. No-op in EE_DELTA, where the emitted
+        # value is this tick's step and the integrator is only carried for state.
+        if not self._use_delta:
+            self._limit_lead()
 
-        # Select output pose: delta or absolute.
+        # Select output pose: this tick's step, or the running target.
         out_pos: np.ndarray = delta_pos if self._use_delta else self.cur_pos
         out_rot: Rotation   = delta_rot  if self._use_delta else self.cur_rot
-
-        # Apply noise at output only — never to the integrated state.
-        # if self.config.use_noise:
-        #     out_pos = out_pos + np.random.normal(0.0, self.config.noise_pos_scale, 3)
-        #     out_rot = Rotation.from_euler("xyz", np.random.normal(0.0, self.config.noise_rot_scale, 3)) * out_rot
 
         x, y, z = out_pos
         qx, qy, qz, qw = out_rot.as_quat()
@@ -278,7 +332,7 @@ class SpaceMouse(Teleoperator):
             f"{self._prefix}qy":      float(qy),
             f"{self._prefix}qz":      float(qz),
             f"{self._prefix}qw":      float(qw),
-            f"{self._prefix}gripper": delta,
+            f"{self._prefix}gripper": self._gripper_target,
             "kp": 0.0,
             "kd": 0.0,
         }

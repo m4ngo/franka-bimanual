@@ -1,32 +1,38 @@
 #!/usr/bin/env bash
 
-# Single-arm GELLO teleop. The physical arm behind the `r_` keys and the leader
-# device the operator holds are SEPARATE settings, both in config/rig.yaml
-# (single_arm_franka: arms / teleop_device); the port itself is in
-# config/teleop.yaml.
+# Single-arm teleop. One script, four leader/mode combinations:
 #
-# $1 mode   gello | gello_ee   (optional, default gello_ee)
+#   spacemouse_delta   SpaceMouse -> EE_DELTA    per-step delta, the policy's own action
+#   spacemouse_ee      SpaceMouse -> EE_POS      integrated absolute target pose
+#   gello_ee           GELLO      -> EE_POS      absolute pose via FR3 forward kinematics
+#   gello              GELLO      -> JOINT_POS   joint setpoints
+#
+# The physical arm behind the `r_` keys and the leader device the operator holds
+# are SEPARATE settings, both in config/rig.yaml (single_arm_franka: arms /
+# teleop_device); ports and hidraw paths are in config/teleop.yaml.
+#
+# This runs scripts/teleop_single_arm.py rather than `lerobot-teleoperate`
+# because the EE_POS modes need the leader's target seeded from the arm's real
+# pose before the first step, and the CLI has no hook for that. See that file.
+#
+# $1 mode   (optional, default spacemouse_delta)
+# Remaining arguments are passed through, e.g. --teleop-device=left --fps=20.
 
 set -euo pipefail
 source "$(dirname "$0")/_config.sh"
 
-MODE="${1:-gello_ee}"
+MODE="${1:-spacemouse_delta}"
+shift || true
 
 case "$MODE" in
-    gello)    CONTROL_MODE=JOINT_POS ;;
-    gello_ee) CONTROL_MODE=EE_POS    ;;
-    *) echo "mode must be gello or gello_ee"; exit 1 ;;
+    spacemouse_delta|spacemouse_ee|gello_ee|gello) ;;
+    *)
+        echo "mode must be one of: spacemouse_delta spacemouse_ee gello_ee gello" >&2
+        exit 1
+        ;;
 esac
 
 DEVICE=$(cfg rig.profiles.single_arm_franka.teleop_device)
-PORT=$(cfg "teleop.gello.devices.${DEVICE}.port")
-echo "using ${DEVICE}-hand GELLO on ${PORT}"
+echo "${MODE}: using the ${DEVICE}-hand leader at ${CONTROL_FPS} Hz"
 
-lerobot-teleoperate \
-    --robot.type=single_arm_franka \
-    --robot.control_mode="$CONTROL_MODE" \
-    --teleop.type="$MODE" \
-    --teleop.id="${MODE}_r_teleop" \
-    --teleop.side=r \
-    --teleop.port="$PORT" \
-    --fps="$CONTROL_FPS"
+exec python "$(dirname "$0")/teleop_single_arm.py" "$MODE" --fps="$CONTROL_FPS" "$@"

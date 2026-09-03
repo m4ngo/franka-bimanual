@@ -59,7 +59,6 @@ try:
         mat_to_quat_xyzw,
     )
     from . import pylibfranka_shm as shm
-    from . import sim_dynamics
     from .torque_config import torque
 except ImportError:
     from franka_jacobian import zero_jacobian  # type: ignore[no-redef]
@@ -68,7 +67,6 @@ except ImportError:
         mat_to_quat_xyzw,
     )
     import pylibfranka_shm as shm  # type: ignore[no-redef]
-    import sim_dynamics  # type: ignore[no-redef]
     from torque_config import torque  # type: ignore[no-redef]
 
 logger = logging.getLogger("control")
@@ -107,24 +105,13 @@ _FRICTION_COULOMB = np.asarray(torque("friction.coulomb_nm"), dtype=np.float64)
 # Widen the band to reduce it; do NOT filter the assist. See _friction_feedforward.
 _FRICTION_TAU_EPS = float(torque("friction.tau_eps_fraction")) * _FRICTION_COULOMB
 
-# What the assist actually cancels: real breakaway MINUS the friction sim already
-# has. mujoco's Panda carries dof_frictionloss on every joint, so driving the FR3
-# to frictionless would overshoot the reference, not match it -- the residual is
-# meant to play sim's own frictionloss. Never negative: joint 7's breakaway is only
-# ~3x this, and a joint measured below it needs no assist rather than a reversed one.
-_SIM_FRICTIONLOSS = np.asarray(torque("friction.sim_frictionloss_nm"), dtype=np.float64)
-_FRICTION_ASSIST_NM = np.maximum(_FRICTION_COULOMB - _SIM_FRICTIONLOSS, 0.0)
+# The assist targets the measured breakaway itself.
+_FRICTION_ASSIST_NM = _FRICTION_COULOMB
 
 # Standing torque libfranka's model misses, ADDED to the OSC law. osc.py is pure PD
 # and cannot reject a static disturbance; EE_DELTA re-anchors the goal on the measured
 # pose, so that error becomes drift rather than an offset. See config/control.yaml.
 _BIAS_NM = np.asarray(torque("bias.joint_nm"), dtype=np.float64)
-
-# Run the OSC law on robosuite's plant model rather than the FR3's, and realise the
-# joint acceleration it produces here. osc.py's uncoupling error is a function of M,
-# so the law is only osc.py's law when it is evaluated on osc.py's M. See
-# osc_torque_controller.run_controller and config/control.yaml.
-_EMULATE_SIM_PLANT = bool(torque("osc.emulate_sim_plant"))
 
 # Reflected rotor inertia, which libfranka's Model.mass() omits -- it returns the
 # LINK rigid-body inertia only. Added to the diagonal so the whole loop (OSC lambda,
@@ -236,10 +223,6 @@ class ControlLoop:
         # stale goal is a step input on a freshly armed controller -- one visible jerk
         # per recovery, which is what six reflexes in a 10 s episode looked like.
         self._reanchor = False
-        # Per-loop rather than read straight from the module constant so the parity
-        # harness can exercise the ported law and the emulation separately -- they
-        # assert different things (identical tau vs identical joint acceleration).
-        self._emulate_sim = _EMULATE_SIM_PLANT
         self._last_mode = None
         self._last_cmd_seq = -1.0
         self._stale = False
@@ -405,16 +388,9 @@ class ControlLoop:
                 self._reanchor = False
             J = self._jacobian(q, T[:3, 3])
             tw = J @ dq
-            M_sim = b_sim = None
-            if self._emulate_sim:
-                # One call, one FK pass: ~141 us against the law's ~1 ms of slack.
-                # Not cached on q -- q changes every tick while moving, so a cache
-                # keyed on it only ever adds a comparison.
-                M_sim, b_sim = sim_dynamics.mass_and_bias(q, dq)
             tau = self.osc.run_controller(
                 ee_pos=T[:3, 3], ee_ori_mat=T[:3, :3], ee_pos_vel=tw[:3], ee_ori_vel=tw[3:],
-                J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis,
-                mass_matrix_sim=M_sim, bias_sim=b_sim)
+                J_full=J, q=q, dq=dq, mass_matrix=M, coriolis=coriolis)
         else:
             tau = self.joint.run_controller(q, dq, M, coriolis,
                                             position_hold=(mode != shm.MODE_JOINT_VEL))
@@ -469,7 +445,6 @@ class ControlLoop:
             shm.S_SUCCESS_RATE: float(getattr(state, "control_command_success_rate", 1.0)),
             shm.S_CLAMP_TRIPS: float(self.clamp_trips),
             shm.S_TORQUE_TRIP: float(self.torque_trips),
-            shm.S_SIM_CLIP: float(self.osc.sim_clip_ticks),
             shm.S_LAMBDA_TRUNC: float(self.osc.lambda_trunc_ticks),
             shm.S_ALIVE: 1.0,
         })

@@ -110,18 +110,19 @@ Hardware used by the single-arm wrapper:
 - Cameras: right wrist (`cam_3_wrist`, `cam_4_wrist`) and workspace scene (`cam_2_scene`)
 
 teleop
-- Joint-mode GELLO: `~/franka_ws/scripts/single_arm_teleop.sh gello`
-- EE-mode GELLO (default): `~/franka_ws/scripts/single_arm_teleop.sh` or `~/franka_ws/scripts/single_arm_teleop.sh gello_ee`
-- SpaceMouse delta teleop: `~/franka_ws/scripts/single_arm_delta_teleop.sh`
+- One script, four leader/mode pairings: `~/franka_ws/scripts/single_arm_teleop.sh <mode>`
+  - `spacemouse_delta` (default) — SpaceMouse, EE_DELTA
+  - `spacemouse_ee` — SpaceMouse, EE_POS (target seeded from the arm's real pose on start)
+  - `gello_ee` — GELLO, EE_POS via FR3 forward kinematics
+  - `gello` — GELLO, JOINT_POS
+- The control mode follows from the mode; there is no separate flag for it.
 - End teleop with `ctrl+C`
 
 recording (homed)
 - Each episode starts by driving the arm to a saved home pose in `~/franka_ws/home_poses/`. Pose files are JSON with `r_q` (7 joint angles) and `gripper` (0=closed, 1=open); see `home_poses/home_pose.json` for the default.
-- General homed recording (GELLO joint, GELLO EE, or SpaceMouse):
-  - `~/franka_ws/scripts/single_arm_record_data_homed.sh <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [gello|gello_ee|spacemouse] [depth]`
+- Homed recording, same four modes as teleop:
+  - `~/franka_ws/scripts/single_arm_record_data_homed.sh <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [spacemouse_delta|spacemouse_ee|gello_ee|gello] [depth]`
   - Example: `~/franka_ws/scripts/single_arm_record_data_homed.sh HuskyMango/test_single 10 pick_block ~/franka_data/data/test_single false home_pose gello_ee true`
-- SpaceMouse delta recording only:
-  - `~/franka_ws/scripts/single_arm_delta_record_data_homed.sh <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name> [depth]`
 - `home_pose_name` is the filename stem (e.g. `home_pose` loads `home_poses/home_pose.json`)
 - `resume` is `true` to append to an existing local dataset, `false` for a fresh run
 - `depth` is `true` (default) to include depth point-cloud observations, or `false` for RGB-only

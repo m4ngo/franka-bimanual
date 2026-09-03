@@ -72,7 +72,10 @@ measure the split with
 no-op at its sim-parity value, and both robot configs read them through
 `default_factory`, so the yaml is the only place any of them is written down.
 Everything under `torque:` is the *control law*, defined by the sim; do not
-tune it to fix the rig.
+tune it to fix the rig. There are **no** declared exceptions — the rig ran
+`torque.osc.default_kp` at 125.0 for a while and no longer does, because all plant
+identification happens in sim now and this side is the reference. Tuning anything
+there is how thirteen parity tests went red with the controller untouched.
 
 Read it through the `franka_config` package (never by parsing YAML yourself):
 
@@ -215,6 +218,16 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   `tests/test_osc_stack.py`'s `make_session`, for the same reason
   `_SIM_PARITY_KNOBS` exists — robosuite has no conditioning term, so a nonzero
   default would report it as a controller regression on every case.
+- [ee_goals.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/ee_goals.py)
+  — the **workstation** half of osc.py: `set_goal`. `OSCGoalBuilder` composes each
+  arm's goal pose and holds the latched `goal_ori`; `osc_torque_controller` is the
+  NUC half. Split out so the port can be diffed against osc.py in one sitting
+  rather than read out of the middle of `bimanual_franka`.
+- [homing.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/homing.py)
+  — `home()`'s per-joint speed budget and the ramp that respects it. The budget is
+  a closed-form result about the joint-impedance gains
+  (`tau_fraction · tau_limit / (kd · (1 + lead_margin))`), and it is **read**, not
+  re-derived, by the test that asserts it. Joint 5 binds at 0.30 rad/s.
 - [torque_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/torque_config.py)
   — resolves `control.yaml`'s `torque:` block on either side of the RPyC link.
   See "Getting config onto the NUC" above.
@@ -267,14 +280,39 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   delta clipped to `torque.delta.*` (osc_pose.json's ±0.05 m / ±0.5 rad).
   Clip **then** fudge: the other order lets `clip_delta` eat the fudge.
 
-The `kp`/`kd` action entries use the sim's exponential remap, matching
-`multi-fast/utils/envs/libero.py`: `kp = 150·10^a_kp` clipped to [0, 1500],
-`damping_ratio = 1·10^a_kd` clipped to [0, 10], `kd = 2√kp·ratio`. The bases are
-**derived** from `torque.osc.{default_kp,kp_limits,…}`, never configured
-separately — a second copy is how it drifts from the sim.
+Goal composition — the whole of the `set_goal` half — is in
+[ee_goals.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/ee_goals.py),
+so it can be read against osc.py without the camera plumbing in between.
+`OSCGoalBuilder` holds the one piece of state osc.py is also stateful about:
+`goal_ori`, latched across steps and rewritten **only** when the commanded
+rotation delta is nonzero. That asymmetry with `goal_pos` (rebuilt every step) is
+what holds the EE's orientation while it translates.
 
-Gripper values are normalised to `[0, 1]` against `gripper.wsg.true_max_mm`
-(110.0 mm).
+The `kp`/`kd` action entries use the sim's exponential remap, matching
+`multi-fast/utils/envs/libero.py`: `kp = default_kp·base^a_kp` clipped to
+`kp_limits`, `damping_ratio = default·base^a_kd` clipped to
+`damping_ratio_limits`, `kd = 2√kp·ratio`.
+
+**The base is `torque.osc.gain_exp_base`, pinned at 10.0, and must NOT be derived
+from `kp_limits[1]/default_kp`.** It used to be, and the sim has since pinned it
+too (`cfg/fast_default.yaml: gain_exp_base`, `libero.py:132`) for the reason that
+derivation is unsafe: a plant fit is allowed to move `default_kp` off 150, and a
+gain action must keep meaning "log10 multiplier on the default". Deriving it
+couples the two, which is exactly how it drifted — `default_kp` 150 → 125 silently
+took the base 10 → 12, so a full-scale gain action asked 1500 here against the
+sim's 1250.
+
+`default_kp` is 150.0, osc_pose.json's own default and the sim plant's, checked by
+`test_default_kp_matches_the_sim_plant`. Everything under `torque:` is sim-defined
+and none of it is a rig trim; rig trims live under `tuning:`.
+
+`{arm}_gripper` is an **absolute** normalised position in `[0, 1]` against
+`gripper.wsg.true_max_mm` (110.0 mm) — the same units the observation reports, so
+a recorded episode replays as itself. `send_action` clips it and commands it
+directly; it does **not** integrate. A momentary leader latches its own target
+(see `SpaceMouse`): the integration used to live in `send_action` and applied to
+every leader, which pinned GELLO — already emitting an absolute position — at
+whichever end the accumulator saturated against.
 
 Camera frames are `observation.image_width` × `observation.image_height` RGB
 and exposed in the observation under `cam_1` … `cam_6` — those are the
@@ -368,10 +406,12 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `teleop.sh` | Bimanual GELLO joint-mode teleop | `JOINT_POS` |
 | `gello_ee_teleop.sh` | Bimanual GELLO EE-mode teleop (FR3 FK on leader) | `EE_POS` |
 | `spacemouse_teleop.sh` | Bimanual SpaceMouse EE-mode teleop | `EE_POS` |
-| `single_arm_delta_teleop.sh` | Single-arm SpaceMouse EE-delta teleop | `EE_DELTA` |
+| `single_arm_teleop.sh <mode>` | Single-arm teleop, all four leader/mode pairings | per mode |
+| `teleop_single_arm.py <mode>` | The driver behind it; owns the `MODES` table | per mode |
 | `record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO joint teleop dataset → HuggingFace | joint |
 | `ee_record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO EE teleop dataset | EE |
 | `replay.sh <repo_id> <episode>` | Replay one episode of a recorded dataset | joint |
+| `replay_dataset.py --mode delta\|ee_pose` | Re-record a whole dataset on the arm; `ee_pose` relabels EE_DELTA actions to the absolute OSC goals they produce, `delta` replays them as recorded (optionally magnitude-bounded) | EE |
 | `train.sh <repo_id> <policy_repo> <bs> <steps> <policy_type> <resume> <config>` | Train a policy with wandb logging, upload to HF | — |
 | `rollout_policy.sh <repo_id> <n_eps> <policy_repo> <out_dir>` | Roll out a policy and log trajectories | EE |
 | `home_pose.py` | Save / drive named home configurations (`home_poses/*.json`) | joint |
@@ -381,9 +421,45 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `osc_check/check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `../sysid/tune.py` | Match real to a sim reference: sweep gains/fudges/`friction_kc`, scored on per-step task response | EE |
+| `../sysid/lerobot_to_hdf5.py` | Convert a recorded EE_POS LeRobot dataset into the `ee_pose` HDF5 multi-fast's `fit_sim_controller` fits against | — |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all six packages | — |
+
+**The leader and the control mode are one decision, not two.**
+`scripts/teleop_single_arm.py`'s `MODES` table is the only place they are paired:
+
+| mode | leader | robot | action units |
+|---|---|---|---|
+| `spacemouse_delta` | SpaceMouse | `EE_DELTA` | per-step delta, the policy's own action |
+| `spacemouse_ee` | SpaceMouse | `EE_POS` | integrated absolute target pose |
+| `gello_ee` | GELLO | `EE_POS` | absolute pose via FR3 FK |
+| `gello` | GELLO | `JOINT_POS` | joint setpoints |
+
+`single_arm_teleop.sh` and `lerobot_record_homed_single_arm.py` both import that
+table rather than re-deriving it — the record script used to take `--teleop-mode`
+and `--control-mode` independently, which let a 5 cm per-tick delta be recorded as
+an absolute goal pose.
+
+**`EE_POS` has no delta envelope, and that is faithful to osc.py** — `scale_action`
+is only reached on the `control_delta=True` branch, and `position_limits` /
+`orientation_limits` are null. But it means the *leader* owns the bound. An
+integrating leader has none by construction: the SpaceMouse advances its target
+`translation_scale` per tick whether or not the arm follows, so a held stick ran
+the goal away at 1.0 m/s and `kp·error` grew without limit. `SpaceMouse.bind_pose_source`
+is the anti-windup — it holds the target within `teleop.spacemouse.max_lead_*` of
+the measured pose. `EE_DELTA` needs none of this: the goal is rebuilt from the
+measured pose every step, so the lead is structurally one clipped delta.
+
+**An integrating leader must be seeded before its first `get_action()`.** In
+`EE_POS` the SpaceMouse's emitted pose IS the OSC goal, so unseeded it commands
+`teleop.initial_pos` on step one and the arm jumps there. `lerobot-teleoperate`
+has no hook between `connect()` and the loop, which is why the single-arm path
+goes through `teleop_single_arm.py` (which still imports LeRobot's own
+`teleop_loop`) and calls `seed_leader` there. **`spacemouse_teleop.sh` — the
+bimanual `EE_POS` path — still has this gap**: `BimanualSpaceMouse.seed_from_robot`
+exists and nothing calls it. GELLO needs no seeding; it re-derives an absolute
+pose from the operator's own joints every tick.
 
 Device paths (GELLO USB ports, SpaceMouse hidraw nodes) and motion scales come
 from `config/teleop.yaml`. **Which** device a single-arm rig uses is a separate
@@ -425,6 +501,17 @@ connects cleanly and then does nothing.
   complement `A − Bᵀ A⁻¹ B`, which is the thing that goes singular. The asymmetry
   is the right one — `goal_ori` is latched across steps and resists with real
   stiffness, `goal_pos` is re-anchored on the measured pose every step and cannot.
+  **It is a deviation FROM sim, not a convergence toward it.** osc.py under
+  `uncouple_pos_ori: true` has the identical leak — same code, same term dropped —
+  and at the sysid anchor sim's is *larger*: the effective pivot offset from the
+  flange under a pure rotation is 0.216/0.280/0.089 m (roll/pitch/yaw) on sim's
+  armature-inflated plant against 0.185/0.185/0.056 m on the FR3, i.e. sim's flange
+  walks 1.2–1.6× further. So sim's EE does not hold position through a rotation
+  either, and a policy trained there learned to correct the walk. Leave it on for
+  teleop feel; turn it **off** when evaluating a sim-trained policy or scoring
+  against a sim reference. Its cost is also plant-dependent and worse on real: retained angular
+  authority `(I − Bᵀ Λ_pos B Λ_ori)` at that pose is 0.26/0.73/1.00 in sim against
+  0.065/0.15/1.00 on the FR3.
   `torque.osc.lambda_rcond` is **not** a third layer and must not be deleted as
   one: it conditions the pinv the law already takes — `control_utils` says "zero
   out small singular values for stability" while `np.linalg.pinv`'s default rcond
