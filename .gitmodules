@@ -1,3 +1,9 @@
 [submodule "multi-fast"]
 	path = multi-fast
 	url = https://github.com/ecai-uw/multi-fast
+[submodule "baselines/sail"]
+	path = baselines/sail
+	url = https://github.com/nadunRanawaka1/SAIL
+[submodule "baselines/bspline_policy"]
+	path = baselines/bspline_policy
+	url = https://github.com/B-spline-policy/bspline-policy
