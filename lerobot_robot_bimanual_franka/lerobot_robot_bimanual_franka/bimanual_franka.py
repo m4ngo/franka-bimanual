@@ -112,6 +112,13 @@ class BimanualFranka(Robot):
         self._depth_crop_radius_m = float(config.depth_crop_radius_m)
         self._last_full_point_cloud: np.ndarray | None = None
 
+        # The OSC goal actually dispatched, per arm, and the measured pose it was
+        # composed on. Read-only: nothing in the control path consumes them, so
+        # they add no limit layer -- they exist so a rollout can record what the
+        # arm was commanded instead of an estimate of it.
+        self._last_osc_goal: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        self._last_osc_anchor: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+
         self._goals = OSCGoalBuilder(
             translation_fudge=config.ee_translation_fudge,
             rotation_fudge=config.ee_rotation_fudge,
@@ -402,6 +409,14 @@ class BimanualFranka(Robot):
         )
         goals = {arm: self._osc_goal(arm, action, kin[arm], ignore_action) for arm in self.active_arms}
         goals = self.safety.shape_goal(goals)
+        # After clip, fudge, the latched goal_ori and the worktable screen: the pose
+        # the arm was told to hold, which is what a sim replay has to reproduce.
+        # Copied -- move_osc_goal_batch ships these over RPyC.
+        self._last_osc_goal = {a: (np.array(p, dtype=np.float64), np.array(q, dtype=np.float64))
+                               for a, (p, q) in goals.items()}
+        self._last_osc_anchor = {a: (np.array(kin[a][3], dtype=np.float64),
+                                     np.array(kin[a][4], dtype=np.float64))
+                                 for a in self.active_arms}
         self.robot_manager.move_osc_goal_batch(
             {a: (pos, quat, kp, kd, self._home_q.get(a)) for a, (pos, quat) in goals.items()}
         )

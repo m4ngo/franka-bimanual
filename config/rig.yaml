@@ -12,6 +12,11 @@
 
 version: 2
 
+# Rig the single-arm entry points drive when no --rig / positional is given.
+# Defined ONCE here so the shell wrapper's banner and the driver's argparse
+# default cannot name different arms.
+default_single_arm_profile: single_arm_right
+
 profiles:
   bimanual_franka:
     arms:
@@ -45,3 +50,15 @@ profiles:
     depth: false
     depth_center_arm: r
     control_mode: JOINT_POS
+
+  single_arm_right:
+    # The physical RIGHT FR3 on mario. Same `r` key prefix as single_arm_franka
+    # so datasets recorded on either rig stay interchangeable.
+    arms:
+      r: right
+    teleop_device: right
+    cameras: [cam_3, cam_4, cam_2]
+    depth_cameras: [cam_2]
+    depth: true
+    depth_center_arm: r
+    control_mode: EE_DELTA

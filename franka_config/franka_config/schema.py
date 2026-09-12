@@ -340,6 +340,11 @@ def profile_names() -> tuple[str, ...]:
     return tuple(get("rig.profiles"))
 
 
+def default_single_arm_profile() -> str:
+    """Rig the single-arm entry points drive when none is given on the CLI."""
+    return str(get("rig.default_single_arm_profile"))
+
+
 # ---------------------------------------------------------------------------
 # Control
 # ---------------------------------------------------------------------------

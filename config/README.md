@@ -87,6 +87,12 @@ alternate rig without editing tracked files.
   yaml and is a bug. Everything under `torque:` is defined by the sim the
   policies were trained in; changing it there without changing the sim breaks
   parity rather than fixing the rig.
+- **The default single-arm rig is `rig.yaml`'s `default_single_arm_profile`.**
+  `scripts/single_arm_teleop.sh` reads it for its banner and passes it on as
+  `--rig`, and both single-arm drivers use it as their argparse default, so the
+  rig a script names is always the rig that connects. It used to be restated in
+  the wrapper, which printed `single_arm_right` while the left arm's server was
+  the one being dialled.
 - **The leader device is not derived from the arm.** `rig.yaml`'s
   `teleop_device` names which physical GELLO/SpaceMouse the operator holds; it
   is independent of which follower arm the profile drives. Both SpaceMice

@@ -40,3 +40,20 @@ def franka_fk(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     a, d, alpha = _DH[7]
     T = T @ _dh_matrix(a, d, alpha, 0.0)
     return T[:3, 3].copy(), Rotation.from_matrix(T[:3, :3]).as_quat()
+
+
+def franka_fk_chain(q: np.ndarray) -> np.ndarray:
+    """Per-link cumulative transforms base->j1, ..., base->EE, shape (8, 4, 4).
+
+    Entries 0..6 are the frames after each joint rotation; 7 adds the fixed
+    flange-to-EE step. Mirrors `lerobot_teleoperator_gello.franka_fk`.
+    """
+    out = np.empty((8, 4, 4), dtype=np.float64)
+    T = np.eye(4)
+    for i in range(7):
+        a, d, alpha = _DH[i]
+        T = T @ _dh_matrix(a, d, alpha, float(q[i]))
+        out[i] = T
+    a, d, alpha = _DH[7]
+    out[7] = T @ _dh_matrix(a, d, alpha, 0.0)
+    return out

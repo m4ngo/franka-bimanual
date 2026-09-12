@@ -37,8 +37,10 @@ arms:
     rpyc_port: 18812
     gripper_rpyc_port: 18822
     gripper:
-      kind: wsg
-      ip: 192.168.2.20
+      #kind: wsg
+      #ip: 192.168.2.20
+      kind: franka_hand
+      ip: 192.168.201.10
     default_key: r
 
 home_poses:

@@ -14,8 +14,10 @@ step one -- an absolute pose the arm jumps to. The loop itself is LeRobot's,
 imported rather than reimplemented.
 
 Which physical arm the rig drives and which leader the operator holds are
-SEPARATE settings, both in config/rig.yaml (single_arm_franka: arms /
-teleop_device); ports and hidraw paths are in config/teleop.yaml.
+SEPARATE settings, both on the rig profile in config/rig.yaml (arms /
+teleop_device); ports and hidraw paths are in config/teleop.yaml. The profile
+used when --rig is omitted is rig.yaml's `default_single_arm_profile`, which is
+also what scripts/single_arm_teleop.sh passes through -- neither side restates it.
 """
 
 from __future__ import annotations
@@ -35,15 +37,26 @@ from lerobot.scripts.lerobot_teleoperate import teleop_loop  # noqa: E402
 from lerobot.teleoperators import make_teleoperator_from_config  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
-from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig  # noqa: E402
+from lerobot_robot_bimanual_franka import (  # noqa: E402
+    ControlMode, SingleArmFrankaConfig, SingleArmRightConfig,
+)
 from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig  # noqa: E402
 from lerobot_teleoperator_spacemouse import SpaceMouseConfig  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-_PROFILE = "single_arm_franka"
+_DEFAULT_RIG = fc.default_single_arm_profile()
 # The exposed key prefix, which is NOT the physical arm -- see config/rig.yaml.
-_ARM_KEY = next(iter(fc.profile(_PROFILE).arms))
+# Every rig in _RIGS must expose it; main() rejects one that does not.
+_ARM_KEY = next(iter(fc.profile(_DEFAULT_RIG).arms))
+
+# Rig profile -> config class. Which PHYSICAL arm each drives is in config/rig.yaml,
+# never here. Both expose the same `r_` key prefix, which is what lets the leader
+# wiring below be shared; main() rejects a rig that does not.
+_RIGS = {
+    "single_arm_franka": SingleArmFrankaConfig,
+    "single_arm_right": SingleArmRightConfig,
+}
 
 def _spacemouse(device: str, teleop_id: str, use_delta: bool, **_) -> SpaceMouseConfig:
     return SpaceMouseConfig(
@@ -129,6 +142,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("mode", choices=sorted(MODES), help="leader and control mode")
+    parser.add_argument("--rig", choices=sorted(_RIGS), default=_DEFAULT_RIG,
+                        help="rig profile; which physical arm it drives is in config/rig.yaml")
     parser.add_argument("--teleop-device", default=None,
                         help="left|right; defaults to the rig profile's teleop_device")
     parser.add_argument("--fps", type=int, default=fc.control_fps())
@@ -137,19 +152,24 @@ def main() -> int:
     args = parser.parse_args()
 
     init_logging()
-    device = args.teleop_device or getattr(fc.profile(_PROFILE), "teleop_device", None)
+    rig = args.rig
+    arm_key = next(iter(fc.profile(rig).arms))
+    if arm_key != _ARM_KEY:
+        parser.error(f"rig {rig!r} exposes key {arm_key!r}, not {_ARM_KEY!r}; the leader "
+                     "prefix and gripper wiring assume the latter.")
+    device = args.teleop_device or getattr(fc.profile(rig), "teleop_device", None)
     if device is None:
         parser.error(
-            f"rig profile {_PROFILE!r} has no teleop_device; set one in config/rig.yaml "
+            f"rig profile {rig!r} has no teleop_device; set one in config/rig.yaml "
             "or pass --teleop-device. Both leaders enumerate identically, so the wrong "
             "one connects cleanly and then does nothing."
         )
 
     control_mode = MODES[args.mode][0]
     logger.info("%s: %s-hand leader driving %s in %s",
-                args.mode, device, _PROFILE, control_mode.value)
+                args.mode, device, rig, control_mode.value)
 
-    robot = make_robot_from_config(SingleArmFrankaConfig(control_mode=control_mode))
+    robot = make_robot_from_config(_RIGS[rig](control_mode=control_mode))
     teleop = make_teleoperator_from_config(
         build_leader(args.mode, device, f"{args.mode}_{_ARM_KEY}_teleop")
     )

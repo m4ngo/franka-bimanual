@@ -13,6 +13,7 @@ _ENV_VAR = "FRANKA_CONFIG_DIR"
 _DIR_NAME = "config"
 _SECTIONS = (
     "world", "arms", "cameras", "control", "rig", "teleop", "policy", "calibration",
+    "reach",
 )
 
 _lock = threading.Lock()

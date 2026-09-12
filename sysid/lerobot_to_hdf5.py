@@ -56,7 +56,6 @@ non-adjacent states into one dt, which is a worse lie than the one it fixes.
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import sys
 from datetime import datetime
@@ -64,138 +63,39 @@ from pathlib import Path
 
 import h5py
 import numpy as np
-import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import franka_config as fc  # noqa: E402
-from lerobot_robot_bimanual_franka.franka_fk import franka_fk  # noqa: E402
+from lerobot_robot_bimanual_franka.ee_kinematics import (  # noqa: E402
+    eef_poses_from_qpos,
+    flange_quat_to_o_t_ee,
+)
+from lerobot_robot_bimanual_franka.lerobot_source import (  # noqa: E402
+    KD,
+    KP,
+    POS,
+    QUAT,
+    arm_prefix,
+    check_action_space,
+    load_frames,
+    resolve_root,
+    task_names,
+)
 from lerobot_robot_bimanual_franka.safety import ActionSafetyScreen  # noqa: E402
 
 logger = logging.getLogger("lerobot_to_hdf5")
 
 NUM_JOINTS = fc.num_joints()
-POS, QUAT = slice(0, 3), slice(3, 7)
-KP, KD = 8, 9
 
-# The EE_POS action schema, in feature order.
-_EE_KEYS = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
 _ACTION_COLUMNS = ["goal_x", "goal_y", "goal_z", "goal_qx", "goal_qy", "goal_qz", "goal_qw"]
 _ACTION_FORMAT = "absolute_pose_quat"
 _ACTION_SPACE = "EE_POS"
-
-# Reach bounds separating an absolute goal from a delta. The delta envelope is
-# +/-0.05 m per axis (norm <= 0.0866) and the FR3 works at 0.3-0.8 m of reach, so
-# nothing legitimate lands between them.
-_DELTA_MAX_NORM = 0.10
-_ABS_MIN_NORM = 0.15
-
-_SEARCH_DIRS = (Path.home() / "franka_data", Path.home() / ".cache/huggingface/lerobot")
-
-
-# ---------------------------------------------------------------------------
-# Source dataset
-# ---------------------------------------------------------------------------
-
-def resolve_root(spec: str) -> Path:
-    """Dataset root from a path or a repo id, without touching the network."""
-    candidates = [Path(spec).expanduser()]
-    candidates += [d / spec for d in _SEARCH_DIRS]
-    candidates += [d / spec.split("/")[-1] for d in _SEARCH_DIRS]
-    for path in candidates:
-        if (path / "meta" / "info.json").is_file():
-            return path.resolve()
-    raise FileNotFoundError(
-        f"no LeRobot dataset for {spec!r}; looked in "
-        + ", ".join(str(c) for c in candidates)
-    )
-
-
-def load_frames(root: Path) -> tuple[pd.DataFrame, dict]:
-    """Every data shard, concatenated, plus the dataset's info.json.
-
-    The parquet is read directly rather than through `LeRobotDataset`: nothing
-    here needs an image, and the dataset class would decode three camera streams
-    to reach seven joint angles.
-    """
-    info = json.loads((root / "meta" / "info.json").read_text())
-    shards = sorted((root / "data").rglob("*.parquet"))
-    if not shards:
-        raise FileNotFoundError(f"no data/**/*.parquet under {root}")
-    df = pd.concat([pd.read_parquet(p) for p in shards], ignore_index=True)
-    return df, info
-
-
-def task_names(root: Path) -> dict[int, str]:
-    tasks = pd.read_parquet(root / "meta" / "tasks.parquet")
-    return {int(idx): str(name) for name, idx in tasks["task_index"].items()}
-
-
-def arm_prefix(info: dict) -> str:
-    """The single `l_`/`r_` key prefix this dataset's action carries.
-
-    Rejects a bimanual recording rather than silently fitting one arm: the fit
-    drives `env.robots[0]`, so there is nowhere for a second arm to go.
-    """
-    names = list(info["features"]["action"]["names"])
-    prefixes = sorted({n.rsplit("_", 1)[0] for n in names if n.endswith("_x")})
-    if len(prefixes) != 1:
-        raise ValueError(
-            f"expected exactly one arm in the action, found {prefixes or names}; "
-            "the fit is single-arm."
-        )
-    prefix = prefixes[0]
-    expected = [f"{prefix}_{k}" for k in _EE_KEYS] + ["kp", "kd"]
-    if names != expected:
-        raise ValueError(f"unexpected action schema {names}, expected {expected}")
-    return prefix
-
-
-def check_action_space(actions: np.ndarray) -> None:
-    """EE_POS or EE_DELTA, decided by reach.
-
-    Both modes emit the SAME feature names, so the recording cannot say which one
-    ran. Writing a delta episode under `absolute_pose_quat` would have the fit
-    chase 5 cm goal positions at the base origin, which is why this refuses
-    rather than guesses.
-    """
-    norms = np.linalg.norm(actions[:, POS], axis=1)
-    if float(np.median(norms)) > _ABS_MIN_NORM:
-        return
-    if float(np.max(norms)) < _DELTA_MAX_NORM:
-        raise ValueError(
-            "this looks like an EE_DELTA recording (max |action_pos| = "
-            f"{float(np.max(norms)):.3f} m); relabel it to absolute goals first "
-            "with scripts/replay_dataset.py --mode ee_pose."
-        )
-    raise ValueError(
-        f"cannot classify the action space: |action_pos| median "
-        f"{float(np.median(norms)):.3f} m, max {float(np.max(norms)):.3f} m."
-    )
 
 
 # ---------------------------------------------------------------------------
 # Per-episode conversion
 # ---------------------------------------------------------------------------
-
-# franka_fk returns the flange pose; the arm's own O_T_EE is that frame rotated
-# -45 deg about its z by the Franka Hand mount. Position is unaffected. Verified to
-# 1.2e-7 rad against the excite_panda datasets, which record O_T_EE directly.
-_FLANGE_TO_EE_QUAT_XYZW = np.array([0.0, 0.0, -np.sin(np.pi / 8), np.cos(np.pi / 8)])
-
-
-def flange_quat_to_o_t_ee(quat_xyzw: np.ndarray) -> np.ndarray:
-    """Post-multiply each row by the tool-frame Hand offset (Hamilton, xyzw)."""
-    x1, y1, z1, w1 = quat_xyzw.T
-    x2, y2, z2, w2 = _FLANGE_TO_EE_QUAT_XYZW
-    out = np.stack([
-        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-    ], axis=1)
-    return out / np.linalg.norm(out, axis=1, keepdims=True)
-
 
 def _qvel_limit() -> np.ndarray:
     return np.asarray(fc.control("franka.max_joint_velocity_rad_s"), dtype=np.float64)
@@ -227,11 +127,9 @@ def convert_episode(actions: np.ndarray, states: np.ndarray, dt: float,
     # estimate of dq at the row it is written to.
     qvel = np.gradient(qpos, dt, axis=0)
 
-    fk = [franka_fk(q) for q in qpos]
-    eef_pos = np.array([p for p, _ in fk], dtype=np.float64)
-    # franka_fk returns the FLANGE; `action` is an O_T_EE goal. Same origin, but the
-    # Franka Hand's frame is the flange turned -45 deg about its own z.
-    eef_quat = flange_quat_to_o_t_ee(np.array([q for _, q in fk], dtype=np.float64))
+    # `action` is an O_T_EE goal, so this needs the Hand-corrected pose, not the
+    # bare flange franka_fk returns.
+    eef_pos, eef_quat = eef_poses_from_qpos(qpos)
 
     goal_pos = np.empty((len(actions), 3))
     goal_quat = np.empty((len(actions), 4))
@@ -286,26 +184,17 @@ def write_hdf5(path: Path, episodes: list[tuple[str, dict, dict]], root_attrs: d
 # Entry point
 # ---------------------------------------------------------------------------
 
-def main() -> int:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("dataset", help="dataset root, or a repo id resolved under ~/franka_data")
-    p.add_argument("--out", default=None,
-                   help="output file (default ~/sysid/outputs/<name>/ee_pose/<name>.hdf5)")
-    p.add_argument("--episodes", default=None, help="comma-separated episode indices")
-    p.add_argument("--trim-start", default="auto",
-                   help="'auto' (drop non-physical leading rows) or a row count")
-    p.add_argument("--max-trim", type=int, default=5,
-                   help="cap on the rows --trim-start auto may drop")
-    p.add_argument("--min-steps", type=int, default=20,
-                   help="skip episodes shorter than this after trimming")
-    p.add_argument("--dry-run", action="store_true", help="report, write nothing")
-    args = p.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    logger.setLevel(logging.INFO)   # the robot stack configures logging on import
-
-    root = resolve_root(args.dataset)
+def convert(
+    source: str,
+    out: Path,
+    episodes: set[int] | None = None,
+    trim_start: str = "auto",
+    max_trim: int = 5,
+    min_steps: int = 20,
+    dry_run: bool = False,
+) -> int:
+    """One recording -> one multi-episode HDF5."""
+    root = resolve_root(source)
     df, info = load_frames(root)
     fps = float(info["fps"])
     dt = 1.0 / fps
@@ -322,26 +211,22 @@ def main() -> int:
     logger.info("%s: %d episodes, %d frames, %g fps, arm %r -> %s",
                 root, info["total_episodes"], info["total_frames"], fps, arm, arm_name)
 
-    wanted = {int(x) for x in args.episodes.split(",")} if args.episodes else None
-    out = Path(args.out).expanduser() if args.out else (
-        Path.home() / "sysid/outputs" / root.name / "ee_pose" / f"{root.name}.hdf5")
-
-    episodes: list[tuple[str, dict, dict]] = []
+    converted: list[tuple[str, dict, dict]] = []
     for ep_index, group in df.groupby("episode_index"):
         ep_index = int(ep_index)
-        if wanted is not None and ep_index not in wanted:
+        if episodes is not None and ep_index not in episodes:
             continue
         group = group.sort_values("frame_index")
         actions = np.stack(group["action"].to_numpy()).astype(np.float64)
         states = np.stack(group["observation.state"].to_numpy()).astype(np.float64)
         check_action_space(actions)
 
-        trim = (leading_trim(states[:, :NUM_JOINTS], dt, args.max_trim)
-                if args.trim_start == "auto" else int(args.trim_start))
+        trim = (leading_trim(states[:, :NUM_JOINTS], dt, max_trim)
+                if trim_start == "auto" else int(trim_start))
         actions, states = actions[trim:], states[trim:]
-        if len(actions) < args.min_steps:
+        if len(actions) < min_steps:
             logger.warning("ep%03d: %d steps after trimming %d, below --min-steps %d; skipped",
-                           ep_index, len(actions), trim, args.min_steps)
+                           ep_index, len(actions), trim, min_steps)
             continue
 
         arrays, stats = convert_episode(actions, states, dt, screen, arm)
@@ -371,7 +256,7 @@ def main() -> int:
             "arm": arm_name,
             **{k: v for k, v in stats.items() if k != "steps"},
         }
-        episodes.append((f"ep{ep_index:03d}", arrays, attrs))
+        converted.append((f"ep{ep_index:03d}", arrays, attrs))
         logger.info(
             "ep%03d: %4d steps (trimmed %d)  goal-vs-EE %.0f/%.0f mm med/p95  "
             "peak |qvel| %.2f rad/s  screened %d  over qvel limit %d",
@@ -379,15 +264,15 @@ def main() -> int:
             stats["track_err_p95_mm"], stats["peak_qvel_rad_s"],
             stats["safety_shaped_steps"], stats["steps_over_qvel_limit"])
 
-    if not episodes:
+    if not converted:
         logger.error("no episodes converted")
         return 1
 
-    if args.dry_run:
-        logger.info("dry run: would write %d trajectories to %s", len(episodes), out)
+    if dry_run:
+        logger.info("dry run: would write %d trajectories to %s", len(converted), out)
         return 0
 
-    write_hdf5(out, episodes, {
+    write_hdf5(out, converted, {
         "source_dataset": str(root),
         "robot_type": info["robot_type"],
         "arm": arm_name,
@@ -395,10 +280,38 @@ def main() -> int:
         "converter": "sysid/lerobot_to_hdf5.py",
         "created": datetime.now().astimezone().isoformat(timespec="seconds"),
     })
-    logger.info("wrote %d trajectories to %s", len(episodes), out)
+    logger.info("wrote %d trajectories to %s", len(converted), out)
     logger.info("fit with: fit.real_dir=%s fit.traj_weights=null   (%s)",
-                out.parent, ", ".join(name for name, _, _ in episodes))
+                out.parent, ", ".join(name for name, _, _ in converted))
     return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("dataset", help="dataset root, or a repo id resolved under ~/franka_data")
+    p.add_argument("--out", default=None,
+                   help="output file (default ~/sysid/outputs/<name>/ee_pose/<name>.hdf5)")
+    p.add_argument("--episodes", default=None, help="comma-separated episode indices")
+    p.add_argument("--trim-start", default="auto",
+                   help="'auto' (drop non-physical leading rows) or a row count")
+    p.add_argument("--max-trim", type=int, default=5,
+                   help="cap on the rows --trim-start auto may drop")
+    p.add_argument("--min-steps", type=int, default=20,
+                   help="skip episodes shorter than this after trimming")
+    p.add_argument("--dry-run", action="store_true", help="report, write nothing")
+    args = p.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logger.setLevel(logging.INFO)   # the robot stack configures logging on import
+
+    root = resolve_root(args.dataset)
+    episodes = {int(x) for x in args.episodes.split(",")} if args.episodes else None
+    out = Path(args.out).expanduser() if args.out else (
+        Path.home() / "sysid/outputs" / root.name / "ee_pose" / f"{root.name}.hdf5")
+
+    return convert(args.dataset, out, episodes=episodes, trim_start=args.trim_start,
+                    max_trim=args.max_trim, min_steps=args.min_steps, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

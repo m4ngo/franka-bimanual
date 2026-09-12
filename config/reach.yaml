@@ -1,0 +1,102 @@
+# Real-robot reach task. The sim side is multi-fast/utils/envs/reach.py; the
+# sampling maths is shared verbatim via its reach_sampling.py, so only the
+# numbers that describe THIS rig live here.
+#
+# Bounds are BASE-frame, not world. The sim env samples in a world frame whose
+# Franka sits at (-0.6, 0, 0.912) unrotated; the right arm here is yawed ~136
+# degrees, so the same world box would not cover the same reachable volume.
+# Converting once to base frame makes the box arm-agnostic, and
+# robot_base_in_world maps it back out.
+
+version: 2
+
+workspace:
+  # Sim's DEFAULT_WORKSPACE_BOUNDS minus FRANKA_BASE_POS, i.e. the identical
+  # volume expressed relative to the arm. xyz min/max rows.
+  #   world [[-0.35,-0.60,0.85],[0.20,0.60,1.40]] - [-0.6,0,0.912]
+  bounds_base_m:
+    - [0.25, -0.60, -0.062]
+    - [0.80,  0.60,  0.488]
+  # Floor override, applied after the box above. null = derive it from
+  # world.worktable + control.worktable_brake (the default, and what you want:
+  # it follows the table and gripper automatically). A literal here is only for
+  # deliberately shrinking the volume further, never for raising it -- the
+  # derived floor is a safety bound, so the resolver takes the MAX of the two.
+  z_floor_base_m: null
+  # Clearance the sampler leaves ABOVE the safety floor. ActionSafetyScreen
+  # silently rescales a goal that would breach the table, which would make the
+  # executed trace differ from the commanded curve -- so the sampler must stay
+  # strictly inside the region where the screen never fires, not merely legal.
+  floor_margin_m: 0.02
+  # Sim's FRANKA_REACHABLE_RADIUS: the fast-reach zone, inside which OSC closes
+  # the gap without singular-Jacobian stalling. Measured from the base.
+  reachable_radius_m: 0.75
+  # World-frame sphere the curve may never enter. ActionSafetyScreen implements
+  # no bimanual arm-repel, so when one arm runs beside a parked one this is the
+  # only thing keeping the two grippers apart.
+  keep_out:
+    # Arm to stay clear of. "other" = whichever arm is not being sampled, per
+    # rig.yaml's bimanual map; an explicit "left"/"right" pins it.
+    #
+    # null (current): DISABLED. The right arm's base pose is not trusted, so a
+    # sphere placed from it would be fiction; it is parked clear by hand instead
+    # and the operator owns that clearance. Nothing here reads the other arm.
+    # Re-enable with "other" once robot_base_in_world("right") is verified.
+    arm: null
+    # null = that arm's HOME EE, from home_poses via FK. ASSUMED, NOT MEASURED:
+    # the rollout never connects to the other arm, so confirm it is actually
+    # homed before every run. A literal world xyz is for a deliberately parked
+    # pose and must be measured, never guessed.
+    center_world_m: null
+    # null = derive. Each arm's collision sphere reaches |center_tool| + radius
+    # from its EE origin, so the sum is the separation at which the two spheres
+    # touch for any pair of orientations.
+    radius_m: null
+    margin_m: 0.05
+
+curve:
+  # Values match cfg/reach/fast_reach.yaml so a real rollout is comparable to a
+  # sim one -- EXCEPT n_segments, which sim runs at 2. The multi-segment branch
+  # is not ported (see sample_episode), and one Bezier is the gentler first curve
+  # to put on hardware. Revisit before the phase-4 trace diff, which needs both
+  # sides sampling identically.
+  n_waypoints: 25
+  n_segments: 1
+  control_offset: 0.2
+  min_goal_dist_m: 0.20
+  max_sample_attempts: 50
+
+orientation:
+  # 0 disables orientation entirely (position-only reach). 60 matches sim's
+  # reach.orient_delta_max_deg. Phase 2 runs at 0; phase 3 turns this up.
+  delta_max_deg: 0.0
+
+task:
+  # EE within this of the goal, AND the waypoint cursor past every waypoint.
+  success_threshold_m: 0.03
+  advance_threshold_m: 0.05
+  max_episode_steps: 300
+  # Held for the whole episode. The base policy emits 0 in the gripper slot to
+  # mean "no manipulation", but send_action reads {arm}_gripper as an ABSOLUTE
+  # normalised position, so forwarding that 0 would drive the gripper shut on
+  # step one. Reach never grasps; 1.0 keeps it open and out of the way.
+  gripper_norm: 1.0
+
+base_policy:
+  # ReachBaseWrapper's units, mirroring cfg/reach/fast_reach.yaml. osc_*_output_max
+  # are the metres/radians one normalised unit of OSC input means -- the same
+  # numbers osc_pose.json calls output_max, so teleop, policy and this agree.
+  # max_step * osc_output_max must stay inside control.yaml's torque.delta, which
+  # RealReach asserts at construction: at 1.0 x 0.05 it lands exactly on the
+  # 0.05 m bound, so raising either silently starts clipping every step.
+  chunk_size: 5
+  prediction_horizon: 10
+  max_step: 1.0
+  osc_output_max: 0.05
+  osc_rot_output_max: 0.5
+  lookahead_k: 1
+  chunk_alpha: 0.3
+  velocity_lookahead_window: 3
+  min_velocity_floor: 0.5
+  # "delta" for phase 2. "target" is sim's current setting and phase 3's.
+  goal_mode: delta

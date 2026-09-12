@@ -12,6 +12,10 @@
 # $7 mode             spacemouse_delta | spacemouse_ee | gello_ee | gello
 #                     (optional, default gello_ee)
 # $8 depth            true | false                    (optional, default true)
+# $9 rig              single_arm_franka | single_arm_right
+#                     (optional, default rig.yaml's default_single_arm_profile --
+#                     which PHYSICAL arm each drives is in config/rig.yaml, NOT
+#                     the key prefix)
 #
 # The control mode is NOT passed here: it follows from the leader, and the one
 # table that pairs them lives in scripts/teleop_single_arm.py. A copy of that
@@ -23,12 +27,14 @@ source "$(dirname "$0")/_config.sh"
 
 if [ -z "${1:-}" ] || [ -z "${2:-}" ] || [ -z "${3:-}" ] || [ -z "${4:-}" ] || [ -z "${5:-}" ] || [ -z "${6:-}" ]; then
     echo "Usage: $0 <repo_id> <num_episodes> <task> <output_dir> <resume> <home_pose_name>" \
-         "[spacemouse_delta|spacemouse_ee|gello_ee|gello] [true|false]"
+         "[spacemouse_delta|spacemouse_ee|gello_ee|gello] [true|false]" \
+         "[single_arm_franka|single_arm_right]"
     exit 1
 fi
 
 MODE="${7:-gello_ee}"
 DEPTH="${8:-true}"
+RIG="${9:-$(cfg rig.default_single_arm_profile)}"
 
 python "$(dirname "$0")/lerobot_record_homed_single_arm.py" \
     --fps "$CONTROL_FPS" \
@@ -39,6 +45,7 @@ python "$(dirname "$0")/lerobot_record_homed_single_arm.py" \
     --resume "$5" \
     --home-pose-name "$6" \
     --depth "$DEPTH" \
+    --rig "$RIG" \
     --teleop-mode "$MODE" \
     --teleop-id "${MODE}_single_arm_teleop" \
     --noise True

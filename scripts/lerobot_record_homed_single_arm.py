@@ -48,7 +48,9 @@ from lerobot.utils.control_utils import (
 from lerobot.utils.utils import init_logging, log_say
 
 # Importing the plugin packages triggers their @register_subclass decorators.
-from lerobot_robot_bimanual_franka import ControlMode, SingleArmFranka, SingleArmFrankaConfig
+from lerobot_robot_bimanual_franka import (
+    ControlMode, SingleArmFranka, SingleArmFrankaConfig, SingleArmRightConfig,
+)
 
 # The mode -> (control mode, leader units) table, shared with the teleop driver so
 # a recording cannot pair a leader with a control mode it does not speak.
@@ -119,17 +121,22 @@ class _StdinKeyboardThread:
 # so it comes from the profile's teleop_device, never from the arm. Both
 # SpaceMice enumerate as identical HID devices, so picking the wrong one
 # connects successfully and then does nothing.
-_PROFILE = "single_arm_franka"
-_ARM_KEY = fc.profile(_PROFILE).depth_center_arm
-_TELEOP_DEVICE = fc.profile(_PROFILE).teleop_device
+_DEFAULT_RIG = fc.default_single_arm_profile()
+_ARM_KEY = fc.profile(_DEFAULT_RIG).depth_center_arm
+# Rig profile -> config class; which PHYSICAL arm each drives is in config/rig.yaml.
+_RIGS = {
+    "single_arm_franka": SingleArmFrankaConfig,
+    "single_arm_right": SingleArmRightConfig,
+}
 
 
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = False) -> SingleArmFranka:
-    cfg = SingleArmFrankaConfig(
+def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = False,
+                 rig: str = _DEFAULT_RIG) -> SingleArmFranka:
+    cfg = _RIGS[rig](
         control_mode=control_mode,
         depth=depth,
         use_noise=noise,
@@ -137,11 +144,11 @@ def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = Fa
     return make_robot_from_config(cfg)
 
 
-def _build_teleop(mode: str, teleop_id: str, device: str | None = None):
-    device = device or _TELEOP_DEVICE
+def _build_teleop(mode: str, teleop_id: str, device: str | None = None, rig: str = _DEFAULT_RIG):
+    device = device or getattr(fc.profile(rig), "teleop_device", None)
     if device is None:
         raise ValueError(
-            f"rig profile {_PROFILE!r} has no teleop_device; set one in config/rig.yaml "
+            f"rig profile {rig!r} has no teleop_device; set one in config/rig.yaml "
             "or pass --teleop-device."
         )
     # use_noise on the GELLO leaders is recording-only jitter (Gello.NOISE_SCALE on
@@ -220,7 +227,10 @@ def main() -> None:
         choices=sorted(MODES),
         help="Leader and the control mode it speaks (ignored when --policy is set)",
     )
-    p.add_argument("--teleop-device", default=_TELEOP_DEVICE,
+    p.add_argument("--rig", choices=sorted(_RIGS), default=_DEFAULT_RIG,
+                   help="Rig profile; which physical arm it drives is in config/rig.yaml "
+                        "(default: rig.yaml's default_single_arm_profile)")
+    p.add_argument("--teleop-device", default=None,
                    help="Which physical leader the operator holds (teleop.yaml devices). "
                         "Defaults to the rig profile's teleop_device.")
     p.add_argument("--teleop-id", default="homed_single_arm_teleop")
@@ -275,11 +285,13 @@ def main() -> None:
     if args.control_mode is not None:
         control_mode = ControlMode(args.control_mode)
     elif args.policy:
-        control_mode = ControlMode(fc.profile(_PROFILE).control_mode)
+        control_mode = ControlMode(fc.profile(args.rig).control_mode)
     else:
         control_mode = MODES[args.teleop_mode][0]
-    robot = _build_robot(control_mode=control_mode, depth=args.depth, noise=args.noise)
-    teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id, args.teleop_device)
+    robot = _build_robot(control_mode=control_mode, depth=args.depth, noise=args.noise,
+                         rig=args.rig)
+    teleop = (None if args.policy else
+              _build_teleop(args.teleop_mode, args.teleop_id, args.teleop_device, rig=args.rig))
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()
 

@@ -122,6 +122,26 @@ class OSCGoalBuilder:
         )
 
     @staticmethod
+    def delta_from_absolute(
+        goal_pos: np.ndarray,
+        goal_quat_xyzw: np.ndarray,
+        ee_pos: np.ndarray,
+        ee_quat_xyzw: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """The arithmetic inverse of ``from_delta``'s pose composition.
+
+        Ignores clip_delta, the fudges and noise -- none are invertible -- so
+        this is the delta a bare policy step would have needed, not a replay of
+        what from_delta applies.
+        """
+        dpos = np.asarray(goal_pos, dtype=np.float64) - np.asarray(ee_pos, dtype=np.float64)
+        drot = (
+            Rotation.from_quat(np.asarray(goal_quat_xyzw, dtype=np.float64))
+            * Rotation.from_quat(np.asarray(ee_quat_xyzw, dtype=np.float64)).inv()
+        ).as_rotvec()
+        return dpos, drot
+
+    @staticmethod
     def offset(goal: Goal, offset_pos: np.ndarray, offset_rotvec: np.ndarray) -> Goal:
         """Add a residual correction (``BimanualFranka.cache_delta``) to an
         ABSOLUTE goal.

@@ -113,7 +113,7 @@ class SingleArmFrankaConfig(RobotConfig):
         invalid = [arm for arm in self.active_arms if arm not in valid]
         if invalid:
             raise ValueError(
-                f"Invalid active arm identifiers for single_arm_franka: {invalid}. "
+                f"Invalid active arm identifiers for {self.rig_profile}: {invalid}. "
                 f"Allowed: {valid}."
             )
 

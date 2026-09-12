@@ -149,6 +149,7 @@ franka_ws/
 ├── tests/                            # full-stack equivalence tests vs robosuite
 ├── sysid/                            # gain/friction identification against sim references
 ├── residual_wrapper/                 # residual policy runner on top of the follower
+├── baselines/                        # SAIL / B-Spline comparison: converters + rollout bridges
 ├── home_poses/                       # named home configurations (JSON)
 └── frames/                           # per-camera reference snapshots + calibration
 ```
@@ -234,6 +235,12 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
 - [rig_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/rig_config.py)
   — the bridge from `config/rig.yaml` profiles to concrete camera configs and
   per-arm connection fields. Keeps `franka_config` free of LeRobot imports.
+- `BimanualFranka._last_osc_goal` / `_last_osc_anchor` are **read-only
+  diagnostics**, not a limit layer: the goal actually dispatched (post
+  `clip_delta`, post fudge, post `shape_goal`) and the measured pose it was
+  composed on. They exist so a rollout can record what the arm was commanded
+  rather than an estimate of it, which is what makes a sim replay exact. Nothing
+  in the control path reads them back.
 - [safety.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/safety.py)
   — `ActionSafetyScreen.shape_goal` raises an OSC goal along world-up until the
   EE collision sphere's lowest point clears
@@ -417,11 +424,19 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `home_pose.py` | Save / drive named home configurations (`home_poses/*.json`) | joint |
 | `openpi_client_franka.py` | Single-arm OpenPI inference client; DROID-style joint-velocity observations to a remote websocket policy | joint |
 | `deploy_nuc_server.sh <mario\|luigi>` | Resolve `torque:` config, copy the torque server + controller to a NUC, restart under `chrt -f 80` | — |
+| `real_reach_rollout.py` | Run the reach task on one arm under the analytic base policy; writes `results.json` + per-episode HTML | EE_DELTA |
+| `real_trajectory_rollout.py --repo-id <ds> --episode N` | One LeRobot episode as the real side of a sim diff; `--source dataset` (no arm, the recording itself) or `--source arm` (re-run today, EE_POS) | EE_POS |
+| `real_reach_viz.py` | Animated HTML for a reach run or a dataset trajectory; `--sim` overlays a sim replay and writes `errors.json` | — |
+| `check_reach_compare_offline.py` | The sim/real comparison against a synthesised sim record; no robot, no robosuite | — |
+| `../multi-fast/scripts/reach/replay_real_reach.py` | Replay a recorded real episode in robosuite (runs in `multi-fast/.venv`) | — |
 | `osc_check/check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
 | `osc_check/check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `../sysid/tune.py` | Match real to a sim reference: sweep gains/fudges/`friction_kc`, scored on per-step task response | EE |
 | `../sysid/lerobot_to_hdf5.py` | Convert a recorded EE_POS LeRobot dataset into the `ee_pose` HDF5 multi-fast's `fit_sim_controller` fits against | — |
+| `sail_rollout.sh` | Roll a trained SAIL policy out; starts its policy server in the `SAIL` conda env | per ckpt |
+| `bspline_rollout.sh` | Roll a trained B-Spline policy out; starts its server in `robodiff` | EE |
+| `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers | — |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all six packages | — |
