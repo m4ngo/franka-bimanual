@@ -1,5 +1,8 @@
 # CLAUDE.md
 
+## Preferred writing style.
+Always write in plain, clear English. Avoid cramming too many adjectives and acronyms together, and make sure to define more technical language. Avoid overcomplicated and bloated speech. Speach in a concise, consistent manner.
+
 Real-world control stack for a **bimanual Franka FR3** setup at TRI. The
 workspace is a collection of LeRobot plugin packages plus shell scripts that
 drive the standard `lerobot-teleoperate` / `lerobot-record` / `lerobot-replay`
@@ -149,7 +152,7 @@ franka_ws/
 ├── tests/                            # full-stack equivalence tests vs robosuite
 ├── sysid/                            # gain/friction identification against sim references
 ├── residual_wrapper/                 # residual policy runner on top of the follower
-├── baselines/                        # SAIL / B-Spline comparison: converters + rollout bridges
+├── baselines/                        # SAIL / B-Spline comparison: converters, trainers, rollout bridges
 ├── home_poses/                       # named home configurations (JSON)
 └── frames/                           # per-camera reference snapshots + calibration
 ```
@@ -361,7 +364,10 @@ single-arm instances; per-arm calibrations live in `{id}_left.json` /
   joystick is released. Buttons latch the gripper target (left=close,
   right=open). Always call `seed_state()` (or `BimanualSpaceMouse.seed_from_robot()`)
   before the first `get_action()` so the integrated pose starts at the actual
-  arm pose.
+  arm pose — and again after anything else moves the arm, since `bind_pose_source`
+  only clamps the carried target to `max_lead` of the arm. The homed record
+  script re-seeds after every `home()` for this reason; unseeded, step one of each
+  episode was a `max_lead_m` jump toward wherever the previous episode ended.
   - **The device mounting lives in `LINEAR_DEVICE_TO_BASE` /
     `ANGULAR_DEVICE_TO_BASE`, not in the sign trims.** `teleop.yaml`'s
     `translation_signs` is identity because that matrix already encodes this
@@ -434,9 +440,14 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `../sysid/tune.py` | Match real to a sim reference: sweep gains/fudges/`friction_kc`, scored on per-step task response | EE |
 | `../sysid/lerobot_to_hdf5.py` | Convert a recorded EE_POS LeRobot dataset into the `ee_pose` HDF5 multi-fast's `fit_sim_controller` fits against | — |
-| `sail_rollout.sh` | Roll a trained SAIL policy out; starts its policy server in the `SAIL` conda env | per ckpt |
-| `bspline_rollout.sh` | Roll a trained B-Spline policy out; starts its server in `robodiff` | EE |
-| `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers | — |
+| `setup_baseline_envs.sh` | Build `.venv-sail` / `.venv-bspline`, the baselines' own interpreters | — |
+| `prepare_baseline_datasets.py` | One EE_POS recording → sysid / SAIL / B-Spline HDF5s | — |
+| `../baselines/{sail,bspline}_bridge/train.py` | Train a baseline on its HDF5 in its own venv (`python -m baselines.sail_bridge.train`) | — |
+| `sail_rollout.sh` | Roll a trained SAIL policy out; starts its policy server in `.venv-sail` | per ckpt |
+| `bspline_rollout.sh` | Roll a trained B-Spline policy out; starts its server in `.venv-bspline` | EE |
+| `check_policy_server.py <sail\|bspline>` | Handshake + one synthetic inference against a running policy server; the preflight for a new checkpoint | — |
+| `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers, plus the servers' request handling under a stubbed robomimic | — |
+| `rollout_summary.py <task>` | Compare every method's rollouts recorded under one task | — |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all six packages | — |
@@ -552,6 +563,25 @@ connects cleanly and then does nothing.
 - **Data outside the repo.** Datasets, eval rollouts, and trained policies
   live under `~/franka_data/`. The only thing the repo tracks is code +
   reference frames + config.
+- **A rollout is one directory, filed under the dataset its policy was TRAINED
+  on.** `~/franka_data/outputs/<train-dataset>/<timestamp>-<method>/` holds the
+  manifest, the episode log, the recorded LeRobotDataset and the videos for that
+  run, and `<method>` is one of `sail`, `bspline`, `multifast`. Grouping by the
+  training dataset rather than by method is what makes the comparison readable:
+  every method that learned from one task's demonstrations lands side by side,
+  and `scripts/rollout_summary.py <task>` prints them as a table. The id is
+  carried end-to-end -- the converters stamp it onto the HDF5
+  (`--source-repo-id`), the policy servers report it in the `meta` handshake,
+  and the rollout files itself under it -- because LeRobot's own `meta/info.json`
+  does not record a repo id and the resolved path drops the org prefix. Trained
+  policies mirror it: `~/franka_data/policies/<train-dataset>/<method>/<run>/`.
+  See [baselines/ROLLOUT.md](baselines/ROLLOUT.md).
+- **The baselines run in their own interpreters, never in `.venv`.** SAIL and
+  B-Spline conflict with each other and with lerobot; `scripts/setup_baseline_envs.sh`
+  builds `.venv-sail` / `.venv-bspline` and `baselines/interpreters.py` is the
+  one place anything resolves them. The upstream conda recipes are not used:
+  both pin a torch with no kernels for the RTX 5090. Nothing is edited inside
+  either submodule -- generated training configs live under `~/franka_data`.
 
 ## Tests
 

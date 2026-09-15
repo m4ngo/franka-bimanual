@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import sys
 import threading
 import time
@@ -39,6 +40,7 @@ sys.path.insert(0, str(_ROOT))
 import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
+from baselines import run_record as rr  # noqa: E402
 from baselines.bspline_bridge import rollout as bsp_rollout  # noqa: E402
 from baselines.sail_bridge import rollout as sail_rollout  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
@@ -231,7 +233,7 @@ class FakeBSpline(_Server):
         if "meta" in req:
             return {"backend": "bspline", "act_dim": self.ACT, "degree": self.DEG,
                     "n_obs_steps": 2, "precision_column": False,
-                    "action_format": "single_yam_rot6d",
+                    "action_format": "real_bimanual_base_rot6d",
                     "obs_key_shapes": {"cam_2_image": [3, 84, 84], "arm_pos": [3],
                                        "arm_quat": [4], "gripper_pos": [1]}}
         if "reset" in req:
@@ -313,9 +315,9 @@ def _args(**kw):
         rig="single_arm_franka", ckpt=None, port=None, host="localhost",
         exec_fps=None, obs_fps=None, dry_run=False,
         allow_missing_cameras=True,   # the fake rig's cameras are its own
-        num_episodes=1, episode_time_s=1.0, task="offline check", metrics=None,
-        repo_id=None, output_dir=None, push_to_hub=False, resume=False,
-        save_videos=None,
+        num_episodes=1, episode_time_s=1.0, task="offline check",
+        train_dataset="Offline/check", outputs_root=None, repo_id=None,
+        no_record=True, push_to_hub=False, save_videos=False,
         home_pose_name=fc.default_home_pose_name(), home_q=None,
         home_gripper=fc.control("homing.gripper_norm"),
         home_max_time_s=fc.control("homing.max_time_s"),
@@ -328,6 +330,17 @@ def _args(**kw):
     for k, v in kw.items():
         setattr(ns, k, v)
     return ns
+
+
+_RUN_ROOT: Path | None = None
+
+
+def _open_run(args, method):
+    """Run directory for one check, under the harness's temp root."""
+    args.outputs_root = str(_RUN_ROOT)
+    train = {"repo_id": args.train_dataset, "resolved_from": "flag",
+             "flag": args.train_dataset, "checkpoint_says": None, "agrees": None}
+    return rc.open_run(args, method, train)
 
 
 def _client(port):
@@ -427,12 +440,19 @@ def check_pure(res: Results) -> None:
     res.check(st2.check() == "timeout" and st2.check() == "timeout",
               "Stopper latches a timeout too")
 
-    # metrics_path is resolved once: the fallback name carries a timestamp, and
-    # it is called after every episode.
-    a = _args()
-    res.check(rc.metrics_path(a, "sail") == rc.metrics_path(a, "sail"),
-              "metrics_path is stable across calls",
-              rc.metrics_path(a, "sail").name)
+    # A run directory is created once and never collides, and the same training
+    # dataset groups every method's runs together.
+    a1, a2 = _args(), _args()
+    d1, _ = _open_run(a1, "sail")
+    d2, _ = _open_run(a2, "bspline")
+    res.check(d1.path.parent == d2.path.parent and d1.path != d2.path,
+              "methods trained on one dataset share its output directory",
+              str(d1.path.parent.relative_to(_RUN_ROOT)))
+    res.check(d1.run_id.endswith("-sail") and d2.run_id.endswith("-bspline")
+              and d1.path.is_dir(),
+              "run id is <timestamp>-<method>", f"{d1.run_id}")
+    res.check(a1.repo_id != a2.repo_id and a1.repo_id.startswith("check"),
+              "recorded dataset repo id is derived per run", a1.repo_id)
 
     # Finding 7: the slowdown window must include the current row on the left,
     # as upstream's append-then-call ordering does.
@@ -466,6 +486,81 @@ def check_pure(res: Results) -> None:
               and rc.STATE_OBS_KEYS[-1] == f"{rc.ARM_KEY}_gripper"
               and len(rc.STATE_OBS_KEYS) == fc.num_joints() + 1,
               "dataset features match a run_residual.py recording")
+
+
+def check_outputs(res: Results) -> None:
+    print("\n[outputs] one directory per task, one run per method")
+
+    # The headline requirement: SAIL, B-Spline and multi-fast trained on the
+    # same demonstrations file themselves under that task, not under themselves.
+    task = "HuskyMango/pickup-bowl"
+    dirs = {}
+    for method in rr.METHODS:
+        a = _args(train_dataset=task)
+        dirs[method], _ = _open_run(a, method)
+    parents = {d.path.parent for d in dirs.values()}
+    res.check(len(parents) == 1
+              and parents.pop() == _RUN_ROOT / "HuskyMango" / "pickup-bowl",
+              "all three methods land under outputs/<org>/<task>",
+              ", ".join(sorted(d.run_id for d in dirs.values())))
+    res.check(all(d.run_id.endswith(f"-{m}") for m, d in dirs.items()),
+              "each run is timestamped and names its method")
+
+    # Two runs of one method at the same instant must be refused, not merged:
+    # a shared directory would interleave two rollouts' episodes.jsonl.
+    fixed = time.time()
+    rr.RunDir("Collision/check", "sail", root=_RUN_ROOT, when=fixed)
+    refused = False
+    try:
+        rr.RunDir("Collision/check", "sail", root=_RUN_ROOT, when=fixed)
+    except FileExistsError as exc:
+        refused = "same second" in str(exc)
+    res.check(refused, "a duplicate run id is refused rather than overwritten")
+
+    # A task id with no org still produces a single level.
+    plain, _ = _open_run(_args(train_dataset="pickup-bowl"), "sail")
+    res.check(plain.path.parent == _RUN_ROOT / "pickup-bowl",
+              "an un-namespaced dataset id gives one level")
+
+    # Path separators in a dataset id cannot escape the outputs root.
+    evil, _ = _open_run(_args(train_dataset="../../etc/passwd"), "sail")
+    res.check(_RUN_ROOT.resolve() in evil.path.resolve().parents,
+              "a dataset id cannot escape the outputs root",
+              str(evil.path.relative_to(_RUN_ROOT)))
+
+    # The manifest carries every section the comparison needs.
+    a = _args(train_dataset="Manifest/check")
+    run_dir, record = _open_run(a, "sail")
+    record.set("policy", checkpoint=rr.file_provenance(None))
+    record.set("parameters", exec_fps=100.0)
+    record.set("environment", rig_profile="single_arm_right")
+    record.add_episode(rc.Episode(episode=0, success=True, verdict="success",
+                                  wall_time_s=8.4, steps=840, inferences=53))
+    record.finish("completed")
+    doc = json.loads(run_dir.manifest_path.read_text())
+    want = {"schema_version", "run", "train_dataset", "environment", "policy",
+            "parameters", "outputs", "summary"}
+    res.check(want <= set(doc), "manifest carries every section",
+              ", ".join(sorted(want - set(doc))) or "all present")
+    res.check(doc["run"]["status"] == "completed"
+              and doc["run"]["method"] == "sail"
+              and doc["environment"]["git"]["commit"],
+              "manifest records status, method and the code that produced it")
+    res.check(doc["summary"]["successes"] == 1
+              and doc["summary"]["success_rate"] == 1.0
+              and doc["summary"]["mean_time_to_success_s"] == 8.4,
+              "summary aggregates the episode log")
+
+    # Episode rows carry the fields the comparison is scored on.
+    row = json.loads(run_dir.episodes_path.read_text().strip())
+    for key in ("episode", "success", "verdict", "wall_time_s", "steps",
+                "frames_recorded", "inferences", "exec_fps", "max_lead_m"):
+        if key not in row:
+            res.check(False, f"episode row is missing {key!r}")
+            break
+    else:
+        res.check(True, "episode rows carry the scored fields",
+                  f"{len(row)} fields")
 
 
 def check_dispatch(res: Results) -> None:
@@ -552,13 +647,13 @@ def check_sail(res: Results, port: int) -> None:
 
         args = _args(exec_fps=200.0, slow_fps=50.0, obs_fps=20.0, episode_time_s=1.2)
         arm = FakeArm(mode)
-        metrics = rc.RunMetrics(policy="sail")
+        run_dir, record = _open_run(args, "sail")
         with operator():
-            rc.run_episodes(args, arm, metrics,
+            rc.run_episodes(args, arm, run_dir, record,
                             sail_rollout.make_episode_fn(
                                 client, meta, args, mode,
-                                rc.check_camera_coverage(meta, arm, True)))
-        ep = metrics.episodes[0]
+                                rc.check_camera_coverage(meta, arm, True), run_dir))
+        ep = record.episodes[0]
 
         tags = _tags(arm)
         # First inference: execute_n rows of chunk 0, from index 0.
@@ -573,8 +668,8 @@ def check_sail(res: Results, port: int) -> None:
                 + [(1, inf_delay + j) for j in range(execute_n)])
         res.check(window == want, "receding horizon: inf_delay of prev, then new chunk",
                   f"got {window[:6]}... want {want[:6]}...")
-        res.check(ep.steps == len(arm.sent) and ep.steps > 0,
-                  "every dispatched goal is counted", f"{ep.steps} steps")
+        res.check(ep["steps"] == len(arm.sent) and ep["steps"] > 0,
+                  "every dispatched goal is counted", f"{ep["steps"]} steps")
 
         # The precision label must never reach the arm. With act_dim 8, row[6] is
         # the gripper tag and row[7] the label (only ever 0.0 or 1.0). If the
@@ -590,8 +685,8 @@ def check_sail(res: Results, port: int) -> None:
         # Chunk 1 has labels on rows 2..4, which are inside the executed window,
         # so some steps must have run slow and some fast.
         gaps = np.diff(arm.send_times)
-        res.check(ep.slow_steps > 0, "precision labels produced slow steps",
-                  f"{ep.slow_steps} of {ep.steps}")
+        res.check(ep["slow_steps"] > 0, "precision labels produced slow steps",
+                  f"{ep["slow_steps"]} of {ep["steps"]}")
         fast_p = float(np.percentile(gaps, 10)) if len(gaps) else 0.0
         slow_p = float(np.max(gaps)) if len(gaps) else 0.0
         res.check(fast_p < 1.0 / 100.0 and slow_p > 1.0 / 100.0,
@@ -610,20 +705,20 @@ def check_sail(res: Results, port: int) -> None:
         res.check(mode is ControlMode.EE_DELTA, "'actions' key -> EE_DELTA")
         args = _args(exec_fps=200.0, obs_fps=20.0, episode_time_s=0.8)
         arm = FakeArm(mode)
-        metrics = rc.RunMetrics(policy="sail")
+        run_dir, record = _open_run(args, "sail")
         with operator(verdict_after=2):
-            rc.run_episodes(args, arm, metrics,
+            rc.run_episodes(args, arm, run_dir, record,
                             sail_rollout.make_episode_fn(
                                 client, meta, args, mode,
-                                rc.check_camera_coverage(meta, arm, True)))
-        ep = metrics.episodes[0]
-        res.check(ep.success, "operator success verdict recorded")
-        res.check(ep.wall_time_s > 0 and ep.inferences > 0,
+                                rc.check_camera_coverage(meta, arm, True), run_dir))
+        ep = record.episodes[0]
+        res.check(ep["success"], "operator success verdict recorded")
+        res.check(ep["wall_time_s"] > 0 and ep["inferences"] > 0,
                   "time-to-success and inference count recorded",
-                  f"{ep.wall_time_s:.2f}s, {ep.inferences} inferences")
+                  f"{ep["wall_time_s"]:.2f}s, {ep["inferences"]} inferences")
         res.check(arm.clipped == 0, "no EE_DELTA command exceeded torque.delta.pos_max_m",
                   f"{arm.clipped} clipped")
-        res.check(ep.max_lead_m == 0.0,
+        res.check(ep["max_lead_m"] == 0.0,
                   "lead monitor is inert in EE_DELTA (goal re-anchors every step)")
     finally:
         srv2.stop()
@@ -636,7 +731,7 @@ def check_bspline(res: Results, port: int) -> None:
     try:
         client = _client(port)
         meta = client.meta()
-        res.check(meta["action_format"] == "single_yam_rot6d" and meta["act_dim"] == 10,
+        res.check(meta["act_dim"] == 10,
                   "meta reports the 10-dim rot6d action our converter produces")
 
         # decode() must reject a wrong-width action rather than silently reading
@@ -662,16 +757,16 @@ def check_bspline(res: Results, port: int) -> None:
                       gripper_slowdown_threshold=0.08, gripper_slowdown_steps=7,
                       gripper_index=9, compare_dim=9)
         arm = FakeArm(ControlMode.EE_POS)
-        metrics = rc.RunMetrics(policy="bspline")
+        run_dir, record = _open_run(args, "bspline")
         with operator():
-            rc.run_episodes(args, arm, metrics,
+            rc.run_episodes(args, arm, run_dir, record,
                             bsp_rollout.make_episode_fn(
                                 client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True)))
-        ep = metrics.episodes[0]
-        res.check(ep.steps > 0, "goals dispatched", f"{ep.steps} steps")
-        res.check(ep.inferences >= 2, "the plan was replanned at least once",
-                  f"{ep.inferences} plans")
+                                rc.check_camera_coverage(meta, arm, True), run_dir))
+        ep = record.episodes[0]
+        res.check(ep["steps"] > 0, "goals dispatched", f"{ep["steps"]} steps")
+        res.check(ep["inferences"] >= 2, "the plan was replanned at least once",
+                  f"{ep["inferences"]} plans")
 
         # Before the first plan lands, the goal must be the homed pose -- not a
         # zero goal, which would command the base-frame origin.
@@ -684,9 +779,9 @@ def check_bspline(res: Results, port: int) -> None:
         med = float(np.median(gaps)) if len(gaps) else 0.0
         res.check(abs(med - 1.0 / 100.0) < 0.004, "exec rate held at --exec-fps",
                   f"median gap {med * 1e3:.2f} ms, target 10.00 ms")
-        res.check(ep.max_lead_m < float(fc.policy("baselines.exec.max_lead_m")),
+        res.check(ep["max_lead_m"] < float(fc.policy("baselines.exec.max_lead_m")),
                   "tracking arm stayed inside the lead bound",
-                  f"max lead {ep.max_lead_m:.4f} m")
+                  f"max lead {ep["max_lead_m"]:.4f} m")
     finally:
         srv.stop()
 
@@ -708,16 +803,16 @@ def check_bspline(res: Results, port: int) -> None:
                       consider_gripper_during_align=False,
                       gripper_slowdown_enabled=False, gripper_slowdown_threshold=0.08,
                       gripper_slowdown_steps=7, gripper_index=9, compare_dim=9)
-        metrics = rc.RunMetrics(policy="bspline")
+        run_dir, record = _open_run(args, "bspline")
         with operator():
-            rc.run_episodes(args, arm, metrics,
+            rc.run_episodes(args, arm, run_dir, record,
                             bsp_rollout.make_episode_fn(
                                 client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True)))
-        ep = metrics.episodes[0]
-        aborted = ep.aborted is not None
+                                rc.check_camera_coverage(meta, arm, True), run_dir))
+        ep = record.episodes[0]
+        aborted = ep["aborted"] is not None
         res.check(aborted, "a frozen arm aborts the episode",
-                  (ep.aborted or "")[:70])
+                  (ep["aborted"] or "")[:70])
         if aborted:
             # A clamp would have kept the commanded goal near the arm; an abort
             # leaves the last goal where the plan put it.
@@ -730,7 +825,7 @@ def check_bspline(res: Results, port: int) -> None:
         srv2.stop()
 
 
-def check_dataset(res: Results, port: int, tmp: Path) -> None:
+def check_dataset(res: Results, port: int) -> None:
     print("\n[dataset] recorded rollout is readable and correctly labelled")
     srv = FakeBSpline(port)
     srv.start()
@@ -739,8 +834,8 @@ def check_dataset(res: Results, port: int, tmp: Path) -> None:
         meta = client.meta()
         exec_fps = 40.0
         args = _args(exec_fps=exec_fps, obs_fps=20.0, episode_time_s=0.6,
-                     num_episodes=2, repo_id="offline/baseline-check",
-                     output_dir=str(tmp))
+                     num_episodes=2, no_record=False,
+                     train_dataset="Offline/dataset-check")
         kwargs = dict(degree=3, n_obs_steps=1, obs_stride=1,
                       origin_time_scale=rc.origin_time_scale(), speed_up_times=1.0,
                       predict_before_end=0.06, time_align_error_threshold=0.1,
@@ -750,17 +845,17 @@ def check_dataset(res: Results, port: int, tmp: Path) -> None:
                       gripper_slowdown_enabled=False, gripper_slowdown_threshold=0.08,
                       gripper_slowdown_steps=7, gripper_index=9, compare_dim=9)
         arm = FakeArm(ControlMode.EE_POS)
-        metrics = rc.RunMetrics(policy="bspline")
+        run_dir, record = _open_run(args, "bspline")
         with operator():
-            rc.run_episodes(args, arm, metrics,
+            rc.run_episodes(args, arm, run_dir, record,
                             bsp_rollout.make_episode_fn(
                                 client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True)))
+                                rc.check_camera_coverage(meta, arm, True), run_dir))
 
         from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        d = LeRobotDataset(repo_id=args.repo_id, root=str(tmp))
+        d = LeRobotDataset(repo_id=args.repo_id, root=str(run_dir.dataset_dir))
         info = d.meta.info["features"]
-        res.check(d.num_episodes == 2 and d.num_frames == sum(e.steps for e in metrics.episodes),
+        res.check(d.num_episodes == 2 and d.num_frames == sum(e["steps"] for e in record.episodes),
                   "every dispatched goal became a recorded frame",
                   f"{d.num_episodes} eps, {d.num_frames} frames")
         # The fps must be the DISPATCH rate, not obs_fps: a dataset labelled
@@ -778,40 +873,203 @@ def check_dataset(res: Results, port: int, tmp: Path) -> None:
                   "first recorded action carries normalised gains and a real gripper")
         # Metrics are written after every episode, so an interrupted run keeps
         # the episodes that did finish.
-        mp = rc.metrics_path(args, "bspline")
-        res.check(mp.is_file(), "metrics written next to the dataset", str(mp.name))
+        res.check(run_dir.manifest_path.is_file() and run_dir.episodes_path.is_file(),
+                  "manifest and episodes written into the run directory",
+                  str(run_dir.path.relative_to(_RUN_ROOT)))
+        doc = json.loads(run_dir.manifest_path.read_text())
+        res.check(doc["outputs"]["dataset"]["repo_id"] == args.repo_id
+                  and doc["outputs"]["dataset"]["episodes"] == 2,
+                  "manifest records the dataset it produced",
+                  f'{doc["outputs"]["dataset"]["episodes"]} episodes')
+        res.check(doc["summary"]["episodes"] == 2
+                  and len(run_dir.episodes_path.read_text().strip().splitlines()) == 2,
+                  "one episodes.jsonl line per episode")
+        # num_frames only advances on save_episode, so this has to come off the
+        # writer's in-progress buffer -- it was silently 0 before.
+        res.check(all(e["frames_recorded"] == e["steps"] > 0 for e in record.episodes)
+                  and [e["dataset_episode_index"] for e in record.episodes] == [0, 1],
+                  "per-episode frame counts and dataset indices are recorded",
+                  f'{[e["frames_recorded"] for e in record.episodes]} frames')
 
         # Finding 9: frames are written once per observation and indexed by
         # WRITTEN frame, so the burned-in clock matches wall time. Indexing by
         # dispatch step made it run per_obs x fast.
-        vids = tmp.parent / "vid"
         args2 = _args(exec_fps=exec_fps, obs_fps=20.0, episode_time_s=0.6,
-                      num_episodes=1, save_videos=str(vids), metrics=str(tmp.parent / "m.json"))
+                      num_episodes=1, save_videos=True,
+                      train_dataset="Offline/video-check")
         arm2 = FakeArm(ControlMode.EE_POS)
-        m2 = rc.RunMetrics(policy="bspline")
+        run_dir2, record2 = _open_run(args2, "bspline")
         with operator():
-            rc.run_episodes(args2, arm2, m2,
+            rc.run_episodes(args2, arm2, run_dir2, record2,
                             bsp_rollout.make_episode_fn(
                                 client, meta, args2, kwargs,
-                                rc.check_camera_coverage(meta, arm2, True)))
+                                rc.check_camera_coverage(meta, arm2, True), run_dir2))
+        vids = run_dir2.video_dir
         files = sorted(vids.glob("*.mp4")) if vids.is_dir() else []
         res.check(len(files) == len(arm2.cameras),
                   "one mp4 per camera written", f"{[f.name for f in files]}")
         per_obs = round(exec_fps / 20.0)
-        frames = m2.episodes[0].steps / per_obs
-        res.check(frames <= m2.episodes[0].steps / max(per_obs - 0.5, 1),
+        frames = record2.episodes[0]["steps"] / per_obs
+        res.check(frames <= record2.episodes[0]["steps"] / max(per_obs - 0.5, 1),
                   "video frames counted per observation, not per dispatched goal",
-                  f"~{frames:.0f} frames for {m2.episodes[0].steps} goals "
+                  f"~{frames:.0f} frames for {record2.episodes[0]["steps"]} goals "
                   f"({per_obs} goals/obs)")
     finally:
         srv.stop()
 
 
+
+def check_servers(res: Results) -> None:
+    """The policy servers' own logic, under a stubbed robomimic.
+
+    The fake servers elsewhere in this file stand in for the REAL ones, so
+    nothing else here exercises what sail_bridge/policy_server.py does between
+    the wire and the model -- and that is exactly where the first hardware run
+    would have failed: robomimic wants frame-stacked, processed observations
+    and `return_action_sequence`, none of which the client sends.
+    """
+    import importlib
+    import types
+
+    print("\n[servers] policy-server request handling")
+
+    # A robomimic whose process_obs_dict does what the real one does to images
+    # (HWC uint8 -> CHW float in [0, 1]) and nothing else; a torch is present
+    # in this venv already.
+    def _process_obs_dict(d):
+        out = {}
+        for k, v in d.items():
+            v = np.asarray(v)
+            if k.endswith("_image"):
+                v = np.transpose(v.astype(np.float32) / 255.0, (2, 0, 1))
+            out[k] = v
+        return out
+    stubs = {}
+    for name in ("robomimic", "robomimic.utils", "robomimic.utils.file_utils",
+                 "robomimic.utils.obs_utils", "robomimic.utils.tensor_utils",
+                 "robomimic.utils.torch_utils", "robomimic.config"):
+        stubs[name] = types.ModuleType(name)
+    stubs["robomimic.utils.obs_utils"].process_obs_dict = _process_obs_dict
+    stubs["robomimic.config"].config_factory = lambda *a, **k: None
+    saved = {k: sys.modules.get(k) for k in stubs}
+    sys.modules.update(stubs)
+    try:
+        sys.modules.pop("baselines.sail_bridge.policy_server", None)
+        srv_mod = importlib.import_module("baselines.sail_bridge.policy_server")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+    # train.data in both forms train.py can leave it in.
+    ns = types.SimpleNamespace
+    res.check(srv_mod.training_hdf5(ns(train=ns(data="~/x/sail.hdf5"))).endswith("/x/sail.hdf5"),
+              "training_hdf5 reads the string form")
+    res.check(srv_mod.training_hdf5(ns(train=ns(data=[{"path": "/a/b.hdf5"}]))) == "/a/b.hdf5",
+              "training_hdf5 reads the --dataset list form")
+    res.check(srv_mod.training_hdf5(ns(train=ns(data=None))) is None,
+              "training_hdf5 tolerates an unset train.data")
+
+    class FakePolicy:
+        def __init__(self):
+            self.calls = []
+            self.episodes = 0
+        def start_episode(self):
+            self.episodes += 1
+        def __call__(self, ob, **kwargs):
+            self.calls.append((ob, kwargs))
+            return np.zeros((16, 8), dtype=np.float32)
+
+    server = srv_mod.SAILPolicyServer.__new__(srv_mod.SAILPolicyServer)
+    server.policy = FakePolicy()
+    server.guide_config = None
+    server.frame_stack = 2
+    server.obs_keys = ["robot0_eef_pos", "robot0_eef_quat", "robot0_gripper_qpos", "cam_2_image"]
+    server.history = None
+
+    def obs(seed):
+        rng = np.random.default_rng(seed)
+        return {"robot0_eef_pos": np.full(3, float(seed), np.float32),
+                "robot0_eef_quat": np.array([0, 0, 0, 1], np.float32),
+                "robot0_gripper_qpos": np.zeros(1, np.float32),
+                "robot0_joint_pos": np.zeros(7, np.float32),      # sent for AWE, not a policy key
+                "cam_2_image": rng.integers(0, 255, (8, 6, 3), dtype=np.uint8)}
+
+    server._reset()
+    first = server._prepare(obs(1))
+    res.check(sorted(first) == sorted(server.obs_keys),
+              "keys the checkpoint does not use are dropped before processing")
+    res.check(first["robot0_eef_pos"].shape == (2, 3) and first["cam_2_image"].shape == (2, 3, 8, 6),
+              "every key is stacked to (frame_stack, ...) with images CHW",
+              f"{first['robot0_eef_pos'].shape} {first['cam_2_image'].shape}")
+    res.check(first["cam_2_image"].dtype == np.float32 and float(first["cam_2_image"].max()) <= 1.0,
+              "images are processed to float [0, 1] before stacking")
+    res.check(np.array_equal(first["robot0_eef_pos"][0], first["robot0_eef_pos"][1]),
+              "the stack is seeded with copies of the first observation, as FrameStackWrapper does")
+    second = server._prepare(obs(2))
+    res.check(second["robot0_eef_pos"][0, 0] == 1.0 and second["robot0_eef_pos"][1, 0] == 2.0,
+              "the stack rolls: [previous, current]")
+    server._reset()
+    third = server._prepare(obs(3))
+    res.check(server.policy.episodes == 2 and third["robot0_eef_pos"][0, 0] == 3.0,
+              "reset starts a new episode and clears the stack")
+
+    missing = obs(4); missing.pop("cam_2_image")
+    try:
+        server._prepare(missing)
+        res.check(False, "a missing checkpoint key is refused")
+    except KeyError as exc:
+        res.check("cam_2_image" in str(exc), "a missing checkpoint key is refused, by name")
+
+    rep = server._infer({"obs": obs(5), "guide_actions": None})
+    ob, kwargs = server.policy.calls[-1]
+    res.check(kwargs.get("return_action_sequence") is True,
+              "the policy is asked for the whole sequence (return_action_sequence=True)")
+    res.check("guide_actions" not in kwargs, "no guide kwargs without --guide-config")
+    res.check(rep["chunk"].shape == (16, 8) and rep["chunk"].dtype == np.float32,
+              "reply carries the (action_horizon, act_dim) float32 chunk")
+    server.frame_stack = 1
+    server._reset()
+    flat = server._prepare(obs(6))
+    res.check(flat["robot0_eef_pos"].shape == (3,), "frame_stack 1 passes single frames through")
+
+    # Control-mode resolution for every key the labeller can produce.
+    for key, mode in (("actions", ControlMode.EE_DELTA),
+                      ("absolute_actions", ControlMode.EE_POS),
+                      ("absolute_actions_with_precision", ControlMode.EE_POS),
+                      ("commanded_absolute_actions_with_precision", ControlMode.EE_POS)):
+        res.check(sail_rollout.resolve_control_mode({"action_keys": [key]}, "auto") is mode,
+                  f"action key {key!r} -> {mode.value}")
+
+    # B-Spline server: the checkpoint's cfg is the authority for the dataset
+    # path (relative to the checkpoint's ancestors) and for n_obs_steps.
+    from baselines.bspline_bridge import policy_server as bsp_srv
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "diffusion_policy" / "data").mkdir(parents=True)
+        (root / "diffusion_policy" / "data" / "x.hdf5").write_bytes(b"")
+        ckpt = root / "bspline_policy" / "data" / "outputs" / "run" / "checkpoints" / "latest.ckpt"
+        ckpt.parent.mkdir(parents=True)
+        ckpt.write_bytes(b"")
+        cfg = ns(task=ns(dataset_path="../diffusion_policy/data/x.hdf5"), n_obs_steps=2, horizon=16)
+        found = bsp_srv._training_hdf5(cfg, str(ckpt))
+        res.check(found == str((root / "diffusion_policy" / "data" / "x.hdf5").resolve()),
+                  "a relative dataset_path resolves against the checkpoint's ancestors", found)
+        res.check(bsp_srv._cfg_lookup(cfg, lambda c: int(c.n_obs_steps)) == 2
+                  and bsp_srv._cfg_lookup(cfg, lambda c: c.missing.key) is None,
+                  "n_obs_steps comes off the checkpoint cfg; an absent key is None")
+        res.check(bsp_srv._training_hdf5(ns(task=ns(dataset_path="/abs/y.hdf5")), str(ckpt)) == "/abs/y.hdf5",
+                  "an absolute dataset_path is kept")
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--only", choices=("pure", "dispatch", "timing", "sail",
-                                      "bspline", "dataset"), default=None)
+    p.add_argument("--only", choices=("pure", "outputs", "dispatch", "timing",
+                                      "servers", "sail", "bspline", "dataset"), default=None)
     p.add_argument("--base-port", type=int, default=5701)
     p.add_argument("--tmp", default=None,
                    help="scratch dir for the recorded dataset (default: a temp dir)")
@@ -820,26 +1078,33 @@ def main() -> int:
     import logging
     logging.basicConfig(level=logging.WARNING, force=True)
 
+    global _RUN_ROOT
+    import shutil
+    import tempfile
+    _RUN_ROOT = Path(args.tmp or tempfile.mkdtemp(prefix="baseline-runs-")) / "outputs"
+
     res = Results()
     if args.only in (None, "pure"):
         check_pure(res)
+    if args.only in (None, "outputs"):
+        check_outputs(res)
     if args.only in (None, "dispatch"):
         check_dispatch(res)
     if args.only in (None, "timing"):
         check_timing(res)
+    if args.only in (None, "servers"):
+        check_servers(res)
     if args.only in (None, "sail"):
         check_sail(res, args.base_port)
     if args.only in (None, "bspline"):
         check_bspline(res, args.base_port + 10)
     if args.only in (None, "dataset"):
-        import shutil
-        import tempfile
-        tmp = Path(args.tmp) if args.tmp else Path(tempfile.mkdtemp(prefix="baseline-ds-"))
-        try:
-            check_dataset(res, args.base_port + 20, tmp / "ds")
-        finally:
-            if not args.tmp:
-                shutil.rmtree(tmp, ignore_errors=True)
+        check_dataset(res, args.base_port + 20)
+
+    if not args.tmp:
+        shutil.rmtree(_RUN_ROOT.parent, ignore_errors=True)
+    else:
+        print(f"\nrun directories kept under {_RUN_ROOT}")
 
     print(f"\n{len(res.rows) - len(res.failed)}/{len(res.rows)} checks passed")
     for _, name, detail in res.failed:

@@ -1,165 +1,236 @@
 # Baselines: SAIL and B-Spline Policy
 
-We want to show our method finishes tasks faster than other methods, without
-dropping the success rate. To do that fairly, all three methods have to learn
-from the *same* demonstrations and be tested on the *same* task.
+We want to show our method finishes tasks faster than other methods without
+dropping the success rate. For that to be fair, every method has to learn from
+the *same* demonstrations and be tested on the *same* task, on the same arm.
 
-This directory is the glue that makes that possible. You record once, and it
-turns that one recording into the three different file formats the three
-methods each expect.
-
-## The idea in one picture
+This directory is the glue: one recording goes in, and out come trained SAIL
+and B-Spline policies, their rollouts on the FR3, and a table comparing them
+with ours. Follow the steps in order.
 
 ```
-   one teleop recording (EE_POS)
-              |
-   scripts/prepare_baseline_datasets.py
-              |
-    +---------+---------+
-    |         |         |
- sysid.hdf5  sail.hdf5  bspline.hdf5
-    |         |         |
- our method  SAIL     B-Spline
-    |         |         |
-    +---------+---------+
-              |
-    run each on the robot, record
-    success + time per episode
+   record once (EE_POS)
+        |
+   1. convert      scripts/prepare_baseline_datasets.py
+        |                 -> sysid.hdf5   sail.hdf5   bspline.hdf5
+   2. train        python -m baselines.sail_bridge.train     sail.hdf5
+                   python -m baselines.bspline_bridge.train  bspline.hdf5
+        |                 -> ~/franka_data/policies/<dataset>/{sail,bspline}/<run>/
+   3. roll out     ./scripts/sail_rollout.sh      --start-server --ckpt ...
+                   ./scripts/bspline_rollout.sh   --start-server --ckpt ...
+                   python residual_wrapper/run_residual.py ...   (ours)
+        |                 -> ~/franka_data/outputs/<dataset>/<timestamp>-<method>/
+   4. compare      python scripts/rollout_summary.py <dataset>
 ```
 
-## How to run it
+Everything below assumes the workspace venv is active (`~/franka_ws/.venv`).
 
-Record one dataset the normal way (`scripts/ee_record_data.sh`), then:
+## 0. One-time setup
+
+The two upstream projects are git submodules (`sail/`, `bspline_policy/`) and
+each needs its own interpreter -- they conflict with each other and with the
+workspace venv. Build both once:
+
+```bash
+./scripts/setup_baseline_envs.sh          # or: sail | bspline
+```
+
+That creates `.venv-sail` and `.venv-bspline` next to `.venv` and checks each
+can see the GPU. It is *not* the upstream conda recipe: those pin a torch with
+no kernels for the RTX 5090, so this uses a current torch and otherwise follows
+their package lists. Every script that needs one of these interpreters finds it
+through `baselines/interpreters.py`; `$SAIL_PYTHON` / `$BSPLINE_PYTHON`
+override it.
+
+If the submodules are empty: `git submodule update --init baselines/sail
+baselines/bspline_policy`.
+
+## 1. Record and convert
+
+Record the demonstrations in **EE_POS** with the normal single-arm tooling --
+`scripts/single_arm_record_data_homed.sh` with the `spacemouse_ee` or
+`gello_ee` mode. The converters refuse anything else: both baselines train on
+absolute poses, and a delta recording cannot be turned into one after the fact.
 
 ```bash
 python scripts/prepare_baseline_datasets.py \
-    --source-repo-id my-recording \
-    --out-dir ~/franka_data/baseline_prep/my-recording
+    --source-repo-id pickup-bowl \
+    --out-dir ~/franka_data/baseline_prep/pickup-bowl
 ```
 
-That writes `sysid.hdf5`, `sail.hdf5` and `bspline.hdf5` into the output
-directory. It only reads files, never touches the robot, so it is safe to run
-any time after recording.
-
-Useful flags:
+This reads the recording (never the arm) and writes `sysid.hdf5`, `sail.hdf5`
+and `bspline.hdf5`. The dataset id is stamped onto each file so everything
+downstream -- checkpoints, servers, rollouts -- knows which task it belongs to
+without you retyping it.
 
 | Flag | Why you'd use it |
 |---|---|
+| `--image-size 84x84` | Shrink camera frames in both files. The file's size is what the policies train and roll out at; the default keeps the recording's resolution |
 | `--episodes 0,1,2` | Convert only a few episodes, for a quick check |
-| `--no-images` | Skip camera frames. Much faster; use when checking shapes |
-| `--skip sail bspline` | Only build the artifacts you need right now |
-| `--bspline-image-size 84x84` | Shrink camera frames for B-Spline training |
+| `--no-images` | Skip camera frames. Fast; for checking shapes only |
+| `--skip sysid` | Only build what you need right now |
 
-You can also run any one converter on its own:
+## 2. Train
+
+Each trainer runs upstream's own training in its own venv, with a config
+generated from the file (camera names, image size, dataset path, output
+directory). Nothing is edited inside the submodules.
 
 ```bash
-python -m baselines.sail_bridge.dataset my-recording --out sail.hdf5
-python -m baselines.bspline_bridge.dataset my-recording --out bspline.hdf5
+python -m baselines.sail_bridge.train    ~/franka_data/baseline_prep/pickup-bowl/sail.hdf5
+python -m baselines.bspline_bridge.train ~/franka_data/baseline_prep/pickup-bowl/bspline.hdf5
 ```
 
-## Which files matter
+SAIL's trainer first runs its two labelling passes on the file (AWE waypoints,
+then precision labels; skipped when already present, `--relabel` redoes them)
+and prints the fraction of steps labelled precise per demo -- if that is near
+0% or 100%, tune `--err-threshold` before spending a training run.
 
-Read them in this order:
+Checkpoints land under `~/franka_data/policies/<dataset>/`:
 
-1. **`scripts/prepare_baseline_datasets.py`** — the top level. Short. It just
-   calls the three converters in turn. Start here.
-2. **`baselines/common.py`** — the shared work: open the recording, walk it
-   episode by episode, work out where the arm actually was and where it was
-   told to go, attach camera frames, write the file.
-3. **`baselines/sail_bridge/dataset.py`** and
-   **`baselines/bspline_bridge/dataset.py`** — one short function each. They
-   only decide which numbers get which names in the output file. All the
-   shared machinery lives in `common.py`.
+```
+policies/pickup-bowl/
+  sail/<timestamp>/models/model_epoch_N.pth
+  bspline/<timestamp>/checkpoints/latest.ckpt
+```
 
-Two helpers were pulled out of the sysid converter so all three converters can
-share them:
+Both trainers print the checkpoint path and the rollout command when they
+finish. Upstream's defaults are long (SAIL 1000 epochs, B-Spline 601); to make
+sure the pipeline runs before committing the time:
 
-- `lerobot_robot_bimanual_franka/ee_kinematics.py` — turns joint angles into a
-  gripper position and orientation.
-- `lerobot_robot_bimanual_franka/lerobot_source.py` — opens a recording and
-  checks it is the kind we expect.
+```bash
+python -m baselines.sail_bridge.train    <sail.hdf5>    --epochs 2 --epoch-every-n-steps 10 --save-every 1
+python -m baselines.bspline_bridge.train <bspline.hdf5> --epochs 2 --checkpoint-every 1
+```
 
-The two upstream projects are git submodules (`sail/`, `bspline_policy/`). We
-don't edit them. Each needs its own conda environment, and they conflict with
-each other and with ours, so training and rollout run by calling out to those
-environments rather than importing them.
+`--dry-run` on either prints the generated config and the exact command without
+running anything.
 
-For a map of either upstream repo — its entry points, useful scripts, and how
-it is put together — read [SAIL.md](SAIL.md) and
-[BSPLINE_POLICY.md](BSPLINE_POLICY.md).
+## 3. Roll out
 
-## Two numbers, and why they're different
+Each rollout is two processes: the policy server in its venv, the arm in ours.
+The wrapper starts both and stops the server when it exits:
 
-Every converter works out two things for each moment in the recording:
+```bash
+./scripts/sail_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 \
+    --ckpt ~/franka_data/policies/pickup-bowl/sail/<ts>/models/model_epoch_1000.pth \
+    --guide-config baselines/sail/robomimic/SAIL/guide_template/base_cfg_weight_1.json
 
-- **where the arm actually was** ("reached") — computed from the recorded joint
-  angles.
-- **where the arm was told to go** ("commanded") — the recorded target.
+./scripts/bspline_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 \
+    --ckpt ~/franka_data/policies/pickup-bowl/bspline/<ts>/checkpoints/latest.ckpt \
+    --speed-up-times 1.0
+```
 
-These are never the same, because a real arm lags behind its target. That gap
-is the whole point: a policy learns to predict the target from what it sees, so
-the observation must be the *actual* position and the training target must be
-the *commanded* one. Swapping them gives the policy its own answer as input,
-and it learns nothing.
+Before the first rollout of any new checkpoint, prove the server answers
+sanely without touching the arm -- start it yourself, then:
 
-## What each output file contains
+```bash
+.venv-sail/bin/python baselines/sail_bridge/policy_server.py --ckpt-path <pth> --port 5556 &
+python scripts/check_policy_server.py sail --port 5556
+```
 
-`sail.hdf5`, one entry per episode:
+(`bspline` likewise on 5555.) It prints the checkpoint's handshake and checks
+one inference comes back with the right shape. Then read
+[ROLLOUT.md](ROLLOUT.md) for the walk-up on hardware: `--dry-run` first, then
+one slow episode, then the speed features one at a time.
 
-| Name | What it holds |
+During an episode **right arrow = success, left arrow = failure**, timeout is a
+failure, Ctrl-C aborts the run. That verdict is the measurement.
+
+Every run writes one directory under `~/franka_data/outputs/`, grouped by the
+dataset the policy was **trained** on, so all three methods for one task sit
+side by side:
+
+```
+outputs/pickup-bowl/
+  20260912_143000-sail/        manifest.json  episodes.jsonl  dataset/  videos/
+  20260912_151500-bspline/
+  20260912_160200-multifast/
+```
+
+The manifest records everything about the run (checkpoint and its hash, every
+parameter, the rig, the git state); `episodes.jsonl` has one line per episode.
+The run works out which task it belongs to from the checkpoint; pass
+`--train-dataset` only when a checkpoint predates the stamp.
+
+## 4. Compare
+
+```bash
+python scripts/rollout_summary.py pickup-bowl
+```
+
+```
+  run                        method      eps   ok   rate  median s   mean s  status       notes
+  20260912_143000-sail       sail          4    3    75%      9.10     9.23  completed    100Hz precision eag
+  20260912_151500-bspline    bspline       4    3    75%      7.40     7.37  completed    100Hz 2.0x
+  20260912_160200-multifast  multifast     4    4   100%      6.10     6.00  completed    20Hz
+```
+
+Time-to-success is over successes only. `--all` sweeps every task, `--json`
+dumps the manifests.
+
+## Checking without the robot
+
+- `python scripts/check_baseline_rollout_offline.py` runs both rollout loops
+  against a fake arm and fake policy servers, plus the servers' own request
+  handling under a stubbed robomimic. No hardware, no baseline venv.
+- `python scripts/check_policy_server.py <sail|bspline>` checks a *real* server
+  with a *real* checkpoint (above).
+- The whole chain was last exercised end to end on `pipeline-test-9-12`
+  (3 episodes): convert, label, 2-epoch training of both, both servers passing
+  the preflight.
+
+## Where the files are
+
+| What | Where |
 |---|---|
-| `obs/robot0_eef_pos`, `obs/robot0_eef_quat` | where the gripper actually was |
-| `obs/robot0_joint_pos`, `obs/robot0_gripper_qpos` | recorded joint angles and grip |
-| `obs/<cam>_image` | camera frames |
-| `absolute_actions` | the reached position, as position + rotation + grip |
-| `commanded_absolute_actions` | the commanded position, same layout |
-| `actions` | the step as a *change* rather than a position |
+| Recordings | `~/franka_data/<dataset>/` |
+| Converted HDF5s | `~/franka_data/baseline_prep/<dataset>/` |
+| Trained policies | `~/franka_data/policies/<dataset>/<method>/<run>/` |
+| Rollouts | `~/franka_data/outputs/<dataset>/<timestamp>-<method>/` |
+| Baseline venvs | `~/franka_ws/.venv-sail`, `~/franka_ws/.venv-bspline` |
+| The knobs | `config/policy.yaml`, `baselines:` block |
 
-`bspline.hdf5` is simpler, matching what that project's own converter writes:
-`obs/arm_pos`, `obs/arm_quat`, `obs/gripper_pos`, `obs/<cam>_image`, and
-`actions`.
+Nothing is written into the repo.
 
-`sysid.hdf5` is unchanged from before; it is what our own method already used.
+## Details, for whoever changes this next
 
-## Notes for whoever picks this up next
+**Which files matter.** `common.py` does the shared conversion work (open the
+recording, walk it episode by episode, work out where the arm was and where it
+was told to go, attach frames, write the file); `sail_bridge/dataset.py` and
+`bspline_bridge/dataset.py` only decide which numbers get which names.
+`sail_bridge/train.py` and `bspline_bridge/train.py` generate the upstream
+configs and call upstream's trainers; `*/policy_server.py` serve a checkpoint
+over ZMQ; `*/rollout.py` drive the arm; `rollout_common.py` and
+`run_record.py` are what the two rollouts (and `run_residual.py`) share.
 
-- **The recording must be in EE_POS.** The converters check this and refuse
-  otherwise. Our controller and our simulation work in absolute positions, so
-  that is the honest format to record in. SAIL is the only one that wants
-  changes rather than positions, so we compute those from the recording.
-- **SAIL normally replays demonstrations through a simulator** to work out
-  where the arm ended up. We skip that: a real recording already knows where
-  the arm was, and a real measurement beats a simulated one. So SAIL's
-  `add_all_actions.py` is not used. Its later steps
-  (`save_awe_waypoint_concurrent.py`, `label_awe_trajectory_precision.py`) run
-  against our file unchanged.
-- **robomimic requires two pieces of bookkeeping** to open a file at all: a
-  sample count on each episode, and an environment description on the file. We
-  write both. Without them, training stops before it starts.
-- The first few frames of every episode are dropped, because each episode
-  begins with the arm settling into its start position and that movement is not
-  part of the demonstration.
+**Two numbers per step, and why they differ.** Every converter records where the
+arm actually *was* (from the joint angles, via `ee_kinematics`) and where it was
+*told to go* (the recorded target). A real arm lags its target, so the
+observation is the reached pose and B-Spline's training target is the
+commanded one; giving a policy its own answer as input teaches it nothing.
+SAIL is the exception by its own design: it trains on the reached poses
+(`absolute_actions`, as upstream's replay pass produces) with the precision
+label appended, and `commanded_absolute_actions` is written alongside for
+`--action-key` to pick instead.
 
-## Running a trained policy on the arm
+**What each file holds.** `sail.hdf5`: `obs/robot0_eef_{pos,quat}`,
+`obs/robot0_joint_pos`, `obs/robot0_gripper_qpos`, `obs/<cam>_image`,
+`actions` (deltas), `absolute_actions`, `commanded_absolute_actions`, and after
+labelling `waypoints_dp`, `precisions`, `absolute_actions_with_precision`.
+`bspline.hdf5`: `obs/arm_pos`, `obs/arm_quat`, `obs/gripper_pos`,
+`obs/<cam>_image`, `actions` (commanded pose, 7-dim; the loader makes it
+10-dim rot6d). Both carry `source_repo_id` on the root. robomimic also needs a
+`num_samples` attribute per demo and `env_args` on `data`; both are written,
+with env type 6 (real) so training never tries to build a simulator.
 
-That half is built: see [ROLLOUT.md](ROLLOUT.md).
+**SAIL's replay pass is skipped.** Upstream's `add_all_actions.py` replays each
+demo in a simulator to discover where the arm ended up; a real recording
+already knows. Its later passes run on our file unchanged, from
+`sail_bridge/train.py`.
 
-```bash
-./scripts/sail_rollout.sh    --start-server --ckpt <CKPT> --rig=single_arm_right
-./scripts/bspline_rollout.sh --start-server --ckpt <CKPT> --rig=single_arm_right
-```
+**The first few frames of every episode are dropped** -- the arm settling into
+its start pose is not part of the demonstration.
 
-Each starts a policy server in the upstream conda env and a rollout client in
-our venv, because the environments conflict. Success is marked by the operator
-(right arrow = success, left = failure), and each run writes a `metrics.json`
-with success and time per episode plus, optionally, a LeRobotDataset.
-
-`python scripts/check_baseline_rollout_offline.py` exercises both loops against
-a fake arm and fake policy servers, so the plumbing can be checked without
-hardware or either conda env.
-
-## Not built yet
-
-Training wrappers. Both upstream training paths still run by hand in their own
-conda environments, as [SAIL.md](SAIL.md) and
-[BSPLINE_POLICY.md](BSPLINE_POLICY.md) describe.
+Maps of the two upstream repos: [SAIL.md](SAIL.md), [BSPLINE_POLICY.md](BSPLINE_POLICY.md).
+Everything about running on the arm: [ROLLOUT.md](ROLLOUT.md).

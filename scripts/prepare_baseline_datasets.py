@@ -40,8 +40,10 @@ def main() -> int:
     p.add_argument("--min-steps", type=int, default=20)
     p.add_argument("--no-images", action="store_true",
                     help="skip camera frames in the SAIL/B-Spline HDF5s (schema/shape checks only)")
-    p.add_argument("--bspline-image-size", default=None,
-                    help="WxH to resize B-Spline's camera frames, e.g. 84x84")
+    p.add_argument("--image-size", default=None,
+                    help="WxH to resize the SAIL and B-Spline camera frames, e.g. 84x84. "
+                         "Default keeps the recording's resolution; the file's size is "
+                         "what both policies train and roll out at")
     p.add_argument("--skip", nargs="*", choices=["sysid", "sail", "bspline"], default=[],
                     help="artifacts to skip")
     args = p.parse_args()
@@ -57,14 +59,17 @@ def main() -> int:
         ),
         "sail": lambda: sail_dataset.convert(
             args.source_repo_id, args.out_dir / "sail.hdf5", episodes=episodes,
+            source_repo_id=args.source_repo_id,
             trim_start=args.trim_start, max_trim=args.max_trim, min_steps=args.min_steps,
             include_images=not args.no_images,
+            image_size=parse_image_size(args.image_size),
         ),
         "bspline": lambda: bspline_dataset.convert(
             args.source_repo_id, args.out_dir / "bspline.hdf5", episodes=episodes,
+            source_repo_id=args.source_repo_id,
             trim_start=args.trim_start, max_trim=args.max_trim, min_steps=args.min_steps,
             include_images=not args.no_images,
-            image_size=parse_image_size(args.bspline_image_size),
+            image_size=parse_image_size(args.image_size),
         ),
     }
 

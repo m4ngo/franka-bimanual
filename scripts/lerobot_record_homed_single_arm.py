@@ -319,9 +319,6 @@ def main() -> None:
     robot.connect()
     if teleop is not None:
         teleop.connect()
-        # An integrating leader must start from the arm's real pose, or step one
-        # commands teleop.initial_pos as an absolute goal. No-op for GELLO.
-        seed_leader(teleop, robot)
 
     listener, events = init_keyboard_listener()
     stdin_kb = _StdinKeyboardThread(events)
@@ -341,6 +338,11 @@ def main() -> None:
                 ok = robot.home(home_q_left=None, home_q_right=home_q_r, **home_kw)
                 if not ok:
                     logger.warning("Homing did not converge before episode %d; proceeding anyway", dataset.num_episodes)
+                # An integrating leader's target must be the pose home() just put the
+                # arm at, or step one commands wherever the last episode left it
+                # (clamped to max_lead of home, which is the jump). No-op for GELLO.
+                if teleop is not None:
+                    seed_leader(teleop, robot, gripper_norm=args.home_gripper)
 
                 log_say(f"Recording episode {dataset.num_episodes}", args.play_sounds)
                 events["exit_early"] = False

@@ -115,7 +115,7 @@ def _measured_ee(robot):
     return pos, quat_xyzw
 
 
-def seed_leader(teleop, robot) -> None:
+def seed_leader(teleop, robot, gripper_norm: float | None = None) -> None:
     """Point an integrating leader at the arm's real EE pose, and keep it there.
 
     A no-op for leaders that do not integrate: GELLO derives an absolute pose from
@@ -125,13 +125,19 @@ def seed_leader(teleop, robot) -> None:
     Seeding fixes the first step; binding the pose source fixes every step after
     it. Without the bind, a held stick advances the EE_POS target 0.05 m per tick
     whether or not the arm follows -- see SpaceMouse.bind_pose_source.
+
+    Call it again after anything else moves the arm (``robot.home()``): the bind
+    only clamps the target to within max_lead of the arm, so a target left at the
+    end of one episode is what step one of the next commands, from up to max_lead
+    away. ``gripper_norm`` re-latches the gripper target as well, to what the
+    gripper was just commanded.
     """
     seed = getattr(teleop, "seed_state", None)
     if not callable(seed):
         return
     kin = robot.robot_manager.current_kinematic_state_batch(list(robot.active_arms))
     _, _, _, pos, quat_xyzw, _ = kin[_ARM_KEY]
-    seed(pos, quat_xyzw)
+    seed(pos, quat_xyzw, gripper_norm)
     teleop.bind_pose_source(lambda: _measured_ee(robot))
     logger.info("seeded %s from the arm's EE at %s (lead capped at %.3f m / %.2f rad)",
                 type(teleop).__name__, np.round(pos, 4),

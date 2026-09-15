@@ -2,10 +2,11 @@
 
 # Roll a trained SAIL policy out on the arm.
 #
-# Two processes: the policy lives in the `SAIL` conda env (python 3.9, torch 2.1,
-# patched robosuite) which cannot coexist with this workspace's venv, so it runs
-# behind ZMQ. With --start-server this script launches it; otherwise start it
-# yourself and point --port at it.
+# Two processes: the policy lives in its own venv (.venv-sail, made by
+# scripts/setup_baseline_envs.sh) which cannot coexist with this workspace's,
+# so it runs behind ZMQ. With --start-server this script launches it; otherwise
+# start it yourself and point --port at it. $SAIL_PYTHON overrides which
+# interpreter runs the server (baselines/interpreters.py).
 #
 # The control mode is resolved from the checkpoint, not chosen here -- see
 # baselines/ROLLOUT.md.
@@ -24,7 +25,6 @@ source "$(dirname "$0")/_config.sh"
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="$(cfg policy.baselines.zmq.sail_port)"
-CONDA_ENV="${SAIL_CONDA_ENV:-SAIL}"
 
 START_SERVER=0
 CKPT=""
@@ -49,8 +49,8 @@ done
 
 SERVER_PGID=""
 cleanup() {
-    # Kill the GROUP, not the pid: `conda run` spawns python as a child, so
-    # killing conda alone orphans the server holding the port and the GPU.
+    # Kill the GROUP, not the pid: a `conda run` interpreter spawns python as a
+    # child, and killing the parent alone orphans the server holding the port.
     [[ -n "$SERVER_PGID" ]] || return 0
     kill -TERM -"$SERVER_PGID" 2>/dev/null || true
     for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -66,8 +66,9 @@ if [[ "$START_SERVER" == 1 ]]; then
     SRV=("$REPO_ROOT/baselines/sail_bridge/policy_server.py"
          --ckpt-path "$CKPT" --port "$PORT")
     [[ -n "$GUIDE" ]] && SRV+=(--guide-config "$GUIDE")
-    echo "starting the SAIL policy server in conda env '${CONDA_ENV}' on port ${PORT}"
-    conda run --no-capture-output -n "$CONDA_ENV" python "${SRV[@]}" &
+    mapfile -t SAIL_PY < <(python -m baselines.interpreters sail)
+    echo "starting the SAIL policy server with '${SAIL_PY[*]}' on port ${PORT}"
+    "${SAIL_PY[@]}" "${SRV[@]}" &
     SERVER_PGID=$!
     # Wait on the handshake rather than a fixed sleep: loading a diffusion
     # checkpoint onto the GPU takes tens of seconds and varies.

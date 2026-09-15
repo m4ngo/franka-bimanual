@@ -23,8 +23,8 @@ has; see baselines/BSPLINE_POLICY.md.)
 Control mode is EE_POS: `bspline_bridge/dataset.py` trains on the absolute
 commanded pose. The sampled action is 10-dim -- xyz + rot6d + gripper -- because
 B-Spline's dataset loader turns our 7-dim [pos, rotvec, gripper] rows into
-rotation_6d, which is also why `infer_action_meta` classifies our data as
-`single_yam_rot6d` and lands it on upstream's fully-supported path.
+rotation_6d. That width is what the client checks; the server's `action_format`
+string is upstream's own label for its arm and is recorded, not interpreted.
 """
 
 from __future__ import annotations
@@ -32,7 +32,6 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
+from baselines import run_record as rr  # noqa: E402
 from baselines.bspline_bridge.spline_plan import SplinePlanner  # noqa: E402
 from baselines.zmq_client import PolicyClient  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
@@ -49,8 +49,8 @@ from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 logger = logging.getLogger("baselines.bspline")
 
 POLICY = "bspline"
-# single_yam_rot6d: [pos(3), rot6d(6), gripper(1)]. The pose columns are what the
-# stitch matches on; the gripper is index 9.
+# [pos(3), rot6d(6), gripper(1)]. The pose columns are what the stitch matches
+# on; the gripper is index 9.
 _ACT_DIM = 10
 _GRIPPER_INDEX = 9
 _POSE_DIM = 9
@@ -65,7 +65,7 @@ def decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     row = np.asarray(row, dtype=np.float64).reshape(-1)
     if row.size != _ACT_DIM:
         raise ValueError(
-            f"expected a {_ACT_DIM}-dim single_yam_rot6d action, got {row.size}. "
+            f"expected a {_ACT_DIM}-dim pos+rot6d+gripper action, got {row.size}. "
             "The checkpoint's action space does not match what "
             "baselines/bspline_bridge/dataset.py writes."
         )
@@ -73,7 +73,7 @@ def decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
 
 
 def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict,
-                    shapes: dict):
+                    shapes: dict, run_dir):
     exec_fps = float(args.exec_fps or fc.policy("baselines.exec.fast_fps"))
     o_fps = float(args.obs_fps or rc.obs_fps())
     per_obs = max(1, int(round(exec_fps / o_fps)))
@@ -87,7 +87,7 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
         planner = SplinePlanner(client, **planner_kwargs)
         dispatcher.start()
         writers: dict = {}
-        video_dir = Path(args.save_videos).expanduser() if args.save_videos else None
+        video_dir = run_dir.video_dir if args.save_videos else None
         # Counts WRITTEN frames, not dispatched goals: the label is
         # `index / fps`, and one frame per observation indexed by the dispatch
         # step would burn in a clock running per_obs x fast.
@@ -167,9 +167,6 @@ def main() -> int:
                    help="start every new plan at min_t instead of stitching")
     args = p.parse_args()
 
-    if args.repo_id and not args.output_dir:
-        p.error("--output-dir is required when --repo-id is set")
-
     logging.basicConfig(level=logging.INFO, force=True)
     port = args.port or int(fc.policy("baselines.zmq.bspline_port"))
     client = PolicyClient(port, int(fc.policy("baselines.zmq.recv_timeout_ms")), args.host)
@@ -208,29 +205,38 @@ def main() -> int:
         compare_dim=_POSE_DIM,
     )
 
-    metrics = rc.RunMetrics(policy=POLICY, header={
-        "ckpt": args.ckpt,
-        "ckpt_sha256": rc.sha256(args.ckpt),
-        "rig": args.rig,
-        "control_mode": ControlMode.EE_POS.value,
-        "exec_fps": args.exec_fps or fc.policy("baselines.exec.fast_fps"),
-        "obs_fps": args.obs_fps or rc.obs_fps(),
-        "speed_up_times": speed,
-        "origin_time_scale": ots,
-        "checkpoint_meta": {k: v for k, v in meta.items() if k != "obs_key_shapes"},
-        "argv": sys.argv,
-    })
+    try:
+        train_dataset = rr.resolve_train_dataset(
+            args.train_dataset, meta.get("train_dataset"), meta.get("training_hdf5"))
+    except ValueError as exc:
+        p.error(str(exc))
+    run_dir, record = rc.open_run(args, POLICY, train_dataset)
+
+    record.set("policy",
+               checkpoint=rr.file_provenance(args.ckpt),
+               server={"host": args.host, "port": port, **{k: v for k, v in meta.items()}},
+               control_mode=ControlMode.EE_POS.value,
+               control_mode_source="fixed",
+               control_mode_reason="bspline_bridge/dataset.py trains on absolute poses")
+    record.set("parameters", **rc.bspline_parameters(args, meta, planner_kwargs))
 
     controller = rc.build_robot(args.rig, ControlMode.EE_POS)
     controller.connect()
+    status, reason = "completed", None
     try:
+        record.set("environment", **rc.environment(args, controller))
         shapes = rc.check_camera_coverage(meta, controller, args.allow_missing_cameras)
-        rc.run_episodes(args, controller, metrics,
-                        make_episode_fn(client, meta, args, planner_kwargs, shapes))
+        rc.run_episodes(args, controller, run_dir, record,
+                        make_episode_fn(client, meta, args, planner_kwargs, shapes, run_dir))
     except KeyboardInterrupt:
+        status, reason = "interrupted", "KeyboardInterrupt at the robot"
         print("\r\ninterrupted\r", flush=True)
+    except Exception as exc:
+        status, reason = "failed", f"{type(exc).__name__}: {exc}"
+        raise
     finally:
-        metrics.write(rc.metrics_path(args, POLICY))
+        record.finish(status, reason)
+        print(f"\r\nrun written to {run_dir.path}\r", flush=True)
         controller.disconnect()
         client.close()
     return 0

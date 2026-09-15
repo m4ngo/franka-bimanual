@@ -21,6 +21,7 @@ import numpy as np  # noqa: E402
 
 from baselines.common import (  # noqa: E402
     NUM_JOINTS,
+    parse_image_size,
     pos_rotvec_gripper,
     reached_and_commanded_poses,
     run_conversion,
@@ -76,6 +77,13 @@ def main() -> int:
     p.add_argument("--max-trim", type=int, default=5)
     p.add_argument("--min-steps", type=int, default=20)
     p.add_argument("--no-images", action="store_true", help="skip camera frames (schema/shape tests)")
+    p.add_argument("--source-repo-id", default=None,
+                   help="dataset's HuggingFace id, stamped on the file so a rollout "
+                        "can name its output directory after the task. Defaults to "
+                        "the `dataset` argument, which is normally already that id")
+    p.add_argument("--image-size", default=None,
+                   help="WxH to resize camera frames to, e.g. 84x84. The file's image "
+                        "size is what the policy trains and rolls out at")
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -83,6 +91,8 @@ def main() -> int:
     return convert(
         args.dataset, args.out, episodes=episodes, trim_start=args.trim_start,
         max_trim=args.max_trim, min_steps=args.min_steps, include_images=not args.no_images,
+        source_repo_id=args.source_repo_id,
+        image_size=parse_image_size(args.image_size),
     )
 
 

@@ -59,8 +59,11 @@ Inside `robomimic/SAIL/`:
 
 ## The pipeline
 
-Recorded robomimic HDF5 → three processing passes → train → evaluate. Run
-everything from the submodule root, `sail/`.
+Recorded robomimic HDF5 → three processing passes → train → evaluate. Upstream
+runs everything by hand from the submodule root, `sail/`; here
+`python -m baselines.sail_bridge.train <sail.hdf5>` runs passes 2-4 in the SAIL
+venv with a generated config, and `sail_bridge/rollout.py` is pass 5. The
+upstream commands, for reference:
 
 ```bash
 conda activate SAIL
@@ -164,7 +167,16 @@ every sample in a batch is conditioned or not together.
 
 Set `train.data` to the processed HDF5. Output goes to
 `train.output_dir` (`../bc_trained_models/SAIL/` by default, i.e. outside the
-repo).
+repo). `sail_bridge/train.py` generates the config from this template, changing
+only what our data changes: the camera keys under `observation.modalities.obs.rgb`,
+`CropRandomizer`'s crop (76/84 of the file's image size, which reproduces the
+template's 76 at 84), the dataset and output paths, and the epoch budget.
+
+Two things `train.py` does that a wrapper has to know: it **catches every
+exception and exits 0** (the wrapper watches for "run failed with error"), and
+when `<output_dir>/<name>` already exists it **asks whether to delete it** --
+every earlier run of that task. Answering `n` makes it add a new timestamped
+subdirectory instead, which is what the wrapper does.
 
 ### Pass 5 — evaluation
 
@@ -221,11 +233,21 @@ raising on anything else — so name rollout outputs to match, or call
 
 ## Environment
 
-`bash sail/robomimic/SAIL/installation.sh` creates a conda env (`SAIL`, python
-3.9, torch 2.1 / cu118), clones ARISE robosuite at the pinned commit `b9d8d3de`
-and applies `third_party/patches/robosuite-v1.4.1-sail.patch`, installs this
-package editable, and clones AWE. The robosuite patch is load-bearing and must
-not be applied to a newer robosuite; it adds:
+Here: `scripts/setup_baseline_envs.sh sail` builds `.venv-sail` (python 3.11,
+a current cu128 torch, robomimic-SAIL editable, AWE from git, an unpatched pip
+robosuite for AWE's imports). Upstream's recipe is below; it is not used
+because its torch 2.1 / cu118 has no kernels for the RTX 5090, and because two
+of its pins contradict its own code: `diffusers==0.11.1` predates the
+`EMAModel(parameters=...)` call in `diffusion_policy.py` (0.12+; the venv
+carries 0.21.4), and AWE's `setup.py` imports `pkg_resources`, which a fresh
+setuptools no longer ships (installed with `--no-build-isolation`).
+
+Upstream: `bash sail/robomimic/SAIL/installation.sh` creates a conda env
+(`SAIL`, python 3.9, torch 2.1 / cu118), clones ARISE robosuite at the pinned
+commit `b9d8d3de` and applies `third_party/patches/robosuite-v1.4.1-sail.patch`,
+installs this package editable, and clones AWE. The robosuite patch is
+load-bearing for the *simulator* and must not be applied to a newer robosuite;
+nothing here builds the simulator, so it is not applied. It adds:
 
 - `env.step(action, control_freq=...)` — the variable control frequency the
   whole method rests on, plus `motion_profile` helpers
@@ -244,6 +266,15 @@ not be applied to a newer robosuite; it adds:
   outside the patched simulator. **Running SAIL on our arm means writing the
   rollout loop ourselves**; the trained policy and the precision labels transfer,
   the executor does not.
+- **Inference wants what the simulator env handed it.** `RolloutPolicy` does
+  no observation processing of its own: robomimic's env wrapper delivered images
+  already CHW float in [0, 1], and with `train.frame_stack: 2` a
+  `FrameStackWrapper` delivered every key as a `[T, ...]` stack seeded with
+  copies of the first frame -- the fork comments out the policy's own obs queue
+  ("already handled by frame_stack") and asserts on a single frame. And
+  `get_action` returns one action and then serves an internal queue unless
+  called with `return_action_sequence=True`, which the eval script passes in
+  its kwargs literal. `sail_bridge/policy_server.py` does all three.
 - **Only CFG is live.** `guide_config` also describes inpainting and a
   consistency (SPARC) loss, and the rollout loop `assert False, "we are not
   using this"` on both. `guide_template/base_cfg_weight_*.json` are the

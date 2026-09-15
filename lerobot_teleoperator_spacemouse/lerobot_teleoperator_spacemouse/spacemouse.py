@@ -147,19 +147,29 @@ class SpaceMouse(Teleoperator):
     # Public helpers
     # ------------------------------------------------------------------
 
-    def seed_state(self, pos: np.ndarray, rot_xyzw: np.ndarray) -> None:
+    def seed_state(self, pos: np.ndarray, rot_xyzw: np.ndarray,
+                   gripper_norm: float | None = None) -> None:
         """Initialise the integrated EE pose from the robot's live state.
 
-        Call this once after connecting (and before the first :pymeth:`get_action`)
+        Call this after connecting (and before the first :pymeth:`get_action`)
         so the spacemouse starts tracking from the arm's true EE position rather
-        than ``config.initial_pos`` / ``config.initial_rot``.
+        than ``config.initial_pos`` / ``config.initial_rot``. Call it AGAIN
+        whenever the arm is moved by something other than this leader -- a
+        ``home()`` between episodes -- or the target the arm was left at is what
+        the next step commands, clamped to ``max_lead`` of the new pose.
 
         Args:
             pos: EE Cartesian position ``[x, y, z]`` in metres.
             rot_xyzw: EE orientation as a unit quaternion ``[qx, qy, qz, qw]``.
+            gripper_norm: if given, re-latch the gripper target to this
+                normalised position too. The gripper is a latched target, not an
+                integrator, so seed it from what the gripper was COMMANDED, not
+                from a measured width that reads a millimetre short of it.
         """
         self.cur_pos = np.asarray(pos, dtype=np.float64).copy()
         self.cur_rot = Rotation.from_quat(rot_xyzw)
+        if gripper_norm is not None:
+            self._gripper_target = float(gripper_norm)
 
     def bind_pose_source(self, source) -> None:
         """Supply a callable returning the arm's measured ``(pos, quat_xyzw)``.

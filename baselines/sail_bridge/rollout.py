@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
+from baselines import run_record as rr  # noqa: E402
 from baselines.zmq_client import PolicyClient  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 
@@ -48,10 +49,10 @@ logger = logging.getLogger("baselines.sail")
 
 POLICY = "sail"
 # Action-key -> control mode. `actions` is the delta our converter derives with
-# OSCGoalBuilder.delta_from_absolute; the two absolute keys are the poses SAIL's
-# own pipeline trains on.
-_DELTA_KEYS = ("actions",)
-_ABS_PREFIX = "absolute_actions"
+# OSCGoalBuilder.delta_from_absolute; anything naming `absolute_actions` --
+# reached or commanded, with or without the precision label -- is a pose.
+_DELTA_KEY = "actions"
+_ABS_MARKER = "absolute_actions"
 
 
 def resolve_control_mode(meta: dict, override: str) -> ControlMode:
@@ -66,14 +67,15 @@ def resolve_control_mode(meta: dict, override: str) -> ControlMode:
             "Pass --control-mode to choose explicitly."
         )
     key = keys[0]
-    if key in _DELTA_KEYS:
-        return ControlMode.EE_DELTA
-    if key.startswith(_ABS_PREFIX):
+    # The absolute check comes first: "actions" is a substring of the absolute keys.
+    if _ABS_MARKER in key:
         return ControlMode.EE_POS
+    if key == _DELTA_KEY:
+        return ControlMode.EE_DELTA
     raise ValueError(
         f"cannot tell the action space from action_keys={keys!r}. Expected "
-        f"{_DELTA_KEYS[0]!r} (delta) or {_ABS_PREFIX}* (absolute); pass "
-        "--control-mode to override."
+        f"{_DELTA_KEY!r} (delta) or a key containing {_ABS_MARKER!r} (absolute); "
+        "pass --control-mode to override."
     )
 
 
@@ -85,7 +87,7 @@ def _decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
 
 
 def make_episode_fn(client: PolicyClient, meta: dict, args,
-                    control_mode: ControlMode, shapes: dict):
+                    control_mode: ControlMode, shapes: dict, run_dir):
     precision = meta["precision_column"] and not args.no_precision
     eag = meta["guided"] and meta["fac_enabled"] and not args.no_eag
     t_f = int(meta["fac_horizon"])
@@ -125,7 +127,7 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
         executed: list[np.ndarray] = []
         goal: tuple[np.ndarray, np.ndarray] | None = None
         writers: dict = {}
-        video_dir = Path(args.save_videos).expanduser() if args.save_videos else None
+        video_dir = run_dir.video_dir if args.save_videos else None
         # One frame per OBSERVATION, indexed by written frames. Writing per
         # dispatched step and labelling at fast_fps mislabels every slow step,
         # and the two baselines' videos would not line up.
@@ -269,9 +271,6 @@ def main() -> int:
     p.add_argument("--no-eag", action="store_true", help="disable error-adaptive guidance")
     args = p.parse_args()
 
-    if args.repo_id and not args.output_dir:
-        p.error("--output-dir is required when --repo-id is set")
-
     logging.basicConfig(level=logging.INFO, force=True)
     port = args.port or int(fc.policy("baselines.zmq.sail_port"))
     client = PolicyClient(port, int(fc.policy("baselines.zmq.recv_timeout_ms")), args.host)
@@ -281,31 +280,41 @@ def main() -> int:
     logger.info("checkpoint: %s", meta)
 
     control_mode = resolve_control_mode(meta, args.control_mode)
-    metrics = rc.RunMetrics(policy=POLICY, header={
-        "ckpt": args.ckpt,
-        "ckpt_sha256": rc.sha256(args.ckpt),
-        "rig": args.rig,
-        "control_mode": control_mode.value,
-        "control_mode_source": args.control_mode,
-        "exec_fps": args.exec_fps or fc.policy("baselines.exec.fast_fps"),
-        "slow_fps": args.slow_fps or fc.policy("baselines.exec.slow_fps"),
-        "obs_fps": args.obs_fps or rc.obs_fps(),
-        "checkpoint_meta": {k: v for k, v in meta.items() if k != "obs_key_shapes"},
-        "argv": sys.argv,
-    })
+    try:
+        train_dataset = rr.resolve_train_dataset(
+            args.train_dataset, meta.get("train_dataset"), meta.get("training_hdf5"))
+    except ValueError as exc:
+        p.error(str(exc))
+    run_dir, record = rc.open_run(args, POLICY, train_dataset)
+
+    record.set("policy",
+               checkpoint=rr.file_provenance(args.ckpt),
+               server={"host": args.host, "port": port, **{k: v for k, v in meta.items()}},
+               control_mode=control_mode.value,
+               control_mode_source=args.control_mode,
+               control_mode_reason=("checkpoint action_keys" if args.control_mode == "auto"
+                                    else "--control-mode"))
+    record.set("parameters", **rc.sail_parameters(args, meta, control_mode))
 
     controller = rc.build_robot(args.rig, control_mode)
     controller.connect()
+    status, reason = "completed", None
     try:
+        record.set("environment", **rc.environment(args, controller))
         # Before homing, not inside the loop: a camera the rig lacks would
         # otherwise surface as a KeyError in the policy server mid-episode.
         shapes = rc.check_camera_coverage(meta, controller, args.allow_missing_cameras)
-        rc.run_episodes(args, controller, metrics,
-                        make_episode_fn(client, meta, args, control_mode, shapes))
+        rc.run_episodes(args, controller, run_dir, record,
+                        make_episode_fn(client, meta, args, control_mode, shapes, run_dir))
     except KeyboardInterrupt:
+        status, reason = "interrupted", "KeyboardInterrupt at the robot"
         print("\r\ninterrupted\r", flush=True)
+    except Exception as exc:
+        status, reason = "failed", f"{type(exc).__name__}: {exc}"
+        raise
     finally:
-        metrics.write(rc.metrics_path(args, POLICY))
+        record.finish(status, reason)
+        print(f"\r\nrun written to {run_dir.path}\r", flush=True)
         controller.disconnect()
         client.close()
     return 0

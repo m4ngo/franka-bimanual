@@ -46,7 +46,14 @@ from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
 
 logger = logging.getLogger(__name__)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import franka_config as fc  # noqa: E402
+from baselines import run_record as rr  # noqa: E402
+from baselines.rollout_common import Episode, frames_in_progress  # noqa: E402
+
+# This method's name in the shared outputs tree, alongside sail and bspline.
+METHOD = "multifast"
 from env_wrapper import default_home_q as _default_home_q  # noqa: E402
 
 _POSES_DIR = fc.home_poses_dir()
@@ -60,7 +67,8 @@ def _stdin_key_pressed() -> bool:
 def _read_key() -> str:
     """Read one keypress from stdin (caller must be in raw mode).
 
-    Returns 'right' for right-arrow, 'ctrl_c' for Ctrl-C, or '' for anything else.
+    Returns 'right' for right-arrow, 'left' for left-arrow, 'ctrl_c' for Ctrl-C,
+    or '' for anything else.
 
     Uses os.read exclusively (never sys.stdin.read) so Python's text-mode buffer
     cannot swallow the CSI tail bytes before we inspect them.
@@ -73,6 +81,8 @@ def _read_key() -> str:
         return "ctrl_c"
     if data.startswith(b"\x1b[C") or data.startswith(b"\x1bOC"):
         return "right"
+    if data.startswith(b"\x1b[D") or data.startswith(b"\x1bOD"):
+        return "left"
     return ""
 
 
@@ -127,14 +137,8 @@ def _build_dataset(args, controller) -> LeRobotDataset:
         encoder_queue_maxsize=8,
         encoder_threads=2,
     )
-    if args.resume:
-        return LeRobotDataset.resume(
-            args.repo_id,
-            root=args.output_dir,
-            image_writer_processes=0,
-            image_writer_threads=4 * n_cams,
-            **common,
-        )
+    # No resume branch: each run gets a fresh directory, so there is never an
+    # existing dataset at this root to continue into.
     return LeRobotDataset.create(
         args.repo_id,
         args.fps,
@@ -307,6 +311,7 @@ def _run_episode(
     video_cams: "list[str] | None" = None,
     video_stem: str = "episode",
     infer_lead: int = 1,
+    ep: "object | None" = None,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -367,13 +372,24 @@ def _run_episode(
         while True:
             t_step = time.perf_counter()
             if episode_time_s is not None and t_step - t_start >= episode_time_s:
+                if ep is not None:
+                    ep.verdict, ep.success = "timeout", False
+                    ep.wall_time_s = t_step - t_start
                 break
             if _stdin_key_pressed():
                 key = _read_key()
                 if key == "ctrl_c":
                     raise KeyboardInterrupt
-                if key == "right":
-                    print("\r\nearly stop requested", flush=True)
+                if key in ("right", "left"):
+                    # The operator's verdict, not just a stop: without it there
+                    # is no time-to-success to compare this method against the
+                    # baselines on. Right = success, left = failure, matching
+                    # baselines/rollout_common.py's Stopper.
+                    verdict = "success" if key == "right" else "failure"
+                    if ep is not None:
+                        ep.verdict, ep.success = verdict, key == "right"
+                        ep.wall_time_s = t_step - t_start
+                    print(f"\r\n{verdict}\r", flush=True)
                     break
             
             # times = []
@@ -413,6 +429,8 @@ def _run_episode(
                     pending = None
                     wait_ms_window.append((time.perf_counter() - t_wait) * 1000.0)
                 infer_idx += 1
+                if ep is not None:
+                    ep.inferences = infer_idx
                 base_chunk = result["base_chunk"]
                 res_chunk = result["res_chunk"]
                 # The forecast is anchored on the pose the policy actually saw,
@@ -544,6 +562,8 @@ def _run_episode(
             prev_kp = kp
             prev_kd = kd
             chunk_used += 1
+            if ep is not None:
+                ep.steps = step_idx
 
 
             elapsed = time.perf_counter() - t_step
@@ -632,6 +652,90 @@ def _save_viz(
         print(f"saved policy-input clouds to {pcd_path} (plot with plot_policy_pcd.py)")
 
 
+def _base_policy_dataset(base_policy: str | None) -> str | None:
+    """The LeRobot dataset a base-policy checkpoint was trained on.
+
+    LeRobot writes `train_config.json` next to `pretrained_model/`, and it
+    carries `dataset.repo_id`. Best-effort: an older or hand-assembled
+    checkpoint simply has none, and the rollout asks for --train-dataset.
+    """
+    if not base_policy:
+        return None
+    here = Path(base_policy).expanduser()
+    for candidate in (here / "train_config.json",
+                      here.parent / "train_config.json",
+                      here.parent.parent / "train_config.json"):
+        if not candidate.is_file():
+            continue
+        try:
+            cfg = json.loads(candidate.read_text())
+        except Exception:
+            continue
+        repo_id = (cfg.get("dataset") or {}).get("repo_id")
+        if repo_id:
+            return repo_id
+    return None
+
+
+def _policy_record(args) -> dict:
+    """Both halves of this method are policies; both are provenance."""
+    return {
+        "base_policy": rr.file_provenance(args.base_policy),
+        "residual_policy": (None if args.no_residual
+                            else rr.file_provenance(args.residual_policy)),
+        "residual_enabled": not args.no_residual,
+        "replay_dataset": args.replay_dataset,
+        "device": args.device,
+        "control_mode": "EE_DELTA",
+        "control_mode_source": "fixed",
+        "control_mode_reason": "the base policy emits per-step EE deltas",
+    }
+
+
+def _parameter_record(args) -> dict:
+    """Every knob this runner resolved, including the normalisation contract the
+    checkpoints were trained against -- changing any of it invalidates them."""
+    return {
+        "exec_fps": float(args.fps),
+        "obs_fps": float(args.fps),
+        "num_episodes": args.num_episodes,
+        "episode_time_s": args.episode_time_s,
+        "task": args.task,
+        "infer_lead": args.infer_lead,
+        "proprio_frame": args.proprio_frame,
+        "sim_proprio_convention": not args.raw_proprio,
+        "base_amp": args.base_amp,
+        "base_compile": args.base_compile,
+        "residual": {
+            "chunk_exec": fc.policy("residual.chunk_exec"),
+            "horizon": fc.policy("residual.horizon"),
+            "pos_scale_m": fc.policy("residual.pos_scale_m"),
+            "rot_scale_rad": fc.policy("residual.rot_scale_rad"),
+            "gains_mag": fc.policy("residual.gains_mag"),
+            "residual_mag": fc.policy("residual.residual_mag"),
+            "residual_trans_mag": fc.policy("residual.residual_trans_mag"),
+            "residual_rot_mag": fc.policy("residual.residual_rot_mag"),
+            "res_pos_gain": fc.policy("residual.res_pos_gain"),
+            "res_rot_gain": fc.policy("residual.res_rot_gain"),
+        },
+    }
+
+
+def _environment_record(args, controller) -> dict:
+    """The same shape the baseline bridges record, so the three are comparable.
+
+    Imported rather than restated: rollout_common.environment resolves the rig
+    profile, the physical arm behind the `r_` prefix, and the torque/tuning
+    blocks a sim-real comparison turns on.
+    """
+    from baselines.rollout_common import environment
+    shim = argparse.Namespace(
+        rig=env_wrapper._PROFILE, home_pose_name=args.home_pose_name,
+        home_q=args.home_q, dry_run=False,
+    )
+    return environment(shim, controller)
+
+
 def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
@@ -697,37 +801,39 @@ def main() -> None:
     parser.add_argument("--home-max-time-s", type=float, default=fc.control("homing.max_time_s"))
     parser.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
 
-    # Recording options (all optional; omitting --repo-id disables recording).
+    # Recording. The run directory owns every output path, so there is no
+    # --output-dir: a run is one directory you can archive or delete whole.
     parser.add_argument("--repo-id", default=None,
-                        help="HuggingFace repo id for the recorded dataset; enables recording")
-    parser.add_argument("--output-dir", default=None,
-                        help="Local root for the dataset (required when --repo-id is set)")
-    parser.add_argument("--task", default=None,
+                        help="repo id for the LeRobotDataset recorded during the run; "
+                             "default <train-dataset>-<method>-<timestamp>")
+    parser.add_argument("--task", default="multifast rollout",
                         help="Single-task description stored with each episode")
     parser.add_argument("--num-episodes", type=int, default=1,
-                        help="Number of episodes to record (only used when recording)")
+                        help="Number of episodes to run")
     parser.add_argument("--episode-time-s", type=float, default=60.0,
-                        help="Duration of each episode in seconds (only used when recording)")
+                        help="Per-episode timeout in seconds; a timeout is a failure")
     parser.add_argument("--fps", type=int, default=fc.control_fps(),
-                        help="Dataset fps (only used when creating a new dataset)")
-    parser.add_argument("--push-to-hub", type=_str2bool, default=True,
+                        help="Control and dataset rate")
+    parser.add_argument("--push-to-hub", type=_str2bool, default=False,
                         help="Push dataset to HuggingFace Hub after recording")
-    parser.add_argument("--resume", type=_str2bool, default=False,
-                        help="Resume an existing dataset instead of creating a new one")
     parser.add_argument("--viz-dir", default=None,
-                        help="Directory to write per-episode Plotly HTML visualizations")
+                        help="Plotly HTML output; defaults to the run directory")
     parser.add_argument("--viz-stride", type=int, default=1,
                         help="Animate every Nth step in the visualization (default 1)")
     parser.add_argument("--replay-dataset", default=None, help="HuggingFace id for the dataset to replay from")
+    parser.add_argument("--train-dataset", default=None,
+                        help="repo id of the dataset the base policy was TRAINED on; "
+                             "names the output directory. Optional when the checkpoint's "
+                             "train_config.json carries it")
+    parser.add_argument("--outputs-root", default=None,
+                        help=f"default {rr.DEFAULT_ROOT}")
+    parser.add_argument("--no-record", action="store_true",
+                        help="skip the LeRobotDataset (manifest and episodes are always written)")
 
     args = parser.parse_args()
-
-    if args.repo_id and not args.output_dir:
-        parser.error("--output-dir is required when --repo-id is set")
-    if args.save_videos and not args.viz_dir:
-        parser.error("--viz-dir is required when --save-videos is set")
-    if args.repo_id and not args.task:
-        parser.error("--task is required when --repo-id is set")
+    # --output-dir is gone; _build_dataset still reads it, and main() points it
+    # at the run directory's own dataset/ once that exists.
+    args.output_dir = None
 
     logging.basicConfig(level=logging.INFO, force=True)
 
@@ -794,94 +900,129 @@ def main() -> None:
         tol_rad=args.home_tol_rad,
     )
 
-    recording = args.repo_id is not None
-    dataset: LeRobotDataset | None = None
+    train_dataset = rr.resolve_train_dataset(
+        args.train_dataset, _base_policy_dataset(args.base_policy), None)
+    run_dir = rr.RunDir(train_dataset["repo_id"], METHOD,
+                        root=args.outputs_root or rr.DEFAULT_ROOT)
+    record = rr.RunRecord(run_dir, METHOD, train_dataset)
+    print(f"run directory: {run_dir.path}")
 
-    if not recording:
-            print("homing...")
-            if not controller.home(**home_kwargs):
-                logger.warning("homing did not converge; proceeding anyway")
+    if args.repo_id is None:
+        args.repo_id = f"{Path(train_dataset['repo_id']).name}-{run_dir.run_id}"
+    args.output_dir = str(run_dir.dataset_dir)
+    if args.viz_dir is None:
+        args.viz_dir = str(run_dir.path)
+
+    record.set("policy", **_policy_record(args))
+    record.set("parameters", **_parameter_record(args))
+    record.set("environment", **_environment_record(args, controller))
+
+    dataset = None
+    encoder = None
+    status, reason = "completed", None
+    try:
+        if not args.no_record:
+            dataset = _build_dataset(args, controller)
+            encoder = VideoEncodingManager(dataset)
+            encoder.__enter__()
+        record.set("outputs", dataset={
+            "recorded": dataset is not None,
+            "repo_id": args.repo_id if dataset is not None else None,
+            "path": str(run_dir.dataset_dir) if dataset is not None else None,
+            "fps": args.fps,
+        })
+
+        print("homing...")
+        homed = bool(controller.home(**home_kwargs))
+        if not homed:
+            logger.warning("homing did not converge; proceeding anyway")
+
+        for ep_idx in range(args.num_episodes):
+            print(f"\r\nepisode {ep_idx + 1}/{args.num_episodes}: place the scene, "
+                  f"then press RIGHT ARROW to start\r", flush=True)
+            _wait_for_right_arrow()
+            print(f"\r\nrunning ({args.episode_time_s:.0f}s max). "
+                  f"RIGHT = success, LEFT = failure, Ctrl-C = abort\r", flush=True)
+
+            ep = Episode(episode=ep_idx, homed=homed, started_at=rr.stamp(),
+                         exec_fps=float(args.fps))
             recorder = EpisodeRecorder() if args.viz_dir else None
+            t0 = time.perf_counter()
             try:
                 _run_episode(
                     controller, base_policy, residual,
-                    dataset=None, episode_time_s=None,
-                    fps=args.fps, recorder=recorder,
+                    dataset=dataset,
+                    episode_time_s=args.episode_time_s,
+                    fps=args.fps,
+                    task=args.task,
+                    recorder=recorder,
                     replaying=args.replay_dataset is not None,
                     proprio_frame=args.proprio_frame,
                     sim_proprio_convention=not args.raw_proprio,
-                    dump_dir=dump_root / "ep000" if dump_root else None,
-                    video_dir=Path(args.viz_dir) if args.save_videos else None,
+                    dump_dir=dump_root / f"ep{ep_idx:03d}" if dump_root else None,
+                    video_dir=run_dir.video_dir if args.save_videos else None,
                     video_cams=args.video_cams,
+                    video_stem=f"episode_{ep_idx:03d}",
                     infer_lead=args.infer_lead,
+                    ep=ep,
                 )
             finally:
+                if not ep.wall_time_s:
+                    ep.wall_time_s = time.perf_counter() - t0
+                ep.ended_at = rr.stamp()
+                # Anything that reached here without a verdict did not end on
+                # the operator's say-so or the clock -- a Ctrl-C, an exception.
+                ep.verdict = ep.verdict or "incomplete"
+                if ep.wall_time_s > 0:
+                    ep.achieved_fps = round(ep.steps / ep.wall_time_s, 2)
+                if dataset is not None:
+                    ep.frames_recorded = frames_in_progress(dataset)
+                    ep.dataset_episode_index = dataset.num_episodes
                 if recorder is not None and len(recorder) > 0:
-                    viz_path = os.path.join(args.viz_dir, "episode.html")
+                    viz_path = os.path.join(args.viz_dir, f"episode_{ep_idx:03d}.html")
                     print(f"saving visualization to {viz_path}...")
-                    _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps)
-                controller.disconnect()
-            return
+                    _save_viz(recorder, viz_path, residual,
+                              f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps)
+                    ep.notes["viz"] = os.path.basename(viz_path)
+                record.add_episode(ep)
 
-    # Multi-episode recording mode.
-    dataset = _build_dataset(args, controller)
-    try:
-        with VideoEncodingManager(dataset):
-            # Home once before the first episode.
-            print(f"homing before episode {dataset.num_episodes}...")
-            if not controller.home(**home_kwargs):
-                logger.warning("homing did not converge; proceeding anyway")
-
-            for ep_idx in range(args.num_episodes):
-                print(f"press right arrow to start episode {dataset.num_episodes} / {args.num_episodes} "
-                      f"({args.episode_time_s:.0f}s)...")
-                _wait_for_right_arrow()
-
-                print(f"recording episode {dataset.num_episodes} / {args.num_episodes} "
-                      f"({args.episode_time_s:.0f}s)...")
-                recorder = EpisodeRecorder() if args.viz_dir else None
-                try:
-                    _run_episode(
-                        controller, base_policy, residual,
-                        dataset=dataset,
-                        episode_time_s=args.episode_time_s,
-                        fps=args.fps,
-                        task=args.task,
-                        recorder=recorder,
-                        replaying=args.replay_dataset is not None,
-                        proprio_frame=args.proprio_frame,
-                        sim_proprio_convention=not args.raw_proprio,
-                        dump_dir=dump_root / f"ep{dataset.num_episodes:03d}" if dump_root else None,
-                        video_dir=Path(args.viz_dir) if args.save_videos else None,
-                        video_cams=args.video_cams,
-                        video_stem=f"episode_{ep_idx:03d}",
-                        infer_lead=args.infer_lead,
-                    )
-                finally:
-                    if recorder is not None and len(recorder) > 0:
-                        viz_path = os.path.join(
-                            args.viz_dir, f"episode_{ep_idx:03d}.html"
-                        )
-                        print(f"saving visualization to {viz_path}...")
-                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps)
+            print(f"\r\nepisode {ep_idx}: {ep.verdict.upper()} "
+                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps\r", flush=True)
+            if dataset is not None:
                 dataset.save_episode()
-                print(f"episode {dataset.num_episodes - 1} saved")
-
-                if ep_idx < args.num_episodes - 1:
-                    print("resetting environment — homing arm before next episode...")
-                    if not controller.home(**home_kwargs):
-                        logger.warning("homing did not converge; proceeding anyway")
+            if ep_idx < args.num_episodes - 1:
+                print("resetting environment — homing arm before next episode...")
+                homed = bool(controller.home(**home_kwargs))
+                if not homed:
+                    logger.warning("homing did not converge; proceeding anyway")
+    except KeyboardInterrupt:
+        status, reason = "interrupted", "KeyboardInterrupt at the robot"
+        print("\r\ninterrupted\r", flush=True)
+    except Exception as exc:
+        status, reason = "failed", f"{type(exc).__name__}: {exc}"
+        raise
     finally:
         if dataset is not None:
+            if encoder is not None:
+                encoder.__exit__(None, None, None)
             dataset.finalize()
+            record.set("outputs", dataset={
+                "recorded": True, "repo_id": args.repo_id,
+                **rr.describe_lerobot_dataset(run_dir.dataset_dir),
+            })
             if args.push_to_hub:
                 try:
                     dataset.push_to_hub()
+                    record.set("outputs", pushed_to_hub=True)
                 except Exception:
-                    logger.exception(
-                        "push_to_hub failed; dataset is on disk at %s",
-                        Path(args.output_dir).resolve(),
-                    )
+                    logger.exception("push_to_hub failed; dataset is on disk at %s",
+                                     run_dir.dataset_dir)
+                    record.set("outputs", pushed_to_hub=False)
+        if args.save_videos and run_dir.video_dir.is_dir():
+            record.set("outputs",
+                       videos=sorted(v.name for v in run_dir.video_dir.glob("*.mp4")))
+        record.finish(status, reason)
+        print(f"\r\nrun written to {run_dir.path}\r", flush=True)
         controller.disconnect()
 
 

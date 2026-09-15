@@ -12,8 +12,6 @@ as copied from it are noted at their definitions.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import select
@@ -40,6 +38,7 @@ from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.lerobot_source import EE_KEYS  # noqa: E402
 
+from baselines import run_record as rr  # noqa: E402
 from baselines.zmq_client import PolicyTimeout  # noqa: E402
 
 # The rig -> config-class table, and the exposed key prefix, have exactly one
@@ -351,9 +350,19 @@ class Dispatcher:
         self.last_action: dict | None = None
         self._deadline = time.perf_counter()
         self._prev_send = 0.0
-        self._gaps: list[float] = []
+        self._gaps: list[float] = []          # current log window, cleared each second
+        self._all_gaps: list[float] = []      # whole episode, for the episode log
         self._window_start = time.perf_counter()
         self._window_steps = 0
+
+    def gap_stats(self) -> tuple[float | None, float | None]:
+        """(mean, max) interval between consecutive goals, in ms, over the whole
+        episode. The max is the number that matters for smoothness: it is how
+        long the OSC loop sat on one goal."""
+        if not self._all_gaps:
+            return None, None
+        return (round(sum(self._all_gaps) / len(self._all_gaps), 3),
+                round(max(self._all_gaps), 3))
 
     def start(self) -> None:
         self._deadline = time.perf_counter()
@@ -361,6 +370,7 @@ class Dispatcher:
         self._window_start = time.perf_counter()
         self._window_steps = 0
         self._gaps.clear()
+        self._all_gaps.clear()
 
     def send(self, action: dict, hz: float) -> None:
         t_send = time.perf_counter()
@@ -370,7 +380,9 @@ class Dispatcher:
         self.steps += 1
         self._window_steps += 1
         if self._prev_send:
-            self._gaps.append((t_send - self._prev_send) * 1000.0)
+            gap = (t_send - self._prev_send) * 1000.0
+            self._gaps.append(gap)
+            self._all_gaps.append(gap)
         self._prev_send = t_send
 
         self._log_window()
@@ -512,10 +524,17 @@ def home_kwargs(args) -> dict:
                 max_time_s=args.home_max_time_s, tol_rad=args.home_tol_rad)
 
 
-def home(controller, kwargs: dict) -> None:
-    """Non-convergence warns and proceeds, as every other entrypoint here does."""
-    if not controller.home(**kwargs):
+def home(controller, kwargs: dict) -> bool:
+    """Non-convergence warns and proceeds, as every other entrypoint here does.
+
+    The verdict is returned rather than swallowed: an episode that started from
+    a pose the arm never reached is not comparable to one that did, and the
+    manifest is where that has to be visible.
+    """
+    ok = bool(controller.home(**kwargs))
+    if not ok:
         logger.warning("homing did not converge; proceeding anyway")
+    return ok
 
 
 # ---------------------------------------------------------------------------
@@ -545,9 +564,13 @@ def dataset_fps(args) -> int:
     return int(round(fps))
 
 
-def build_dataset(args, controller):
+def build_dataset(args, controller, root: Path):
     """Mirrors run_residual.py:_build_dataset, so a baseline rollout carries the
-    same `observation.state` / `action` features as a residual one."""
+    same `observation.state` / `action` features as a residual one.
+
+    `root` is the run directory's own `dataset/`, so a run is one directory you
+    can archive or delete whole.
+    """
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     features = {
@@ -574,12 +597,26 @@ def build_dataset(args, controller):
     common = dict(batch_encoding_size=1, vcodec="auto", streaming_encoding=True,
                   encoder_queue_maxsize=8, encoder_threads=2,
                   image_writer_processes=0, image_writer_threads=4 * n_cams)
-    if args.resume:
-        return LeRobotDataset.resume(args.repo_id, root=args.output_dir, **common)
     return LeRobotDataset.create(
-        args.repo_id, dataset_fps(args), root=args.output_dir,
+        args.repo_id, dataset_fps(args), root=root,
         robot_type=controller.name, features=features, use_videos=True, **common,
     )
+
+
+def frames_in_progress(dataset) -> int:
+    """Frames added to the current, not-yet-saved episode.
+
+    `dataset.num_frames` only advances on save_episode(), so the per-episode
+    count has to come off the writer's buffer -- which is where an interrupted
+    episode's frames are, too.
+    """
+    if dataset is None:
+        return 0
+    try:
+        return int(dataset.writer.episode_buffer["size"])
+    except Exception:
+        buf = getattr(dataset, "episode_buffer", None)
+        return int(buf["size"]) if buf else 0
 
 
 def add_frame(dataset, obs: dict, action: dict, task: str, cameras) -> None:
@@ -619,57 +656,39 @@ def write_video_frame(writers, video_dir, stem, fps, cam, img, step_idx):
 
 @dataclass
 class Episode:
-    """One rollout attempt. `success` is operator-marked: right arrow ends the
-    episode as a success, left arrow as a failure, and a timeout is a failure.
-    Without that there is no time-to-success to compare the baselines on."""
+    """One rollout attempt, as written to episodes.jsonl.
+
+    `success` is operator-marked: right arrow ends the episode as a success,
+    left arrow as a failure, and a timeout is a failure. Without that verdict
+    there is no time-to-success to compare the methods on.
+    """
     episode: int
     success: bool = False
+    verdict: str | None = None          # success | failure | timeout | aborted
     wall_time_s: float = 0.0
-    steps: int = 0
+    started_at: str | None = None
+    ended_at: str | None = None
+
+    steps: int = 0                      # goals dispatched
+    frames_recorded: int = 0            # rows added to the LeRobotDataset
+    dataset_episode_index: int | None = None
     inferences: int = 0
-    slow_steps: int = 0
-    guided_inferences: int = 0
-    aborted: str | None = None
+    slow_steps: int = 0                 # SAIL precision modulation
+    guided_inferences: int = 0          # SAIL EAG fired
+
+    exec_fps: float | None = None       # nominal dispatch rate
+    achieved_fps: float | None = None   # steps / wall_time
+    send_gap_ms_mean: float | None = None
+    send_gap_ms_max: float | None = None
+
     max_lead_m: float = 0.0
     max_lead_rad: float = 0.0
+    homed: bool | None = None
+    aborted: str | None = None
+    notes: dict = field(default_factory=dict)   # per-method extras
 
     def as_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
-
-
-@dataclass
-class RunMetrics:
-    policy: str
-    header: dict = field(default_factory=dict)
-    episodes: list[Episode] = field(default_factory=list)
-
-    def write(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        n_ok = sum(1 for e in self.episodes if e.success)
-        times = [e.wall_time_s for e in self.episodes if e.success]
-        path.write_text(json.dumps({
-            "policy": self.policy,
-            **self.header,
-            "summary": {
-                "episodes": len(self.episodes),
-                "successes": n_ok,
-                "success_rate": (n_ok / len(self.episodes)) if self.episodes else 0.0,
-                "mean_time_to_success_s": (sum(times) / len(times)) if times else None,
-            },
-            "episodes": [e.as_dict() for e in self.episodes],
-        }, indent=2))
-        logger.info("wrote metrics to %s (%d/%d succeeded)",
-                    path, n_ok, len(self.episodes))
-
-
-def sha256(path: str | None) -> str | None:
-    if not path or not Path(path).is_file():
-        return None
-    h = hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def propagate_pose(pos, quat_xyzw, deltas) -> tuple[np.ndarray, np.ndarray]:
@@ -716,17 +735,7 @@ def add_common_args(p, *, policy_name: str) -> None:
     p.add_argument("--num-episodes", type=int, default=10)
     p.add_argument("--episode-time-s", type=float, default=60.0)
     p.add_argument("--task", default=f"{policy_name} rollout")
-    p.add_argument("--metrics", default=None,
-                   help="output JSON; default <output-dir>/metrics.json, else "
-                        "~/franka_data/baseline_eval/<policy>-<timestamp>.json")
-    p.add_argument("--repo-id", default=None,
-                   help="HuggingFace repo id for a recorded dataset; enables recording")
-    p.add_argument("--output-dir", default=None,
-                   help="local dataset root (required with --repo-id)")
-    p.add_argument("--push-to-hub", action="store_true")
-    p.add_argument("--resume", action="store_true")
-    p.add_argument("--save-videos", default=None,
-                   help="directory for one time-aligned mp4 per camera")
+    add_output_args(p)
 
     p.add_argument("--home-pose-name", default=fc.default_home_pose_name())
     p.add_argument("--home-q", nargs=NUM_JOINTS, type=float, default=None)
@@ -735,25 +744,140 @@ def add_common_args(p, *, policy_name: str) -> None:
     p.add_argument("--home-tol-rad", type=float, default=fc.control("homing.tol_rad"))
 
 
-def metrics_path(args, policy_name: str) -> Path:
-    """Resolved once and cached on `args`.
+def environment(args, controller) -> dict:
+    """The rig this run actually drove, resolved rather than assumed.
 
-    The fallback name carries a timestamp, so recomputing it would scatter each
-    episode of one run into its own file -- and it is called after every episode
-    precisely so an interrupted run keeps what finished.
+    Records the PHYSICAL arm alongside the profile: the key prefix is `r_` on
+    both single-arm profiles and says nothing about which FR3 moved, which is
+    exactly the confusion a manifest has to settle months later.
     """
-    cached = getattr(args, "_metrics_path", None)
-    if cached is not None:
-        return cached
-    if args.metrics:
-        path = Path(args.metrics).expanduser()
-    elif args.output_dir:
-        path = Path(args.output_dir).expanduser() / "metrics.json"
-    else:
-        path = (Path.home() / "franka_data" / "baseline_eval"
-                / f"{policy_name}-{time.strftime('%Y%m%d_%H%M%S')}.json")
-    args._metrics_path = path
-    return path
+    profile = fc.profile(args.rig)
+    arm_name = profile.arms[ARM_KEY]
+    spec = fc.arm(arm_name)
+    return {
+        "rig_profile": args.rig,
+        "key_prefix": ARM_KEY,
+        "physical_arm": arm_name,
+        "arm": {
+            "robot_ip": spec.robot_ip,
+            "server_ip": spec.server_ip,
+            "rpyc_port": spec.rpyc_port,
+            "gripper_rpyc_port": spec.gripper_rpyc_port,
+            "gripper_kind": spec.gripper.kind,
+            "gripper_ip": spec.gripper.ip,
+            "nuc": spec.ssh_target,
+            "ee_sphere": {"center_tool_m": list(spec.ee_sphere.center_tool_m),
+                          "radius_m": spec.ee_sphere.radius_m},
+        },
+        "cameras": {name: [cam.height, cam.width]
+                    for name, cam in controller.cameras.items()},
+        "robot_type": controller.name,
+        "control_fps": fc.control_fps(),
+        "home_pose": args.home_pose_name,
+        "home_q_override": list(args.home_q) if args.home_q else None,
+        "torque": {
+            "default_kp": fc.control("torque.osc.default_kp"),
+            "gain_exp_base": fc.control("torque.osc.gain_exp_base"),
+            "uncouple_pos_ori": fc.control("torque.osc.uncouple_pos_ori"),
+            "cross_coupling_compensation": fc.control(
+                "torque.osc.cross_coupling_compensation", None),
+            "delta_pos_max_m": fc.control("torque.delta.pos_max_m"),
+            "delta_rot_max_rad": fc.control("torque.delta.rot_max_rad"),
+        },
+        # The per-rig trims are what a sim/real comparison turns on, so they are
+        # part of the run, not of the machine.
+        "tuning": {
+            "ee_translation_fudge": fc.control("tuning.ee_translation_fudge"),
+            "ee_rotation_fudge": fc.control("tuning.ee_rotation_fudge"),
+            "friction_kc": fc.control("tuning.friction_kc"),
+            "kp_ori_scale": list(fc.control("tuning.kp_ori_scale")),
+            "kp_pos_scale": list(fc.control("tuning.kp_pos_scale")),
+            "kd_ori_scale": list(fc.control("tuning.kd_ori_scale")),
+            "kd_pos_scale": list(fc.control("tuning.kd_pos_scale")),
+        },
+        "safety": {
+            "worktable_height_m": fc.worktable_height_m(),
+            "brake_distance_min_m": fc.control("worktable_brake.distance_min_m"),
+            "max_lead_m": fc.policy("baselines.exec.max_lead_m"),
+            "max_lead_rad": fc.policy("baselines.exec.max_lead_rad"),
+        },
+        "dry_run": bool(args.dry_run),
+    }
+
+
+def _shared_parameters(args) -> dict:
+    return {
+        "exec_fps": float(args.exec_fps or fc.policy("baselines.exec.fast_fps")),
+        "obs_fps": float(args.obs_fps or obs_fps()),
+        "num_episodes": args.num_episodes,
+        "episode_time_s": args.episode_time_s,
+        "task": args.task,
+        "allow_missing_cameras": bool(args.allow_missing_cameras),
+    }
+
+
+def sail_parameters(args, meta: dict, control_mode) -> dict:
+    """Every knob SAIL's executor resolved, and where each came from."""
+    precision = bool(meta.get("precision_column")) and not args.no_precision
+    eag = bool(meta.get("guided") and meta.get("fac_enabled")) and not args.no_eag
+    return {
+        **_shared_parameters(args),
+        "slow_fps": float(args.slow_fps or fc.policy("baselines.exec.slow_fps")),
+        "precision_modulation": precision,
+        "precision_available": bool(meta.get("precision_column")),
+        "eag": eag,
+        "eag_available": bool(meta.get("fac_enabled")),
+        "eag_horizon": meta.get("fac_horizon"),
+        "inf_delay": int(fc.policy("baselines.sail.inf_delay")),
+        "execute_n_actions": int(fc.policy("baselines.sail.execute_n_actions")),
+        "slowdown_window_size": int(fc.policy("baselines.sail.slowdown_window_size")),
+        "pos_teb": float(fc.policy("baselines.sail.pos_teb")),
+        "ori_teb": float(fc.policy("baselines.sail.ori_teb")),
+        "action_horizon": meta.get("action_horizon"),
+        "prediction_horizon": meta.get("prediction_horizon"),
+    }
+
+
+def bspline_parameters(args, meta: dict, planner_kwargs: dict) -> dict:
+    """Every knob the spline planner resolved."""
+    return {
+        **_shared_parameters(args),
+        **{k: v for k, v in planner_kwargs.items() if not k.startswith("_")},
+        "action_format": meta.get("action_format"),
+        "act_dim": meta.get("act_dim"),
+    }
+
+
+def add_output_args(p) -> None:
+    """Where a run is filed. Shared with residual_wrapper so all three methods
+    land in the same tree under one set of flag names."""
+    p.add_argument("--train-dataset", default=None,
+                   help="repo id of the dataset this policy was TRAINED on; names "
+                        "the output directory. Optional when the checkpoint carries "
+                        "it (converter --source-repo-id)")
+    p.add_argument("--outputs-root", default=None,
+                   help=f"default {rr.DEFAULT_ROOT}")
+    p.add_argument("--repo-id", default=None,
+                   help="repo id for the LeRobotDataset recorded during the run; "
+                        "default <train-dataset>-<method>-<timestamp>")
+    p.add_argument("--no-record", action="store_true",
+                   help="skip the LeRobotDataset (manifest and episodes are always written)")
+    p.add_argument("--push-to-hub", action="store_true")
+    p.add_argument("--save-videos", action="store_true",
+                   help="one time-aligned mp4 per camera into <run-dir>/videos")
+
+
+def open_run(args, method: str, train_dataset: dict) -> tuple[rr.RunDir, rr.RunRecord]:
+    """Create the run directory and start its manifest."""
+    run_dir = rr.RunDir(train_dataset["repo_id"], method,
+                        root=args.outputs_root or rr.DEFAULT_ROOT)
+    record = rr.RunRecord(run_dir, method, train_dataset)
+    if args.repo_id is None:
+        # Derived so two runs of the same method on the same task never collide,
+        # and so the dataset says what produced it.
+        args.repo_id = f"{Path(train_dataset['repo_id']).name}-{run_dir.run_id}"
+    logger.info("run directory: %s", run_dir.path)
+    return run_dir, record
 
 
 class Stopper:
@@ -792,23 +916,29 @@ class Stopper:
         return self.verdict
 
 
-def run_episodes(args, controller, metrics: RunMetrics, episode_fn) -> None:
+def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
     """Outer harness: home, wait for the operator, run, record, repeat.
 
     `episode_fn(controller, dispatcher, dataset, ep, stopper)` runs one episode
-    and fills in `ep`. Shared so the two backends differ only in their loop.
+    and fills in `ep`. Shared so the three methods differ only in their loop.
     """
     kw = home_kwargs(args)
     dataset = None
     encoder = None
     try:
-        if args.repo_id:
+        if not args.no_record:
             from lerobot.datasets.video_utils import VideoEncodingManager
-            dataset = build_dataset(args, controller)
+            dataset = build_dataset(args, controller, run_dir.dataset_dir)
             encoder = VideoEncodingManager(dataset)
             encoder.__enter__()
+        record.set("outputs", dataset={
+            "recorded": dataset is not None,
+            "repo_id": args.repo_id if dataset is not None else None,
+            "path": str(run_dir.dataset_dir) if dataset is not None else None,
+            "fps": dataset_fps(args),
+        }, videos_dir=str(run_dir.video_dir) if args.save_videos else None)
 
-        home(controller, kw)
+        homed = home(controller, kw)
         for idx in range(args.num_episodes):
             print(f"\r\nepisode {idx + 1}/{args.num_episodes}: place the scene, "
                   f"then press RIGHT ARROW to start\r", flush=True)
@@ -816,7 +946,8 @@ def run_episodes(args, controller, metrics: RunMetrics, episode_fn) -> None:
             print(f"\r\nrunning ({args.episode_time_s:.0f}s max). "
                   f"RIGHT = success, LEFT = failure, Ctrl-C = abort\r", flush=True)
 
-            ep = Episode(episode=idx)
+            ep = Episode(episode=idx, homed=homed,
+                         started_at=rr.stamp(), exec_fps=dataset_fps(args))
             dispatcher = Dispatcher(controller, dry_run=args.dry_run)
             stopper = Stopper(args.episode_time_s)
             try:
@@ -828,30 +959,50 @@ def run_episodes(args, controller, metrics: RunMetrics, episode_fn) -> None:
                 # The operator can still place the scene and try again, and the
                 # episode is recorded as a failure with the reason attached.
                 ep.aborted = f"{type(exc).__name__}: {exc}"
+                ep.verdict = "aborted"
                 logger.error("episode %d aborted: %s", idx, exc)
             finally:
                 ep.steps = dispatcher.steps
                 if not ep.wall_time_s:
                     ep.wall_time_s = stopper.elapsed()
-                metrics.episodes.append(ep)
-                # Written after every episode, so a run interrupted at the robot
-                # still leaves the episodes that did finish.
-                metrics.write(metrics_path(args, metrics.policy))
+                ep.ended_at = rr.stamp()
+                ep.verdict = ep.verdict or stopper.verdict or "incomplete"
+                if ep.wall_time_s > 0:
+                    ep.achieved_fps = round(ep.steps / ep.wall_time_s, 2)
+                ep.send_gap_ms_mean, ep.send_gap_ms_max = dispatcher.gap_stats()
+                if dataset is not None:
+                    ep.frames_recorded = frames_in_progress(dataset)
+                    ep.dataset_episode_index = dataset.num_episodes
+                record.add_episode(ep)
 
-            print(f"\r\nepisode {idx}: {'SUCCESS' if ep.success else 'failure'} "
+            print(f"\r\nepisode {idx}: {ep.verdict.upper()} "
                   f"in {ep.wall_time_s:.2f}s, {ep.steps} steps\r", flush=True)
             if dataset is not None:
                 dataset.save_episode()
             if idx < args.num_episodes - 1:
-                home(controller, kw)
+                homed = home(controller, kw)
     finally:
         if dataset is not None:
             if encoder is not None:
                 encoder.__exit__(None, None, None)
             dataset.finalize()
+            record.set("outputs", dataset={
+                "recorded": True,
+                "repo_id": args.repo_id,
+                **rr.describe_lerobot_dataset(run_dir.dataset_dir),
+            })
             if args.push_to_hub:
                 try:
                     dataset.push_to_hub()
+                    record.set("outputs", pushed_to_hub=True)
                 except Exception:
                     logger.exception("push_to_hub failed; dataset is on disk at %s",
-                                     Path(args.output_dir).resolve())
+                                     run_dir.dataset_dir)
+                    record.set("outputs", pushed_to_hub=False)
+        if args.save_videos and run_dir.video_dir.is_dir():
+            record.set("outputs",
+                       videos=sorted(p.name for p in run_dir.video_dir.glob("*.mp4")))
+        # The manifest is otherwise only rewritten per episode, so the dataset
+        # description gathered above would never reach disk for a caller that
+        # does not go on to call record.finish().
+        record.write()

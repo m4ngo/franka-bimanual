@@ -1,20 +1,24 @@
-# Running a trained baseline on the arm
+# Running a trained policy on the arm
 
 The converters in this directory turn one recording into the three formats the
 three methods train on. This is the other end: running each trained policy on
 the real FR3 and writing down success and time, so the comparison the directory
 exists for can actually be scored.
 
+All three methods -- SAIL, B-Spline and our own multi-fast residual runner --
+share the operator protocol, the episode log and the output tree, so their runs
+are directly comparable. Only the two baselines need a separate policy process.
+
 ## Why there are two processes
 
-Each upstream project needs its own conda environment, and they conflict with
-each other and with the workspace venv that owns `lerobot`, `franka_config` and
-the RPyC link to the arm. So the policy never runs in the same process as the
-robot:
+Each upstream project needs its own environment (`.venv-sail`, `.venv-bspline`,
+from `scripts/setup_baseline_envs.sh`), and they conflict with each other and
+with the workspace venv that owns `lerobot`, `franka_config` and the RPyC link
+to the arm. So the policy never runs in the same process as the robot:
 
 ```
- conda env (SAIL / robodiff)            workspace venv (~/franka_ws/.venv)
- ---------------------------            ---------------------------------
+ baseline venv (.venv-sail / -bspline)  workspace venv (~/franka_ws/.venv)
+ -------------------------------------  ---------------------------------
  policy_server.py                       rollout.py
    loads the checkpoint         ZMQ       owns the arm, the cameras,
    answers "what action?"   <-------->    the clock and the recording
@@ -35,60 +39,139 @@ not take and the other arm is about to move.
 
 ```bash
 ./scripts/sail_rollout.sh --start-server \
-    --ckpt ~/franka_data/sail/model_epoch_300.pth \
+    --ckpt ~/franka_data/policies/pickup-bowl/sail/<ts>/models/model_epoch_1000.pth \
     --guide-config baselines/sail/robomimic/SAIL/guide_template/base_cfg_weight_1.json \
-    --rig=single_arm_right --num-episodes 10 \
-    --repo-id you/sail-eval --output-dir ~/franka_data/sail-eval
+    --rig=single_arm_right --num-episodes 10
 
 ./scripts/bspline_rollout.sh --start-server \
-    --ckpt ~/franka_data/bsp/latest.ckpt \
-    --rig=single_arm_right --speed-up-times 1.0 --num-episodes 10 \
-    --repo-id you/bsp-eval --output-dir ~/franka_data/bsp-eval
+    --ckpt ~/franka_data/policies/pickup-bowl/bspline/<ts>/checkpoints/latest.ckpt \
+    --rig=single_arm_right --speed-up-times 1.0 --num-episodes 10
+
+python residual_wrapper/run_residual.py \
+    --base-policy ~/franka_data/policies/pickup-bowl/multifast/pretrained_model \
+    --residual-policy ~/franka_data/policies/pickup-bowl/multifast/best.pt \
+    --num-episodes 10
 ```
 
+None of them takes an output path. Each works out which dataset its policy was
+trained on and files itself under that task automatically -- see **Where a run
+goes** below. Pass `--train-dataset <repo-id>` when a checkpoint predates the
+stamp and the run cannot work it out.
+
 Each wrapper reaps the policy server's whole process group on exit, including a
-Ctrl-C. That matters: `conda run` spawns python as a child, and an orphaned
-server keeps the port — the next run would then handshake with the stale one and
-silently evaluate the previous checkpoint under the new one's recorded sha256.
+Ctrl-C. That matters: an orphaned server keeps the port — the next run would
+then handshake with the stale one and silently evaluate the previous checkpoint
+under the new one's recorded sha256. The interpreter comes from
+`baselines/interpreters.py` (`$SAIL_PYTHON` / `$BSPLINE_PYTHON` override it).
 
 To run the halves separately, start the server yourself and drop
 `--start-server`:
 
 ```bash
-conda activate SAIL
-python baselines/sail_bridge/policy_server.py --ckpt-path <CKPT> --port 5556
-
-conda activate robodiff
-python baselines/bspline_bridge/policy_server.py --ckpt-path <CKPT> --port 5555
+.venv-sail/bin/python    baselines/sail_bridge/policy_server.py    --ckpt-path <CKPT> --port 5556
+.venv-bspline/bin/python baselines/bspline_bridge/policy_server.py --ckpt-path <CKPT> --port 5555
 ```
+
+Then, before the arm is involved at all:
+
+```bash
+python scripts/check_policy_server.py sail --port 5556      # or bspline --port 5555
+```
+
+prints the checkpoint's handshake and checks that one inference comes back in
+the shape the rollout expects. It is the only check that runs the real server
+against the real checkpoint; the offline harness fakes both.
 
 The B-Spline server subclasses upstream's own `policy_server_bspline.py` to add
 one request (`meta`) and changes nothing else — upstream replies `{}` to a key it
 does not know, so it cannot tell the client the image sizes or the spline degree,
-and both are load-bearing. Neither submodule is edited.
+and both are load-bearing. The SAIL server does three things upstream's simulator
+env did for the policy: frame-stacks observations, processes images to CHW float,
+and asks for the whole action sequence (item 11 below). Neither submodule is
+edited.
 
 During an episode: **right arrow** ends it as a success, **left arrow** as a
 failure, a timeout counts as a failure, and Ctrl-C aborts the run. That verdict
 is the measurement — there is no automatic success detector on this rig.
 
-## What comes out
+## Where a run goes
 
-A `metrics.json` next to the dataset (or under `~/franka_data/baseline_eval/`),
-rewritten after every episode so an interrupted run keeps what finished:
+Every run is one self-contained directory, grouped by the dataset the policy was
+**trained** on rather than by method. That grouping is the experiment: one task's
+demonstrations, every method that learned from them, side by side.
 
-```json
-{"policy": "sail", "ckpt_sha256": "...", "rig": "single_arm_right",
- "control_mode": "EE_POS", "exec_fps": 100, "obs_fps": 20,
- "summary": {"episodes": 10, "successes": 7, "success_rate": 0.7,
-             "mean_time_to_success_s": 8.4},
- "episodes": [{"episode": 0, "success": true, "wall_time_s": 8.42, "steps": 842,
-               "inferences": 53, "slow_steps": 120, "guided_inferences": 41,
-               "aborted": null, "max_lead_m": 0.031}]}
+```
+~/franka_data/outputs/
+  HuskyMango/pickup-bowl/
+    20260912_143000-sail/
+      manifest.json      everything known about the run
+      episodes.jsonl     one line per episode, appended as it finishes
+      dataset/           the LeRobotDataset recorded during the run
+      videos/            one time-aligned mp4 per camera (--save-videos)
+    20260912_151500-bspline/
+    20260912_160200-multifast/
 ```
 
-Plus, with `--repo-id`, a LeRobotDataset carrying the same `observation.state` /
-`action` features a `run_residual.py` recording does, so all three methods'
-rollouts are readable by one set of tools.
+Nothing is written into the repo. `--outputs-root` moves the tree, `--no-record`
+skips the LeRobotDataset (the manifest and episode log are always written), and
+two runs of one method in the same second are refused rather than merged.
+
+### How a run knows its task
+
+The converters stamp the dataset id onto the HDF5 they write
+(`--source-repo-id`, defaulting to the dataset argument), the policy servers read
+it back off the checkpoint's training file and report it in the `meta`
+handshake, and the rollout files itself under it. multi-fast reads
+`train_config.json` next to its base-policy checkpoint instead.
+
+`--train-dataset` overrides all of that, and is required when none of it
+resolves. When the flag and the checkpoint disagree the flag wins and the
+manifest records both with `agrees: false` -- that disagreement is usually a
+checkpoint pointed at the wrong directory, and silently filing a run under the
+wrong task is the failure this exists to prevent.
+
+## What the manifest holds
+
+Enough to tell, months later, exactly what ran:
+
+| Section | What it answers |
+|---|---|
+| `run` | id, method, status (`completed` / `interrupted` / `failed`), start, duration |
+| `train_dataset` | which task, how it was resolved, whether the flag and checkpoint agreed, and the recording's own episode/frame counts |
+| `policy` | checkpoint path, sha256, size and mtime; the server's full `meta`; the control mode and **why** it was chosen |
+| `parameters` | every resolved knob -- rates, horizons, speed-up, guidance, tolerances |
+| `environment` | rig profile and the **physical** arm behind the `r_` prefix, its IPs and ports, cameras and their resolutions, the `torque:` and `tuning:` blocks in force, the safety floor, the git commit and whether the tree was dirty, host, user, python, argv |
+| `outputs` | the recorded dataset's repo id, path, episodes and frames; the videos |
+| `summary` | episodes, successes, success rate, and time-to-success (mean/median/min/max) over successes only |
+
+`episodes.jsonl` carries one line per attempt: the verdict and how it was
+reached, wall time, goals dispatched, frames recorded, inferences, slow steps,
+guided inferences, achieved vs nominal rate, send-gap mean and max, worst lead,
+whether homing converged, and any abort reason. It is appended as each episode
+finishes, so a run interrupted at the robot still describes everything that did.
+
+The recorded LeRobotDataset carries the same `observation.state` / `action`
+features a `run_residual.py` recording does, so all three methods' rollouts are
+readable by one set of tools.
+
+## Reading the comparison
+
+```bash
+python scripts/rollout_summary.py HuskyMango/pickup-bowl
+```
+
+```
+HuskyMango/pickup-bowl
+  run                        method      eps   ok   rate  median s   mean s  status       notes
+  ---------------------------------------------------------------------------------------------
+  20260912_143000-sail       sail          4    3    75%      9.10     9.23  completed    100Hz precision eag
+  20260912_151500-bspline    bspline       4    3    75%      7.40     7.37  completed    100Hz 2.0x
+  20260912_160200-multifast  multifast     4    4   100%      6.10     6.00  completed    20Hz
+```
+
+Time is over **successes only**: a failure's duration is the timeout and says
+nothing about how fast a method is. `--all` sweeps every task, `--json` emits the
+manifests instead of the table.
 
 ## The two speed mechanisms
 
@@ -148,15 +231,28 @@ covered by a check in scripts/check_baseline_rollout_offline.py.
    carries full-resolution frames while its config expects 84x84, and nothing
    else in the stack would notice the mismatch. Both servers report their shapes
    in the `meta` handshake.
-8. **The two single-arm rigs expose different cameras** — `single_arm_franka` has
+8. **A run is filed by its TRAINING dataset, not its rollout.** The directory
+   name comes from the demonstrations the policy learned from, so every method
+   trained on one task lands together. A checkpoint converted before the stamp
+   existed cannot say which that was, and the run stops and asks for
+   `--train-dataset` rather than guessing.
+9. **The two single-arm rigs expose different cameras** — `single_arm_franka` has
    cam_1/cam_5/cam_2, `single_arm_right` has cam_3/cam_4/cam_2 — so a checkpoint
    trained on one names keys the other does not have. The rollout refuses that
    before homing rather than letting it surface as a `KeyError` inside the policy
    server mid-episode. `--allow-missing-cameras` sends blank frames instead and
    accepts that the policy is off-distribution.
-9. **A recorded dataset is labelled at the DISPATCH rate**, one frame per goal,
+10. **A recorded dataset is labelled at the DISPATCH rate**, one frame per goal,
    not at `obs_fps`. For SAIL that is the nominal fast rate; the real per-step
    rate varies, and `slow_steps` says how often it dropped.
+11. **SAIL's policy wants what its simulator env used to hand it.** With
+   `train.frame_stack: 2` (the template) every observation key must arrive as a
+   `[T, ...]` stack, seeded with copies of the first frame; images must already
+   be CHW float in [0, 1]; and `get_action` returns ONE action and then serves
+   an internal queue unless asked for the sequence. The server does all three
+   (`sail_bridge/policy_server.py`), and `check_policy_server.py` is where a
+   regression shows up as a shape error rather than as a policy that "does
+   nothing".
 
 Every knob above lives in `config/policy.yaml` under `baselines:` and nowhere
 else. `python -m franka_config get policy.baselines.exec.fast_fps` prints what
@@ -165,7 +261,7 @@ the stack will actually use.
 ## Checking it without the robot
 
 `scripts/check_baseline_rollout_offline.py` runs both loops end to end against a
-fake arm and fake policy servers — no hardware, no conda env:
+fake arm and fake policy servers — no hardware, no baseline venv:
 
 ```bash
 python scripts/check_baseline_rollout_offline.py
@@ -185,13 +281,18 @@ precision strip, the rate switching, the spline's wall-clock timing at three
 `(speed_up, origin_time_scale)` combinations, the abort-not-clamp behaviour, and
 the recorded dataset's schema and fps.
 
+Its `[servers]` section also drives the real servers' request handling under a
+stubbed robomimic: frame stacking, image processing, key filtering,
+`return_action_sequence`, and the checkpoint-config reads.
+
 What it cannot tell you: whether the arm tracks, and whether a real checkpoint's
-actions are sane.
+actions are sane — `check_policy_server.py` covers the second.
 
 ## First run on hardware
 
 Operator on the e-stop. Preflight per `RIGHT_ARM_RIG_HANDOFF.md` (want
-`RobotMode.Idle []`), then walk up:
+`RobotMode.Idle []`) and `scripts/check_policy_server.py` against the server,
+then walk up:
 
 ```bash
 # 1. handshake and homing only, no motion

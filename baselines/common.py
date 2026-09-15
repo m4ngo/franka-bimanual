@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+import time
 from pathlib import Path
 
 import h5py
@@ -109,8 +110,17 @@ def run_conversion(
     min_steps: int = 20,
     include_images: bool = True,
     image_size: tuple[int, int] | None = None,
+    source_repo_id: str | None = None,
 ) -> int:
-    """One recording -> one `data/demo_<i>/...` HDF5, via `convert_episode`."""
+    """One recording -> one `data/demo_<i>/...` HDF5, via `convert_episode`.
+
+    `source_repo_id` is the dataset's HuggingFace id, stamped onto the file so a
+    rollout can name its output directory after the task without the operator
+    retyping it. Defaults to `source`, which is already that id at every call
+    site. It is deliberately NOT `str(root)`: the resolved path drops the org
+    prefix (`HuskyMango/pickup-bowl` lives at `~/franka_data/pickup-bowl`), and
+    LeRobot's own `meta/info.json` does not record the id at all.
+    """
     root = resolve_root(root_override or source)
     df, info = load_frames(root)
     dt = 1.0 / float(info["fps"])
@@ -122,7 +132,9 @@ def run_conversion(
     written = 0
     with h5py.File(tmp, "w") as f:
         f.attrs["source_dataset"] = str(root)
+        f.attrs["source_repo_id"] = source_repo_id or source
         f.attrs["converter"] = converter_name
+        f.attrs["converted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         grp = f.create_group("data")
         for key, val in (root_attrs or {}).items():
             grp.attrs[key] = val

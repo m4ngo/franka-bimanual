@@ -83,6 +83,14 @@ python train.py --config-name=train_diffusion_unet_real_hybrid_bspline_workspace
   training.resume=false logging.mode=offline
 ```
 
+Here, `python -m baselines.bspline_bridge.train <bspline.hdf5>` runs that
+command in `.venv-bspline` with a task config generated from the file
+(`shape_meta` with our camera keys and image size, the dataset path, a
+`cache_suffix` keyed by the file's size and mtime) placed in the run directory
+and reached through hydra's `--config-dir`, plus `hydra.run.dir` pointed at
+`~/franka_data/policies/<dataset>/bspline/<timestamp>/`. Nothing is written into
+the submodule.
+
 `train.py` is a 41-line shim: it puts the project directory and
 `diffusion_policy/` on `sys.path`, registers the `eval:` OmegaConf resolver, and
 hands off to Diffusion Policy's `TrainDiffusionUnetHybridWorkspace`. Checkpoints
@@ -146,7 +154,9 @@ actions           (T, 7)   xyz + rotvec + gripper
 The dataset loader converts the 3-vector rotation to `rotation_6d`, which is why
 `shape_meta.action.shape` is `[10]` while the file holds 7. Our converter is
 [bspline_bridge/dataset.py](bspline_bridge/dataset.py) and writes exactly these
-keys.
+keys, under our camera names. The image shape in `shape_meta` must match the
+file exactly: the replay conversion copies frames into a zarr of that shape and
+fails otherwise, which is why the task config is generated from the file.
 
 ## Deployment: where the speed-up actually happens
 
@@ -183,11 +193,19 @@ a background thread doing inference:
 
 ## Environments
 
-Two, and they conflict:
+Here: `scripts/setup_baseline_envs.sh bspline` builds `.venv-bspline` (python
+3.11, a current cu128 torch, the conda yaml's package list by pip,
+`robomimic==0.2.0 --no-deps`, this package editable, and pytorch3d built from
+source CPU-only -- only `pytorch3d.transforms` is used). The yaml's own torch
+(2.6) has no kernels for the RTX 5090, which is why the recipe is not used as
+shipped. `diffusion_policy` is never installed: upstream's `train.py` and
+`policy_server_bspline.py` put it on `sys.path` themselves.
+
+Upstream has two, and they conflict:
 
 - Training and inference: conda, from
   `bspline_policy/diffusion_policy/conda_environment.yaml` (env named
-  `robodiff`, referred to as `bsp-simple` in some of their docs), plus
+  `bsp-simple` there, `robodiff` in the inference README), plus
   `robomimic==0.2.0 --no-deps`, then `pip install -e .` from
   `bspline_policy/bspline_policy/` (where `setup.py` is — the upstream README
   says `pip install -e bspline_policy` from inside that same directory, which
@@ -195,8 +213,8 @@ Two, and they conflict:
 - Hardware: `uv sync` in `bspline_policy/real_env/`, plus editable installs of
   its `i2rt/` and `pyroki/` subdirectories.
 
-Neither is our workspace venv, which is why our side of the comparison stops at
-producing the HDF5.
+Neither is our workspace venv, which is why the policy runs behind ZMQ
+(ROLLOUT.md).
 
 ## Caveats found while reading
 
@@ -219,4 +237,12 @@ producing the HDF5.
   `<hdf5>.<cache_suffix>.zarr.zip` next to the input and the sampler writes a
   `.bspline_sampler_<hash>.npz`. The sampler hash covers its own parameters, but
   the zarr cache is only keyed by `cache_suffix` — regenerate the HDF5 without
-  changing the suffix and training silently reads the old replay buffer.
+  changing the suffix and training silently reads the old replay buffer. The
+  generated task config keys the suffix by the file's size and mtime for this
+  reason.
+- **`infer_action_meta` labels every checkpoint `real_bimanual_base_rot6d`** at
+  the pinned commit, whatever the data. The label is informational; the client
+  checks `action_dim` (10) and nothing else.
+- **`n_obs_steps` is not in the checkpoint's action metadata.** The server takes
+  it as a flag; ours defaults that flag to the checkpoint's `cfg.n_obs_steps`
+  and warns on a mismatch, because a different window is a silent shape change.

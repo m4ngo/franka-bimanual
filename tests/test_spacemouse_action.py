@@ -394,6 +394,48 @@ def test_ee_pos_target_cannot_run_away_from_the_arm():
     return f"lead capped at {lead:.3f} m / {ang:.3f} rad; EE_DELTA step {step:g} m"
 
 
+def test_reseed_after_home_makes_step_one_the_home_pose():
+    """A homed recording must re-seed the leader after EVERY home(), not once at
+    connect. The integrator carries the target across the episode boundary and
+    bind_pose_source only clamps it to max_lead of the arm, so unseeded, step one
+    of the next episode commands wherever the last one ended, from up to max_lead
+    away -- which is the jump seen at the start of each episode. The gripper is a
+    latched target with the same problem, seeded from the COMMANDED home value.
+    """
+    cfg = SpaceMouseConfig(prefix="r_", use_delta=False, deadzone=0.0)
+    quat = np.array([0.0, 0.0, 0.0, 1.0])
+    start, home = np.array([0.5, 0.0, 0.4]), np.array([0.3, 0.2, 0.5])
+    home_gripper = 1.0
+    assert home_gripper != cfg.initial_gripper_norm, "case is vacuous if these agree"
+
+    tel = SpaceMouse(cfg)
+    tel._device = _FakeDevice(_FakeState(y=1.0, buttons=(1, 0)))   # drive away, close
+    tel.seed_state(start, quat)
+    arm = {"pos": start}
+    tel.bind_pose_source(lambda: (arm["pos"], quat))
+    for _ in range(5):
+        tel.get_action()
+
+    tel._device = _FakeDevice(_FakeState())                        # stick released
+    arm["pos"] = home                                              # robot.home()
+
+    # Without a re-seed: the stale target, clamped to max_lead of home.
+    act = tel.get_action()
+    stale = np.array([act["r_x"], act["r_y"], act["r_z"]])
+    jump = np.linalg.norm(stale - home)
+    assert np.isclose(jump, cfg.max_lead_m), f"expected a {cfg.max_lead_m} m jump, got {jump}"
+    assert act["r_gripper"] == cfg.gripper_closed_norm
+
+    # With one: step one is the home pose and the home gripper, exactly.
+    tel.seed_state(home, quat, home_gripper)
+    act = tel.get_action()
+    seeded = np.array([act["r_x"], act["r_y"], act["r_z"]])
+    assert np.array_equal(seeded, home), f"step one commanded {seeded}, not home {home}"
+    assert np.allclose([act["r_qx"], act["r_qy"], act["r_qz"], act["r_qw"]], quat)
+    assert act["r_gripper"] == home_gripper
+    return f"unseeded step one jumped {jump:.3f} m; seeded step one is home exactly"
+
+
 def test_gains_channel_is_neutral():
     """kp/kd of 0.0 means the configured defaults, critically damped."""
     act = make_teleop(_FakeState()).get_action()

@@ -58,6 +58,8 @@ baselines:
     ori_teb: 0.05             # EAG orientation tracking-error bound (rad)
 
   bspline:
+    # Fallback only: the server reports the checkpoint's own n_obs_steps and
+    # the client uses that; this is what an older server without it gets.
     n_obs_steps: 2
     # Upstream defaults this to 20, calibrated for their 10 Hz data / 200 Hz
     # control split. Here observations arrive at obs_fps and 20 would buffer 40

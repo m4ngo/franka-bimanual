@@ -92,7 +92,7 @@ class PolicyClient:
             action_horizon   int           -- sail
             fac_enabled      bool          -- sail; gates EAG
             fac_horizon      int           -- sail
-            action_format    str           -- bspline, e.g. "single_yam_rot6d"
+            action_format    str           -- bspline; upstream's label, recorded only
             degree           int           -- bspline
         """
         rep = self.request({"meta": True})
