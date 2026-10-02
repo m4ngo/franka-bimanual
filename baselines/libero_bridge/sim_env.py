@@ -228,6 +228,9 @@ class SimTask:
         if dt is None:
             return self.env.step(np.asarray(action, dtype=np.float64).tolist())
         env = self.env.env
+        # robosuite runs int(dt / model_timestep) physics steps; anything else would be dropped silently.
+        if abs(dt / env.model_timestep - round(dt / env.model_timestep)) > 1e-6:
+            raise ValueError(f"{1 / dt:g} Hz is not a whole number of {env.model_timestep} s physics steps")
         env.control_timestep = dt
         try:
             _, reward, done, info = self.env.step(np.asarray(action, dtype=np.float64).tolist())

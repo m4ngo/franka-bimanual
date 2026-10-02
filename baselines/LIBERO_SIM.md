@@ -608,7 +608,7 @@ rather than sleeping, since checkpoint load time varies
 ([:113](../scripts/libero_rollout.sh#L113)); runs the rollout under
 `multi-fast/.venv` ([:121](../scripts/libero_rollout.sh#L121)); on exit kills the
 server's process group and waits for the port to free
-([`cleanup`](../scripts/libero_rollout.sh#L71)). The group, not the pid, because
+([`cleanup`](../scripts/libero_rollout.sh#L72)). The group, not the pid, because
 `conda run` spawns python as a child. It never `exec`s the rollout, which would
 drop the trap and orphan the server.
 
@@ -736,7 +736,7 @@ goal_ori = R(scale_action(a[3:6])) @ measured_ori    # ±0.5 rad
 ```
 
 so hitting a target means solving for `a` against the pose measured at that step.
-[`SimTask.action`](libero_bridge/sim_env.py#L265) calls multi-fast's
+[`SimTask.action`](libero_bridge/sim_env.py#L280) calls multi-fast's
 [`target_slot_to_delta`](../multi-fast/utils/base_policy_utils.py#L553) rather than
 reimplementing the inverse -- it is the exact inverse of the relabeler that wrote
 the training targets, so executor and converter cannot drift. It also undoes the
@@ -746,7 +746,7 @@ re-estimated per episode in
 [`SimTask.start`](libero_bridge/sim_env.py#L203). Skip that transform and nothing
 errors; it just commands a goal rotated ~90°. The delta is recomputed every env
 step against that step's measured pose
-([`Stepper.send`](libero_bridge/rollout.py#L160)), matching `EE_POS` on the arm,
+([`Stepper.send`](libero_bridge/rollout.py#L162)), matching `EE_POS` on the arm,
 and out-of-range targets saturate like `scale_action` does. pi05 skips all of it
 ([`Stepper.send_raw`](libero_bridge/rollout.py#L183)).
 
@@ -759,7 +759,7 @@ that file. Episode time is simulated seconds, written to `wall_time_s` so
 `rollout_summary.py` reads it unchanged, with real time beside it as
 `clock_time_s`.
 
-**SAIL** ([`sail_episode`](libero_bridge/rollout.py#L257),
+**SAIL** ([`sail_episode`](libero_bridge/rollout.py#L245),
 [`sail_settings`](libero_bridge/rollout.py#L228)) implements upstream's three eval
 mechanisms:
 
@@ -772,14 +772,22 @@ mechanisms:
   `future_action_condition` and a `--guide-config`; `--no-eag` disables it.
 
 A SAIL row is a trajectory sample at the recording rate, so at `fast_fps` 100 Hz
-against a 20 Hz env one row occupies a fifth of an env step and the trajectory
-plays 5x faster than recorded -- the same ratio the arm runs, and the point of the
-method. `Stepper.send` carries the fractional remainder; rounding rows up to whole
-steps would cap every method at demo speed. The arm only keeps up under SAIL's
-own controller ([SAIL's controller](#sails-controller)).
+the trajectory plays 5x faster than recorded -- the same ratio the arm runs, and
+the point of the method. Each row is one env step lasting `1/hz`
+([`SimTask.step(action, dt)`](libero_bridge/sim_env.py#L226)), which is all
+SAIL's robosuite patch does: it changes the control period, not the physics. The
+step's observables are read fresh, since robosuite otherwise refreshes them at
+the env's own 20 Hz. Before this, a row lasted a fifth of a 20 Hz step and only
+the row that completed a step reached the env, so 4 of every 5 fast rows were
+dropped and every fifth was held for 50 ms; runs before 2026-10-02 were made that
+way. The rate must be a whole number of 2 ms physics steps (100 and 20 Hz are);
+any other rate raises. The env is built with `ignore_done=True` because 100 Hz
+steps pass robosuite's 1000-step horizon inside libero_10's budget; the episode
+budget is the Stepper's, in simulated seconds. The arm only keeps up under
+SAIL's own controller ([SAIL's controller](#sails-controller)).
 
-**B-Spline** ([`bspline_episode`](libero_bridge/rollout.py#L364),
-[`bspline_planner_kwargs`](libero_bridge/rollout.py#L328)) is shorter because the
+**B-Spline** ([`bspline_episode`](libero_bridge/rollout.py#L352),
+[`bspline_planner_kwargs`](libero_bridge/rollout.py#L315)) is shorter because the
 server returns spline parameters, not actions, so the loop samples the plan
 itself. `origin_time_scale` is the env's control rate: knots count demo frames, so
 `t` advances one knot per env step. Time alignment is off in sim -- upstream
@@ -787,6 +795,13 @@ stitches a new plan onto the old within a window bounded by time since its
 observation, and with synchronous inference on a sim clock no sim time passes, so
 the window is empty and the plan starts at `min_t`. That is correct at zero
 latency; only the diagnostic was meaningless. `--time-align` restores it.
+
+The plan is sampled once per `fast_fps` step (100 Hz, as the paper samples in
+sim), not once per 20 Hz env step, and observations are kept every
+`fast_fps / 20` steps so the policy's frames stay one demo frame apart. Each
+sample is led forward by `(kd/kp)·(1 - 1/speed_up_times)` seconds along the
+plan's velocity, read from the live sim controller; the hardware rollout does
+the same, and ROLLOUT.md ("The two speed mechanisms") explains why.
 
 **pi05.** [`pi05.load`](libero_bridge/pi05.py#L63) builds the config block
 multi-fast's own `load_base_policy` expects and returns its `Pi05BaseWrapper`, so

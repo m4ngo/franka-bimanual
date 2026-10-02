@@ -40,7 +40,6 @@ not take and the other arm is about to move.
 ```bash
 ./scripts/sail_rollout.sh --start-server \
     --ckpt ~/franka_data/policies/pickup-bowl/sail/<ts>/models/model_epoch_1000.pth \
-    --guide-config baselines/sail/robomimic/SAIL/guide_template/base_cfg_weight_1.json \
     --rig=single_arm_right --num-episodes 10
 
 ./scripts/bspline_rollout.sh --start-server \
@@ -52,6 +51,9 @@ python residual_wrapper/run_residual.py \
     --residual-policy ~/franka_data/policies/pickup-bowl/multifast/best.pt \
     --rig=single_arm_right --num-episodes 10
 ```
+
+`sail_rollout.sh` passes SAIL's own `base_cfg_weight_1.json` guide config, as
+upstream's README evaluates; `--guide-config ""` runs unguided.
 
 None of them takes an output path. Each works out which dataset its policy was
 trained on and files itself under that task automatically -- see **Where a run
@@ -295,6 +297,13 @@ of the current plan but only while the arm is tracking it. All three are on by
 default when the checkpoint supports them; `--no-precision` and `--no-eag` turn
 the last two off.
 
+Inference on the arm takes real time (about 85 ms per request), longer than
+the 4 rows a 16-row chunk has spare at 100 Hz. Rather than stop when the old
+plan runs out, the loop applies the paper's latency bound (Sec. 4.4): every row
+is sent at most `(horizon - execute_n) / (2 * latency)` Hz, using the last
+request's round trip. That keeps the arm moving through inference, at the cost
+of a lower top speed when inference is slow: at 100 ms the cap is 40 rows/s.
+
 Two things about the targets shape that loop. Row 0 of every chunk is the pose
 the arm was *observed* at — SAIL's controller-invariant targets are the reached
 poses, and upstream's converter labels frame t with frame t's own pose — so a
@@ -310,6 +319,21 @@ setting, `baselines.sail.sim_osc` (LIBERO_SIM.md, "SAIL's controller").
 **B-Spline** predicts spline parameters and evaluates them at wall-clock `t`, so
 `--speed-up-times 2.0` is a change of variable and nothing else. `t` advances at
 `speed_up_times · origin_time_scale` per second.
+
+A sped-up plan needs the goal led forward. The OSC trails a goal moving at
+velocity `v` by `(kd/kp)·v`, so at `speed_up_times` s the arm lags s times
+further behind than it did in the demonstrations. Every replan starts from the
+observed pose, so that extra lag came back as a backward jump in the goal on
+up to 0.9 of replans at 4x. Upstream avoids this by speeding its servo up with
+the plan (`set_ik_dt_scale`). Here the gains stay as they are; instead each
+sample is moved `(kd/kp)·(1 - 1/s)` seconds further along the plan's own
+velocity (`rollout_common.damping_lag`, `policy_math.lead_goal`), which puts the
+lag back to the demonstrations' 1x lag. At 1x the lead is zero.
+
+The B-Spline server runs inference the way upstream deploys it: 10 DDIM steps
+(`--num-inference-steps`), the whole denoising loop replayed as one CUDA graph
+(upstream's `CudaGraphDDIMSampler`), and one warm-up at startup instead of one
+inside every episode.
 
 ## Things that fail silently
 

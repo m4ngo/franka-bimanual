@@ -63,12 +63,10 @@ baselines:
     inf_delay: 4
     slowdown_window_size: 6
     # EAG tracking-error bounds: guidance is dropped for an inference when the
-    # arm is further than this from the plan. Upstream's 0.02 m / 0.05 rad go
-    # with its kp 600 controller (lag ~1 cm, ~1.5 deg). At kp 150 the arm's
-    # steady lag on a 20 Hz plan is 21 mm / 3 deg median, so those bounds drop
-    # guidance on 3 of 4 inferences and successive chunks are drawn unconditioned
-    # -- the jump in a new direction at every chunk boundary. These pass ~90% of
-    # inferences at kp 150 (measured 2026-09-17); restore upstream's with osc_kp 600.
+    # arm is further than this from the plan. These are upstream's values, which
+    # go with its kp 600 controller (lag ~1 cm, ~1.5 deg). At kp 150 the arm's
+    # steady lag on a 20 Hz plan is 21 mm / 3 deg median, so they drop guidance
+    # on 3 of 4 inferences; osc_kp below is what keeps the arm inside them.
     pos_teb: 0.02             # m, inf-norm
     ori_teb: 0.05             # rad
     # OSC stiffness the rollout runs under. Upstream evaluates under
@@ -83,7 +81,8 @@ baselines:
     # over robosuite's osc_pose.json; null keeps the stock value. LIBERO's 5 cm
     # per-step limit is never changed. SAIL trains on the poses the arm reached
     # and swaps the teleop controller for a stiff one to play them faster than
-    # recorded (SAIL paper Sec. 4.2): twice the stock kp at half the damping.
+    # recorded (SAIL paper Sec. 4.2; its sim kp is 1000-3000, Table J.4): 10x the
+    # stock kp 150 at half the damping.
     # Measured in LIBERO_SIM.md, "SAIL's controller".
     sim_osc:
       kp: 1500
@@ -93,9 +92,10 @@ baselines:
     # Fallback only: the server reports the checkpoint's own n_obs_steps and
     # the client uses that; this is what an older server without it gets.
     n_obs_steps: 2
-    # Upstream defaults this to 20, calibrated for their 10 Hz data / 200 Hz
-    # control split. Here observations arrive at obs_fps and 20 would buffer 40
-    # of them before the first plan.
+    # Hardware only. Upstream defaults this to 20, calibrated for their 10 Hz
+    # data / 200 Hz control split. Here observations arrive at obs_fps and 20
+    # would buffer 40 of them before the first plan. The sim rollout derives its
+    # own (fast_fps / 20) so the policy's frames stay one demo frame apart.
     obs_stride: 1
     # Index-space knots -> seconds, i.e. the rate the demonstrations were
     # RECORDED at: t advances at this many knot-index units per second, and the
