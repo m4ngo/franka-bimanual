@@ -77,15 +77,18 @@ baselines:
     # null = torque.osc.default_kp. Sent on the kp action channel through the
     # log-base remap, so kp_limits still bind on the arm.
     osc_kp: 300
+    # Damping ratio on the arm, on the kd channel by the same remap. null =
+    # torque.osc.default_damping_ratio (1.0). 0.5 matches the sim default below.
+    osc_damping_ratio: 0.5
     # The sim rollout's OSC gains (baselines/libero_bridge/rollout.py), merged
     # over robosuite's osc_pose.json; null keeps the stock value. LIBERO's 5 cm
     # per-step limit is never changed. SAIL trains on the poses the arm reached
     # and swaps the teleop controller for a stiff one to play them faster than
-    # recorded (SAIL paper Sec. 4.2; its sim kp is 1000-3000, Table J.4): 10x the
-    # stock kp 150 at half the damping.
-    # Measured in LIBERO_SIM.md, "SAIL's controller".
+    # recorded (SAIL paper Sec. 4.2): twice the stock kp at half the damping.
+    # SAIL is also evaluated at kp 1000/2000/3000 with --osc-kp and
+    # --osc-damping-ratio; see LIBERO_SIM.md, "SAIL's controller".
     sim_osc:
-      kp: 1500
+      kp: 300
       damping_ratio: 0.5
 
   bspline:

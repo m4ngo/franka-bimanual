@@ -255,25 +255,30 @@ def _gains() -> dict:
             "kd": float(fc.policy("sysid.default_kd"))}
 
 
-def gain_action(kp: float | None) -> dict:
-    """kp/kd action channels that put the OSC at stiffness `kp`; None is `_gains()`.
+def gain_action(kp: float | None, damping_ratio: float | None = None) -> dict:
+    """kp/kd action channels that put the OSC at stiffness `kp` and `damping_ratio`;
+    None leaves that channel at `_gains()`.
 
-    The inverse of resolve_gains' remap (kp = default_kp * base ** a), so the
-    channel keeps meaning "log-base multiplier on the default" and kp_limits
-    still bind on the arm. The damping ratio stays at its default, 1.0.
+    The inverse of resolve_gains' remap (kp = default_kp * base ** a_kp, ratio =
+    default_damping_ratio * base ** a_kd), so each channel keeps meaning
+    "log-base multiplier on the default" and the limits still bind on the arm.
     """
-    gains = _gains()
-    if kp is None:
-        return gains
     base = float(fc.control("torque.osc.gain_exp_base"))
-    default = float(fc.control("torque.osc.default_kp"))
-    a = math.log(float(kp) / default, base)
-    if not -1.0 <= a <= 1.0:
-        raise ValueError(
-            f"osc kp {kp} is outside the gain channel's reach "
-            f"[{default / base:g}, {default * base:g}]"
-        )
-    return {**gains, "kp": a}
+
+    def channel(value: float, default: float, name: str) -> float:
+        a = math.log(float(value) / default, base)
+        if not -1.0 <= a <= 1.0:
+            raise ValueError(f"osc {name} {value} is outside the gain channel's reach "
+                             f"[{default / base:g}, {default * base:g}]")
+        return a
+
+    gains = _gains()
+    if kp is not None:
+        gains["kp"] = channel(kp, float(fc.control("torque.osc.default_kp")), "kp")
+    if damping_ratio is not None:
+        gains["kd"] = channel(damping_ratio, float(fc.control("torque.osc.default_damping_ratio")),
+                              "damping ratio")
+    return gains
 
 
 def damping_lag(gains: dict) -> np.ndarray:
@@ -810,6 +815,8 @@ def sail_parameters(args, meta: dict, control_mode) -> dict:
                    else float(fc.control("torque.osc.default_kp"))),
         "osc_kp_source": ("baselines.sail.osc_kp" if fc.policy("baselines.sail.osc_kp") is not None
                           else "torque.osc.default_kp"),
+        "osc_damping_ratio": float(fc.policy("baselines.sail.osc_damping_ratio")
+                                   or fc.control("torque.osc.default_damping_ratio")),
         "slowdown_window_size": int(fc.policy("baselines.sail.slowdown_window_size")),
         "pos_teb": float(fc.policy("baselines.sail.pos_teb")),
         "ori_teb": float(fc.policy("baselines.sail.ori_teb")),

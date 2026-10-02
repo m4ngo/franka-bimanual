@@ -115,7 +115,8 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
     slow_fps = float(args.slow_fps or fc.policy("baselines.exec.slow_fps"))
     o_fps = float(args.obs_fps or rc.obs_fps())
     osc_kp = fc.policy("baselines.sail.osc_kp")
-    gains = rc.gain_action(None if osc_kp is None else float(osc_kp))
+    osc_damping = fc.policy("baselines.sail.osc_damping_ratio")
+    gains = rc.gain_action(osc_kp, osc_damping)
 
     if horizon < inf_delay + execute_n:
         raise ValueError(
@@ -126,10 +127,11 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
         )
     logger.info(
         "mode=%s precision=%s eag=%s fast/slow=%.0f/%.0f Hz obs=%.0f Hz "
-        "inf_delay=%d execute_n=%d horizon=%d osc_kp=%s",
+        "inf_delay=%d execute_n=%d horizon=%d osc_kp=%s damping=%s",
         control_mode.value, precision, eag, fast_fps, slow_fps, o_fps,
         inf_delay, execute_n, horizon,
         "default" if osc_kp is None else f"{float(osc_kp):g}",
+        "default" if osc_damping is None else f"{float(osc_damping):g}",
     )
 
     def episode_fn(controller, dispatcher, dataset, ep, stopper) -> None:

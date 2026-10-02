@@ -312,8 +312,9 @@ chunk entered at row 0 first tells the arm to stay put; upstream never does
 has a plan. And upstream evaluates under `osc_pose_SAIL.json`, kp 600, where
 the arm reaches each target and EAG's 2 cm bound is met; at the law's default
 150 the arm trails a 20 Hz plan by ~2 cm and guidance is dropped on nearly every
-inference. `baselines.sail.osc_kp` sets the rollout's stiffness through the kp
-action channel; the manifest records what ran. The sim rollout has its own
+inference. On the arm SAIL runs at kp 300 and damping ratio 0.5
+(`baselines.sail.osc_kp`, `osc_damping_ratio`), sent through the kp and kd
+action channels; the manifest records what ran. The sim rollout has its own
 setting, `baselines.sail.sim_osc` (LIBERO_SIM.md, "SAIL's controller").
 
 **B-Spline** predicts spline parameters and evaluates them at wall-clock `t`, so

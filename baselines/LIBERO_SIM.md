@@ -534,6 +534,27 @@ tried the same day (sweeps `gains_*_clip`) and dropped: the limit is part of
 LIBERO's action space, every method runs under it, and with it kept the same
 gains were no slower (5.45 s against 5.82 s).
 
+**The evaluation grid.** SAIL is evaluated in sim at four settings, the
+default plus three inside the paper's range (Table J.4):
+
+| kp | damping ratio |
+|---|---|
+| 300 | 0.5 (default, and what the arm runs) |
+| 1000 | 1.0 |
+| 2000 | 0.75 |
+| 3000 | 0.5 |
+
+```bash
+for g in "300 0.5" "1000 1.0" "2000 0.75" "3000 0.5"; do
+    set -- $g
+    python -m baselines.libero_bridge.evaluate ~/franka_data/baseline_prep/libero_10 \
+        --backend sail --num-episodes 20 --sweep-id sail_kp$1_z${2/./} \
+        --extra --osc-kp $1 --osc-damping-ratio $2
+done
+```
+
+Run them one after another, or give each its own `--port` (below).
+
 Reproduce a row. This one is stock; with no `--osc-*` flags SAIL runs its
 default. Use a new sweep id, or the pooled row mixes in the runs above:
 
