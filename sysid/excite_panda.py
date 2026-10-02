@@ -5,6 +5,15 @@
     python sysid/excite_panda.py --dry-run --tag smoke
     python sysid/excite_panda.py --selftest            # port fidelity, no hardware
     python sysid/excite_panda.py --verify ~/sysid/outputs/<run>/
+    python sysid/excite_panda.py --gain-amp 0.3 --tag panda_excite_gain --yes   # oscillating gains
+    python sysid/excite_panda.py --kp 0.3 --kd -0.2 --tag panda_excite_kp0.3 --yes  # fixed gains
+    python sysid/excite_panda.py --validate step5c --yes   # names *_train / step5c_validate
+
+All four specs run by default: v3_step5d, v4_chirp, step5b, step5c. `--validate`
+suffixes the named episodes `_validate` and the rest `_train`, which is what the
+plant fit's `val_regex` holds out (cfg/sysid/fit_controller.yaml); without it the
+names stay plain and nothing is held out. `sysid/merge_episodes.py` joins runs
+(and lerobot_to_hdf5.py conversions) into one file for the fit.
 
 Drives each trajectory ONCE and writes two HDF5 files that describe the same run
 in two action spaces:
@@ -37,9 +46,23 @@ delta path pursue exactly `(P*, Q*)`. Both files therefore carry the identical
 checks that offline through the robot's own OSCGoalBuilder.
 
 That equivalence holds only while the delta stays inside the +/-0.05 m / +/-0.5 rad
-envelope, which is per axis. Our OSC runs default_kp 125 against panda_control's
+envelope, which is per axis. Our OSC runs default_kp 150 against panda_control's
 500, so at their amplitudes the tracking error is several times the envelope; the
 probe pass below scales the generators' amplitudes until it fits.
+
+Gain excitation
+---------------
+`--kp/--kd` hold a FIXED normalised gain action for the whole run (0 = the
+defaults, kp 150 and damping ratio 1; 0.3 = kp 299). `--gain-amp` puts the
+channel under test instead: a quadrature oscillation
+(`gain_schedule.quadrature_schedule`) rides on top of `--kp/--kd` while the
+trajectory runs. Either way every step records the normalised `gain_action`
+(T,2) the policy interface saw plus the physical `kp`/`kd` (T,6) `resolve_gains`
+turned it into, and the sim replays a nonzero gain -- fixed or moving -- under
+variable impedance at exactly that gain. The sim replay remaps `gain_action` with its own law and checks it lands on
+the recorded `kp`/`kd` -- which is why the remap constants (`osc_base_kp`,
+`gain_exp_base`, limits, the `tuning` trims) are stamped as attrs: a rig trim is a
+declared deviation from "same actions", and the sim refuses to read through one.
 
 The anchor
 ----------
@@ -66,10 +89,10 @@ from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-import h5py
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "multi-fast"))
 
 import franka_config as fc  # noqa: E402
 import panda_traj  # noqa: E402
@@ -82,8 +105,8 @@ from sysid import (  # noqa: E402
     _rotvec_between,
     _sha256,
     _write_run_json,
-    save_sysid_hdf5,
 )
+from utils.sysid import episode_hdf5  # noqa: E402
 
 logger = logging.getLogger("excite_panda")
 
@@ -93,13 +116,17 @@ _SPEC_DIR = Path(__file__).resolve().parent / "specs"
 
 #: Fields buffered per step. Mirrors sysid.py's set plus eef_goal_lin_vel (the
 #: generators' analytic dx_des -- the OSC goal interface has no feedforward
-#: velocity channel, so it is a reference diagnostic, not a command).
+#: velocity channel, so it is a reference diagnostic, not a command) and the
+#: per-step gain record: gain_action is the normalised [a_kp, a_kd] sent, kp/kd
+#: the 6-vectors resolve_gains made of it.
 _FIELDS = (
     "action", "eef_goal_pos", "eef_goal_quat", "eef_goal_lin_vel",
     "eef_ang_vel", "eef_lin_vel", "eef_pos", "eef_quat",
     "fault_count", "qpos", "qvel", "t_sim",
     "tau_cmd", "tau_measured", "tau_ext",
+    "gain_action", "kp", "kd",
 )
+_GAIN_FIELDS = ("gain_action", "kp", "kd")
 
 _ACTION_COLUMNS = {
     "delta": ["dpos_x", "dpos_y", "dpos_z", "dquat_x", "dquat_y", "dquat_z", "dquat_w"],
@@ -107,6 +134,8 @@ _ACTION_COLUMNS = {
 }
 _ACTION_FORMAT = {"delta": "metric_quat", "ee_pose": "absolute_pose_quat"}
 _ACTION_SPACE = {"delta": "EE_DELTA", "ee_pose": "EE_POS"}
+_FRAME_ATTRS = {"frame": "base", "quat_order": "xyzw", "ee_convention": "O_T_EE"}
+_PRODUCER = "sysid/excite_panda.py"
 
 
 # ---------------------------------------------------------------------------
@@ -131,12 +160,13 @@ def _stack() -> SimpleNamespace:
         from lerobot_robot_bimanual_franka.ee_goals import (  # noqa: PLC0415
             OSCGoalBuilder, delta_rotvec,
         )
+        from lerobot_robot_bimanual_franka import gain_schedule as gs  # noqa: PLC0415
         _STACK = SimpleNamespace(
             ControlMode=ControlMode, SingleArmFranka=SingleArmFranka,
             SingleArmFrankaConfig=SingleArmFrankaConfig,
             OSCGoalBuilder=OSCGoalBuilder, delta_rotvec=delta_rotvec,
             ActionSafetyScreen=sf.ActionSafetyScreen,
-            bf=bf, osc=osc, hm=hm, safety=sf, fp=fp,
+            bf=bf, osc=osc, hm=hm, safety=sf, fp=fp, gs=gs,
         )
     return _STACK
 
@@ -166,6 +196,26 @@ def _shadow(cfg):
         {_ARM_KEY: fc.ee_sphere(cfg.arm_name(_ARM_KEY))},
     )
     return goals, safety
+
+
+def _shadow_gains(cfg, a_kp: float, a_kd: float,
+                  scales: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """The (kp6, kd6) send_action resolves from this step's gain action, through
+    the same trims the robot reads off its config (or the recorded ones, on verify)."""
+    if scales is None:
+        scales = {k: getattr(cfg, k) for k in
+                  ("kp_pos_scale", "kp_ori_scale", "kd_pos_scale", "kd_ori_scale")}
+    return _stack().osc.resolve_gains(
+        a_kp, a_kd, scales["kp_ori_scale"], scales["kd_ori_scale"],
+        kp_pos_scale=scales["kp_pos_scale"], kd_pos_scale=scales["kd_pos_scale"])
+
+
+def _gain_schedule(spec_t_s: np.ndarray, gains: dict) -> np.ndarray:
+    """(T, 2) normalised gain actions on the reference grid; constant when the
+    amplitudes are zero, so every existing invocation records exactly what it sent."""
+    return _stack().gs.quadrature_schedule(
+        spec_t_s, gains["amp_kp"], gains["amp_kd"], gains["freq_hz"], gains["ramp_s"],
+        gains["phase_kd_rad"], gains["kp0"], gains["kd0"])
 
 
 # ---------------------------------------------------------------------------
@@ -208,8 +258,10 @@ def _reference(spec: dict, fps: float, s_pos: float, s_rot: float,
     # the chirp sweep and the ramp into one sample less than the intended window.
     n = int(round(float(spec["duration_s"]) * fps)) + 1
     t_s = np.arange(n, dtype=np.float64) / float(fps)
-    return panda_traj.build(spec["kind"], t_s, x_anchor, q_anchor,
-                            _scaled_params(spec, s_pos, s_rot), ramp_out_s)
+    ref = panda_traj.build(spec["kind"], t_s, x_anchor, q_anchor,
+                           _scaled_params(spec, s_pos, s_rot), ramp_out_s)
+    ref["t_s"] = t_s
+    return ref
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +335,7 @@ def _home_verified(robot, q_target, tol: float = HOME_TOL_RAD,
 # ---------------------------------------------------------------------------
 
 def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: float,
-                drive_mode: str, kp: float, kd: float, gripper_norm: float,
+                drive_mode: str, gains: dict, gripper_norm: float,
                 ramp_out_s: float, abort_m: float, abort_rad: float,
                 flush_path: Path | None = None, flush_attrs: dict | None = None,
                 flush_every: int = 100, label: str = "") -> tuple[dict, dict]:
@@ -291,7 +343,9 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
 
     Returns (recorded, stats). `recorded["action"]` is the delta as sent; the
     absolute-action file is built from eef_goal_pos/eef_goal_quat, which is the
-    goal the shadow builder says the controller actually pursued.
+    goal the shadow builder says the controller actually pursued. `gains` is the
+    `gain_schedule.describe` dict; its schedule is evaluated on the reference's
+    own time grid, so the probe and record passes see the same gain at the same t.
     """
     s = _stack()
     tf = float(cfg.ee_translation_fudge)
@@ -311,6 +365,7 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
     ref = _reference(spec, fps, s_pos, s_rot, x_anchor, q_anchor, ramp_out_s)
     goal_pos_ref, goal_quat_ref = ref["goal_pos"], ref["goal_quat"]
     n_steps = len(goal_pos_ref)
+    gain_ref = _gain_schedule(ref["t_s"], gains)
 
     dt = 1.0 / float(fps)
     t_start = time.perf_counter()
@@ -385,6 +440,8 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
                 cmd_pos, cmd_quat = dpos, drot_quat
             else:
                 cmd_pos, cmd_quat = goal_pos_ref[step], goal_quat_ref[step]
+            a_kp, a_kd = float(gain_ref[step, 0]), float(gain_ref[step, 1])
+            kp6, kd6 = _shadow_gains(cfg, a_kp, a_kd)
             robot.send_action({
                 f"{_ARM_KEY}_x": float(cmd_pos[0]),
                 f"{_ARM_KEY}_y": float(cmd_pos[1]),
@@ -394,8 +451,8 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
                 f"{_ARM_KEY}_qz": float(cmd_quat[2]),
                 f"{_ARM_KEY}_qw": float(cmd_quat[3]),
                 f"{_ARM_KEY}_gripper": float(gripper_norm),
-                "kp": kp,
-                "kd": kd,
+                "kp": a_kp,
+                "kd": a_kd,
             })
 
             t_now = time.perf_counter() - t_start
@@ -418,10 +475,13 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
             buf["tau_cmd"].append(np.asarray(tau_cmd, dtype=np.float32))
             buf["tau_measured"].append(np.asarray(tau_meas, dtype=np.float32))
             buf["tau_ext"].append(np.asarray(tau_ext, dtype=np.float32))
+            buf["gain_action"].append(np.array([a_kp, a_kd], dtype=np.float32))
+            buf["kp"].append(np.asarray(kp6, dtype=np.float32))
+            buf["kd"].append(np.asarray(kd6, dtype=np.float32))
 
             if flush_path is not None and (step + 1) % flush_every == 0:
-                save_sysid_hdf5({k: np.stack(v) for k, v in buf.items() if v},
-                                str(flush_path), attrs=flush_attrs, quiet=True)
+                _flush(flush_path, label or spec["kind"],
+                       {k: np.stack(v) for k, v in buf.items() if v}, flush_attrs)
 
             elapsed = time.perf_counter() - t_step
             if elapsed < dt:
@@ -451,6 +511,10 @@ def run_episode(robot, cfg, spec: dict, *, fps: float, s_pos: float, s_rot: floa
         "amp_scale_pos": s_pos,
         "amp_scale_rot": s_rot,
         "params": _scaled_params(spec, s_pos, s_rot),
+        "gain_action_range": (np.min(gain_ref[:len(buf["t_sim"])], axis=0).tolist()
+                              if buf["t_sim"] else None,
+                              np.max(gain_ref[:len(buf["t_sim"])], axis=0).tolist()
+                              if buf["t_sim"] else None),
         "exact_dual_label": bool(stale == 0 and clip_steps == 0),
     }
     if recorded:
@@ -482,6 +546,14 @@ def derive_scales(stats: dict, probe_scale: float, pos_margin: float,
 # HDF5 output
 # ---------------------------------------------------------------------------
 
+def _flush(path: Path, name: str, recorded: dict, attrs: dict | None) -> None:
+    """The mid-episode flush: one episode in the delta space, atomic."""
+    a = {**_FRAME_ATTRS, "num_samples": int(len(recorded["action"])),
+         "action_format": _ACTION_FORMAT["delta"], "action_space": _ACTION_SPACE["delta"],
+         "action_columns": _ACTION_COLUMNS["delta"], **(attrs or {})}
+    episode_hdf5.write_episodes(path, [(name, recorded, a)], producer=_PRODUCER)
+
+
 def _pose_action(recorded: dict) -> np.ndarray:
     """The EE_POS action that commands the same goal: the goal itself."""
     return np.concatenate([recorded["eef_goal_pos"], recorded["eef_goal_quat"]],
@@ -490,34 +562,20 @@ def _pose_action(recorded: dict) -> np.ndarray:
 
 def save_dual_hdf5(episodes: list[tuple[str, dict, dict]], path: Path,
                    space: str) -> None:
-    """Write one multi-episode file in the layout fit_sim_controller reads
-    (`data/<episode>/<field>`; it hardcodes the group name `data`).
+    """Write one multi-episode file in the episode layout (EPISODE_HDF5.md).
 
     `space` selects which array lands in `action`; every other field is the same
-    recorded data in both files. save_sim_format_hdf5 cannot be reused -- it
-    requires `action_norm` and is replay-mode only.
+    recorded data in both files.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with h5py.File(tmp, "w") as f:
-        grp = f.create_group("data")
-        for name, recorded, attrs in episodes:
-            ep = grp.create_group(name)
-            for field, arr in recorded.items():
-                if field == "action":
-                    continue
-                ep.create_dataset(field, data=arr, compression="gzip", compression_opts=4)
-            action = recorded["action"] if space == "delta" else _pose_action(recorded)
-            ep.create_dataset("action", data=action, compression="gzip", compression_opts=4)
-            ep.attrs["num_samples"] = int(action.shape[0])
-            ep.attrs["action_format"] = _ACTION_FORMAT[space]
-            ep.attrs["action_space"] = _ACTION_SPACE[space]
-            ep.attrs["action_columns"] = _ACTION_COLUMNS[space]
-            for key, val in (attrs or {}).items():
-                if val is not None:
-                    ep.attrs[key] = val
-    os.replace(tmp, path)
+    out = []
+    for name, recorded, attrs in episodes:
+        action = recorded["action"] if space == "delta" else _pose_action(recorded)
+        arrays = {**{k: v for k, v in recorded.items() if k != "action"}, "action": action}
+        a = {**_FRAME_ATTRS, "num_samples": int(action.shape[0]),
+             "action_format": _ACTION_FORMAT[space], "action_space": _ACTION_SPACE[space],
+             "action_columns": _ACTION_COLUMNS[space], **(attrs or {})}
+        out.append((name, arrays, a))
+    episode_hdf5.write_episodes(path, out, producer=_PRODUCER)
     logger.info("saved %d episode(s) to %s", len(episodes), path)
 
 
@@ -547,52 +605,80 @@ def verify_run(run_dir: Path, tol: float = _VERIFY_TOL) -> bool:
 
     cfg = _rig_config(s.ControlMode.EE_DELTA)
     ok = True
-    with h5py.File(delta_path, "r") as fd, h5py.File(pose_path, "r") as fp_:
-        names = sorted(fd["data"].keys())
-        if names != sorted(fp_["data"].keys()):
-            logger.error("episode sets differ between the two files")
-            return False
-        for name in names:
-            d, p = fd["data"][name], fp_["data"][name]
-            gp = np.asarray(d["eef_goal_pos"], dtype=np.float64)
-            gq = np.asarray(d["eef_goal_quat"], dtype=np.float64)
-            ee_pos = np.asarray(d["eef_pos"], dtype=np.float64)
-            ee_quat = np.asarray(d["eef_quat"], dtype=np.float64)
+    for path in (delta_path, pose_path):
+        problems = episode_hdf5.validate(path, legacy_ok=False)
+        for pr in problems:
+            logger.error("%s: %s", path, pr)
+        ok = ok and not problems
+    deltas = {n: (a, t) for n, a, t, _ in episode_hdf5.read_episodes(delta_path)}
+    poses = {n: (a, t) for n, a, t, _ in episode_hdf5.read_episodes(pose_path)}
+    if sorted(deltas) != sorted(poses):
+        logger.error("episode sets differ between the two files")
+        return False
+    for name in sorted(deltas):
+        (d, d_attrs), (p, _) = deltas[name], poses[name]
+        gp = np.asarray(d["eef_goal_pos"], dtype=np.float64)
+        gq = np.asarray(d["eef_goal_quat"], dtype=np.float64)
+        ee_pos = np.asarray(d["eef_pos"], dtype=np.float64)
+        ee_quat = np.asarray(d["eef_quat"], dtype=np.float64)
 
-            # The two files must describe the same goals.
-            for field in ("eef_goal_pos", "eef_goal_quat"):
-                if not np.array_equal(np.asarray(d[field]), np.asarray(p[field])):
-                    logger.error("%s: %s differs between files", name, field)
-                    ok = False
+        # The two files must describe the same goals, and the same gains.
+        for field in ("eef_goal_pos", "eef_goal_quat", *_GAIN_FIELDS):
+            if (field in d) != (field in p):
+                logger.error("%s: %s present in only one file", name, field)
+                ok = False
+            elif field in d and not np.array_equal(np.asarray(d[field]), np.asarray(p[field])):
+                logger.error("%s: %s differs between files", name, field)
+                ok = False
 
-            # Each file's action must reproduce those goals.
-            for space, grp in (("delta", d), ("ee_pose", p)):
-                goals, safety = _shadow(cfg)
-                goals.reset(_ARM_KEY, ee_quat[0])
-                a = np.asarray(grp["action"], dtype=np.float64)
-                err_p = err_q = 0.0
-                for t in range(len(a)):
-                    if space == "delta":
-                        g = goals.from_delta(_ARM_KEY, a[t, 0:3],
-                                             s.delta_rotvec(a[t, 3:7]),
-                                             ee_pos[t], ee_quat[t])
-                    else:
-                        g = goals.absolute(a[t, 0:3], a[t, 3:7])
-                    rp, rq = safety.shape_goal({_ARM_KEY: g})[_ARM_KEY]
-                    err_p = max(err_p, float(np.max(np.abs(rp - gp[t]))))
-                    # Quaternion double cover: compare on the closer hemisphere.
-                    err_q = max(err_q, float(min(np.max(np.abs(rq - gq[t])),
-                                                 np.max(np.abs(rq + gq[t])))))
-                status = "OK" if (err_p <= tol and err_q <= tol) else "FAIL"
-                if status == "FAIL":
-                    ok = False
-                logger.info("%-28s %-8s pos %.2e  quat %.2e  %s",
-                            name, space, err_p, err_q, status)
+        # The recorded physical gains must be resolve_gains of the recorded
+        # action -- the claim the sim replay leans on when it remaps the
+        # action itself.
+        if all(f in d for f in _GAIN_FIELDS):
+            ga = np.asarray(d["gain_action"], dtype=np.float64)
+            kp_rec = np.asarray(d["kp"], dtype=np.float64)
+            kd_rec = np.asarray(d["kd"], dtype=np.float64)
+            scales = episode_hdf5.attr_json(d_attrs, "tuning_gain_scales", None)
+            err_g = 0.0
+            for t in range(len(ga)):
+                kp6, kd6 = _shadow_gains(cfg, ga[t, 0], ga[t, 1], scales)
+                err_g = max(err_g, float(np.max(np.abs(kp6 - kp_rec[t]) / np.maximum(kp6, 1e-12))),
+                            float(np.max(np.abs(kd6 - kd_rec[t]) / np.maximum(kd6, 1e-12))))
+            status = "OK" if err_g <= tol else "FAIL"
+            if status == "FAIL":
+                ok = False
+            logger.info("%-28s %-8s gains rel %.2e  a_kp [%.3f, %.3f]  a_kd [%.3f, %.3f]  %s",
+                        name, "gain", err_g, ga[:, 0].min(), ga[:, 0].max(),
+                        ga[:, 1].min(), ga[:, 1].max(), status)
+
+        # Each file's action must reproduce those goals.
+        for space, arrays in (("delta", d), ("ee_pose", p)):
+            goals, safety = _shadow(cfg)
+            goals.reset(_ARM_KEY, ee_quat[0])
+            a = np.asarray(arrays["action"], dtype=np.float64)
+            err_p = err_q = 0.0
+            for t in range(len(a)):
+                if space == "delta":
+                    g = goals.from_delta(_ARM_KEY, a[t, 0:3],
+                                         s.delta_rotvec(a[t, 3:7]),
+                                         ee_pos[t], ee_quat[t])
+                else:
+                    g = goals.absolute(a[t, 0:3], a[t, 3:7])
+                rp, rq = safety.shape_goal({_ARM_KEY: g})[_ARM_KEY]
+                err_p = max(err_p, float(np.max(np.abs(rp - gp[t]))))
+                # Quaternion double cover: compare on the closer hemisphere.
+                err_q = max(err_q, float(min(np.max(np.abs(rq - gq[t])),
+                                             np.max(np.abs(rq + gq[t])))))
+            status = "OK" if (err_p <= tol and err_q <= tol) else "FAIL"
+            if status == "FAIL":
+                ok = False
+            logger.info("%-28s %-8s pos %.2e  quat %.2e  %s",
+                        name, space, err_p, err_q, status)
     return ok
 
 
 # ---------------------------------------------------------------------------
-# Self-test (port fidelity, no hardware, no robot packages)
+# Self-test (port fidelity + gain schedule, no hardware)
 # ---------------------------------------------------------------------------
 
 def selftest() -> bool:
@@ -649,6 +735,23 @@ def selftest() -> bool:
     check(np.allclose(half["goal_pos"] - x_anchor,
                       0.5 * (r3["goal_pos"] - x_anchor), atol=1e-12),
           "position offsets scale linearly with the amplitude scale")
+
+    # The gain schedule: what the sim replay will be handed per step.
+    gs = _stack().gs
+    t_s = np.arange(0, 8.0 + 1e-9, 0.05)
+    g = gs.quadrature_schedule(t_s, 0.3, 0.3, 0.25, ramp_s=1.0, kp0=0.0, kd0=0.0)
+    check(g.shape == (len(t_s), 2), "gain schedule is (T, 2)")
+    check(np.allclose(g[0], 0.0), "gain schedule starts at the centre (ramped in)")
+    check(np.all(np.abs(g) <= 0.3 + 1e-12), "gain schedule stays within the amplitude")
+    check(abs(np.max(g[:, 0]) - 0.3) < 1e-6 and abs(np.min(g[:, 0]) + 0.3) < 1e-6,
+          "a_kp reaches both +amp and -amp")
+    steady = t_s >= 1.0
+    q = np.hypot(g[steady, 0] / 0.3, g[steady, 1] / 0.3)
+    check(np.allclose(q, 1.0, atol=1e-9), "quadrature: (a_kp, a_kd) traces the unit circle after ramp-in")
+    g0 = gs.quadrature_schedule(t_s, 0.0, 0.0, 0.25, kp0=0.1, kd0=-0.2)
+    check(np.all(g0 == np.array([0.1, -0.2])), "zero amplitude is the constant --kp/--kd")
+    g_big = gs.quadrature_schedule(t_s, 5.0, 5.0, 0.25)
+    check(np.all(np.abs(g_big) <= 1.0), "schedule is clipped to the [-1, 1] action range")
     return ok
 
 
@@ -728,6 +831,7 @@ def _run_metadata(args, specs, stack) -> dict:
     return {
         "status": "running",
         "mode": "excite_panda",
+        "gain_remap": stack.gs.remap_constants(),
         "quat_encoding": "exact",
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "argv": sys.argv,
@@ -749,15 +853,35 @@ def _run_metadata(args, specs, stack) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Record panda_control's v3/v4 excitation trajectories in both EE action spaces.")
-    p.add_argument("--specs", nargs="*", default=["panda_v3.json", "panda_v4.json"],
+    p.add_argument("--specs", nargs="*",
+                   default=["panda_v3.json", "panda_v4.json", "panda_step5b.json", "panda_step5c.json"],
                    help="Spec files (bare names resolve under sysid/specs/)")
+    p.add_argument("--validate", nargs="*", default=None, metavar="NAME",
+                   help="Episode names (a spec's `name`, e.g. step5c) to record as "
+                        "<name>_validate; every other one becomes <name>_train, the "
+                        "split cfg/sysid/fit_controller.yaml's val_regex reads. Off: plain names")
     p.add_argument("--fps", type=float, default=float(fc.control_fps()))
     p.add_argument("--drive-mode", choices=("delta", "ee_pose"), default="delta",
                    help="Which action space actually drives the arm. delta is the "
                         "path that can clip, so driving it makes the pose file a "
                         "faithful derivation rather than a possibly-unreachable one.")
-    p.add_argument("--kp", type=float, default=0.0, help="OSC kp action entry")
-    p.add_argument("--kd", type=float, default=0.0, help="OSC damping-ratio action entry")
+    p.add_argument("--kp", type=float, default=0.0,
+                   help="Fixed normalised kp action for the whole run, -1..1 (0 = kp 150, "
+                        "0.3 = kp 299); the centre of the oscillation when --gain-amp is set")
+    p.add_argument("--kd", type=float, default=0.0,
+                   help="Fixed normalised damping-ratio action for the whole run (0 = ratio 1)")
+    # Gain excitation: a quadrature oscillation of the normalised gain actions on
+    # top of --kp/--kd. 0 (the default) keeps the gains fixed at --kp/--kd.
+    p.add_argument("--gain-amp", type=float, default=0.0,
+                   help="Amplitude of the kp gain-action oscillation (0.3 -> kp 75..300)")
+    p.add_argument("--gain-amp-kd", type=float, default=None,
+                   help="Amplitude of the kd oscillation (default: --gain-amp)")
+    p.add_argument("--gain-freq", type=float, default=None,
+                   help="Oscillation frequency in Hz (default gain_schedule.DEFAULT_FREQ_HZ)")
+    p.add_argument("--gain-ramp-s", type=float, default=None,
+                   help="Half-cosine ramp-in of the oscillation (default gain_schedule.DEFAULT_RAMP_S)")
+    p.add_argument("--gain-phase-kd-deg", type=float, default=90.0,
+                   help="Phase of the kd oscillation relative to kp; 90 = quadrature")
     p.add_argument("--gripper-norm", type=float,
                    default=float(fc.control("homing.gripper_norm")))
     p.add_argument("--home-tol-rad", type=float, default=HOME_TOL_RAD,
@@ -808,6 +932,13 @@ def main() -> int:
     spec_paths = [(_SPEC_DIR / s if "/" not in s else Path(s).expanduser())
                   for s in args.specs]
     specs = [(p, _load_spec(p)) for p in spec_paths]
+    if args.validate is not None:
+        known = {sp["name"] for _, sp in specs}
+        unknown = sorted(set(args.validate) - known)
+        if unknown:
+            raise SystemExit(f"--validate names {unknown} match no spec; specs are {sorted(known)}")
+        for _, sp in specs:
+            sp["name"] = f"{sp['name']}_{'validate' if sp['name'] in args.validate else 'train'}"
 
     s = _stack()
     mode = (s.ControlMode.EE_DELTA if args.drive_mode == "delta" else s.ControlMode.EE_POS)
@@ -822,6 +953,32 @@ def main() -> int:
     logger.info("fudges: translation=%g rotation=%g; delta envelope +/-%g m, +/-%g rad",
                 cfg.ee_translation_fudge, cfg.ee_rotation_fudge,
                 s.osc.DELTA_POS_MAX, s.osc.DELTA_ROT_MAX)
+
+    gains = s.gs.describe(
+        amp_kp=args.gain_amp,
+        amp_kd=args.gain_amp if args.gain_amp_kd is None else args.gain_amp_kd,
+        freq_hz=s.gs.DEFAULT_FREQ_HZ if args.gain_freq is None else args.gain_freq,
+        ramp_s=s.gs.DEFAULT_RAMP_S if args.gain_ramp_s is None else args.gain_ramp_s,
+        phase_kd_rad=float(np.radians(args.gain_phase_kd_deg)),
+        kp0=args.kp, kd0=args.kd)
+    remap = s.gs.remap_constants()
+    if s.gs.varies(gains):
+        lo, hi = (np.clip(np.array([gains["kp0"] - gains["amp_kp"], gains["kp0"] + gains["amp_kp"]]), -1, 1))
+        logger.info("gain excitation: a_kp %+.2f..%+.2f (kp %.0f..%.0f), a_kd amp %.2f, %g Hz, "
+                    "ramp %g s", lo, hi,
+                    remap["osc_base_kp"] * remap["gain_exp_base"] ** lo,
+                    remap["osc_base_kp"] * remap["gain_exp_base"] ** hi,
+                    gains["amp_kd"], gains["freq_hz"], gains["ramp_s"])
+    else:
+        kp6, kd6 = _shadow_gains(cfg, args.kp, args.kd)
+        logger.info("gains fixed for the run: a_kp %+.2f a_kd %+.2f -> kp %.0f kd %.1f%s",
+                    args.kp, args.kd, kp6[0], kd6[0],
+                    "" if (args.kp or args.kd) else " (the defaults)")
+    trims = remap["tuning_gain_scales"]
+    if (s.gs.varies(gains) or args.kp or args.kd) and any(
+            v != 1.0 for vec in trims.values() for v in vec):
+        logger.warning("tuning gain trims are not 1.0 (%s): the sim replay will refuse "
+                       "to remap this recording's gain actions", trims)
 
     # Pre-flight the references at full amplitude, as upstream does.
     for path, spec in specs:
@@ -860,14 +1017,24 @@ def main() -> int:
         "mode": "excite_panda",
         "drive_mode": args.drive_mode,
         "quat_encoding": "exact",
+        # The schedule centre. With --gain-amp these are not the gain of any one
+        # step; gain_varies says so and gain_action/kp/kd carry the per-step truth.
         "kp": args.kp,
         "kd": args.kd,
+        "gain_varies": bool(s.gs.varies(gains)),
+        "gain_schedule": json.dumps(gains),
         "fps": args.fps,
         "gripper_norm": args.gripper_norm,
         "ee_translation_fudge_factor": float(cfg.ee_translation_fudge),
         "ee_rotation_fudge_factor": float(cfg.ee_rotation_fudge),
-        "osc_base_kp": getattr(s.osc, "DEFAULT_KP", None),
-        "kp_gain": getattr(s.osc, "KP_EXP_SCALE", 1.0) ** args.kp,
+        # The rig's action -> gain map, for the sim to check against its own.
+        "osc_base_kp": remap["osc_base_kp"],
+        "osc_default_damping_ratio": remap["osc_default_damping_ratio"],
+        "gain_exp_base": remap["gain_exp_base"],
+        "kp_limits": remap["kp_limits"],
+        "damping_ratio_limits": remap["damping_ratio_limits"],
+        "tuning_gain_scales": json.dumps(remap["tuning_gain_scales"]),
+        "kp_gain": remap["gain_exp_base"] ** args.kp,
         "dry_run": bool(args.dry_run),
         "source": "panda_control gen_excitation_traj.py / gen_chirp_traj.py",
     }
@@ -880,8 +1047,8 @@ def main() -> int:
             kind = spec["kind"]
             name = spec["name"]
             init_q = np.asarray(spec["init_qpos"], dtype=np.float64)
-            common = dict(fps=args.fps, drive_mode=args.drive_mode, kp=args.kp,
-                          kd=args.kd, gripper_norm=args.gripper_norm,
+            common = dict(fps=args.fps, drive_mode=args.drive_mode, gains=gains,
+                          gripper_norm=args.gripper_norm,
                           ramp_out_s=args.ramp_out_s,
                           abort_m=(args.track_abort_m if args.track_abort_m is not None
                                    else float(spec.get("track_abort_m", 0.05))),
@@ -919,7 +1086,10 @@ def main() -> int:
                 continue
             logger.info("[%s] homed to %.4f rad of the target", name, home_err)
             flush = run_dir / f"{i}_record_{name}.hdf5"
+            # init_qpos is overwritten with the MEASURED start (row 0) once the
+            # episode has run; the spec's homing target stays as spec_init_qpos.
             attrs = {**base_attrs, "traj_kind": kind, "init_qpos": init_q,
+                     "spec_init_qpos": init_q, "obs_timing": "pre_action",
                      "reference_episode": name, "spec_file": str(path),
                      "timestamp": datetime.now().astimezone().isoformat(timespec="seconds")}
             recorded, stats = run_episode(robot, cfg, spec, s_pos=s_pos, s_rot=s_rot,
@@ -931,6 +1101,7 @@ def main() -> int:
                 continue
 
             ep_attrs = {**attrs,
+                        "init_qpos": np.asarray(recorded["qpos"][0], dtype=np.float64),
                         "amp_scale_pos": s_pos, "amp_scale_rot": s_rot,
                         "clip_steps": stats["clip_steps"],
                         "zero_rot_steps": stats["zero_rot_steps"],
@@ -946,7 +1117,7 @@ def main() -> int:
                         "x_anchor": stats["x_anchor"], "q_anchor": stats["q_anchor"],
                         "resolved_params": json.dumps(stats["params"]),
                         "peak_rates": json.dumps(stats["peak_rates"])}
-            save_sysid_hdf5(recorded, str(flush), attrs=ep_attrs, quiet=True)
+            _flush(flush, name, recorded, ep_attrs)
             assert name not in used_names, f"duplicate episode name {name!r}"
             used_names.add(name)
             episodes.append((name, recorded, ep_attrs))

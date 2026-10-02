@@ -46,7 +46,9 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from scipy.spatial.transform import Rotation
 
-from lerobot_teleoperator_gello.franka_fk import franka_fk_chain
+from lerobot_robot_bimanual_franka.franka_fk import franka_fk_chain
+from lerobot_robot_bimanual_franka.gain_schedule import remap_constants
+from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains
 
 _PROFILE = "single_arm_franka"
 _ARM = fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
@@ -236,6 +238,36 @@ class EpisodeRecorder:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _physical_gains(kp_action: np.ndarray, kd_action: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The translational kp and kd the arm ran for each step's normalised gain
+    action: resolve_gains with the rig's tuning trims, exactly as send_action
+    resolves them. The orientation block differs from these by
+    kp_ori_scale / kd_ori_scale."""
+    t = remap_constants()["tuning_gain_scales"]
+    gains = [resolve_gains(a, b, t["kp_ori_scale"], t["kd_ori_scale"],
+                           kp_pos_scale=t["kp_pos_scale"], kd_pos_scale=t["kd_pos_scale"])
+             for a, b in zip(kp_action, kd_action)]
+    return (np.array([kp6[0] for kp6, _ in gains], dtype=np.float64),
+            np.array([kd6[0] for _, kd6 in gains], dtype=np.float64))
+
+
+def _value_range(v: np.ndarray, pad_frac: float = 0.1) -> list[float]:
+    """[lo, hi] around a series with padding, never zero-width."""
+    lo, hi = float(np.min(v)), float(np.max(v))
+    pad = max((hi - lo) * pad_frac, abs(hi) * 0.05, 1e-6)
+    return [lo - pad, hi + pad]
+
+
+def _gain_axes(fig, kp_true: np.ndarray, kd_true: np.ndarray) -> None:
+    """Rows 1-2, col 2: the normalised gain action on the left axis at its fixed
+    [-1, 1], the physical gain on the right axis over its own range."""
+    for row, name, true in ((1, "kp", kp_true), (2, "kd", kd_true)):
+        fig.update_yaxes(range=[-1.05, 1.05], title_text=f"{name} gain",
+                         row=row, col=2, secondary_y=False)
+        fig.update_yaxes(range=_value_range(true), title_text=f"{name} (pos)",
+                         row=row, col=2, secondary_y=True, showgrid=False)
+
 
 def _skeleton_pts(q: np.ndarray) -> np.ndarray:
     """Return (9, 3) skeleton positions in ROBOT frame: robot base origin + 7
@@ -674,6 +706,8 @@ def save_episode_html(
     pcd_max_pts: int = 3000,
     cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
     cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
+    reference_trail: np.ndarray | None = None,
+    reference_name: str = "reference EE",
 ) -> None:
     """Write a self-contained animated Plotly HTML from recorded episode data.
 
@@ -725,6 +759,10 @@ def save_episode_html(
                                    calibration in config_single_arm_franka.
         cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
                                    frame; None hides the camera frame.
+        reference_trail:           Optional (N, 3) WORLD-frame EE trail from another
+                                   episode (e.g. the paired base-only run), drawn
+                                   static and dashed for comparison.
+        reference_name:            Legend label for that trail.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -741,9 +779,12 @@ def save_episode_html(
     indices = list(range(0, T_full, max(1, frame_stride)))
     T = len(indices)
 
+    reference = (None if reference_trail is None
+                 else np.asarray(reference_trail, dtype=np.float32).reshape(-1, 3))
     joint_angles     = [recorder.joint_angles[i]      for i in indices]
     kp_arr           = np.array([recorder.kp[i]      for i in indices])
     kd_arr           = np.array([recorder.kd[i]      for i in indices])
+    kp_true_arr, kd_true_arr = _physical_gains(kp_arr, kd_arr)
     grip_arr         = np.array([recorder.gripper[i] for i in indices])
     res_grip_arr     = np.array([recorder.res_gripper[i] for i in indices])
     # Backward compat: recorders predating res_rotvecs plot a zero panel.
@@ -805,6 +846,8 @@ def save_episode_html(
         chunk_pts.append(ev["total_traj"])
     frame_pts = _reference_frame_points(cam_in_world_translation)
     frame_pts += _reach_target_points(recorder.reach_waypoints, recorder.reach_goal)
+    if reference is not None and len(reference) > 0:
+        frame_pts.append(reference)
     all_xyz = np.concatenate(
         [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
         else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
@@ -832,8 +875,8 @@ def save_episode_html(
     fig = make_subplots(
         rows=4, cols=2,
         specs=[
-            [{"type": "scene", "rowspan": 4}, {"type": "xy"}],
-            [None,                             {"type": "xy"}],
+            [{"type": "scene", "rowspan": 4}, {"type": "xy", "secondary_y": True}],
+            [None,                             {"type": "xy", "secondary_y": True}],
             [None,                             {"type": "xy"}],
             [None,                             {"type": "xy"}],
         ],
@@ -886,14 +929,14 @@ def save_episode_html(
         fig.add_trace(axis_trace, row=1, col=1)
     # Traces 13-14: kp_gain (solid) and kp_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
-    fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
-                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
-                  row=1, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=kp_true_arr[:1], mode="lines",
+                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true (pos)"),
+                  row=1, col=2, secondary_y=True)
     # Traces 15-16: kd_gain (solid) and kd_true (dotted)
     fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
-    fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
-                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
-                  row=2, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=kd_true_arr[:1], mode="lines",
+                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true (pos)"),
+                  row=2, col=2, secondary_y=True)
     # Trace 17: gripper
     fig.add_trace(
         _metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"),
@@ -976,13 +1019,13 @@ def save_episode_html(
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
                        line=dict(color="crimson", width=2)),
             # 14: kp_true 0..t
-            go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
+            go.Scatter(x=ts[:t + 1], y=kp_true_arr[:t + 1], mode="lines",
                        line=dict(color="crimson", width=2, dash="dot")),
             # 15: kd_gain 0..t
             go.Scatter(x=ts[:t + 1], y=kd_t, mode="lines",
                        line=dict(color="seagreen", width=2)),
             # 16: kd_true 0..t
-            go.Scatter(x=ts[:t + 1], y=10**(kd_t * 2 * np.sqrt(kp_t)), mode="lines",
+            go.Scatter(x=ts[:t + 1], y=kd_true_arr[:t + 1], mode="lines",
                        line=dict(color="seagreen", width=2, dash="dot")),
             # 17: gripper 0..t
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
@@ -1069,12 +1112,11 @@ def save_episode_html(
         )],
     )
 
-    # Fixed axis ranges for metric subplots.
-    # kp/kd panels show both the normalised gain [-1,1] and the true value (10^gain),
-    # so use autorange for those two; gripper is always [0,1].
+    # Fixed axis ranges for metric subplots: the normalised gain action on the
+    # left axis, the physical gain the arm ran on its own right axis (hover for
+    # the value), gripper always [0,1].
     x_end = float(ts[-1]) + 1
-    fig.update_yaxes(title_text="kp",      row=1, col=2)
-    fig.update_yaxes(title_text="kd",      row=2, col=2)
+    _gain_axes(fig, kp_true_arr, kd_true_arr)
     fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_yaxes(title_text="res rot (rad)", row=4, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
@@ -1100,6 +1142,11 @@ def save_episode_html(
     for reach_trace in _reach_target_traces(recorder.reach_waypoints, recorder.reach_goal):
         fig.add_trace(reach_trace, row=1, col=1)
 
+    # Another episode's trail, for comparison (static).
+    if reference is not None and len(reference) > 0:
+        fig.add_trace(_trail_trace(reference, color="darkorange", name=reference_name,
+                                   dash="dash", width=3, marker_size=2), row=1, col=1)
+
     fig.write_html(path, include_plotlyjs="cdn")
 
 
@@ -1114,6 +1161,9 @@ def save_rollout_html(
     pcd_max_pts: int = 3000,
     cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
     cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
+    forecast_name: str = "base chunk forecast",
+    reference_trail: np.ndarray | None = None,
+    reference_name: str = "reference EE",
 ) -> None:
     """Write a self-contained animated Plotly HTML for a base-policy-only rollout.
 
@@ -1148,6 +1198,10 @@ def save_rollout_html(
                                    camera frame.
         cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
                                    frame; None hides the camera frame.
+        forecast_name:             Legend label for the chunk forecast.
+        reference_trail:           Optional (N, 3) WORLD-frame trail drawn static
+                                   and dashed, as in save_episode_html.
+        reference_name:            Legend label for that trail.
     """
     T_full = len(recorder)
     if T_full == 0:
@@ -1165,6 +1219,7 @@ def save_rollout_html(
     joint_angles   = [recorder.joint_angles[i]     for i in indices]
     kp_arr         = np.array([recorder.kp[i]      for i in indices])
     kd_arr         = np.array([recorder.kd[i]      for i in indices])
+    kp_true_arr, kd_true_arr = _physical_gains(kp_arr, kd_arr)
     grip_arr       = np.array([recorder.gripper[i] for i in indices])
     res_grip_arr       = np.array([recorder.res_gripper[i] for i in indices])
     ts             = np.array(indices, dtype=np.float32)
@@ -1215,6 +1270,10 @@ def save_rollout_html(
     chunk_pts = [ev["base_traj"] for ev in chunk_events]
     frame_pts = _reference_frame_points(cam_in_world_translation)
     frame_pts += _reach_target_points(recorder.reach_waypoints, recorder.reach_goal)
+    reference = (None if reference_trail is None
+                 else np.asarray(reference_trail, dtype=np.float32).reshape(-1, 3))
+    if reference is not None and len(reference) > 0:
+        frame_pts.append(reference)
     all_xyz = np.concatenate(
         [actual_pos] + skeletons + chunk_pts + pcd_for_bbox + frame_pts if chunk_pts
         else [actual_pos] + skeletons + pcd_for_bbox + frame_pts,
@@ -1243,8 +1302,8 @@ def save_rollout_html(
     fig = make_subplots(
         rows=3, cols=2,
         specs=[
-            [{"type": "scene", "rowspan": 3}, {"type": "xy"}],
-            [None,                             {"type": "xy"}],
+            [{"type": "scene", "rowspan": 3}, {"type": "xy", "secondary_y": True}],
+            [None,                             {"type": "xy", "secondary_y": True}],
             [None,                             {"type": "xy"}],
         ],
         column_widths=[0.65, 0.35],
@@ -1262,7 +1321,7 @@ def save_rollout_html(
     )
     # Trace 2: base chunk forecast (full projected trajectory from most recent inference)
     fig.add_trace(
-        _trail_trace(_init_base_fcast, color="royalblue", name="base chunk forecast"),
+        _trail_trace(_init_base_fcast, color="royalblue", name=forecast_name),
         row=1, col=1,
     )
     # Trace 3-5: live EE orientation triad.
@@ -1273,14 +1332,14 @@ def save_rollout_html(
         fig.add_trace(axis_trace, row=1, col=1)
     # Traces 9-10: kp
     fig.add_trace(_metric_trace(ts[:1], kp_arr[:1], "crimson", "kp_gain"), row=1, col=2)
-    fig.add_trace(go.Scatter(x=ts[:1], y=10**kp_arr[:1], mode="lines",
-                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true"),
-                  row=1, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=kp_true_arr[:1], mode="lines",
+                             line=dict(color="crimson", width=2, dash="dot"), name="kp_true (pos)"),
+                  row=1, col=2, secondary_y=True)
     # Traces 11-12: kd
     fig.add_trace(_metric_trace(ts[:1], kd_arr[:1], "seagreen", "kd_gain"), row=2, col=2)
-    fig.add_trace(go.Scatter(x=ts[:1], y=10**(kd_arr[:1] * 2 * np.sqrt(kp_arr[:1])), mode="lines",
-                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true"),
-                  row=2, col=2)
+    fig.add_trace(go.Scatter(x=ts[:1], y=kd_true_arr[:1], mode="lines",
+                             line=dict(color="seagreen", width=2, dash="dot"), name="kd_true (pos)"),
+                  row=2, col=2, secondary_y=True)
     # Trace 13: gripper
     fig.add_trace(_metric_trace(ts[:1], grip_arr[:1], "darkorchid", "gripper"), row=3, col=2)
     # Trace 14 (optional): point cloud
@@ -1330,11 +1389,11 @@ def save_rollout_html(
         frame_data.extend([
             go.Scatter(x=ts[:t + 1], y=kp_t, mode="lines",
                        line=dict(color="crimson", width=2)),
-            go.Scatter(x=ts[:t + 1], y=10**kp_t, mode="lines",
+            go.Scatter(x=ts[:t + 1], y=kp_true_arr[:t + 1], mode="lines",
                        line=dict(color="crimson", width=2, dash="dot")),
             go.Scatter(x=ts[:t + 1], y=kd_t, mode="lines",
                        line=dict(color="seagreen", width=2)),
-            go.Scatter(x=ts[:t + 1], y=10**(kd_t * 2 * np.sqrt(kp_t)), mode="lines",
+            go.Scatter(x=ts[:t + 1], y=kd_true_arr[:t + 1], mode="lines",
                        line=dict(color="seagreen", width=2, dash="dot")),
             go.Scatter(x=ts[:t + 1], y=grip_arr[:t + 1], mode="lines",
                        line=dict(color="darkorchid", width=2)),
@@ -1406,8 +1465,7 @@ def save_rollout_html(
     )
 
     x_end = float(ts[-1]) + 1
-    fig.update_yaxes(title_text="kp",      row=1, col=2)
-    fig.update_yaxes(title_text="kd",      row=2, col=2)
+    _gain_axes(fig, kp_true_arr, kd_true_arr)
     fig.update_yaxes(range=[-1.05, 1.05], title_text="gripper", row=3, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=1, col=2)
     fig.update_xaxes(range=[float(ts[0]), x_end], title_text="step", row=2, col=2)
@@ -1432,6 +1490,10 @@ def save_rollout_html(
     # Reach curve + goal (static; absent for every other base policy).
     for reach_trace in _reach_target_traces(recorder.reach_waypoints, recorder.reach_goal):
         fig.add_trace(reach_trace, row=1, col=1)
+
+    if reference is not None and len(reference) > 0:
+        fig.add_trace(_trail_trace(reference, color="darkorange", name=reference_name,
+                                   dash="dash", width=3, marker_size=2), row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")
 

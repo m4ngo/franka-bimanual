@@ -42,34 +42,20 @@ import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
 from baselines import run_record as rr  # noqa: E402
-from baselines.bspline_bridge.spline_plan import SplinePlanner  # noqa: E402
+from baselines.rollout_viz import render_after_run  # noqa: E402
+from baselines.bspline_bridge.spline_plan import (  # noqa: E402
+    GRIPPER_INDEX, POSE_DIM, SplinePlanner, decode_action as decode,
+)
 from baselines.zmq_client import PolicyClient  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 
 logger = logging.getLogger("baselines.bspline")
 
 POLICY = "bspline"
-# [pos(3), rot6d(6), gripper(1)]. The pose columns are what the stitch matches
-# on; the gripper is index 9.
-_ACT_DIM = 10
-_GRIPPER_INDEX = 9
-_POSE_DIM = 9
-
-
-def decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """Sampled spline row -> (pos, quat_xyzw, gripper).
-
-    Decoded here rather than through upstream's `decode_action_vector`, whose
-    formats all return YAM/X5 action dicts.
-    """
-    row = np.asarray(row, dtype=np.float64).reshape(-1)
-    if row.size != _ACT_DIM:
-        raise ValueError(
-            f"expected a {_ACT_DIM}-dim pos+rot6d+gripper action, got {row.size}. "
-            "The checkpoint's action space does not match what "
-            "baselines/bspline_bridge/dataset.py writes."
-        )
-    return row[:3], rc.rot6d_to_quat_xyzw(row[3:9]), float(row[_GRIPPER_INDEX])
+# The action layout and its decoder live in spline_plan, next to the spline they
+# come out of, so the sim rollout uses the same ones.
+_GRIPPER_INDEX = GRIPPER_INDEX
+_POSE_DIM = POSE_DIM
 
 
 def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict,
@@ -77,10 +63,13 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
     exec_fps = float(args.exec_fps or fc.policy("baselines.exec.fast_fps"))
     o_fps = float(args.obs_fps or rc.obs_fps())
     per_obs = max(1, int(round(exec_fps / o_fps)))
+    dt = 1.0 / exec_fps
+    # Holds the arm's lag behind a sped-up plan at the demos' 1x lag, as upstream's servo scaling does.
+    lead = rc.damping_lag(rc.gain_action(None)) * (1.0 - 1.0 / planner_kwargs["speed_up_times"])
     logger.info("EE_POS at %.0f Hz, observations at %.0f Hz (%d goals per obs), "
-                "speed_up=%.2f origin_time_scale=%.1f",
+                "speed_up=%.2f origin_time_scale=%.1f goal lead %.3f s",
                 exec_fps, o_fps, per_obs,
-                planner_kwargs["speed_up_times"], planner_kwargs["origin_time_scale"])
+                planner_kwargs["speed_up_times"], planner_kwargs["origin_time_scale"], lead[0])
 
     def episode_fn(controller, dispatcher, dataset, ep, stopper) -> None:
         client.reset()
@@ -93,6 +82,7 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
         # step would burn in a clock running per_obs x fast.
         video_frames = 0
         goal: tuple[np.ndarray, np.ndarray, float] | None = None
+        plans_seen = 0
 
         try:
             while True:
@@ -120,8 +110,14 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
                 for i in range(per_obs):
                     if i:
                         sample = planner.poll_action()
+                    if planner.plans != plans_seen:
+                        plans_seen = planner.plans
+                        dispatcher.chunk([np.concatenate(decode(r)[:2])
+                                          for r in planner.plan_samples()])
                     if sample is not None:
-                        goal = decode(sample)
+                        pos, quat, grip = decode(sample)
+                        pos, quat = rc.lead_goal(pos, quat, *decode(planner.peek(dt))[:2], dt, lead)
+                        goal = (pos, quat, grip)
                     action = rc.ee_pos_action(*goal)
                     dispatcher.send(action, exec_fps)
                     if dataset is not None:
@@ -239,6 +235,7 @@ def main() -> int:
         print(f"\r\nrun written to {run_dir.path}\r", flush=True)
         controller.disconnect()
         client.close()
+        render_after_run(run_dir.path)
     return 0
 
 

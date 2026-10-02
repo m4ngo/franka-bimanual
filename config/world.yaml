@@ -48,7 +48,7 @@ worktable:
   # frame, i.e. world 1.022 with the base at 0.912 — ~12 cm above the actual
   # surface. Moving to the true plane lowers the brake by that much, so the
   # effective stop is worktable.height_m + worktable_brake.distance_min_m.
-  height_m: 0.905
+  height_m: 1.0 # 0.905
   frame: world
 
 sim_alignment:

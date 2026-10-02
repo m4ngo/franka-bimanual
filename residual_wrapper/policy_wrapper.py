@@ -3,19 +3,18 @@ Policy wrappers for the base (LeRobot ACT/diffusion) and residual policies.
 
 Action spaces
 -------------
-Base policy output  : [dx, dy, dz, dqx, dqy, dqz, dqw, gripper, kp, kd]
-                      Per-step EE delta in robot frame, in physical units as returned
-                      by the lerobot postprocessor.  Position columns (0–2) are in
-                      metres (the units stored in the training dataset).  Rotation
-                      columns (3–6) encode the delta as a unit quaternion (xyzw).
-                      These are forwarded directly to send_action() in EE_DELTA mode.
+Base policy output  : [x, y, z, qx, qy, qz, qw, gripper, kp, kd]
+                      ABSOLUTE EE pose in the robot base frame (EE_POS), in physical
+                      units as returned by the lerobot postprocessor: metres and a unit
+                      quaternion (xyzw), i.e. the action column of the EE_POS recording
+                      it was trained on. run_residual.py refuses a checkpoint whose
+                      training actions were per-step deltas (BasePolicy.action_space).
 
-Residual input chunk: (_RESIDUAL_HORIZON, 9) normalised per-step deltas.
+Residual input chunk: (_RESIDUAL_HORIZON, 9) chunk-start-relative normalised targets.
                       [dx, dy, dz, rx, ry, rz, gripper, kp, kd]
-                      Position deltas normalised to [-1, 1] where ±1 = ±0.05 m.
-                      Rotation deltas (axis-angle rotvec) normalised where ±1 = ±0.5 rad.
-                      Derived by converting each base-chunk step's delta quat to a rotvec
-                      and dividing by the respective scales.
+                      Each base pose minus the pose the base planned from (the measured
+                      pose at its observation): position / 0.05 m, rotation as an
+                      axis-angle rotvec / 0.5 rad (env_wrapper.chunk_to_relative).
 
 Residual output     : (_CHUNK_EXEC, 9) chunk — [damping, stiffness, dx, dy, dz, rx, ry, rz, grip_delta]
                       (gains first, DAMPING before stiffness — multi-fast convention)
@@ -31,6 +30,7 @@ import numpy as np
 import torch
 
 from env_wrapper import _STATE_OBS_KEYS, _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG, _RESIDUAL_TRANS_MAG, _RESIDUAL_ROT_MAG
+from lerobot_robot_bimanual_franka.lerobot_source import action_space as _action_space
 from lerobot.configs.policies import PreTrainedConfig
 from lerobot.policies.factory import get_policy_class, make_pre_post_processors
 from lerobot.policies.utils import prepare_observation_for_inference, populate_queues
@@ -86,6 +86,7 @@ class BasePolicy:
         self.policy = policy_cls.from_pretrained(path, config=cfg)
         self.policy.eval()
         self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, pretrained_path=path)
+        self.path = Path(path)
 
         self._amp_dtype = _AMP_DTYPES.get(str(amp or "none").lower())
         if amp and self._amp_dtype is None and str(amp).lower() != "none":
@@ -113,6 +114,31 @@ class BasePolicy:
 
     def reset(self) -> None:
         self.policy.reset()
+
+    def action_space(self) -> str:
+        """`EE_POS` or `EE_DELTA`: what the training actions were, read off the
+        checkpoint's own unnormaliser stats so the dataset need not be on disk.
+        The reach of the action position column decides it, the same rule
+        lerobot_source.action_space applies to a recording."""
+        from safetensors.numpy import load_file
+
+        files = sorted(self.path.glob("policy_postprocessor_step_*_unnormalizer_processor.safetensors"))
+        if not files:
+            raise FileNotFoundError(f"no unnormaliser stats under {self.path}; cannot tell whether "
+                                    "this checkpoint emits poses or deltas")
+        stats = load_file(str(files[0]))
+        if "action.min" in stats and "action.max" in stats:
+            corners = np.stack([stats["action.min"][:3], stats["action.max"][:3]])
+        elif "action.mean" in stats and "action.std" in stats:
+            mean, std = stats["action.mean"][:3], stats["action.std"][:3]
+            corners = np.stack([mean - 3 * std, mean + 3 * std])
+        else:
+            raise KeyError(f"{files[0]} holds no action min/max or mean/std")
+        # The classifier reads a whole action column; the two corners of the
+        # training range are the same test on its extremes.
+        rows = np.zeros((2, 7), dtype=np.float64)
+        rows[:, :3] = corners
+        return _action_space(rows)
 
     def warmup(self, obs: dict, n: int = 3) -> None:
         """Pay compile/autotune and cuDNN algorithm selection before the loop starts.
@@ -164,6 +190,9 @@ class Trajectory(BasePolicy):
     
     def reset(self) -> None:
         self.cur_step = 0
+
+    def action_space(self) -> str:
+        return _action_space(np.asarray(self.trajectory, dtype=np.float64))
 
     def infer(self, obs: dict) -> np.ndarray:
         """Run one inference pass.
@@ -252,7 +281,8 @@ class ResidualPolicy:
 
         Args:
             obs: dict with keys:
-                "action_chunk" (10, 9) — normalised delta chunk from base policy
+                "action_chunk" (10, 9) — the base chunk, chunk-start-relative and
+                                         normalised (env_wrapper.chunk_to_relative)
                                          columns 0:7 = [dx, dy, dz, rx, ry, rz, grip]
                                          columns 7:9 = [kp, kd] (dropped before model)
                 "proprio"      (17,)    — [x, y, z, qx, qy, qz, qw, finger_qpos_m, -finger_qpos_m,

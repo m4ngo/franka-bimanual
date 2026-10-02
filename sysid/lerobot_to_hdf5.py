@@ -4,8 +4,8 @@
     python sysid/lerobot_to_hdf5.py ~/franka_data/sysid-8-28
     python sysid/lerobot_to_hdf5.py sysid-8-28 --episodes 0,1,2 --dry-run
 
-Writes one multi-episode file in `excite_panda.py`'s ee_pose layout
-(`data/<episode>/<field>`, `action_format = absolute_pose_quat`), which is what
+Writes one multi-episode episode file (EPISODE_HDF5.md; `action_format =
+absolute_pose_quat`, base frame), which is what
 `multi-fast/scripts/sysid/fit_sim_controller.py` loads through `fit.real_dir`.
 
 The file lands in an `ee_pose/` subdirectory for excite_panda's reason:
@@ -29,12 +29,25 @@ here:
                 test_osc_stack's round-trip test.
   action        the recorded EE_POS action after `ActionSafetyScreen`, i.e. the
                 goal the controller actually pursued. Nothing else touches an
-                EE_POS goal -- no delta envelope, no latched orientation and no
-                recording noise, all of which live on the EE_DELTA branch (see
-                `ee_goals.OSCGoalBuilder.absolute`).
+                EE_POS goal -- no delta envelope and no latched orientation, both
+                of which live on the EE_DELTA branch (see
+                `ee_goals.OSCGoalBuilder.absolute`) -- unless the recording ran
+                with use_noise set, in which case the goal carried
+                `OSCGoalBuilder.perturb`'s jitter that the recorded action does not.
 
 Row alignment is already the fit's: LeRobot writes obs_t and then calls
 send_action, so state precedes its action and sim step t scores against row t+1.
+
+The gain columns
+----------------
+`kp`/`kd` (action columns 8, 9) are the normalised gain actions. An episode that
+holds them constant is stamped with scalar `kp_action`/`kd_action` attrs, as the
+fit's consistency check reads. One that MOVES them gets excite_panda's per-step
+record instead -- `gain_action` (T,2) and the physical `kp`/`kd` (T,6) that
+`resolve_gains` makes of it, plus the remap constants -- so the sim replays it
+under variable impedance. The trims used are the rig's CURRENT `tuning.*_scale`,
+because the recording does not carry them; a policy rollout records them in its
+run metadata, and they have been 1.0 throughout.
 
 The leading rows
 ----------------
@@ -56,15 +69,16 @@ non-adjacent states into one dt, which is a worse lie than the one it fixes.
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import sys
 from datetime import datetime
 from pathlib import Path
 
-import h5py
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "multi-fast"))
 
 import franka_config as fc  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import (  # noqa: E402
@@ -82,7 +96,10 @@ from lerobot_robot_bimanual_franka.lerobot_source import (  # noqa: E402
     resolve_root,
     task_names,
 )
+from lerobot_robot_bimanual_franka.gain_schedule import remap_constants  # noqa: E402
+from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains  # noqa: E402
 from lerobot_robot_bimanual_franka.safety import ActionSafetyScreen  # noqa: E402
+from utils.sysid import episode_hdf5  # noqa: E402
 
 logger = logging.getLogger("lerobot_to_hdf5")
 
@@ -163,21 +180,34 @@ def convert_episode(actions: np.ndarray, states: np.ndarray, dt: float,
     return arrays, stats
 
 
+def gain_record(actions: np.ndarray, remap: dict) -> tuple[dict, dict]:
+    """excite_panda's per-step gain arrays and attrs for an episode whose gain
+    actions move. Constant-gain episodes keep the scalar attrs (see convert)."""
+    scales = remap["tuning_gain_scales"]
+    ga = actions[:, [KP, KD]].astype(np.float64)
+    kp6 = np.empty((len(ga), 6))
+    kd6 = np.empty((len(ga), 6))
+    for t, (a_kp, a_kd) in enumerate(ga):
+        kp6[t], kd6[t] = resolve_gains(
+            a_kp, a_kd, scales["kp_ori_scale"], scales["kd_ori_scale"],
+            kp_pos_scale=scales["kp_pos_scale"], kd_pos_scale=scales["kd_pos_scale"])
+    arrays = {"gain_action": ga.astype(np.float32),
+              "kp": kp6.astype(np.float32), "kd": kd6.astype(np.float32)}
+    attrs = {
+        "gain_varies": True,
+        "osc_base_kp": remap["osc_base_kp"],
+        "osc_default_damping_ratio": remap["osc_default_damping_ratio"],
+        "gain_exp_base": remap["gain_exp_base"],
+        "kp_limits": remap["kp_limits"],
+        "damping_ratio_limits": remap["damping_ratio_limits"],
+        "tuning_gain_scales": json.dumps(scales),
+    }
+    return arrays, attrs
+
+
 def write_hdf5(path: Path, episodes: list[tuple[str, dict, dict]], root_attrs: dict) -> None:
-    """`data/<episode>/<field>`, the group name `fit_sim_controller` hardcodes."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with h5py.File(tmp, "w") as f:
-        for key, val in root_attrs.items():
-            f.attrs[key] = val
-        grp = f.create_group("data")
-        for name, arrays, attrs in episodes:
-            ep = grp.create_group(name)
-            for field, arr in arrays.items():
-                ep.create_dataset(field, data=arr, compression="gzip", compression_opts=4)
-            for key, val in attrs.items():
-                ep.attrs[key] = val
-    tmp.replace(path)
+    """The episode layout every consumer reads (utils/sysid/episode_hdf5.py)."""
+    episode_hdf5.write_episodes(path, episodes, root_attrs, producer="sysid/lerobot_to_hdf5.py")
 
 
 # ---------------------------------------------------------------------------
@@ -208,6 +238,7 @@ def convert(
         {arm: fc.robot_base_in_world(arm_name)}, {arm: fc.ee_sphere(arm_name)}
     )
     tasks = task_names(root)
+    remap = remap_constants()
     logger.info("%s: %d episodes, %d frames, %g fps, arm %r -> %s",
                 root, info["total_episodes"], info["total_frames"], fps, arm, arm_name)
 
@@ -230,16 +261,20 @@ def convert(
             continue
 
         arrays, stats = convert_episode(actions, states, dt, screen, arm)
-        # The fit pins kp and damping_ratio, so a recording that moved them is not
-        # describable by the file it is about to be written into.
-        for col, label in ((KP, "kp"), (KD, "kd")):
-            lo, hi = float(actions[:, col].min()), float(actions[:, col].max())
-            if hi > lo:
-                logger.warning("ep%03d: the %s action varies (%.3f..%.3f); the fit pins "
-                               "the gains", ep_index, label, lo, hi)
+        # A recording that moved the gains is replayed under variable impedance:
+        # carry the per-step record, not a scalar the fit would pin on.
+        gain_attrs = {}
+        if np.any(actions[:, [KP, KD]] != actions[0, [KP, KD]]):
+            gain_arrays, gain_attrs = gain_record(actions, remap)
+            arrays.update(gain_arrays)
+            logger.info("ep%03d: gain actions vary (a_kp %.3f..%.3f, a_kd %.3f..%.3f); "
+                        "recorded per step with the rig's current tuning trims", ep_index,
+                        actions[:, KP].min(), actions[:, KP].max(),
+                        actions[:, KD].min(), actions[:, KD].max())
 
         attrs = {
             "num_samples": stats["steps"],
+            "frame": "base", "quat_order": "xyzw", "ee_convention": "O_T_EE",
             "action_format": _ACTION_FORMAT,
             "action_space": _ACTION_SPACE,
             "action_columns": _ACTION_COLUMNS,
@@ -250,6 +285,7 @@ def convert(
             "trimmed_leading_rows": trim,
             "kp_action": float(actions[0, KP]),
             "kd_action": float(actions[0, KD]),
+            **gain_attrs,
             "qvel_source": "central_difference",
             "eef_source": "franka_fk",
             "source_dataset": str(root),

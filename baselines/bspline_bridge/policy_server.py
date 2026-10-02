@@ -31,6 +31,8 @@ import sys
 import traceback
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from baselines.run_record import read_source_repo_id  # noqa: E402  stdlib-only
@@ -123,6 +125,8 @@ def main() -> int:
                    help="observation window; default: what the checkpoint was trained with")
     p.add_argument("--degree", type=int, default=None)
     p.add_argument("--device", default="cuda")
+    p.add_argument("--num-inference-steps", type=int, default=10,
+                   help="DDIM steps; 10 is upstream's own rollout command")
     args = p.parse_args()
 
     up = _load_upstream()
@@ -138,7 +142,16 @@ def main() -> int:
               f"{trained_n_obs}; the policy will see a window it was not trained on")
 
     policy = up.BSplinePolicy(args.ckpt_path, degree=args.degree, device=args.device)
+    policy.policy.num_inference_steps = args.num_inference_steps
+    # Upstream's deployment sampler: the whole DDIM loop replayed as one CUDA graph.
+    from bspline_policy.scripts.policy_local_bspline import CudaGraphDDIMSampler
+    CudaGraphDDIMSampler(policy.policy, args.device).install()
     wrapper = up.PolicyWrapper(policy, n_obs_steps=n_obs_steps)
+    # Warm-up and graph capture now, not inside the first episode's clock.
+    dummy = {k: (np.zeros((v["shape"][1], v["shape"][2], 3), np.uint8) if v.get("type") == "rgb"
+                 else np.zeros(v["shape"], np.float32))
+             for k, v in policy.obs_shape_meta.items()}
+    policy.step([dummy] * n_obs_steps)
 
     action_meta = policy.get_action_metadata()
     # cfg.task.dataset_path is the HDF5 the replay buffer was built from; it
@@ -152,6 +165,7 @@ def main() -> int:
         "n_obs_steps": int(n_obs_steps),
         "n_action_steps": int(policy.n_action_steps),
         "horizon": _cfg_lookup(cfg, lambda c: int(c.horizon)),
+        "num_inference_steps": int(policy.policy.num_inference_steps),
         "action_format": action_meta.get("action_format"),
         "relative_knots": bool(action_meta.get("relative_knots")),
         # A B-Spline action carries no precision label; the field exists so one
@@ -175,6 +189,7 @@ def main() -> int:
                         rep = dict(meta)
                     elif "reset" in req:
                         self.policy.reset()
+                        policy.warmed_up = True     # upstream re-arms its warm-up on every reset
                         print("Policy has been reset")
                     elif "obs" in req:
                         rep["bspline"] = self.step(req["obs"])

@@ -243,7 +243,10 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   `clip_delta`, post fudge, post `shape_goal`) and the measured pose it was
   composed on. They exist so a rollout can record what the arm was commanded
   rather than an estimate of it, which is what makes a sim replay exact. Nothing
-  in the control path reads them back.
+  in the control path reads them back. `last_ee_wrench` is the same kind of
+  diagnostic: libfranka's `O_F_ext_hat_K` per arm from the latest state read,
+  which the real rollouts record as the end-effector force
+  (`baselines/ROLLOUT.md`, "End-effector force").
 - [safety.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/safety.py)
   — `ActionSafetyScreen.shape_goal` raises an OSC goal along world-up until the
   EE collision sphere's lowest point clears
@@ -412,7 +415,8 @@ before believing the import.
 ## Scripts
 
 Bash wrappers around the LeRobot CLIs. All scripts assume the venv is active and
-read hosts/ports/rates from `config/` via `scripts/_config.sh`.
+read hosts/ports/rates from `config/` via `scripts/_config.sh`. `ENTRYPOINTS.md`
+groups every real/sim record, replay and compare entry point by purpose.
 
 | Script | What it does | Mode |
 |---|---|---|
@@ -424,29 +428,37 @@ read hosts/ports/rates from `config/` via `scripts/_config.sh`.
 | `record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO joint teleop dataset → HuggingFace | joint |
 | `ee_record_data.sh <repo_id> <n_eps> <task> <out_dir> <resume>` | Record GELLO EE teleop dataset | EE |
 | `replay.sh <repo_id> <episode>` | Replay one episode of a recorded dataset | joint |
-| `replay_dataset.py --mode delta\|ee_pose` | Re-record a whole dataset on the arm; `ee_pose` relabels EE_DELTA actions to the absolute OSC goals they produce, `delta` replays them as recorded (optionally magnitude-bounded) | EE |
+| `replay_dataset.py --mode delta\|ee_pose` | Re-record a whole dataset on the arm; `ee_pose` relabels EE_DELTA actions to the absolute OSC goals they produce (an EE_POS source is screened and replayed as is), `delta` replays deltas as recorded (optionally magnitude-bounded) and refuses an EE_POS source | EE |
+| `filter_noop_actions.py --source-repo-id <ds> --target-repo-id <id>` | Copy a recording without its no-op frames; `delta` drops a frame whose delta is below threshold, `ee_pose` one whose target pose did not change from the previous frame (mode classified by reach, `--dry-run` reports counts without decoding video) | — |
 | `train.sh <repo_id> <policy_repo> <bs> <steps> <policy_type> <resume> <config>` | Train a policy with wandb logging, upload to HF | — |
 | `rollout_policy.sh <repo_id> <n_eps> <policy_repo> <out_dir>` | Roll out a policy and log trajectories | EE |
 | `home_pose.py` | Save / drive named home configurations (`home_poses/*.json`) | joint |
 | `openpi_client_franka.py` | Single-arm OpenPI inference client; DROID-style joint-velocity observations to a remote websocket policy | joint |
 | `deploy_nuc_server.sh <mario\|luigi>` | Resolve `torque:` config, copy the torque server + controller to a NUC, restart under `chrt -f 80` | — |
-| `real_reach_rollout.py` | Run the reach task on one arm under the analytic base policy; writes `results.json` + per-episode HTML | EE_DELTA |
-| `real_trajectory_rollout.py --repo-id <ds> --episode N` | One LeRobot episode as the real side of a sim diff; `--source dataset` (no arm, the recording itself) or `--source arm` (re-run today, EE_POS) | EE_POS |
-| `real_reach_viz.py` | Animated HTML for a reach run or a dataset trajectory; `--sim` overlays a sim replay and writes `errors.json` | — |
+| `real_reach_rollout.py` | Run the reach task on one arm under the analytic base policy; writes `episodes.hdf5` (see `EPISODE_HDF5.md`) + per-episode HTML | EE_DELTA |
+| `real_trajectory_rollout.py --repo-id <ds> --episode N\|--all` | One LeRobot episode, or every episode into one `episodes.hdf5`, as the real side of a sim diff or a fit input; EE_DELTA and EE_POS recordings alike (classified by reach); `--source dataset` (no arm, the recording itself) or `--source arm` (re-run today, EE_POS) | EE_POS |
+| `plot_episodes.py` | Animated HTML for a reach run or a dataset trajectory; a `sim_replay.hdf5` beside it is overlaid and `errors.json` written | — |
+| `plot_dataset_coverage.py <file.hdf5>` | Coverage figure for one episode file: every EE path and orientation overlaid, each joint's span against the FR3 range, and joint angles over time | — |
+| `results_json_to_hdf5.py` | Translate a legacy `results.json` / `sim_episode_*.json` run into `episodes.hdf5` / `sim_replay.hdf5` | — |
+| `../multi-fast/utils/sysid/episode_hdf5.py <file>` | Describe and validate an episode HDF5 (the one layout every trajectory is stored in) | — |
 | `check_reach_compare_offline.py` | The sim/real comparison against a synthesised sim record; no robot, no robosuite | — |
-| `../multi-fast/scripts/reach/replay_real_reach.py` | Replay a recorded real episode in robosuite (runs in `multi-fast/.venv`) | — |
+| `../multi-fast/scripts/reach/replay_goals_in_sim.py` | Replay a recorded real episode in robosuite into `sim_replay.hdf5`: the real goals re-issued open loop (runs in `multi-fast/.venv`) | — |
+| `../multi-fast/scripts/reach/rerun_policy_in_sim.py` | Re-run a `run_residual.py` reach episode in sim with the same FAST checkpoint, start joints and curve, closed loop, into `sim_replay.hdf5`; `plot_episodes.py` then compares | — |
 | `osc_check/check_osc_parity.py` | Diff `osc_torque_controller` against robosuite's real `osc.py` / `control_utils.py` | — |
 | `osc_check/check_osc_e2e.py` | Same, but through the whole `send_action` → server path | — |
 | `osc_check/check_osc_axes.py` | Move the arm one OSC axis at a time; reports commanded-vs-measured | EE |
 | `../sysid/tune.py` | Match real to a sim reference: sweep gains/fudges/`friction_kc`, scored on per-step task response | EE |
 | `../sysid/lerobot_to_hdf5.py` | Convert a recorded EE_POS LeRobot dataset into the `ee_pose` HDF5 multi-fast's `fit_sim_controller` fits against | — |
+| `../sysid/merge_episodes.py <out> <files...>` | Join episode files into one fit dataset, with renames and the `_train` / `_validate` split | — |
 | `setup_baseline_envs.sh` | Build `.venv-sail` / `.venv-bspline`, the baselines' own interpreters | — |
 | `prepare_baseline_datasets.py` | One EE_POS recording → sysid / SAIL / B-Spline HDF5s | — |
+| `train_pipeline.py start <pipelines/*.yaml>` | Convert a recording and train all three policies (diffusion base, B-Spline, SAIL) from one yaml, detached, into one run directory; each stage reuses, or resumes from the checkpoint of, an earlier run's same training unless `--retrain <stage>`; `status` (shows a failed stage's error line) / `summary` / `stop` / `retry <stage>` (resumes from the stage's last checkpoint; an OOM beside the other trainings is retried on its own automatically) | — |
 | `../baselines/{sail,bspline}_bridge/train.py` | Train a baseline on its HDF5 in its own venv (`python -m baselines.sail_bridge.train`) | — |
 | `sail_rollout.sh` | Roll a trained SAIL policy out; starts its policy server in `.venv-sail` | per ckpt |
 | `bspline_rollout.sh` | Roll a trained B-Spline policy out; starts its server in `.venv-bspline` | EE |
 | `check_policy_server.py <sail\|bspline>` | Handshake + one synthetic inference against a running policy server; the preflight for a new checkpoint | — |
 | `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers, plus the servers' request handling under a stubbed robomimic | — |
+| `check_residual_executor_offline.py` | `run_residual.py`'s EE_POS-base executor against `reach_residual.py`'s own functions and a fake arm: chunk-relative targets, FAST's composition, one-step deltas, the delta-checkpoint refusal | — |
 | `rollout_summary.py <task>` | Compare every method's rollouts recorded under one task | — |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
@@ -575,7 +587,11 @@ connects cleanly and then does nothing.
   and the rollout files itself under it -- because LeRobot's own `meta/info.json`
   does not record a repo id and the resolved path drops the org prefix. Trained
   policies mirror it: `~/franka_data/policies/<train-dataset>/<method>/<run>/`.
-  See [baselines/ROLLOUT.md](baselines/ROLLOUT.md).
+  See [baselines/ROLLOUT.md](baselines/ROLLOUT.md). A `scripts/train_pipeline.py`
+  run instead keeps its converted datasets, all three policies, logs and wandb
+  links together under `~/franka_data/pipeline/<train-dataset>/<timestamp>-<name>/`,
+  driven by a `pipelines/*.yaml`; the rollout scripts take `--ckpt` paths, so
+  either layout rolls out the same way.
 - **The baselines run in their own interpreters, never in `.venv`.** SAIL and
   B-Spline conflict with each other and with lerobot; `scripts/setup_baseline_envs.sh`
   builds `.venv-sail` / `.venv-bspline` and `baselines/interpreters.py` is the
@@ -677,6 +693,9 @@ For code-level debugging:
   estimate — which is why it fires on the proximal joints, not the wrist.
 - A gain change had no effect → you did not re-run `deploy_nuc_server.sh`. The
   NUC runs its own copy of `control.yaml`'s `torque:` block.
+- `EE force not recorded` at the start of a real rollout → that NUC's server
+  predates the published wrench (it sends a 49-float state bundle, not 55).
+  Re-run `scripts/deploy_nuc_server.sh` for it.
 - `RuntimeError: Cannot resolve the torque block` on the NUC → the deploy did
   not write `nuc_control_config.py`. Re-run the deploy script; it fails the
   import check rather than letting the arm run on a stale gain.

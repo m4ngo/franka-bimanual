@@ -272,7 +272,9 @@ def main() -> None:
         default=None,
         help="Homing control rate (Hz). Default: control.rates.home_fps in config/control.yaml.",
     )
-    p.add_argument("--noise", type=bool, default=False, help="Whether to add noise to actions or not")
+    p.add_argument("--noise", type=_str2bool, default=False,
+                   help="Follower-side action noise at control.yaml's noise.* scales "
+                        "(EE_DELTA and EE_POS)")
 
     args = p.parse_args()
     init_logging()

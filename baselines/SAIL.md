@@ -178,6 +178,17 @@ when `<output_dir>/<name>` already exists it **asks whether to delete it** --
 every earlier run of that task. Answering `n` makes it add a new timestamped
 subdirectory instead, which is what the wrapper does.
 
+**The dataset fetches 16x the images the model reads.** `SequenceDataset.get_item`
+loads `train.seq_length` frames (32, the prediction horizon) of every
+observation key per sample, and `process_batch_for_training` keeps the first
+`observation_horizon` (2). Upstream's 84x84 two-camera data hides this; with
+three 224x224 cameras it was 5 s per gradient step with the GPU idle. The
+wrapper therefore runs `sail_bridge/robomimic_train.py`, which cuts the obs
+fetch to `observation_horizon` frames and then calls the stock entry point.
+The batch the model receives is identical -- `robomimic_train.py --config <json>
+--check` compares patched and unpatched samples and reports mismatches
+(none). `--no-obs-window` runs stock robomimic for comparison.
+
 ### Pass 5 — evaluation
 
 `run_trained_agent_receding_horizon.py` is where speed and guidance actually

@@ -11,7 +11,6 @@ of the scene, and animation frames mapped onto the wrong traces.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -22,50 +21,32 @@ _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
 sys.path.insert(0, str(_ROOT / "scripts"))
 
-import franka_config as fc  # noqa: E402
+from lerobot_robot_bimanual_franka import gain_schedule as gs  # noqa: E402
+from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach_geometry import base_to_world  # noqa: E402
-from real_reach_viz import (  # noqa: E402
+from plot_episodes import (  # noqa: E402
 	_episode_arrays, _sim_arrays, build_reach_figure, compute_reach_errors, load_run,
 )
 
 
-def _world_to_base(arm: str, pts: np.ndarray) -> np.ndarray:
-	"""TEST ONLY. Inverts `base_to_world` to rebuild the input this harness needs.
-
-	Shipped code never does this -- `robot_base_in_world` maps base->world and is
-	not inverted by consumers. Here it only reconstructs, exactly (R is
-	orthonormal), the base-frame trace that produced the recorded world one, so
-	the round-trip assertion has something to be exact against.
-	"""
-	pose = fc.robot_base_in_world(arm)
-	R = np.asarray(pose.rotation)
-	return (np.asarray(pts, dtype=np.float64) - np.asarray(pose.translation)) @ R
-
-
-def _world_to_base_quat(arm: str, quats: np.ndarray) -> np.ndarray:
-	pose = fc.robot_base_in_world(arm)
-	return (Rotation.from_matrix(np.asarray(pose.rotation)).inv()
-			* Rotation.from_quat(np.asarray(quats, dtype=np.float64))).as_quat()
-
-
 def synth_sim(ep: dict, arm: str, offset=(0.0, 0.0, 0.0), lag: int = 0) -> dict:
-	"""A sim record that IS the real episode, in sim's frame and convention.
+	"""A sim episode that IS the real episode, in sim's frame and convention.
 
 	Built by inverting every map the comparison applies, so a zero perturbation
 	must round-trip to zero error. `offset` is added in BASE frame; `lag`
 	truncates sim, standing in for an episode that ended earlier.
 	"""
-	rp = ep["replay"]
+	arr, at = ep["arrays"], ep["attrs"]
 	# The site offset a sim replay would measure on the shipped Panda. Any rigid
 	# tool-frame offset must round-trip; these are the real numbers so the test
 	# also reads as documentation.
 	site_rot = Rotation.from_rotvec([0.0, 0.0, -1.571289])
 	site_pos = np.array([0.0, 0.0, -0.0069])
 
-	pos_b = _world_to_base(arm, ep["trace"]) + np.asarray(offset)
-	quat_b = _world_to_base_quat(arm, ep["ee_quat"])
-	goal_b = np.asarray(rp["osc_goal_pos"], dtype=np.float64)
-	gq = np.asarray(rp["osc_goal_quat"], dtype=np.float64)
+	pos_b = np.asarray(arr["eef_pos"], dtype=np.float64) + np.asarray(offset)
+	quat_b = np.asarray(arr["eef_quat"], dtype=np.float64)
+	goal_b = np.asarray(arr["eef_goal_pos"], dtype=np.float64)
+	gq = np.asarray(arr["eef_goal_quat"], dtype=np.float64)
 
 	def to_site(p, q):
 		"""O_T_EE -> robosuite grip site, the map the sim replay applies to goals."""
@@ -75,25 +56,34 @@ def synth_sim(ep: dict, arm: str, offset=(0.0, 0.0, 0.0), lag: int = 0) -> dict:
 	site = [to_site(p, q) for p, q in zip(pos_b, quat_b)]
 	gsite = [to_site(p, q) for p, q in zip(goal_b, gq)]
 	n = len(site) - lag
-	return {
-		"schema": "sim_reach_replay/1", "episode": ep["episode"],
-		"frame": "base_sim", "quat_order": "xyzw", "fps": ep["fps"],
-		"ee_convention": "robosuite_grip_site", "mode": "replay_absolute_goal",
-		"steps": {
-			"eef_pos": [p.tolist() for p, _ in site[:n]],
-			"eef_quat": [q.tolist() for _, q in site[:n]],
-			"goal_pos": [p.tolist() for p, _ in gsite[:n]],
-			"goal_quat": [q.tolist() for _, q in gsite[:n]],
-			"qpos": np.asarray(ep["qpos"], dtype=np.float64)[:n].tolist(),
-			"cursor": ep["cursor_trace"][:n],
-			"goal_transport_max_m": 0.0,
-		},
-		"start": {"qpos_max_err_rad": 0.0},
-		"sim": {"site_in_otee": {"rotvec_rad": site_rot.as_rotvec().tolist(),
-								 "pos_m": site_pos.tolist()}},
-		"outcome": {"steps": n, "success": bool(ep["success"]),
-					"cursor": ep["cursor_trace"][n - 1], "curve_len": ep["curve_len"]},
+	spos = np.asarray([p for p, _ in site[:n]]).reshape(n, 3)
+	squat = np.asarray([q for _, q in site[:n]]).reshape(n, 4)
+	gpos = np.asarray([p for p, _ in gsite[:n]]).reshape(n, 3)
+	gquat = np.asarray([q for _, q in gsite[:n]]).reshape(n, 4)
+	arrays = {
+		"action": np.concatenate([gpos, gquat], axis=1),
+		"eef_pos": spos, "eef_quat": squat, "eef_goal_pos": gpos, "eef_goal_quat": gquat,
+		"qpos": np.asarray(arr["qpos"], dtype=np.float64)[:n],
+		"qvel": np.asarray(arr["qvel"], dtype=np.float64)[:n],
 	}
+	if "cursor" in arr:
+		arrays["cursor"] = np.asarray(arr["cursor"])[:n]
+	for key in ("gain_action", "kp", "kd"):
+		if key in arr:
+			arrays[key] = np.asarray(arr[key], dtype=np.float64)[:n]
+	attrs = {
+		"num_samples": n, "fps": at["fps"], "frame": "base_sim", "quat_order": "xyzw",
+		"ee_convention": "robosuite_grip_site", "action_format": "absolute_pose_quat",
+		"action_space": "EE_POS", "init_qpos": np.asarray(at["init_qpos"], dtype=np.float64),
+		"site_in_otee_rotvec": site_rot.as_rotvec(), "site_in_otee_pos": site_pos,
+		"goal_transport_max_m": 0.0, "start_qpos_max_err_rad": 0.0,
+		"impedance_mode": "variable" if "gain_action" in arr else "fixed",
+	}
+	if "cursor" in arr:
+		attrs.update({"success": bool(at.get("success", False)),
+					  "cursor": int(np.asarray(arr["cursor"])[n - 1]),
+					  "curve_len": int(at["curve_len"])})
+	return {"name": ep["name"], "arrays": arrays, "attrs": attrs, "curve": ep.get("curve")}
 
 
 def check(ep: dict, arm: str) -> list[str]:
@@ -153,10 +143,54 @@ def check(ep: dict, arm: str) -> list[str]:
 
 	# (f) transport check surfaces
 	sim = synth_sim(ep, arm)
-	sim["steps"]["goal_transport_max_m"] = 1e-3
+	sim["attrs"]["goal_transport_max_m"] = 1e-3
 	fig = build_reach_figure(ep, arm=arm, sim=sim)
 	req("REPLAY NOT FAITHFUL" in fig.layout.title.text,
 		"an unfaithful goal transport is called out in the title")
+
+	# (g) a record whose gain action moved: the error-by-gain table appears, the
+	# round trip is still exactly zero, and the figure grows a gain panel.
+	req("by_gain" not in compute_reach_errors(d, _sim_arrays(synth_sim(ep, arm), arm), ep,
+											  synth_sim(ep, arm)),
+		"no gain record -> no by_gain")
+	gep = {"name": ep["name"], "arrays": dict(ep["arrays"]), "attrs": dict(ep["attrs"]),
+		   "curve": ep.get("curve")}
+	n_steps = len(gep["arrays"]["eef_goal_pos"])
+	t_s = np.arange(n_steps) / float(gep["attrs"]["fps"])
+	gep["arrays"]["gain_action"] = ga = gs.quadrature_schedule(t_s, 0.3, 0.3, 0.25)
+	remap = gs.remap_constants()
+	trims = remap["tuning_gain_scales"]
+	resolved = [resolve_gains(a[0], a[1], trims["kp_ori_scale"], trims["kd_ori_scale"],
+							  kp_pos_scale=trims["kp_pos_scale"], kd_pos_scale=trims["kd_pos_scale"]) for a in ga]
+	gep["arrays"]["kp"] = np.asarray([r[0] for r in resolved])
+	gep["arrays"]["kd"] = np.asarray([r[1] for r in resolved])
+	gep["attrs"].update({k: v for k, v in remap.items() if k != "tuning_gain_scales"})
+	gd = _episode_arrays(gep, arm)
+	req(gd["gain_action"].shape == (len(gd["commanded"]), 2),
+		"gain_action is read per step, aligned with the commands")
+	gsim = synth_sim(gep, arm)
+	e = compute_reach_errors(gd, _sim_arrays(gsim, arm), gep, gsim)
+	req("by_gain" in e and e["sim_impedance_mode"] == "variable",
+		"a moving gain action yields by_gain and reports the sim's impedance mode")
+	if "by_gain" in e:
+		bg = e["by_gain"]
+		req(all(bg[ch][t]["n"] > 0 for ch in ("a_kp", "a_kd") for t in ("low", "mid", "high")),
+			"three non-empty terciles per gain channel")
+		req(all(bg[ch][t]["rmse_pos_mm"] < 1e-6 for ch in ("a_kp", "a_kd") for t in ("low", "mid", "high")),
+			"zero-perturbation round trip is 0 in every tercile")
+		req(bg["a_kp"]["low"]["range"][1] <= bg["a_kp"]["mid"]["range"][0] + 1e-12
+			<= bg["a_kp"]["high"]["range"][0] + 1e-12, "terciles are ordered")
+	f = build_reach_figure(gep, arm=arm, sim=gsim)
+	titles = [a.text for a in f.layout.annotations] if f.layout.annotations else []
+	titles = {ax.title.text for ax in (f.layout[k] for k in f.layout if k.startswith("yaxis"))
+			  if ax.title.text}
+	req("gain action (-1..1)" in titles and "kp, kd (log)" in titles,
+		"with-gain figure carries the gain panel: action on the left axis, kp/kd on the right")
+	names = {tr.name for tr in f.data if tr.name}
+	req({"a_kp", "a_kd", "kp", "kd"} <= names, "gain panel draws a_kp, a_kd, kp and kd")
+	req("kp (sim)" in names and "kd (sim)" in names, "gain panel draws the sim's resolved kp/kd dashed")
+	req(all(len(fr.traces) == len(fr.data) for fr in f.frames),
+		"with-gain: every frame supplies one trace per index")
 	return fails
 
 
@@ -167,10 +201,10 @@ def main() -> int:
 	args = ap.parse_args()
 
 	_, eps = load_run(args.run)
-	ep = next(e for e in eps if int(e.get("episode", -1)) == args.episode
-			  and not e.get("dry_run"))
-	arm = ep.get("arm", "left")
-	print(f"episode {ep['episode']}, arm {arm}, {ep['steps']} steps")
+	ep = next(e for e in eps if int(e["attrs"].get("episode", -1)) == args.episode
+			  and not e["attrs"].get("dry_run"))
+	arm = ep["attrs"].get("arm", "left")
+	print(f"{ep['name']}, arm {arm}, {ep['attrs']['num_samples']} steps")
 	fails = check(ep, arm)
 	print("\nPASS" if not fails else f"\nFAIL ({len(fails)})")
 	return 0 if not fails else 1

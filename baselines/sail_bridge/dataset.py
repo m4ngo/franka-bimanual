@@ -21,6 +21,7 @@ import numpy as np  # noqa: E402
 
 from baselines.common import (  # noqa: E402
     NUM_JOINTS,
+    home_rotvec_axis,
     parse_image_size,
     pos_rotvec_gripper,
     reached_and_commanded_poses,
@@ -45,14 +46,17 @@ def convert_episode(actions, states, arm, screen):
     )
     delta_actions = np.concatenate([dpos, drot, gripper_act[:, None]], axis=1).astype("float32")
 
+    # One rotation vector per orientation (common.canonical_rotvec): the label
+    # the policy regresses must not flip sign as the wrist rolls through pi.
+    axis_ref = home_rotvec_axis(arm)
     return {
         "obs/robot0_eef_pos": reached_pos.astype("float32"),
         "obs/robot0_eef_quat": reached_quat.astype("float32"),
         "obs/robot0_joint_pos": qpos.astype("float32"),
         "obs/robot0_gripper_qpos": gripper_obs[:, None],
         "actions": delta_actions,
-        "absolute_actions": pos_rotvec_gripper(reached_pos, reached_quat, gripper_act),
-        "commanded_absolute_actions": pos_rotvec_gripper(commanded_pos, commanded_quat, gripper_act),
+        "absolute_actions": pos_rotvec_gripper(reached_pos, reached_quat, gripper_act, axis_ref),
+        "commanded_absolute_actions": pos_rotvec_gripper(commanded_pos, commanded_quat, gripper_act, axis_ref),
     }
 
 
@@ -64,7 +68,8 @@ _ENV_ARGS = json.dumps({"env_name": "bimanual_franka", "type": 6, "env_kwargs": 
 def convert(source: str, out: Path, **kwargs) -> int:
     return run_conversion(
         source, out, convert_episode, "baselines/sail_bridge/dataset.py",
-        root_attrs={"env_args": _ENV_ARGS}, **kwargs,
+        root_attrs={"env_args": _ENV_ARGS, "rotvec_hemisphere": "home EE axis (common.canonical_rotvec)"},
+        **kwargs,
     )
 
 

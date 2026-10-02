@@ -46,17 +46,21 @@ KinematicSnapshot = tuple[NDArray, NDArray, NDArray, NDArray, NDArray, NDArray]
 TorqueSnapshot = tuple[NDArray, NDArray, NDArray]
 
 _ZERO_TAU = (np.zeros(NUM_JOINTS), np.zeros(NUM_JOINTS), np.zeros(NUM_JOINTS))
+# A server deployed before the wrench was published sends the first 49 floats.
+_BUNDLE_LEN = 55
 
 
-def _unpack(bundle: tuple) -> tuple[KinematicSnapshot, int, TorqueSnapshot]:
-    """Flat 49-float bundle: q(7) dq(7) pos(3) quat(4) twist(6) rec(1) tau x3(21)."""
+def _unpack(bundle: tuple) -> tuple[KinematicSnapshot, int, TorqueSnapshot, NDArray | None]:
+    """Flat 55-float bundle: q(7) dq(7) pos(3) quat(4) twist(6) rec(1) tau x3(21)
+    wrench(6). The wrench is None from an older server."""
     b = np.asarray(bundle, dtype=np.float64)
     q, pos = b[0:7], b[14:17]
     # J is not on the wire; rebuild it from the same q/ee_pos the server used.
     snap: KinematicSnapshot = (
         q, b[7:14], zero_jacobian(q, ee_pos_base=pos), pos, b[17:21], b[21:27],
     )
-    return snap, int(b[27]), (b[28:35], b[35:42], b[42:49])
+    wrench = b[49:55] if len(b) >= _BUNDLE_LEN else None
+    return snap, int(b[27]), (b[28:35], b[35:42], b[42:49]), wrench
 
 
 class RobotDriver:
@@ -78,6 +82,9 @@ class RobotDriver:
         self._last_snap: KinematicSnapshot | None = None
         # Refreshed on every state read; see TorqueSnapshot.
         self.last_torques: TorqueSnapshot = _ZERO_TAU
+        # libfranka's O_F_ext_hat_K from the same read; None until the server
+        # publishes it (scripts/deploy_nuc_server.sh).
+        self.last_wrench: NDArray | None = None
 
         self._conn = rpyc.connect(
             server_ip,
@@ -107,7 +114,7 @@ class RobotDriver:
                 )
         if err is not None:
             logger.warning("RobotDriver(%s): %s", self.robot_ip, err)
-        snap, self.recovery_count, self.last_torques = _unpack(bundle)
+        snap, self.recovery_count, self.last_torques, self.last_wrench = _unpack(bundle)
         self._last_snap = snap
         return snap
 
@@ -309,6 +316,11 @@ class MultiRobotWrapper:
 
     def torque_snapshot_batch(self, names: list[str]) -> dict[str, TorqueSnapshot]:
         return {n: self.drivers[n].last_torques for n in names}
+
+    def ee_wrench(self, name: str) -> NDArray | None:
+        """Estimated external wrench at the EE from that arm's last state read:
+        force (N) then torque (Nm), base frame. None from an older server."""
+        return self.drivers[name].last_wrench
 
     def _gather(self, fn, names, timeout_s: float | None = None) -> dict[str, Any]:
         futs = [(n, self._pool.submit(fn, n)) for n in names]

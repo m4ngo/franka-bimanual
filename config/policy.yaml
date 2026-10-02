@@ -52,10 +52,42 @@ baselines:
     # run_trained_agent_receding_horizon.py, which carries a "move these
     # somewhere else" TODO. This is somewhere else.
     execute_n_actions: 8
+    # Rows of the PREVIOUS plan executed while the new one is inferred. Upstream
+    # runs in sim, where inference takes no sim time, so this fixed count IS its
+    # latency model. Here inference takes real time, and the old plan keeps
+    # going for as long as it does: at least this many rows, more if inference
+    # is slower than that, until the old chunk runs out. The new chunk is then
+    # entered at the row matching the rows that went out since its observation
+    # -- its row 0 is that observation's own pose (the targets are the reached
+    # poses), so entering earlier commands the arm back to where it was seen.
     inf_delay: 4
     slowdown_window_size: 6
-    pos_teb: 0.02             # EAG position tracking-error bound (m)
-    ori_teb: 0.05             # EAG orientation tracking-error bound (rad)
+    # EAG tracking-error bounds: guidance is dropped for an inference when the
+    # arm is further than this from the plan. Upstream's 0.02 m / 0.05 rad go
+    # with its kp 600 controller (lag ~1 cm, ~1.5 deg). At kp 150 the arm's
+    # steady lag on a 20 Hz plan is 21 mm / 3 deg median, so those bounds drop
+    # guidance on 3 of 4 inferences and successive chunks are drawn unconditioned
+    # -- the jump in a new direction at every chunk boundary. These pass ~90% of
+    # inferences at kp 150 (measured 2026-09-17); restore upstream's with osc_kp 600.
+    pos_teb: 0.02             # m, inf-norm
+    ori_teb: 0.05             # rad
+    # OSC stiffness the rollout runs under. Upstream evaluates under
+    # robosuite_configs/osc_pose_SAIL.json -- kp 600, damping ratio 1 -- and its
+    # reached-pose targets and pos_teb assume the arm gets there: at the law's
+    # default 150 the arm trails a 20 Hz plan by ~2 cm (kd/kp = 0.16 s at
+    # 0.12 m/s), over pos_teb, so guidance is dropped on nearly every inference.
+    # null = torque.osc.default_kp. Sent on the kp action channel through the
+    # log-base remap, so kp_limits still bind on the arm.
+    osc_kp: 300
+    # The sim rollout's OSC gains (baselines/libero_bridge/rollout.py), merged
+    # over robosuite's osc_pose.json; null keeps the stock value. LIBERO's 5 cm
+    # per-step limit is never changed. SAIL trains on the poses the arm reached
+    # and swaps the teleop controller for a stiff one to play them faster than
+    # recorded (SAIL paper Sec. 4.2): twice the stock kp at half the damping.
+    # Measured in LIBERO_SIM.md, "SAIL's controller".
+    sim_osc:
+      kp: 1500
+      damping_ratio: 0.5
 
   bspline:
     # Fallback only: the server reports the checkpoint's own n_obs_steps and
@@ -79,3 +111,7 @@ baselines:
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7
+    # The sim rollout's OSC, as baselines.sail.sim_osc. null: the stock
+    # controller, because B-Spline trains on the goals that controller was
+    # sent, and a stiffer one overshoots them (LIBERO_SIM.md, "SAIL's controller").
+    sim_osc: null

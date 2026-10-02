@@ -20,7 +20,10 @@ because the client sends one raw observation per request:
   * frame stacking -- with `train.frame_stack > 1` the model wants every key as
     `[T, ...]` and asserts otherwise (diffusion_policy.py:_get_action_trajectory).
     Upstream gets that from robomimic's FrameStackWrapper, which seeds the stack
-    with T copies of the first observation; the same happens here.
+    with T copies of the first observation and then appends one per env STEP, so
+    the frames the policy sees are consecutive control steps. A single obs per
+    request would space them one inference apart instead; the client therefore
+    sends the last frames as a list and every one is appended, in order.
   * image processing -- robomimic envs return `ObsUtils.process_obs`-ed frames
     (CHW float in [0, 1]); RolloutPolicy does no processing of its own.
   * `return_action_sequence=True` -- without it get_action returns ONE action
@@ -29,8 +32,8 @@ because the client sends one raw observation per request:
 Requests:
     {"meta": True}                          -> capability dict
     {"reset": True}                         -> {}
-    {"obs": {...},                          -> {"chunk": (N, act_dim) float32}
-     "guide_actions": ndarray | None}
+    {"obs": {...} | [{...}, ...],           -> {"chunk": (N, act_dim) float32}
+     "guide_actions": ndarray | None}       (a list is oldest first)
 """
 
 from __future__ import annotations
@@ -255,8 +258,10 @@ class SAILPolicyServer:
     def _infer(self, req: dict) -> dict:
         obs = req["obs"]
         if isinstance(obs, (list, tuple)):
-            # The stack is kept here, so only the newest observation is fed; a
-            # list is accepted for protocol symmetry with upstream's B-Spline server.
+            # Consecutive steps, oldest first: each goes into the stack in turn, so
+            # the last frame_stack of them are what the policy sees.
+            for earlier in obs[:-1]:
+                self._prepare(earlier)
             obs = obs[-1]
         kwargs: dict = {"return_action_sequence": True}
         if self.guide_config is not None:

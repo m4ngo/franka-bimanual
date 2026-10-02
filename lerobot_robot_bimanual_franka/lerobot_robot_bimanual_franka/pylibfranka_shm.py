@@ -101,6 +101,9 @@ S_TORQUE_TRIP = 54
 # inertia is the term that blows up. Fits inside the existing block, so unlike the
 # G_TAU_* additions this one does not force a paired server/child redeploy.
 S_LAMBDA_TRUNC = 56
+# libfranka's O_F_ext_hat_K: the estimated external wrench at the EE, force (N)
+# then torque (Nm), base frame. Also inside the existing block.
+S_F_EXT = slice(57, 63)
 STATE_SIZE = 64
 
 _TOTAL = GOAL_SIZE + STATE_SIZE

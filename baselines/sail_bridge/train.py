@@ -9,7 +9,8 @@ pass 1, and this runs passes 2-4 in the SAIL venv:
     2. AWE waypoints            save_awe_waypoint_concurrent.py   -> waypoints_dp
     3. precision labels         label_awe_trajectory_precision.py -> <key>_with_precision
     4. robomimic/scripts/train.py with a config generated from
-       exps/templates/diffusion_policy_SAIL.json
+       exps/templates/diffusion_policy_SAIL.json, through robomimic_train.py
+       (which stops the dataset fetching 16x the images the model reads)
 
 Passes 2 and 3 edit the HDF5 in place and are skipped when their keys already
 exist (--relabel forces them). The generated config differs from the template
@@ -28,6 +29,7 @@ import glob
 import json
 import logging
 import os
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -47,7 +49,9 @@ SAIL_ROOT = _REPO_ROOT / "baselines" / "sail"
 TEMPLATE = SAIL_ROOT / "robomimic" / "exps" / "templates" / "diffusion_policy_SAIL.json"
 AWE_SCRIPT = SAIL_ROOT / "robomimic" / "SAIL" / "precision_processing" / "save_awe_waypoint_concurrent.py"
 LABEL_SCRIPT = SAIL_ROOT / "robomimic" / "SAIL" / "precision_processing" / "label_awe_trajectory_precision.py"
-TRAIN_SCRIPT = SAIL_ROOT / "robomimic" / "scripts" / "train.py"
+# Not upstream's robomimic/scripts/train.py directly: the launcher cuts the
+# per-sample observation window to what the policy reads, then calls it.
+TRAIN_SCRIPT = Path(__file__).resolve().parent / "robomimic_train.py"
 
 DEFAULT_ACTION_KEY = "absolute_actions_with_precision"
 # The pose layout every converter writes, plus the label column.
@@ -105,7 +109,9 @@ def build_config(info: Info, args, output_dir: Path) -> dict:
     cfg = json.loads(TEMPLATE.read_text())
     cfg = copy.deepcopy(cfg)
     cfg["experiment"]["name"] = args.name
-    cfg["experiment"]["logging"]["log_wandb"] = False
+    cfg["experiment"]["logging"]["log_wandb"] = bool(args.wandb)
+    if args.wandb_project:
+        cfg["experiment"]["logging"]["wandb_proj_name"] = args.wandb_project
     cfg["experiment"]["logging"]["log_tb"] = not args.no_tb
     cfg["experiment"]["epoch_every_n_steps"] = int(args.epoch_every_n_steps)
     cfg["experiment"]["save"]["every_n_epochs"] = int(args.save_every)
@@ -115,6 +121,16 @@ def build_config(info: Info, args, output_dir: Path) -> dict:
     tr["dataset_keys"] = [args.action_key]
     tr["action_keys"] = [args.action_key]
     tr["num_epochs"] = int(args.epochs)
+    # robomimic saves only every every_n_epochs or at listed epochs; a budget
+    # off that grid would otherwise end on an unsaved epoch.
+    save = cfg["experiment"]["save"]
+    save["epochs"] = sorted(set(save["epochs"]) | {int(args.epochs)})
+    if args.resume is not None:
+        # robomimic rebuilds the model and EMA from the checkpoint and carries the
+        # epoch count on; the optimizer starts fresh (the checkpoint holds none)
+        # at the same constant learning rate.
+        tr["load_ckpt"] = str(args.resume.resolve())
+        tr["epoch_start"] = checkpoint_epoch(args.resume) + 1
     tr["batch_size"] = int(args.batch_size)
     tr["seed"] = int(args.seed)
     tr["num_data_workers"] = int(args.data_workers)
@@ -128,6 +144,16 @@ def build_config(info: Info, args, output_dir: Path) -> dict:
     else:
         cfg["observation"]["encoder"]["rgb"]["obs_randomizer_class"] = None
     return cfg
+
+
+_CKPT_EPOCH = re.compile(r"model_epoch_(\d+)\.pth$")
+
+
+def checkpoint_epoch(path: Path) -> int:
+    m = _CKPT_EPOCH.search(path.name)
+    if m is None:
+        raise SystemExit(f"{path} is not a robomimic model_epoch_N.pth checkpoint")
+    return int(m.group(1))
 
 
 def newest_checkpoint(output_dir: Path, name: str) -> Path | None:
@@ -144,18 +170,32 @@ def main() -> int:
     p.add_argument("--output-dir", type=Path, default=None,
                    help="default ~/franka_data/policies/<train-dataset>")
     p.add_argument("--name", default="sail", help="experiment name; a subdirectory of --output-dir")
+    p.add_argument("--resume", type=Path, default=None, metavar="MODEL_EPOCH_N.PTH",
+                   help="continue from this checkpoint: epochs N+1 .. the epoch count, into a new "
+                        "<output-dir>/<name>/<timestamp>/ beside it")
     p.add_argument("--action-key", default=DEFAULT_ACTION_KEY,
                    help="what the policy predicts; upstream trains on the reached pose "
                         "plus its precision label")
     p.add_argument("--epochs", type=int, default=None, help="default: the template's")
+    p.add_argument("--steps", type=int, default=None,
+                   help="gradient-step budget in place of --epochs: epochs = "
+                        "ceil(steps / epoch_every_n_steps), the same count lerobot-train's "
+                        "--steps means, so the three policies can be trained equally long")
     p.add_argument("--epoch-every-n-steps", type=int, default=None,
                    help="gradient steps per epoch; default: the template's")
-    p.add_argument("--save-every", type=int, default=None,
-                   help="checkpoint every N epochs; default: the template's")
+    p.add_argument("--save-every", "--checkpoint-every", dest="save_every", type=int, default=None,
+                   help="checkpoint every N epochs; default: the template's. The last epoch is "
+                        "always saved. --checkpoint-every is B-Spline's name for it, so one "
+                        "--extra can carry it to both")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--data-workers", type=int, default=None)
     p.add_argument("--no-tb", action="store_true", help="no tensorboard logging")
+    p.add_argument("--wandb", action="store_true", help="log online to wandb; default off")
+    p.add_argument("--wandb-project", default=None, help="default: the template's wandb_proj_name")
+    p.add_argument("--wandb-entity", default=None,
+                   help="robomimic insists on one; default $WANDB_ENTITY, else the login's default")
+    p.add_argument("--wandb-name", default=None, help="run name on wandb; default: --name")
     p.add_argument("--err-threshold", type=float, default=0.005,
                    help="AWE reconstruction error (m) that picks the waypoints")
     p.add_argument("--num-workers", type=int, default=6, help="AWE worker processes")
@@ -173,6 +213,8 @@ def main() -> int:
         if not path.is_file():
             p.error(f"{path} is missing; git submodule update --init baselines/sail")
 
+    if args.steps is not None and args.epochs is not None:
+        p.error("--steps and --epochs are two ways to say the same thing; pass one")
     template = json.loads(TEMPLATE.read_text())
     for attr, key in (("epochs", ("train", "num_epochs")),
                       ("epoch_every_n_steps", ("experiment", "epoch_every_n_steps")),
@@ -185,6 +227,12 @@ def main() -> int:
             for k in key:
                 node = node[k]
             setattr(args, attr, node)
+
+    if args.steps is not None:
+        # robomimic counts epochs; an epoch is epoch_every_n_steps gradient steps.
+        args.epochs = -(-int(args.steps) // int(args.epoch_every_n_steps))
+        logger.info("--steps %d -> %d epochs of %d steps (%d steps)", args.steps, args.epochs,
+                    args.epoch_every_n_steps, args.epochs * int(args.epoch_every_n_steps))
 
     info = inspect_hdf5(args.hdf5)
     output_dir = policies_dir(info.source_repo_id, args.output_dir)
@@ -241,14 +289,26 @@ def main() -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     config_path.write_text(json.dumps(cfg, indent=4))
     logger.info("config written to %s", config_path)
+    if args.resume is not None:
+        if checkpoint_epoch(args.resume) >= int(args.epochs):
+            logger.error("%s already holds epoch %d of %d; nothing to resume",
+                         args.resume, checkpoint_epoch(args.resume), args.epochs)
+            return 1
+        logger.info("resuming at epoch %d of %d from %s", checkpoint_epoch(args.resume) + 1, args.epochs, args.resume)
     logger.info("=== training (%d epochs x %d steps, batch %d) ===",
                 args.epochs, args.epoch_every_n_steps, args.batch_size)
+    # robomimic_train.py reads these instead of robomimic's gitignored macros_private.py.
+    env = dict(os.environ)
+    if args.wandb_entity:
+        env["WANDB_ENTITY"] = args.wandb_entity
+    if args.wandb_name:
+        env["WANDB_NAME"] = args.wandb_name
     t0 = time.time()
     # train.py catches every exception, prints it, and exits 0. When
     # <output-dir>/<name> already exists it asks whether to DELETE it -- every
     # earlier run of this task -- and "n" is what makes it add a new timestamped
     # subdirectory instead, which is the layout wanted here.
-    rc, failed = stream(train_cmd, SAIL_ROOT, watch="run failed with error", stdin_text="n\n")
+    rc, failed = stream(train_cmd, SAIL_ROOT, env=env, watch="run failed with error", stdin_text="n\n")
     ckpt = newest_checkpoint(output_dir, args.name)
     if rc != 0 or failed or ckpt is None or ckpt.stat().st_mtime < t0:
         logger.error("training did not produce a checkpoint (exit %d, failed=%s)", rc, failed)

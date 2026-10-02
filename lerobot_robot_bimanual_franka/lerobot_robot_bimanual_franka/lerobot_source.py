@@ -73,22 +73,30 @@ def arm_prefix(info: dict) -> str:
     return prefix
 
 
-def check_action_space(actions: np.ndarray) -> None:
-    """EE_POS or EE_DELTA, decided by reach.
+def action_space(actions: np.ndarray) -> str:
+    """`EE_POS` or `EE_DELTA`, decided by reach.
 
     Both modes emit the SAME feature names, so the recording cannot say which
-    one ran; this refuses rather than reading a delta as an absolute goal.
+    one ran, and reading one as the other is not a small error: an absolute
+    pose taken as a delta clips to the envelope and re-anchors on the arm
+    every step, i.e. "5 cm further and 0.5 rad more from wherever you are".
     """
     norms = np.linalg.norm(actions[:, POS], axis=1)
     if float(np.median(norms)) > _ABS_MIN_NORM:
-        return
+        return "EE_POS"
     if float(np.max(norms)) < _DELTA_MAX_NORM:
-        raise ValueError(
-            "this looks like an EE_DELTA recording (max |action_pos| = "
-            f"{float(np.max(norms)):.3f} m); record with EE_POS instead, or "
-            "relabel with scripts/replay_dataset.py --mode ee_pose."
-        )
+        return "EE_DELTA"
     raise ValueError(
         f"cannot classify the action space: |action_pos| median "
         f"{float(np.median(norms)):.3f} m, max {float(np.max(norms)):.3f} m."
     )
+
+
+def check_action_space(actions: np.ndarray) -> None:
+    """Refuse anything but an EE_POS recording."""
+    if action_space(actions) == "EE_DELTA":
+        raise ValueError(
+            "this looks like an EE_DELTA recording (max |action_pos| = "
+            f"{float(np.max(np.linalg.norm(actions[:, POS], axis=1))):.3f} m); record "
+            "with EE_POS instead, or relabel with scripts/replay_dataset.py --mode ee_pose."
+        )

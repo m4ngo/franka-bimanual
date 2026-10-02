@@ -33,6 +33,31 @@ from scipy.optimize import minimize_scalar
 
 logger = logging.getLogger("baselines.bspline.plan")
 
+# The sampled action's layout: [pos(3), rot6d(6), gripper(1)]. B-Spline's own
+# dataset loader turns the converters' 7-dim [pos, rotvec, gripper] rows into
+# rotation_6d, so this width is the checkpoint's, not a choice made here. The
+# pose columns are what a stitch matches on; the gripper is a step.
+ACT_DIM = 10
+POSE_DIM = 9
+GRIPPER_INDEX = 9
+
+
+def decode_action(row) -> tuple[np.ndarray, np.ndarray, float]:
+    """Sampled spline row -> (pos, quat_xyzw, gripper).
+
+    Decoded here rather than through upstream's `decode_action_vector`, whose
+    formats all return YAM/X5 action dicts.
+    """
+    from baselines.policy_math import rot6d_to_quat_xyzw
+
+    row = np.asarray(row, dtype=np.float64).reshape(-1)
+    if row.size != ACT_DIM:
+        raise ValueError(
+            f"expected a {ACT_DIM}-dim pos+rot6d+gripper action, got {row.size}. "
+            "The checkpoint's action space does not match what the converter writes."
+        )
+    return row[:3], rot6d_to_quat_xyzw(row[3:9]), float(row[GRIPPER_INDEX])
+
 
 def safer_knots(knots) -> np.ndarray:
     """Ported verbatim. A predicted knot column is not guaranteed monotonic and
@@ -65,6 +90,8 @@ class SplinePlanner:
         gripper_slowdown_steps: int = 7,
         gripper_index: int = 9,
         compare_dim: int = 9,
+        clock=None,
+        synchronous: bool = False,
     ) -> None:
         self.client = client
         self.degree = int(degree)
@@ -85,6 +112,14 @@ class SplinePlanner:
         self.gripper_slowdown_threshold = float(gripper_slowdown_threshold)
         self.gripper_slowdown_steps = int(gripper_slowdown_steps)
         self.gripper_index = int(gripper_index)
+        # The plan is sampled at `clock()`, so a simulator passes its own step
+        # counter and `t` advances with SIM time instead of the wall clock.
+        # Wall-clock diagnostics below stay on perf_counter.
+        self._clock = clock if clock is not None else time.perf_counter
+        # Synchronous: the request is served inside _request_if_needed rather
+        # than by the worker. In sim the caller owns the clock, so an inference
+        # that overlaps stepping would make the plan's phase depend on GPU speed.
+        self._synchronous = bool(synchronous)
 
         self.lock = threading.Lock()
         self.req_queue: queue.Queue = queue.Queue(maxsize=1)
@@ -93,6 +128,7 @@ class SplinePlanner:
         self.max_t = 0.0
         self.last_obs_time_to_predict: float | None = None
         self.last_t_normalized: float | None = None
+        self._sampled = None    # (predictor, t, max_t) of the last poll_action sample
         self.getting_spline = False
         self.plans = 0
         self.align_errors: list[float] = []
@@ -102,8 +138,10 @@ class SplinePlanner:
         self._last_gripper: float | None = None
         self._slowdown_remaining = 0
         self._stop = False
-        self._thread = threading.Thread(target=self._predict_process, daemon=True)
-        self._thread.start()
+        self._thread = None
+        if not self._synchronous:
+            self._thread = threading.Thread(target=self._predict_process, daemon=True)
+            self._thread.start()
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -124,7 +162,8 @@ class SplinePlanner:
 
     def close(self) -> None:
         self._stop = True
-        self.req_queue.put(None)
+        if self._thread is not None:
+            self.req_queue.put(None)
 
     def waiting_for_first_plan(self) -> bool:
         with self.lock:
@@ -137,6 +176,8 @@ class SplinePlanner:
         is what makes upstream's process abort on exit, and here it would leave
         the ZMQ socket closing under an active send.
         """
+        if self._synchronous:
+            return True
         deadline = time.perf_counter() + float(timeout)
         while time.perf_counter() < deadline:
             with self.lock:
@@ -162,7 +203,7 @@ class SplinePlanner:
         with self.lock:
             if self.predictor is None or self.last_obs_time_to_predict is None:
                 return None
-            now = time.perf_counter()
+            now = self._clock()
             if self.gripper_slowdown_enabled:
                 t = self._step_gripper_slowdown_time(now)
             else:
@@ -176,7 +217,20 @@ class SplinePlanner:
                 # than extrapolating a spline past its own support.
                 return None
             self.last_t_normalized = t
+            self._sampled = (self.predictor, t, self.max_t)
             return np.asarray(self.predictor(np.array([t])), dtype=np.float64).squeeze()
+
+    def peek(self, dt: float) -> np.ndarray:
+        """The plan poll_action last sampled, `dt` clock seconds after that sample."""
+        with self.lock:
+            predictor, t, max_t = self._sampled
+            t = min(t + dt * self.speed_up_times * self.origin_time_scale, max_t)
+            return np.asarray(predictor(np.array([t])), dtype=np.float64).squeeze()
+
+    def plan_samples(self, step: float = 1.0) -> np.ndarray:
+        """The installed plan sampled every `step` knot units over its whole support."""
+        with self.lock:
+            return np.asarray(self.predictor(np.arange(self.min_t, self.max_t + 1e-9, step)))
 
     # -- planning ----------------------------------------------------------
 
@@ -187,7 +241,7 @@ class SplinePlanner:
             if self.predictor is None or self.last_obs_time_to_predict is None:
                 needs = True
             else:
-                elapsed = time.perf_counter() - self.last_obs_time_to_predict
+                elapsed = self._clock() - self.last_obs_time_to_predict
                 remaining = (self.max_t / self.origin_time_scale
                              - elapsed * self.speed_up_times)
                 # remaining is in origin-trajectory seconds, consumed at
@@ -200,12 +254,16 @@ class SplinePlanner:
                 return
             self.getting_spline = True
             epoch = self._epoch
+        req = {
+            "obs": [dict(o) for o in sequence],
+            "obs_time": self._clock(),
+            "epoch": epoch,
+        }
+        if self._synchronous:
+            self._serve(req)
+            return
         try:
-            self.req_queue.put_nowait({
-                "obs": [dict(o) for o in sequence],
-                "obs_time": time.perf_counter(),
-                "epoch": epoch,
-            })
+            self.req_queue.put_nowait(req)
         except queue.Full:
             with self.lock:
                 self.getting_spline = False
@@ -215,23 +273,26 @@ class SplinePlanner:
             req = self.req_queue.get()
             if req is None:
                 return
-            try:
-                t0 = time.perf_counter()
-                rep = self.client.request({"obs": req["obs"]})
-                if "error" in rep:
-                    raise RuntimeError(f"policy server: {rep['error']}")
-                bspline = rep.get("bspline")
-                if bspline is None:
-                    raise RuntimeError(
-                        "server returned no 'bspline'. Start it with "
-                        "--response-format bspline."
-                    )
-                logger.info("new spline in %.3fs", time.perf_counter() - t0)
-                self._install(np.asarray(bspline, dtype=np.float64), req)
-            except Exception:
-                logger.exception("spline request failed")
-                with self.lock:
-                    self.getting_spline = False
+            self._serve(req)
+
+    def _serve(self, req: dict) -> None:
+        try:
+            t0 = time.perf_counter()
+            rep = self.client.request({"obs": req["obs"]})
+            if "error" in rep:
+                raise RuntimeError(f"policy server: {rep['error']}")
+            bspline = rep.get("bspline")
+            if bspline is None:
+                raise RuntimeError(
+                    "server returned no 'bspline'. Start it with "
+                    "--response-format bspline."
+                )
+            logger.info("new spline in %.3fs", time.perf_counter() - t0)
+            self._install(np.asarray(bspline, dtype=np.float64), req)
+        except Exception:
+            logger.exception("spline request failed")
+            with self.lock:
+                self.getting_spline = False
 
     def _install(self, bspline: np.ndarray, req: dict) -> None:
         with self.lock:
@@ -244,7 +305,7 @@ class SplinePlanner:
             if (self.predictor is None or self.disable_time_align
                     or self.last_t_normalized is None):
                 self._flush(bspline)
-                self.last_obs_time_to_predict = time.perf_counter()
+                self.last_obs_time_to_predict = self._clock()
                 t_new, error = self.min_t, 0.0
             else:
                 old = np.asarray(
@@ -256,7 +317,7 @@ class SplinePlanner:
                     logger.warning("time-align error %.6f too large; restarting at min_t", error)
                     t_new = self.min_t
                 self.last_obs_time_to_predict = (
-                    time.perf_counter()
+                    self._clock()
                     - t_new / self.speed_up_times / self.origin_time_scale
                 )
                 if error > self.time_align_error_threshold:
@@ -265,7 +326,7 @@ class SplinePlanner:
                 self.align_errors.append(float(error))
             if self.gripper_slowdown_enabled:
                 self._accumulated_t = float(t_new)
-                self._last_step_time = time.perf_counter()
+                self._last_step_time = self._clock()
             self.plans += 1
             self.getting_spline = False
 
@@ -287,7 +348,7 @@ class SplinePlanner:
         is closest to the last one emitted from the old plan, not at t=0, so the
         stitch does not jump the arm backwards."""
         new_max_t = float(np.clip(
-            (time.perf_counter() - obs_time) * self.speed_up_times * self.origin_time_scale,
+            (self._clock() - obs_time) * self.speed_up_times * self.origin_time_scale,
             self.min_t, self.max_t,
         ))
         max_allowed = self.max_t - self.predict_before_end * self.origin_time_scale - 0.1

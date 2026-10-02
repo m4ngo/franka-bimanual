@@ -8,15 +8,16 @@ the reach task's own references in place of the sim trajectory: the commanded
 curve, the safety floor, and the keep-out sphere.
 
 Everything drawn is WORLD frame, because that is the frame the floor and the
-keep-out sphere are defined in and the frame results.json records. The arm
-skeleton is the one thing that starts in base frame; `base_to_world` maps it
-out, and is never inverted.
+keep-out sphere are defined in. The episode files (EPISODE_HDF5.md) are base
+frame; `base_to_world` maps every array out on load, and is never inverted.
 
-  python scripts/real_reach_viz.py ~/franka_data/real_reach/<timestamp>
-  python scripts/real_reach_viz.py <run_dir>/results.json --episode 2
+  python scripts/plot_episodes.py ~/franka_data/real_reach/<timestamp>
+  python scripts/plot_episodes.py <run_dir>/episodes.hdf5 --episode 2
 
-real_reach_rollout.py calls save_reach_html itself, so a live run writes its
-HTML next to results.json; this is for re-rendering an existing run.
+real_reach_rollout.py calls save_run_html itself, so a live run writes its
+HTML next to episodes.hdf5; this is for re-rendering an existing run. A
+sim_replay.hdf5 in the run directory (from replay_goals_in_sim.py) is overlaid
+episode by episode and the per-episode error summary goes to errors.json.
 """
 
 import argparse
@@ -31,8 +32,14 @@ from scipy.spatial.transform import Rotation
 
 _ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_ROOT))
+# The error-by-gain table lives sim-side so both replay paths print the same one.
+sys.path.insert(0, str(_ROOT / "multi-fast"))
 
 import franka_config as fc  # noqa: E402
+from utils.sysid import episode_hdf5  # noqa: E402
+from utils.sysid.gains import (  # noqa: E402
+	GAIN_AXIS_LEFT, GAIN_AXIS_RIGHT, format_gain_table, gain_panel_traces, gain_terciles,
+)
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk_chain  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach_geometry import (  # noqa: E402
 	base_to_world, base_to_world_quat, keep_out_sphere, safety_z_floor_world,
@@ -62,98 +69,106 @@ _XYZ_COLORS = ("crimson", "seagreen", "steelblue")
 # ---------------------------------------------------------------------- io
 
 def load_run(path: str | Path) -> tuple[Path, list[dict]]:
-	"""Accept a run directory or its results.json; return (run_dir, episodes)."""
+	"""Accept a run directory or its episodes.hdf5; return (run_dir, episodes).
+
+	An episode here is {"name", "attrs", "arrays", "curve"} straight from the
+	file, attrs with the legacy frame defaults filled in.
+	"""
 	p = Path(path).expanduser()
 	if p.is_dir():
-		p = p / "results.json"
+		p = p / episode_hdf5.REAL_FILE
 	if not p.is_file():
-		raise FileNotFoundError(f"{p} not found -- pass a run directory or its results.json")
-	return p.parent, json.loads(p.read_text())
+		raise FileNotFoundError(f"{p} not found -- pass a run directory or its {episode_hdf5.REAL_FILE}")
+	episodes = [{"name": n, "arrays": a, "attrs": episode_hdf5.with_defaults(t), "curve": c}
+				for n, a, t, c in episode_hdf5.read_episodes(p)]
+	return p.parent, episodes
 
 
-def _episode_arrays(ep: dict, arm: str) -> dict:
-	"""Pull one episode's arrays out of a results.json record, all world frame.
-
-	Runs recorded before the trace was enriched carry only `trace`/`waypoints`,
-	and stored `goal` in BASE frame while its siblings were world -- the missing
-	`frame` key is what marks them, and the goal is converted on the way in.
-	"""
-	def arr(key, shape):
-		v = ep.get(key)
-		return (np.zeros((0,) + shape[1:]) if not v
-				else np.asarray(v, dtype=np.float64).reshape(shape))
-
-	# Three record shapes exist. Newest: the curve lives in base frame under
-	# `replay` and is mapped out here, so it is defined exactly once. Middle:
-	# world-frame curve at top level. Oldest: the same, but `goal` was base while
-	# its siblings were world.
-	rp = ep.get("replay")
-	if rp is not None and rp.get("waypoints") is None:
-		# A plain trajectory: no task curve at all.
-		legacy, goal = False, None
-		wp, vel = np.zeros((0, 3)), np.zeros(0)
-	elif rp is not None:
-		legacy = False
-		goal = base_to_world(arm, np.asarray(rp["goal"], dtype=np.float64).reshape(3))
-		wp = base_to_world(arm, np.asarray(rp["waypoints"], dtype=np.float64).reshape(-1, 3))
-		vel = np.asarray(rp.get("velocity_scales") or [], dtype=np.float64).reshape(-1)
-	else:
-		legacy = ep.get("frame") != "world"
-		goal = np.asarray(ep["goal"], dtype=np.float64).reshape(3)
-		if legacy:
-			goal = base_to_world(arm, goal)
-		wp = np.asarray(ep["waypoints"], dtype=np.float64).reshape(-1, 3)
-		vel = np.asarray(ep.get("velocity_scales") or [], dtype=np.float64).reshape(-1)
-	out = {
-		"legacy": legacy,
-		"goal": goal,
-		"waypoints": wp,
-		"velocity_scales": vel,
-		"trace": arr("trace", (-1, 3)),
-		"commanded": arr("commanded", (-1, 3)),
-		"ee_quat": arr("ee_quat", (-1, 4)),
-		"qpos": arr("qpos", (-1, 7)),
-		"cursor_trace": arr("cursor_trace", (-1,)),
-		"stale_anchor_m": arr("stale_anchor_m", (-1,)),
-		"timing_shifted": False,
-	}
-	if rp is not None and len(out["trace"]) and ep.get("obs_timing") != "post_period":
-		# Recorded with the state read right after the send: trace[t] is the
-		# response to goal t-1, one step behind sim's trace[t]. Shift the
-		# measurements left by one so index t means the same thing on both
-		# sides; the last goal then has no measured response and is dropped.
-		for k in ("trace", "ee_quat", "qpos", "cursor_trace", "stale_anchor_m"):
-			out[k] = out[k][1:]
-		out["commanded"] = out["commanded"][:-1]
-		out["timing_shifted"] = True
-	pos0 = rp.get("ee_pos0") if rp is not None else None
-	if pos0 is None and rp is not None and rp.get("waypoints") is not None:
-		pos0 = rp["waypoints"][0]          # a reach curve starts at the reset EE
-	if rp is not None and pos0 is not None and len(out["trace"]):
-		# t=0: the pose both sides start from, before any command. Drawn so the
-		# identical start is visible; the first command applies from here.
-		out["start"] = {
-			"pos": base_to_world(arm, np.asarray(pos0, dtype=np.float64)),
-			# Records before ee_quat0: the first dispatched goal IS the latched
-			# reset orientation (zero rotation delta), as the sim replay assumes.
-			"quat": base_to_world_quat(arm, np.asarray(
-				rp.get("ee_quat0") or rp["osc_goal_quat"][0], dtype=np.float64)),
-			"qpos": np.asarray(rp["qpos0"], dtype=np.float64)}
+def load_sim_run(path: str | Path) -> dict[str, dict]:
+	"""Every sim episode in a sim_replay.hdf5 (or the run directory holding
+	one), by episode name; refuses a file whose frame is not the sim's, because
+	a silently-wrong frame renders as a plausible-looking divergence."""
+	p = Path(path).expanduser()
+	if p.is_dir():
+		p = p / episode_hdf5.SIM_FILE
+	if not p.is_file():
+		return {}
+	out = {}
+	for n, a, t, c in episode_hdf5.read_episodes(p):
+		t = episode_hdf5.with_defaults(t)
+		if t.get("frame") != "base_sim" or t.get("ee_convention") != "robosuite_grip_site":
+			raise ValueError(f"{p}:{n} frame/ee_convention is {t.get('frame')!r}/"
+							 f"{t.get('ee_convention')!r}, not a sim replay")
+		out[n] = {"name": n, "arrays": a, "attrs": t, "curve": c}
 	return out
 
 
-def load_sim_record(path: str | Path) -> dict:
-	"""Read one sim_reach_replay/1 JSON, refusing anything whose header does not
-	match what `_sim_arrays` assumes. A silently-wrong frame or quaternion order
-	renders as a plausible-looking divergence, which is the worst failure mode
-	this comparison has."""
-	rec = json.loads(Path(path).expanduser().read_text())
-	if rec.get("schema") != "sim_reach_replay/1":
-		raise ValueError(f"{path}: unexpected schema {rec.get('schema')!r}")
-	if rec.get("frame") != "base_sim" or rec.get("quat_order") != "xyzw":
-		raise ValueError(f"{path}: frame/quat_order is "
-						 f"{rec.get('frame')!r}/{rec.get('quat_order')!r}")
-	return rec
+def _episode_arrays(ep: dict, arm: str) -> dict:
+	"""One real episode's arrays, mapped from the file's base frame to WORLD."""
+	arr, at, curve = ep["arrays"], ep["attrs"], ep.get("curve")
+	n = int(at.get("num_samples", len(arr["eef_pos"])))
+
+	def col(key, shape):
+		v = arr.get(key)
+		return (np.zeros((0,) + shape[1:]) if v is None or len(v) == 0
+				else np.asarray(v, dtype=np.float64).reshape(shape))
+
+	if curve is not None:
+		goal = base_to_world(arm, np.asarray(curve["goal"], dtype=np.float64).reshape(3))
+		wp = base_to_world(arm, np.asarray(curve["waypoints"], dtype=np.float64).reshape(-1, 3))
+		vel = np.asarray(curve["velocity_scales"], dtype=np.float64).reshape(-1)
+	else:
+		goal, wp, vel = None, np.zeros((0, 3)), np.zeros(0)
+	trace = col("eef_pos", (-1, 3))
+	cmd = col("eef_goal_pos", (-1, 3))
+	quat = col("eef_quat", (-1, 4))
+	out = {
+		"goal": goal,
+		"waypoints": wp,
+		"velocity_scales": vel,
+		"trace": base_to_world(arm, trace) if len(trace) else trace,
+		"commanded": base_to_world(arm, cmd) if len(cmd) else cmd,
+		"ee_quat": (np.asarray([base_to_world_quat(arm, q) for q in quat], dtype=np.float64)
+					if len(quat) else np.zeros((0, 4))),
+		"qpos": col("qpos", (-1, 7)),
+		"cursor_trace": col("cursor", (-1,)),
+		"stale_anchor_m": col("anchor_gap_m", (-1,)),
+		# The normalised kp/kd action each step sent; row t drove step t, like
+		# `commanded`. Empty for records that never carried one. kp/kd are the
+		# physical gains the arm resolved from it, when recorded.
+		"gain_action": col("gain_action", (-1, 2)),
+		"kp": col("kp", (-1, 6)), "kd": col("kd", (-1, 6)),
+		"timing_shifted": False,
+	}
+	if n and at.get("obs_timing") != "post_period":
+		# Row t is the state BEFORE action t (excitation runs, dataset conversions,
+		# and old records read right after the send): the response to goal t-1,
+		# one step behind sim's row t. Row 0 is therefore the start pose; keep it,
+		# then shift the measurements left by one so index t means the same thing
+		# on both sides. The last goal then has no measured response and is dropped.
+		if len(quat):
+			out["start"] = {"pos": out["trace"][0], "quat": out["ee_quat"][0],
+							"qpos": out["qpos"][0]}
+		for k in ("trace", "ee_quat", "qpos", "cursor_trace", "stale_anchor_m"):
+			out[k] = out[k][1:]
+		out["commanded"] = out["commanded"][:-1]
+		for k in ("gain_action", "kp", "kd"):
+			out[k] = out[k][:-1]
+		out["timing_shifted"] = True
+	pos0 = at.get("ee_pos0")
+	if pos0 is None and curve is not None:
+		pos0 = curve["waypoints"][0]          # a reach curve starts at the reset EE
+	if pos0 is not None and n and "start" not in out:
+		# t=0: the pose both sides start from, before any command. Drawn so the
+		# identical start is visible; the first command applies from here.
+		quat0 = at.get("ee_quat0")
+		if quat0 is None:
+			quat0 = arr["eef_goal_quat"][0]   # zero rotation delta: the latched reset orientation
+		out["start"] = {
+			"pos": base_to_world(arm, np.asarray(pos0, dtype=np.float64)),
+			"quat": base_to_world_quat(arm, np.asarray(quat0, dtype=np.float64)),
+			"qpos": np.asarray(at["init_qpos"], dtype=np.float64)}
+	return out
 
 
 def _sim_arrays(sim: dict, arm: str) -> dict:
@@ -164,36 +179,39 @@ def _sim_arrays(sim: dict, arm: str) -> dict:
 	23% of the success threshold), then base->world for the arm that actually
 	ran. `robot_base_in_world` is never inverted.
 	"""
-	st = sim["steps"]
-	conv = sim.get("sim", {}).get("site_in_otee")
-	if conv is None:
-		raise ValueError("sim record has no sim.site_in_otee -- it predates the frame fix; "
-						 "re-run replay_real_reach.py on the same results.json")
-	rv, sp = np.asarray(conv["rotvec_rad"]), np.asarray(conv["pos_m"])
-	pos = np.asarray(st["eef_pos"], dtype=np.float64).reshape(-1, 3)
-	quat = np.asarray(st["eef_quat"], dtype=np.float64).reshape(-1, 4)
-	gpos = np.asarray(st["goal_pos"], dtype=np.float64).reshape(-1, 3)
-	gquat = np.asarray(st["goal_quat"], dtype=np.float64).reshape(-1, 4)
+	arr, at = sim["arrays"], sim["attrs"]
+	if at.get("site_in_otee_rotvec") is None:
+		raise ValueError("sim episode has no site_in_otee attrs -- re-run replay_goals_in_sim.py")
+	rv, sp = np.asarray(at["site_in_otee_rotvec"]), np.asarray(at["site_in_otee_pos"])
+	pos = np.asarray(arr["eef_pos"], dtype=np.float64).reshape(-1, 3)
+	quat = np.asarray(arr["eef_quat"], dtype=np.float64).reshape(-1, 4)
+	gpos = np.asarray(arr["eef_goal_pos"], dtype=np.float64).reshape(-1, 3)
+	gquat = np.asarray(arr["eef_goal_quat"], dtype=np.float64).reshape(-1, 4)
 	tcp, ee = (zip(*(sim_ee_to_robot_ee(p, q, rv, sp) for p, q in zip(pos, quat)))
 			   if len(pos) else ((), ()))
 	tcp = np.asarray(tcp, dtype=np.float64).reshape(-1, 3)
 	gtcp = np.asarray([sim_ee_to_robot_ee(p, q, rv, sp)[0] for p, q in zip(gpos, gquat)],
 					  dtype=np.float64).reshape(-1, 3)
-	st0 = sim.get("start", {})
 	start = None
-	if st0.get("eef_pos") is not None and st0.get("eef_quat") is not None:
-		p0, q0 = sim_ee_to_robot_ee(np.asarray(st0["eef_pos"]), np.asarray(st0["eef_quat"]), rv, sp)
+	if at.get("ee_pos0") is not None and at.get("ee_quat0") is not None:
+		p0, q0 = sim_ee_to_robot_ee(np.asarray(at["ee_pos0"]), np.asarray(at["ee_quat0"]), rv, sp)
 		start = {"pos": base_to_world(arm, p0), "quat": base_to_world_quat(arm, q0),
-				 "qpos": np.asarray(st0["qpos"], dtype=np.float64)}
+				 "qpos": np.asarray(at["init_qpos"], dtype=np.float64)}
+	cursor = arr.get("cursor")
 	return {
 		"start": start,
+		"gain_action": (np.asarray(arr["gain_action"], dtype=np.float64).reshape(-1, 2)
+						if "gain_action" in arr else np.zeros((0, 2))),
+		"kp": np.asarray(arr["kp"], dtype=np.float64).reshape(-1, 6) if "kp" in arr else np.zeros((0, 6)),
+		"kd": np.asarray(arr["kd"], dtype=np.float64).reshape(-1, 6) if "kd" in arr else np.zeros((0, 6)),
 		"trace": base_to_world(arm, tcp) if len(tcp) else np.zeros((0, 3)),
 		"trace_base": tcp,
 		"commanded": base_to_world(arm, gtcp) if len(gtcp) else np.zeros((0, 3)),
 		"ee_quat": (np.asarray([base_to_world_quat(arm, q) for q in ee], dtype=np.float64)
 					if len(ee) else np.zeros((0, 4))),
-		"qpos": np.asarray(st["qpos"], dtype=np.float64).reshape(-1, 7),
-		"cursor_trace": np.asarray(st["cursor"], dtype=np.float64).reshape(-1),
+		"qpos": np.asarray(arr["qpos"], dtype=np.float64).reshape(-1, 7),
+		"cursor_trace": (np.asarray(cursor, dtype=np.float64).reshape(-1)
+						 if cursor is not None else np.zeros(0)),
 	}
 
 
@@ -225,11 +243,12 @@ def compute_reach_errors(d: dict, s: dict, ep: dict, sim: dict) -> dict:
 	n = min(len(d["trace"]), len(s["trace"]))
 	real, simt = d["trace"][:n], s["trace"][:n]
 	err = simt - real
+	sa, ra = sim["attrs"], ep["attrs"]
 	out = {
 		"n_steps_real": int(len(d["trace"])), "n_steps_sim": int(len(s["trace"])),
 		"n_steps_compared": int(n),
-		"goal_transport_max_m": sim["steps"].get("goal_transport_max_m"),
-		"start_qpos_max_err_rad": sim.get("start", {}).get("qpos_max_err_rad"),
+		"goal_transport_max_m": sa.get("goal_transport_max_m"),
+		"start_qpos_max_err_rad": sa.get("start_qpos_max_err_rad"),
 		"position_error_m": _stats(np.linalg.norm(err, axis=1)) if n else _stats([]),
 		"position_error_axis_m": {ax: _stats(err[:, i]) for i, ax in enumerate("xyz")} if n else {},
 	}
@@ -242,19 +261,26 @@ def compute_reach_errors(d: dict, s: dict, ep: dict, sim: dict) -> dict:
 			rr = Rotation.from_quat(d["ee_quat"][:n])
 			ss = Rotation.from_quat(s["ee_quat"][:n])
 			out["rotation_error_rad"] = _stats((ss * rr.inv()).magnitude())
+		if len(d["gain_action"]) >= n and np.any(d["gain_action"][:n] != d["gain_action"][0]):
+			# Error by gain tercile: the number that says whether the two arms
+			# still agree once the gain action moves (flat = yes).
+			joint_err = (np.sqrt(np.mean((s["qpos"][:n] - d["qpos"][:n]) ** 2, axis=1))
+						 if len(d["qpos"]) >= n and len(s["qpos"]) >= n else None)
+			out["by_gain"] = gain_terciles(d["gain_action"][:n], np.linalg.norm(err, axis=1), joint_err)
+			out["sim_impedance_mode"] = sa.get("impedance_mode")
 		cr = d["cursor_trace"][:n]
 		cs = s["cursor_trace"][:n]
 		if len(cr) == n and len(cs) == n:
 			out["cursor_lag"] = _stats(cs - cr)
-	if "cursor_trace" not in ep:
+	if ep.get("curve") is None:
 		out.pop("cursor_lag", None)
 		return out
 	out["task"] = {
-		"real_success": bool(ep.get("success", False)),
-		"sim_success": bool(sim.get("outcome", {}).get("success", False)),
-		"real_cursor": int(ep.get("cursor", 0)),
-		"sim_cursor": int(sim.get("outcome", {}).get("cursor", 0)),
-		"curve_len": int(ep.get("curve_len", 0)),
+		"real_success": bool(ra.get("success", False)),
+		"sim_success": bool(sa.get("success", False)),
+		"real_cursor": int(ra.get("cursor", 0)),
+		"sim_cursor": int(sa.get("cursor", 0)),
+		"curve_len": int(ra.get("curve_len", 0)),
 	}
 	return out
 
@@ -378,7 +404,10 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 	                      fires and silently rescales the goal
 	               row 3  per-axis and L2 gap between the commanded goal and the
 	                      pose actually reached
-	               row 4  (sim only) sim-vs-real position error per axis + L2,
+	               row 4  (gain records only) the normalised kp/kd action each
+	                      step sent (-1..1, left axis) and the kp/kd the
+	                      controller actually ran (log right axis); sim dashed
+	               row 5  (sim only) sim-vs-real position error per axis + L2,
 	                      with the geodesic rotation error in degrees on the
 	                      right axis
 	               last   per-joint q, real solid and sim dashed on a shared hue
@@ -391,8 +420,9 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 	A dry-run record has no steps; it renders as the static scene alone, which
 	is what to look at before letting the arm move.
 	"""
-	arm = ep.get("arm") or arm or "left"
-	fps = float(fps or ep.get("fps") or fc.control_fps())
+	A = ep["attrs"]
+	arm = A.get("arm") or arm or "left"
+	fps = float(fps or A.get("fps") or fc.control_fps())
 	d = _episode_arrays(ep, arm)
 	s = _sim_arrays(sim, arm) if sim is not None else None
 
@@ -405,6 +435,9 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 	wp, goal = d["waypoints"], d["goal"]
 	trace, cmd, quat, qpos = d["trace"], d["commanded"], d["ee_quat"], d["qpos"]
 	cursor = d["cursor_trace"]
+	gain = d["gain_action"] if np.any(d["gain_action"] != (d["gain_action"][0] if len(d["gain_action"]) else 0)) else np.zeros((0, 2))
+	gain_kp = d["kp"] if len(d["kp"]) == len(gain) and len(gain) else None
+	gain_kd = d["kd"] if len(d["kd"]) == len(gain) and len(gain) else None
 	# Frame 0 is the shared start pose, before any command; step t is frame t+1.
 	# Both sides get it or neither, so index alignment is never disturbed.
 	drew_start = (d.get("start") is not None and len(trace)
@@ -416,6 +449,9 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 		qpos = np.vstack([st["qpos"][None], qpos]) if len(qpos) else qpos
 		cmd = np.vstack([st["pos"][None], cmd]) if len(cmd) else cmd   # no goal yet: hold
 		cursor = np.concatenate([[0.0], cursor]) if len(cursor) else cursor
+		gain = np.vstack([gain[:1], gain]) if len(gain) else gain      # no command yet: hold
+		gain_kp = np.vstack([gain_kp[:1], gain_kp]) if gain_kp is not None else None
+		gain_kd = np.vstack([gain_kd[:1], gain_kd]) if gain_kd is not None else None
 		if s is not None:
 			ss = s["start"]
 			s = dict(s)
@@ -425,9 +461,11 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 			s["commanded"] = np.vstack([ss["pos"][None], s["commanded"]]) if len(s["commanded"]) else s["commanded"]
 			s["cursor_trace"] = (np.concatenate([[0.0], s["cursor_trace"]])
 								 if len(s["cursor_trace"]) else s["cursor_trace"])
+			for k in ("gain_action", "kp", "kd"):     # same hold as the real gain row
+				s[k] = np.vstack([s[k][:1], s[k]]) if len(s[k]) else s[k]
 	T_ = len(trace)
 	has_curve = goal is not None
-	curve_len = int(ep.get("curve_len") or len(wp)) if has_curve else 0
+	curve_len = int(A.get("curve_len") or len(wp)) if has_curve else 0
 
 	if len(cursor) != T_:
 		cursor = np.zeros(T_)
@@ -457,8 +495,11 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 
 	scene_only = T_ == 0
 	# Panel rows, top to bottom: distances+cursor (curve only), floor clearance,
-	# commanded-vs-reached, sim-vs-real (sim only), per-joint q.
+	# commanded-vs-reached, gain action (gain records only), sim-vs-real (sim
+	# only), per-joint q.
+	has_gain = len(gain) == T_ and T_ > 0
 	order = (([("dist", True)] if has_curve else []) + [("floor", False), ("track", False)]
+			 + ([("gain", True)] if has_gain else [])
 			 + ([("simdiff", True)] if s is not None else []) + [("q", False)])
 	R = {name: i + 1 for i, (name, _) in enumerate(order)}
 	SECONDARY = {i + 1 for i, (_, sec) in enumerate(order) if sec}
@@ -577,7 +618,23 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 						   mode="lines", line=dict(color=_C_SIM, width=1.5, dash="dash"),
 						   name="sim L2 err"), row=R["track"], col=2)
 
-		# ---- row 4 (sim only): sim vs real --------------------------------
+		# ---- gain row (gain records only): the action, and the gain it became --
+		if has_gain:
+			remap = {"base_kp": float(A.get("osc_base_kp", 150.0)),
+					 "base_ratio": float(A.get("osc_default_damping_ratio", 1.0)),
+					 "exp_base": float(A.get("gain_exp_base", 10.0))}
+			for tr, sec in gain_panel_traces(ts, gain, gain_kp, gain_kd, **remap):
+				add(tr, row=R["gain"], col=2, secondary_y=sec)
+			if s is not None and len(s["kp"]):
+				# The sim's own resolved gains, dashed: equal to real's by
+				# construction once the remap check passed, so a gap here is a bug.
+				n_s = len(s["kp"])
+				sim_ga = s["gain_action"] if len(s["gain_action"]) == n_s else gain[:n_s]
+				for tr, sec in gain_panel_traces(ts[:n_s], sim_ga, s["kp"], s["kd"], label="sim",
+												 dash="dash", show_action=False):
+					add(tr, row=R["gain"], col=2, secondary_y=sec)
+
+		# ---- sim row (sim only): sim vs real -------------------------------
 		if s is not None:
 			n = min(T_, len(sim_trace))
 			if n:
@@ -685,6 +742,7 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 											 (sim_trace[:, 2] - floor) if len(sim_trace) else [],
 											 [0.0]])),
 			"track": _yrange(np.concatenate([err.ravel(), err_norm, [0.0]])),
+			"gain": _yrange(np.concatenate([gain.ravel(), [0.0]])) if has_gain else (-1.0, 1.0),
 			"simdiff": _yrange(np.concatenate([sim_err.ravel(), sim_err_norm, [0.0]])),
 			"q": _yrange(qpos) if len(qpos) else (-1.0, 1.0),
 		}
@@ -701,20 +759,20 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 		]
 
 	# ---- layout ------------------------------------------------------------
-	what = "real reach" if has_curve else str(ep.get("repo_id", "trajectory"))
-	head = title or f"{what} — episode {ep.get('episode', 0)} — arm {arm}"
+	what = "real reach" if has_curve else "trajectory"
+	head = title or f"{what} — {ep['name']} — arm {arm}"
 	if s is not None:
 		head += " — sim vs real"
-	if ep.get("dry_run"):
+	if A.get("dry_run"):
 		sub = "dry run — curve sampled, no action sent"
 	elif T_ and not has_curve:
-		src = ep.get("real_source", "arm")
-		sub = (f"{ep.get('steps', T_)} steps | real = "
+		src = A.get("source", "arm")
+		sub = (f"{A.get('steps', T_)} steps | real = "
 			   f"{'the dataset recording (older controller)' if src == 'dataset' else 'arm re-run'} | "
 			   f"min floor clearance {(trace[:, 2] - floor).min()*1000:+.0f} mm")
 	elif T_:
-		sub = (f"{'SUCCESS' if ep.get('success') else 'timeout'} in {ep.get('steps', T_)} steps | "
-			   f"cursor {int(ep.get('cursor', cursor[-1]))}/{curve_len} | "
+		sub = (f"{'SUCCESS' if A.get('success') else 'timeout'} in {A.get('steps', T_)} steps | "
+			   f"cursor {int(A.get('cursor', cursor[-1]))}/{curve_len} | "
 			   f"final |EE-goal| {np.linalg.norm(trace[-1] - goal)*1000:.0f} mm | "
 			   f"min floor clearance {(trace[:, 2] - floor).min()*1000:+.0f} mm")
 		if len(cmd) == T_:
@@ -723,14 +781,16 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 		sub = "no steps recorded"
 	if s is not None and len(sim_err_norm):
 		n = len(sim_err_norm)
-		sub += (f"<br>sim vs real over {n} steps: mean {sim_err_norm.mean()*1000:.1f} "
+		how = ("same policy re-run closed loop in sim" if sim["attrs"].get("mode") == "policy_rerun"
+			   else "sim replays real's dispatched goals")
+		sub += (f"<br>{how}; sim vs real over {n} steps: mean {sim_err_norm.mean()*1000:.1f} "
 				f"max {sim_err_norm.max()*1000:.1f} mm")
 		if len(rot_err_deg):
 			sub += f" | rot mean {rot_err_deg.mean():.2f} max {rot_err_deg.max():.2f} deg"
 		if has_curve:
-			sub += (f" | sim {'SUCCESS' if sim.get('outcome', {}).get('success') else 'timeout'} "
-					f"cursor {sim.get('outcome', {}).get('cursor', 0)}/{curve_len}")
-		transport = sim.get("steps", {}).get("goal_transport_max_m")
+			sub += (f" | sim {'SUCCESS' if sim['attrs'].get('success') else 'timeout'} "
+					f"cursor {sim['attrs'].get('cursor', 0)}/{curve_len}")
+		transport = sim["attrs"].get("goal_transport_max_m")
 		if transport is not None and transport > 1e-9:
 			# Sim modified the command it was handed; every error above is
 			# meaningless until that is fixed.
@@ -739,9 +799,6 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 	if d.get("timing_shifted"):
 		sub += ("<br>real trace was read right after each send (one step stale); "
 				"shifted one step to align with sim")
-	if d["legacy"]:
-		sub += "<br>legacy trace: goal converted from base frame, no skeleton or commanded goal"
-
 	fig.update_layout(
 		title=dict(text=f"{head}<br><sup>{sub}</sup>", x=0.5, xanchor="center"),
 		showlegend=True,
@@ -785,6 +842,11 @@ def build_reach_figure(ep: dict, arm: str | None = None, fps: float | None = Non
 							 range=[0, max(curve_len, 1)], showgrid=False)
 		fig.update_yaxes(title_text="above floor (m)", row=R["floor"], col=2)
 		fig.update_yaxes(title_text="goal - reached (m)", row=R["track"], col=2)
+		if has_gain:
+			fig.update_yaxes(title_text=GAIN_AXIS_LEFT, range=[-1.05, 1.05], row=R["gain"], col=2,
+							 secondary_y=False)
+			fig.update_yaxes(title_text=GAIN_AXIS_RIGHT, type="log", row=R["gain"], col=2,
+							 secondary_y=True, showgrid=False)
 		if s is not None:
 			fig.update_yaxes(title_text="sim - real (m)", row=R["simdiff"], col=2, secondary_y=False)
 			fig.update_yaxes(title_text="rot err (deg)", row=R["simdiff"], col=2, secondary_y=True,
@@ -813,27 +875,25 @@ def save_run_html(run_dir: str | Path, episodes: list[dict], arm: str | None = N
 				  errors_path: str | Path | None = None) -> list[Path]:
 	"""One HTML per episode in a run directory. Returns the paths written.
 
-	With `sim_dir`, an episode that has a matching `sim_episode_<NNN>.json`
-	beside it is rendered as a comparison into `compare_<NNN>.html`, so a
-	re-render with sim never clobbers the hardware-only figure.
+	An episode that has a matching one in `sim_dir`'s sim_replay.hdf5 (default:
+	the run directory) is rendered as a comparison into `compare_<name>.html`,
+	so a re-render with sim never clobbers the hardware-only figure.
 	"""
 	out, summaries = [], []
-	sim_dir = Path(sim_dir) if sim_dir else None
+	sims = load_sim_run(sim_dir or run_dir)
 	for ep in episodes:
-		n = int(ep.get("episode", len(out)))
-		sim = None
-		if sim_dir is not None:
-			cand = sim_dir / f"sim_episode_{n:03d}.json"
-			if cand.is_file():
-				sim = load_sim_record(cand)
-		p = Path(run_dir) / (f"compare_{n:03d}.html" if sim else f"episode_{n:03d}.html")
+		sim = sims.get(ep["name"])
+		p = Path(run_dir) / (f"compare_{ep['name']}.html" if sim else f"episode_{ep['name']}.html")
 		save_reach_html(ep, p, arm=arm, frame_stride=frame_stride, sim=sim)
 		out.append(p)
 		if sim is not None:
-			a = ep.get("arm") or arm or "left"
-			summaries.append({"episode": n,
+			a = ep["attrs"].get("arm") or arm or "left"
+			summaries.append({"episode": ep["name"],
 							  **compute_reach_errors(_episode_arrays(ep, a),
 													 _sim_arrays(sim, a), ep, sim)})
+			if "by_gain" in summaries[-1]:
+				print(f"{ep['name']} error by gain tercile (sim {summaries[-1]['sim_impedance_mode']}):")
+				print(format_gain_table(summaries[-1]["by_gain"]))
 	if summaries and errors_path:
 		Path(errors_path).write_text(json.dumps(
 			{"schema": "real_reach_errors/1", "alignment": "index",
@@ -845,56 +905,46 @@ def save_run_html(run_dir: str | Path, episodes: list[dict], arm: str | None = N
 def main() -> int:
 	ap = argparse.ArgumentParser(description=__doc__,
 								 formatter_class=argparse.RawDescriptionHelpFormatter)
-	ap.add_argument("run", help="run directory under ~/franka_data/real_reach, or its results.json")
+	ap.add_argument("run", help="run directory under ~/franka_data/real_reach, or its episodes.hdf5")
 	ap.add_argument("--episode", type=int, default=None, help="render only this episode index")
 	ap.add_argument("--out", default=None, help="output HTML path (single episode only)")
 	ap.add_argument("--arm", default=None, choices=("left", "right"),
-					help="arm the run drove; only needed for traces recorded before "
-						 "the arm was written into results.json")
+					help="arm the run drove; only needed for episodes without an arm attr")
 	ap.add_argument("--stride", type=int, default=1, help="animate every Nth step")
 	ap.add_argument("--sim", default=None,
-					help="a sim_episode_<NNN>.json, or a directory holding them "
-						 "(default: look in the run directory itself)")
+					help="a sim_replay.hdf5, or the directory holding one "
+						 "(default: the run directory itself)")
 	ap.add_argument("--no-errors", action="store_true",
 					help="skip writing errors.json alongside a comparison")
 	args = ap.parse_args()
 
 	run_dir, episodes = load_run(args.run)
 	if args.episode is not None:
-		episodes = [e for e in episodes if int(e.get("episode", -1)) == args.episode]
+		episodes = [e for e in episodes if int(e["attrs"].get("episode", -1)) == args.episode]
 		if not episodes:
-			print(f"no episode {args.episode} in {run_dir}/results.json")
+			print(f"no episode {args.episode} in {run_dir / episode_hdf5.REAL_FILE}")
 			return 1
 	if args.out and len(episodes) != 1:
 		print("--out takes a single episode; pass --episode too")
 		return 1
 
-	sim_path = Path(args.sim).expanduser() if args.sim else run_dir
-	if sim_path.is_file():
-		if len(episodes) != 1:
-			print("--sim with a file needs --episode")
-			return 1
-		sim = load_sim_record(sim_path)
-		dest = args.out or (run_dir / f"compare_{int(episodes[0].get('episode', 0)):03d}.html")
-		save_reach_html(episodes[0], dest, arm=args.arm, frame_stride=args.stride, sim=sim)
-		a = episodes[0].get("arm") or args.arm or "left"
-		if not args.no_errors:
-			summary = compute_reach_errors(_episode_arrays(episodes[0], a),
-										   _sim_arrays(sim, a), episodes[0], sim)
-			print(json.dumps(summary, indent=1))
-		print(dest)
-		return 0
-
 	if args.out:
-		save_reach_html(episodes[0], args.out, arm=args.arm, frame_stride=args.stride)
+		ep = episodes[0]
+		sim = load_sim_run(args.sim or run_dir).get(ep["name"])
+		save_reach_html(ep, args.out, arm=args.arm, frame_stride=args.stride, sim=sim)
+		if sim is not None and not args.no_errors:
+			a = ep["attrs"].get("arm") or args.arm or "left"
+			summary = compute_reach_errors(_episode_arrays(ep, a), _sim_arrays(sim, a), ep, sim)
+			print(json.dumps(summary, indent=1))
+			if "by_gain" in summary:
+				print(format_gain_table(summary["by_gain"]))
 		print(args.out)
 		return 0
 	for p in save_run_html(run_dir, episodes, arm=args.arm, frame_stride=args.stride,
-						   sim_dir=sim_path,
+						   sim_dir=args.sim,
 						   errors_path=None if args.no_errors else run_dir / "errors.json"):
 		print(p)
 	return 0
-
 
 
 if __name__ == "__main__":

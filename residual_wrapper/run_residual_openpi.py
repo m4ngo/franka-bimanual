@@ -46,8 +46,25 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import VideoEncodingManager
 from openpi_policy_wrapper import OpenPIBasePolicy
 from policy_wrapper import ResidualPolicy
+from baselines.force_log import ForceLog, WrenchTrace, note as force_note
 
 logger = logging.getLogger(__name__)
+
+
+def _force_log(args) -> "ForceLog | None":
+    """force_profiles.npz in --viz-dir, else beside the recorded dataset -- not
+    inside it, because push_to_hub uploads that directory."""
+    if args.viz_dir:
+        return ForceLog(Path(args.viz_dir) / "force_profiles.npz")
+    if args.output_dir:
+        out = Path(args.output_dir)
+        return ForceLog(out.with_name(out.name + "_force_profiles.npz"))
+    return None
+
+
+def _finish_force(forces: "ForceLog | None", ep_idx: int, wrench: WrenchTrace) -> str:
+    stats = forces.add_trace(ep_idx, wrench) if forces is not None else None
+    return force_note(stats)
 
 
 def main() -> None:
@@ -192,6 +209,7 @@ def main() -> None:
 
     recording = args.repo_id is not None
     dataset = None
+    forces = _force_log(args)
 
     if not recording:
         print("homing...")
@@ -199,6 +217,7 @@ def main() -> None:
             logger.warning("homing did not converge; proceeding anyway")
         from viz import EpisodeRecorder
         recorder = EpisodeRecorder() if args.viz_dir else None
+        wrench = WrenchTrace(env_wrapper._ARM_KEY)
         try:
             _run_episode(
                 controller, base_policy, residual,
@@ -210,8 +229,10 @@ def main() -> None:
                 dump_dir=dump_root / "ep000" if dump_root else None,
                 video_dir=Path(args.viz_dir) if args.save_videos else None,
                 video_cams=args.video_cams,
+                wrench=wrench,
             )
         finally:
+            print(f"episode done{_finish_force(forces, 0, wrench)}")
             if recorder is not None and len(recorder) > 0:
                 viz_path = os.path.join(args.viz_dir, "episode.html")
                 print(f"saving visualization to {viz_path}...")
@@ -235,6 +256,7 @@ def main() -> None:
                 print(f"recording episode {dataset.num_episodes} / {args.num_episodes} "
                       f"({args.episode_time_s:.0f}s)...")
                 recorder = EpisodeRecorder() if args.viz_dir else None
+                wrench = WrenchTrace(env_wrapper._ARM_KEY)
                 try:
                     _run_episode(
                         controller, base_policy, residual,
@@ -250,8 +272,10 @@ def main() -> None:
                         video_dir=Path(args.viz_dir) if args.save_videos else None,
                         video_cams=args.video_cams,
                         video_stem=f"episode_{ep_idx:03d}",
+                        wrench=wrench,
                     )
                 finally:
+                    print(f"episode {ep_idx} done{_finish_force(forces, ep_idx, wrench)}")
                     if recorder is not None and len(recorder) > 0:
                         viz_path = os.path.join(args.viz_dir, f"episode_{ep_idx:03d}.html")
                         print(f"saving visualization to {viz_path}...")

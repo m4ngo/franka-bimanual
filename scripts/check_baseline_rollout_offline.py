@@ -109,6 +109,11 @@ class FakeArm:
         pos, quat = eef_poses_from_qpos(self.q[None])
         return pos[0], quat[0]
 
+    @property
+    def last_ee_wrench(self) -> dict:
+        # |F| equals the number of goals sent so far, so a run's max is its step count.
+        return {self.k: np.array([0.0, 0.0, float(len(self.sent)), 0.0, 0.0, 0.0])}
+
     def get_observation(self) -> dict:
         obs = {f"{self.k}_joint_{i + 1}": float(v) for i, v in enumerate(self.q)}
         obs[f"{self.k}_gripper"] = self.gripper
@@ -185,6 +190,7 @@ class FakeSail(_Server):
         self.fac_horizon, self.guided = fac_horizon, guided
         self.chunk_id = -1
         self.guide_seen: list = []
+        self.frames_seen: list = []
 
     def handle(self, req):
         if "meta" in req:
@@ -205,12 +211,15 @@ class FakeSail(_Server):
         self.guide_seen.append(req.get("guide_actions"))
         absolute = not self.action_keys[0] == "actions"
         chunk = np.zeros((self.action_horizon, self.act_dim))
-        base = np.asarray(req["obs"]["robot0_eef_pos"], dtype=np.float64)
+        # A list is consecutive frames, oldest first; the newest is the anchor.
+        obs = req["obs"][-1] if isinstance(req["obs"], (list, tuple)) else req["obs"]
+        self.frames_seen.append(len(req["obs"]) if isinstance(req["obs"], (list, tuple)) else 1)
+        base = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
         for j in range(self.action_horizon):
             if absolute:
                 chunk[j, :3] = base + np.array([0.002 * (j + 1), 0.0, 0.0])
                 chunk[j, 3:6] = Rotation.from_quat(
-                    np.asarray(req["obs"]["robot0_eef_quat"], dtype=np.float64)).as_rotvec()
+                    np.asarray(obs["robot0_eef_quat"], dtype=np.float64)).as_rotvec()
             else:
                 chunk[j, :3] = [0.002, 0.0, 0.0]
                 chunk[j, 3:6] = 0.0
@@ -563,10 +572,29 @@ def check_outputs(res: Results) -> None:
                   f"{len(row)} fields")
 
 
+def check_force(res: Results, run_dir, ep: dict) -> None:
+    """One wrench sample per dispatched goal, summarised as eval_fast does."""
+    f = ep.get("ee_force_n") or {}
+    res.check(f.get("max") == ep["steps"] and f.get("mean") == (ep["steps"] + 1) / 2,
+              "ee_force_n summarises one |F| sample per dispatched goal", str(f))
+    with np.load(run_dir.force_profiles_path) as z:
+        force, t = z["ee_force_000"], z["time_000"]
+        torque = z["ee_torque_000"]
+    res.check(force.shape == (ep["steps"], 3) and torque.shape == force.shape
+              and len(t) == len(force) and bool(np.all(np.diff(t) > 0)),
+              "force_profiles.npz holds per-step force, torque and time",
+              f"force {force.shape}, time {t[0]:.3f}..{t[-1]:.3f} s")
+    doc = json.loads(run_dir.manifest_path.read_text())
+    res.check((doc["summary"].get("ee_force_n") or {}).get("max") == f.get("max"),
+              "the manifest summary carries the run's force")
+
+
 def check_dispatch(res: Results) -> None:
     print("\n[dispatch] the goal-push clock holds its rate")
 
     class Sink:
+        last_ee_wrench: dict = {}
+
         def send_action(self, a):
             pass
 
@@ -661,15 +689,28 @@ def check_sail(res: Results, port: int) -> None:
         res.check(first == [(0, j) for j in range(execute_n)],
                   "first inference executes execute_n rows from index 0",
                   f"{first[:4]}...")
-        # Second: inf_delay rows of chunk 0 continuing at execute_n, then chunk 1
-        # entered at inf_delay -- the horizon receding.
-        window = tags[execute_n:execute_n + inf_delay + execute_n]
-        want = ([(0, execute_n + i) for i in range(inf_delay)]
-                + [(1, inf_delay + j) for j in range(execute_n)])
-        res.check(window == want, "receding horizon: inf_delay of prev, then new chunk",
-                  f"got {window[:6]}... want {want[:6]}...")
+        # Second: chunk 0 carries on from execute_n while chunk 1 is inferred --
+        # at least inf_delay rows, more only if the fake server was slower than
+        # that -- and chunk 1 is entered at the row matching how many went out,
+        # never at 0: the horizon receding, with the observation's age honoured.
+        rest = tags[execute_n:]
+        entry = next((i for i, t in enumerate(rest) if t[0] == 1), len(rest))
+        old_rows = rest[:entry]
+        new_rows = rest[entry:entry + execute_n]
+        res.check(entry >= inf_delay
+                  and old_rows == [(0, execute_n + i) for i in range(entry)]
+                  and new_rows == [(1, entry + j) for j in range(execute_n)],
+                  "receding horizon: prev chunk while inferring, new chunk entered at the rows elapsed",
+                  f"entry {entry} (inf_delay {inf_delay}); got {rest[:6]}...")
         res.check(ep["steps"] == len(arm.sent) and ep["steps"] > 0,
                   "every dispatched goal is counted", f"{ep["steps"]} steps")
+        check_force(res, run_dir, ep)
+        # The frame stack is fed consecutive STEPS: the first inference has only
+        # its own observation, every later one also gets the frame taken one
+        # dispatch before it.
+        res.check(srv.frames_seen[:1] == [1] and all(n == 2 for n in srv.frames_seen[1:]),
+                  "frame stack fed the step before each observation",
+                  f"frames per request {srv.frames_seen[:5]}...")
 
         # The precision label must never reach the arm. With act_dim 8, row[6] is
         # the gripper tag and row[7] the label (only ever 0.0 or 1.0). If the

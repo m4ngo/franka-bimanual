@@ -1,4 +1,25 @@
-"""Entry point for running and recording residual-policy episodes on the Franka."""
+"""Entry point for running and recording residual-policy episodes on the Franka.
+
+Two residual families, told apart by the checkpoint --residual-policy names:
+
+  best.pt (torch)        the point-cloud residual on a LeRobot base policy: the
+                         loop in this file, recorded as a LeRobotDataset under a
+                         run directory. The base emits ABSOLUTE poses (EE_POS; a
+                         delta-trained checkpoint is refused) and is executed the
+                         way the reach path below executes its analytic base:
+                         the chunk is taken relative to the pose the base planned
+                         from, the residual is summed there, and each resulting
+                         target is dispatched as the one-step EE_DELTA from the
+                         pose measured at that step (env_wrapper, "Chunk-start-
+                         relative targets").
+  ft_policy_*.zip (SB3)  multi-fast's FAST residual on the analytic reach base:
+                         reach_residual.run, recorded as episodes.hdf5 plus the
+                         same viz.py HTML per episode (--policy both runs the
+                         base alone and then base + residual on one curve).
+
+  python residual_wrapper/run_residual.py --base-policy <ckpt> --residual-policy best.pt
+  python residual_wrapper/run_residual.py --residual-policy ft_policy_400000_steps.zip --num-episodes 5
+"""
 
 import argparse
 import hashlib
@@ -15,30 +36,29 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from scipy.spatial.transform import Rotation
 
 import env_wrapper
 from viz import EpisodeRecorder, save_episode_html, save_rollout_html, save_policy_pcd_npz
-from viz import _propagate_pose_traj
 from env_wrapper import (
     ee_pose_to_world,
     to_sim_world_points,
     to_sim_world_pose,
     to_sim_world_twist,
     _ACTION_KEYS,
+    _ARM_KEY,
     _CHUNK_EXEC,
     _RESIDUAL_HORIZON,
     _STATE_OBS_KEYS,
-    _RES_POS_GAIN,
-    _RES_ROT_GAIN,
-    _POS_SCALE,
     _ROT_SCALE,
-    build_action,
+    chunk_to_relative,
+    compose_chunk,
     current_ee_pose,
+    delta_action,
     measured_ee_twist_world,
-    process_chunk,
+    relative_to_poses,
     split_gripper,
     strip_depth,
+    target_to_delta,
 )
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import VideoEncodingManager
@@ -50,6 +70,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import franka_config as fc  # noqa: E402
 from baselines import run_record as rr  # noqa: E402
+from baselines.force_log import ForceLog, WrenchTrace, note as force_note  # noqa: E402
 from baselines.rollout_common import Episode, frames_in_progress  # noqa: E402
 
 # This method's name in the shared outputs tree, alongside sail and bspline.
@@ -204,6 +225,16 @@ def _infer_chunk(
     res_chunk: np.ndarray = np.empty((0, 9))
     network_pcd = None
 
+    # The anchor: the measured base-frame pose at the observation the base
+    # planned from -- the same snapshot send_action anchors its deltas on, and
+    # the frame an EE_POS recording's targets were compared against.
+    if kin is None:
+        raise RuntimeError("no kinematic snapshot to anchor the chunk on; "
+                           "get_observation() must precede inference")
+    anchor_pos = np.asarray(kin[_ARM_KEY][3], dtype=np.float64).copy()
+    anchor_quat = np.asarray(kin[_ARM_KEY][4], dtype=np.float64).copy()
+    base_rel = chunk_to_relative(base_chunk, anchor_pos, anchor_quat)
+
     if residual is not None:
         if kin is None:
             vel = np.zeros(6)
@@ -231,9 +262,8 @@ def _infer_chunk(
                 point_cloud = to_sim_world_points(point_cloud)
         else:
             proprio_pose = ee_pose
-        processed_chunk = process_chunk(base_chunk)
         residual_obs = {
-            "action_chunk": processed_chunk[:_RESIDUAL_HORIZON],
+            "action_chunk": base_rel[:_RESIDUAL_HORIZON],
             "proprio": np.concatenate([
                 split_gripper(proprio_pose).astype(np.float32),
                 # Sim controller_state convention: [damping_norm, kp_norm].
@@ -248,6 +278,8 @@ def _infer_chunk(
             np.savez_compressed(
                 dump_dir / f"obs_{infer_idx:05d}.npz",
                 base_chunk_raw=base_chunk.astype(np.float32),
+                anchor_pos=anchor_pos.astype(np.float32),
+                anchor_quat=anchor_quat.astype(np.float32),
                 action_chunk=residual_obs["action_chunk"],
                 proprio=residual_obs["proprio"],
                 point_cloud=residual_obs["point_cloud"],
@@ -255,9 +287,18 @@ def _infer_chunk(
                 res_chunk=res_chunk.astype(np.float32),
             )
 
+    # Composed once per chunk, as predict_diffused composes the reach chunk; the
+    # bound is the chunk length, the bound chunk-start-relative targets get.
+    total_rel = compose_chunk(base_rel, res_chunk, bound=float(len(base_rel)))
     return {
         "base_chunk": base_chunk,
+        "base_rel": base_rel,
         "res_chunk": res_chunk,
+        "total_rel": total_rel,
+        "anchor_pos": anchor_pos,
+        "anchor_quat": anchor_quat,
+        "base_poses": relative_to_poses(base_rel, anchor_pos, anchor_quat),
+        "total_poses": relative_to_poses(total_rel, anchor_pos, anchor_quat),
         "ee_pose": ee_pose,
         "network_pcd": network_pcd,
     }
@@ -312,6 +353,7 @@ def _run_episode(
     video_stem: str = "episode",
     infer_lead: int = 1,
     ep: "object | None" = None,
+    wrench: "WrenchTrace | None" = None,
 ) -> None:
     """Run one episode of the policy loop.
 
@@ -328,11 +370,18 @@ def _run_episode(
         infer_lead: how many steps ahead of a chunk's first execution the
             inference for it is started, on a worker thread. 1 disables the
             overlap (inference blocks the loop, the old behaviour).
+        wrench: optional WrenchTrace; sampled after every goal sent.
     """
     base_policy.reset()
+    # The residual is composed into the targets below; nothing rides on the
+    # robot's own cached offset, as on the reach path.
+    controller.cache_delta(np.zeros(3), np.zeros(3))
 
-    base_chunk: np.ndarray = np.empty((0, 10))
+    base_rel: np.ndarray = np.empty((0, 9))
     res_chunk: np.ndarray = np.empty((0, 9))
+    exec_rel: np.ndarray = np.empty((0, 9))
+    base_poses: np.ndarray = np.empty((0, 7))
+    exec_poses: np.ndarray = np.empty((0, 7))
     chunk_used = _CHUNK_EXEC   # triggers immediate inference on first step
     prev_kp = 0.0
     prev_kd = 0.0
@@ -391,15 +440,9 @@ def _run_episode(
                         ep.wall_time_s = t_step - t_start
                     print(f"\r\n{verdict}\r", flush=True)
                     break
-            
-            # times = []
-            # times.append(time.perf_counter())
             obs = controller.get_observation()
-            # times.append(time.perf_counter())
             ee_pose = current_ee_pose(obs, sim_convention=sim_proprio_convention)
-            # times.append(time.perf_counter())
             obs_no_depth = strip_depth(obs)
-            # times.append(time.perf_counter())
             # Grab it here: send_action() consumes and clears the cache.
             kin_snapshot = controller.kin
             # Array channel, not obs scalars; a fresh array each get_observation,
@@ -431,85 +474,46 @@ def _run_episode(
                 infer_idx += 1
                 if ep is not None:
                     ep.inferences = infer_idx
-                base_chunk = result["base_chunk"]
+                base_rel = result["base_rel"]
                 res_chunk = result["res_chunk"]
-                # The forecast is anchored on the pose the policy actually saw,
-                # which with a prefetch is infer_lead steps behind this one.
-                chunk_ee_pose = result["ee_pose"]
+                base_poses = result["base_poses"]
+                # One anchor per chunk: the pose the base planned from, which with
+                # a prefetch is infer_lead steps behind this one. When replaying
+                # a recording the residual is visualised only; the recording's
+                # own targets and gains drive the arm.
+                exec_rel = base_rel if replaying else result["total_rel"]
+                exec_poses = base_poses if replaying else result["total_poses"]
                 chunk_used = 0
 
                 if recorder is not None and result["network_pcd"] is not None:
                     recorder.record_policy_pcd(len(recorder), result["network_pcd"])
 
                 if recorder is not None:
-                    ee3 = chunk_ee_pose[:3].astype(np.float32)
-                    ee_pose_xyzw = chunk_ee_pose[:7].astype(np.float32)
-                    # Raw unnormalised position deltas (metres) from postprocessor.
-                    # Cumsum from current EE gives the commanded delta trajectory.
-                    base_deltas = base_chunk[:_RESIDUAL_HORIZON, :3].astype(np.float32)
-                    base_rotvecs = np.array([
-                        Rotation.from_quat(step[3:7]).as_rotvec() for step in base_chunk[:_RESIDUAL_HORIZON]
-                    ], dtype=np.float32)
-                    base_traj = np.vstack([ee3, ee3 + np.cumsum(base_deltas, axis=0)])
-                    base_traj_pose = _propagate_pose_traj(ee_pose_xyzw, base_deltas, base_rotvecs)
-                    if residual is not None and len(res_chunk) > 0:
-                        K_res = min(len(res_chunk), _RESIDUAL_HORIZON)
-                        # Same headroom clip as the execution path so plots show
-                        # what actually runs.
-                        total_deltas = base_deltas.copy()
-                        total_deltas[:K_res] = np.clip(
-                            base_deltas[:K_res] / _POS_SCALE + res_chunk[:K_res, 2:5], -1.0, 1.0
-                        ).astype(np.float32) * _POS_SCALE
-                        total_rotvecs = base_rotvecs.copy()
-                        total_rotvecs[:K_res] = np.clip(
-                            base_rotvecs[:K_res] / _ROT_SCALE + res_chunk[:K_res, 5:8], -1.0, 1.0
-                        ).astype(np.float32) * _ROT_SCALE
-                        total_traj = np.vstack([ee3, ee3 + np.cumsum(total_deltas, axis=0)])
-                        total_traj_pose = _propagate_pose_traj(ee_pose_xyzw, total_deltas, total_rotvecs)
-                    else:
-                        total_traj = base_traj.copy()
-                        total_traj_pose = base_traj_pose.copy()
                     recorder.record_chunk(
                         step=len(recorder),
-                        ee_pos=ee3,
-                        base_traj=base_traj,
-                        total_traj=total_traj,
-                        base_traj_pose=base_traj_pose,
-                        total_traj_pose=total_traj_pose,
+                        ee_pos=result["anchor_pos"].astype(np.float32),
+                        base_traj=base_poses[:, :3].astype(np.float32),
+                        total_traj=result["total_poses"][:, :3].astype(np.float32),
+                        base_traj_pose=base_poses.astype(np.float32),
+                        total_traj_pose=result["total_poses"].astype(np.float32),
                     )
 
-            if residual is not None:
-                res = res_chunk[chunk_used]
-                # Sim executes clip(base + residual, -1, 1) per normalized channel;
-                # clip the residual to the base's remaining headroom to match.
-                b_pos = base_chunk[chunk_used, :3].astype(np.float64) / _POS_SCALE
-                b_rot = Rotation.from_quat(base_chunk[chunk_used, 3:7]).as_rotvec() / _ROT_SCALE
-                dpos = (np.clip(b_pos + res[2:5], -1.0, 1.0) - b_pos) * _POS_SCALE * _RES_POS_GAIN
-                drot = (np.clip(b_rot + res[5:8], -1.0, 1.0) - b_rot) * _ROT_SCALE * _RES_ROT_GAIN
-                if replaying:
-                    # residual is visualized only; base/trajectory gains drive execution
-                    kp = float(base_chunk[chunk_used, 8])
-                    kd = float(base_chunk[chunk_used, 9])
-                else:
-                    # Residual layout is [damping, stiffness, ...] (multi-fast convention).
-                    kp = float(res[1])
-                    kd = float(res[0])
-            else:
-                dpos = np.zeros(3, dtype=np.float32)
-                drot = np.zeros(3, dtype=np.float32)
-                kp = float(base_chunk[chunk_used, 8])
-                kd = float(base_chunk[chunk_used, 9])
-
-            if not replaying:
-                controller.cache_delta(dpos, drot)
-            # print('base grip', base_chunk[chunk_used][8])
-            # print('res grip', res[8])
-            action = build_action(base_chunk[chunk_used], kp=kp, kd=kd)
-            # print(action)
-            if residual is not None:
-                action["r_gripper"] = float(np.clip(action["r_gripper"] + res[8], -1.0, 1.0))
+            # Stage two of the executor: the target this step aims at was fixed at
+            # the chunk's composition; the delta that lands on it is re-expressed
+            # against the pose measured now and clipped to one step.
+            pos_now = np.asarray(kin_snapshot[_ARM_KEY][3], dtype=np.float64)
+            quat_now = np.asarray(kin_snapshot[_ARM_KEY][4], dtype=np.float64)
+            target = exec_poses[chunk_used + 1]
+            row = exec_rel[chunk_used]
+            kp, kd = float(row[7]), float(row[8])
+            action = delta_action(target_to_delta(target, pos_now, quat_now),
+                                  gripper=float(row[6]), kp=kp, kd=kd)
+            res = res_chunk[chunk_used] if chunk_used < len(res_chunk) else None
+            drot = (exec_rel[chunk_used, 3:6] - base_rel[chunk_used, 3:6]) * _ROT_SCALE
             t_send = time.perf_counter()
             controller.send_action(action)
+            if wrench is not None:
+                wrench.sample(controller)
             if t_prev_send:
                 send_gap_ms_window.append((t_send - t_prev_send) * 1000.0)
             t_prev_send = t_send
@@ -529,22 +533,19 @@ def _run_episode(
 
             if recorder is not None:
                 q = np.array([obs[f"r_joint_{i}"] for i in range(1, 8)])
-                # In delta mode, base_chunk[:3] is a position delta, not an absolute
-                # target.  Add it to the current EE position so both trail fields stay
-                # in world-space metres for meaningful 3D visualization.
-                base_desired_pos = ee_pose[:3] + base_chunk[chunk_used, :3]
+                # Targets and the measured pose in one frame (base, metres): the
+                # anchor's, not the sim-convention proprio pose the residual reads.
                 recorder.record(
                     q=q,
-                    actual_ee_pos=ee_pose[:3],
-                    base_desired_pos=base_desired_pos,
-                    total_desired_pos=base_desired_pos + dpos,
+                    actual_ee_pos=pos_now.astype(np.float32),
+                    base_desired_pos=base_poses[chunk_used + 1, :3].astype(np.float32),
+                    total_desired_pos=target[:3].astype(np.float32),
                     kp=kp,
                     kd=kd,
-                    gripper=action["r_gripper"],
-                    res_gripper=res[8] if residual is not None else 0,
+                    gripper=action[f"{_ARM_KEY}_gripper"],
+                    res_gripper=float(res[8]) if res is not None else 0.0,
                     point_cloud=controller.last_full_point_cloud,
-                    # point_cloud=point_cloud,
-                    res_rotvec=drot,
+                    res_rotvec=drot.astype(np.float32),
                 )
 
             if dataset is not None:
@@ -677,7 +678,7 @@ def _base_policy_dataset(base_policy: str | None) -> str | None:
     return None
 
 
-def _policy_record(args) -> dict:
+def _policy_record(args, base_action_space: str) -> dict:
     """Both halves of this method are policies; both are provenance."""
     return {
         "base_policy": rr.file_provenance(args.base_policy),
@@ -686,9 +687,12 @@ def _policy_record(args) -> dict:
         "residual_enabled": not args.no_residual,
         "replay_dataset": args.replay_dataset,
         "device": args.device,
+        "base_action_space": base_action_space,
         "control_mode": "EE_DELTA",
         "control_mode_source": "fixed",
-        "control_mode_reason": "the base policy emits per-step EE deltas",
+        "control_mode_reason": "the base policy emits absolute EE_POS targets; each is "
+                               "executed as the one-step delta from the pose measured at "
+                               "that step, as the reach executor runs its base",
     }
 
 
@@ -730,7 +734,7 @@ def _environment_record(args, controller) -> dict:
     """
     from baselines.rollout_common import environment
     shim = argparse.Namespace(
-        rig=env_wrapper._PROFILE, home_pose_name=args.home_pose_name,
+        rig=controller.config.rig_profile, home_pose_name=args.home_pose_name,
         home_q=args.home_q, dry_run=False,
     )
     return environment(shim, controller)
@@ -743,10 +747,13 @@ def _str2bool(v: str) -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-policy", required=False, help="Path to base policy checkpoint")
+    parser.add_argument("--rig", choices=sorted(env_wrapper._RIGS), default=env_wrapper._PROFILE,
+                        help="rig profile for a LeRobot base; which physical arm it drives "
+                             "is in config/rig.yaml (the reach path uses --arm)")
     parser.add_argument(
         "--residual-policy",
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
-        help="Path to residual policy checkpoint (best.pt)",
+        help="Residual checkpoint: best.pt (point-cloud residual) or a FAST .zip (reach)",
     )
     parser.add_argument("--save-videos", action="store_true",
                         help="Write one time-aligned mp4 per camera into --viz-dir "
@@ -830,7 +837,26 @@ def main() -> None:
     parser.add_argument("--no-record", action="store_true",
                         help="skip the LeRobotDataset (manifest and episodes are always written)")
 
+    reach = parser.add_argument_group("reach residual (FAST .zip checkpoint only; also "
+                                      "reads --num-episodes, --device, --viz-stride)")
+    reach.add_argument("--seed", type=int, default=0, help="curve sampling seed")
+    reach.add_argument("--arm", default="left", choices=("left", "right"),
+                       help="physical arm to drive; the key prefix stays r_ either way")
+    reach.add_argument("--policy", default="residual", choices=("residual", "base", "both"),
+                       help="per episode: the residual on its base, the base alone, or both "
+                            "in succession on the same curve")
+    reach.add_argument("--out", default=str(Path.home() / "franka_data" / "reach_residual"),
+                       help="run directories go under here")
+    reach.add_argument("--no-viz", action="store_true",
+                       help="write episodes.hdf5 only, no episode HTML")
+
     args = parser.parse_args()
+    if Path(args.residual_policy).suffix == ".zip":
+        # A different base, loop and record entirely; nothing below applies.
+        import reach_residual
+        reach_residual.run(args.residual_policy, args.num_episodes, args.seed, args.arm,
+                           args.policy, args.device, args.out, args.viz_stride, args.no_viz)
+        return
     # --output-dir is gone; _build_dataset still reads it, and main() points it
     # at the run directory's own dataset/ once that exists.
     args.output_dir = None
@@ -846,8 +872,10 @@ def main() -> None:
         home_gripper = float(pose.get("gripper", args.home_gripper))
 
     print("attempting connection to robot...")
-    controller = env_wrapper.start_controller()
-    print("robot initialized!")
+    controller = env_wrapper.start_controller(rig=args.rig)
+    print(f"robot initialized: {controller.config.rig_profile} -> physical arm "
+          f"{controller.config.arm_name(_ARM_KEY)!r} at {controller.config.r_robot_ip}, "
+          f"cameras {sorted(controller.cameras)}")
 
     if args.replay_dataset is None:
         print(f"attempting to start base policy: {args.base_policy}")
@@ -858,6 +886,32 @@ def main() -> None:
         print(f"attempting to fetch replay dataset: {args.replay_dataset}")
         base_policy = Trajectory(args.replay_dataset, device=args.device)
         print("replay dataset found!")
+
+    # The executor below turns absolute targets into per-step deltas; a base that
+    # already emits deltas would have every 5 cm step read as a pose next to the
+    # base origin. Decided from the checkpoint's own normalisation stats.
+    try:
+        base_action_space = base_policy.action_space()
+    except (FileNotFoundError, KeyError) as exc:
+        raise SystemExit(f"cannot verify the base policy's action space: {exc}") from exc
+    if base_action_space != "EE_POS":
+        raise SystemExit(
+            f"{args.base_policy or args.replay_dataset}: trained on {base_action_space} actions, "
+            "and this runner executes absolute EE_POS targets. Train the base on an EE_POS "
+            "recording (or relabel one with scripts/replay_dataset.py --mode ee_pose)."
+        )
+    print(f"base policy action space: {base_action_space}")
+
+    # The single-arm rigs expose different cameras; refuse before homing rather
+    # than KeyError inside the preprocessor mid-episode.
+    base_cfg = getattr(getattr(base_policy, "policy", None), "config", None)
+    missing = [k for k in (getattr(base_cfg, "image_features", None) or {})
+               if k.removeprefix("observation.images.") not in controller.cameras]
+    if missing:
+        controller.disconnect()
+        raise SystemExit(
+            f"{args.base_policy}: needs {missing}, and rig {args.rig} has cameras "
+            f"{sorted(controller.cameras)}. Pass the --rig it was recorded on.")
 
     residual: ResidualPolicy | None = None
     if args.no_residual:
@@ -913,9 +967,11 @@ def main() -> None:
     if args.viz_dir is None:
         args.viz_dir = str(run_dir.path)
 
-    record.set("policy", **_policy_record(args))
+    record.set("policy", **_policy_record(args, base_action_space))
     record.set("parameters", **_parameter_record(args))
     record.set("environment", **_environment_record(args, controller))
+    forces = ForceLog(run_dir.force_profiles_path)
+    record.set("outputs", force_profiles=str(run_dir.force_profiles_path))
 
     dataset = None
     encoder = None
@@ -947,6 +1003,7 @@ def main() -> None:
             ep = Episode(episode=ep_idx, homed=homed, started_at=rr.stamp(),
                          exec_fps=float(args.fps))
             recorder = EpisodeRecorder() if args.viz_dir else None
+            wrench = WrenchTrace(_ARM_KEY)
             t0 = time.perf_counter()
             try:
                 _run_episode(
@@ -965,6 +1022,7 @@ def main() -> None:
                     video_stem=f"episode_{ep_idx:03d}",
                     infer_lead=args.infer_lead,
                     ep=ep,
+                    wrench=wrench,
                 )
             finally:
                 if not ep.wall_time_s:
@@ -975,6 +1033,7 @@ def main() -> None:
                 ep.verdict = ep.verdict or "incomplete"
                 if ep.wall_time_s > 0:
                     ep.achieved_fps = round(ep.steps / ep.wall_time_s, 2)
+                ep.ee_force_n = forces.add_trace(ep_idx, wrench)
                 if dataset is not None:
                     ep.frames_recorded = frames_in_progress(dataset)
                     ep.dataset_episode_index = dataset.num_episodes
@@ -987,7 +1046,7 @@ def main() -> None:
                 record.add_episode(ep)
 
             print(f"\r\nepisode {ep_idx}: {ep.verdict.upper()} "
-                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps\r", flush=True)
+                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps{force_note(ep.ee_force_n)}\r", flush=True)
             if dataset is not None:
                 dataset.save_episode()
             if ep_idx < args.num_episodes - 1:

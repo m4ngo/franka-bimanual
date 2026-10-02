@@ -52,10 +52,16 @@ No normalization or noise is applied to proprio in the student pipeline
 
 Both sides: `[dx, dy, dz, drx, dry, drz, grip]` per step, normalized [-1,1]
 (pos ±1 = ±0.05 m, rot ±1 = ±0.5 rad axis-angle), gains never included.
-Real reconstructs normalization in `env_wrapper.process_chunk` (meters/0.05,
-quat→rotvec/0.5, gripper (g−0.5)×2). Open items: gripper sign convention
-match; rotation-delta FRAME (sim world-frame axis-angle vs real base-frame
-composition — z-yaw absorbed by train augment, tilt is not).
+Real builds it in `env_wrapper.chunk_to_relative`: the base's absolute pose
+targets minus the anchor (the measured pose at the observation the base
+inferred on), position/0.05, rotation as the rotvec of target·anchor⁻¹ /0.5,
+gripper passed through -- chunk-start-relative, the reach path's convention
+(`reach_residual.chunk_poses` inverted). The dump carries `anchor_pos` /
+`anchor_quat` next to `base_chunk_raw` so the sim-side recomputation (A1) can
+be redone for this form; the delta-form recomputation in
+`multi-fast/scripts/sysid/test_student_io_parity.py` predates it. Open items:
+gripper sign convention match; rotation FRAME (sim world-frame axis-angle vs
+real base-frame composition — z-yaw absorbed by train augment, tilt is not).
 
 ### 1d. Output (5 steps × 9) and downstream handling
 
@@ -194,7 +200,7 @@ Tier 1 harness (validates the fixes) → instrument + Tier 2 → Tier 3.
 - Real: `residual_wrapper/run_residual.py` (obs assembly ~195-320),
   `residual_wrapper/policy_wrapper.py` (`ResidualPolicy`),
   `residual_wrapper/env_wrapper.py` (scales, `current_ee_pose`,
-  `process_chunk`, `split_gripper`),
+  `chunk_to_relative`, `split_gripper`),
   `lerobot_robot_bimanual_franka/.../bimanual_franka.py` (point cloud,
   world calibration `_r_robot_in_world`).
 - Sim: `multi-fast/utils/distill/{policy,dataset,inference}.py`,

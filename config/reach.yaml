@@ -56,15 +56,20 @@ workspace:
 
 curve:
   # Values match cfg/reach/fast_reach.yaml so a real rollout is comparable to a
-  # sim one -- EXCEPT n_segments, which sim runs at 2. The multi-segment branch
-  # is not ported (see sample_episode), and one Bezier is the gentler first curve
-  # to put on hardware. Revisit before the phase-4 trace diff, which needs both
-  # sides sampling identically.
+  # sim one. n_waypoints is PER SEGMENT: a multi-segment curve has
+  # min(n_waypoints * n_segments, MAX_WAYPOINTS) dense points, as in sim. 1 is
+  # one smooth Bezier; 2 chains two through a random node with a kink at the
+  # junction, which is what the residual checkpoints were trained on.
   n_waypoints: 25
-  n_segments: 1
+  n_segments: 2
   control_offset: 0.2
+  # Single-segment only; the multi-segment sampler has no node spacing, as in sim.
   min_goal_dist_m: 0.20
   max_sample_attempts: 50
+  # Per-node velocity caps (n_segments + 1 of them) and the in-segment peak:
+  # full speed at the start, a stop at every junction and at the goal.
+  node_velocities: [1.0, 0.0, 0.0]
+  segment_peak_velocity: 1.0
 
 orientation:
   # 0 disables orientation entirely (position-only reach). 60 matches sim's

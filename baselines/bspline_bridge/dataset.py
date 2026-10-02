@@ -18,6 +18,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from baselines.common import (  # noqa: E402
     NUM_JOINTS,
+    home_rotvec_axis,
     parse_image_size,
     pos_rotvec_gripper,
     reached_and_commanded_poses,
@@ -42,7 +43,8 @@ def convert_episode(actions, states, arm, screen):
         "obs/arm_pos": reached_pos.astype("float32"),
         "obs/arm_quat": reached_quat.astype("float32"),
         "obs/gripper_pos": gripper_obs[:, None],
-        "actions": pos_rotvec_gripper(commanded_pos, commanded_quat, gripper_act),
+        "actions": pos_rotvec_gripper(commanded_pos, commanded_quat, gripper_act,
+                                      home_rotvec_axis(arm)),
     }
 
 

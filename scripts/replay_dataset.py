@@ -4,7 +4,12 @@ EE_DELTA actions to equivalent EE_POS ones.
 
     --mode delta     replay the source actions verbatim through EE_DELTA
     --mode ee_pose   convert each step to the ABSOLUTE OSC goal that delta would
-                     have produced, and replay that through EE_POS
+                     have produced, and replay that through EE_POS. An EE_POS
+                     source is replayed as recorded (screened, nothing else).
+
+The source's action space is classified by reach (`lerobot_source.action_space`)
+because both modes write the same feature names; --mode delta refuses an EE_POS
+source rather than reading a pose as a step.
 
 Both modes drive the real arm and capture fresh observations, because the point
 is to re-measure the source trajectories under the CURRENT controller -- these
@@ -71,6 +76,7 @@ from lerobot.utils.utils import init_logging  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_goals import OSCGoalBuilder, delta_rotvec  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk  # noqa: E402
+from lerobot_robot_bimanual_franka.lerobot_source import action_space  # noqa: E402
 from lerobot_robot_bimanual_franka.safety import ActionSafetyScreen  # noqa: E402
 from sysid.lerobot_to_hdf5 import flange_quat_to_o_t_ee  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
@@ -86,14 +92,9 @@ NUM_JOINTS = fc.num_joints()
 POS, QUAT, GRIP = slice(0, 3), slice(3, 7), 7
 
 
-def to_ee_pose_actions(actions: np.ndarray, states: np.ndarray, cfg) -> np.ndarray:
-    """One episode of EE_DELTA actions -> the absolute EE_POS actions that command
-    the same OSC goals.
-
-    `actions` (T, 10) and `states` (T, 8) come straight out of the source dataset.
-    Uses the robot's own goal builder and safety screen, so this is the control
-    path rather than a copy of it.
-    """
+def _goal_path(cfg) -> tuple[OSCGoalBuilder, ActionSafetyScreen]:
+    """The robot's own goal builder and safety screen, so a conversion is the
+    control path rather than a copy of it."""
     goals = OSCGoalBuilder(
         translation_fudge=cfg.ee_translation_fudge,
         rotation_fudge=cfg.ee_rotation_fudge,
@@ -104,7 +105,18 @@ def to_ee_pose_actions(actions: np.ndarray, states: np.ndarray, cfg) -> np.ndarr
     safety = ActionSafetyScreen(
         {_ARM: cfg.base_in_world(_ARM)}, {_ARM: fc.ee_sphere(cfg.arm_name(_ARM))}
     )
+    return goals, safety
 
+
+def to_ee_pose_actions(actions: np.ndarray, states: np.ndarray, cfg) -> np.ndarray:
+    """One episode of EE_DELTA actions -> the absolute EE_POS actions that command
+    the same OSC goals.
+
+    `actions` (T, 10) and `states` (T, 8) come straight out of the source dataset.
+    Uses the robot's own goal builder and safety screen, so this is the control
+    path rather than a copy of it.
+    """
+    goals, safety = _goal_path(cfg)
     out = np.zeros_like(actions)
     for t, (a, s) in enumerate(zip(actions, states)):
         ee_pos, ee_quat = franka_fk(np.asarray(s[:NUM_JOINTS], dtype=np.float64))
@@ -122,6 +134,30 @@ def to_ee_pose_actions(actions: np.ndarray, states: np.ndarray, cfg) -> np.ndarr
         out[t, GRIP] = s[NUM_JOINTS]
         out[t, 8:] = a[8:]                    # kp, kd pass through unchanged
     return out
+
+
+def screen_ee_pose_actions(actions: np.ndarray, states: np.ndarray, cfg) -> np.ndarray:
+    """One episode of EE_POS actions -> the goals they commanded: the same rows
+    after `absolute()` and the safety screen, which is all that touches an
+    absolute goal. The gripper follows the same measured-column rule as above."""
+    goals, safety = _goal_path(cfg)
+    out = np.zeros_like(actions)
+    for t, (a, s) in enumerate(zip(actions, states)):
+        goal = goals.absolute(a[POS], a[QUAT])
+        out[t, POS], out[t, QUAT] = safety.shape_goal({_ARM: goal})[_ARM]
+        out[t, GRIP] = s[NUM_JOINTS]
+        out[t, 8:] = a[8:]
+    return out
+
+
+def episode_goals(actions: np.ndarray, states: np.ndarray, cfg) -> tuple[np.ndarray, str]:
+    """The absolute goals one episode commanded, whichever space it was recorded
+    in, and that space. Classified by reach (`lerobot_source.action_space`),
+    because both modes write the same feature names."""
+    space = action_space(actions)
+    if space == "EE_DELTA":
+        return to_ee_pose_actions(actions, states, cfg), space
+    return screen_ee_pose_actions(actions, states, cfg), space
 
 
 def bound_deltas(actions: np.ndarray, max_pos: float | None,
@@ -276,8 +312,12 @@ def main() -> int:
         actions = np.asarray(rows["action"], dtype=np.float64)
         states = np.asarray(rows["observation.state"], dtype=np.float64)
         task = args.task or _source_task(source, meta, lo)
+        space = action_space(actions)
         if args.mode == "ee_pose":
-            out = to_ee_pose_actions(actions, states, cfg)
+            out, _ = episode_goals(actions, states, cfg)
+        elif space != "EE_DELTA":
+            raise SystemExit(f"episode {ep} is an {space} recording; --mode delta replays "
+                             f"deltas. Use --mode ee_pose.")
         else:
             out, n_pos, n_rot = bound_deltas(actions, args.max_delta_pos_m,
                                              args.max_delta_rot_rad)

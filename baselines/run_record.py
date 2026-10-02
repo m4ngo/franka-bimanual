@@ -7,10 +7,11 @@ no policy, so the residual runner can use it as cheaply as the baseline bridges.
 Layout, rooted at `~/franka_data/outputs` (data never lives in the repo):
 
     outputs/<train-dataset>/<timestamp>-<method>/
-        manifest.json     everything known about the run
-        episodes.jsonl    one line per episode, appended as it finishes
-        dataset/          the LeRobotDataset recorded during the run
-        videos/           one time-aligned mp4 per camera per episode
+        manifest.json       everything known about the run
+        episodes.jsonl      one line per episode, appended as it finishes
+        dataset/            the LeRobotDataset recorded during the run
+        videos/             one time-aligned mp4 per camera per episode
+        force_profiles.npz  per-step end-effector force/torque per episode
 
 Grouping by the TRAINING dataset rather than by method is what makes the
 comparison readable: every method trained on one task's demonstrations lands in
@@ -41,7 +42,10 @@ DEFAULT_ROOT = Path.home() / "franka_data" / "outputs"
 
 # Directory-name suffix per method. `multifast` rather than `multi-fast` so the
 # run id stays one token either side of the timestamp separator.
-METHODS = ("sail", "bspline", "multifast")
+# pi05 is multi-fast's BASE policy on its own; multifast is that base plus a
+# trained FAST residual. Kept apart so a base-only run cannot be read as the
+# whole method (baselines/libero_bridge/pi05.py).
+METHODS = ("sail", "bspline", "multifast", "pi05")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -270,6 +274,10 @@ class RunDir:
     def episodes_path(self) -> Path:
         return self.path / "episodes.jsonl"
 
+    @property
+    def force_profiles_path(self) -> Path:
+        return self.path / "force_profiles.npz"
+
 
 # ---------------------------------------------------------------------------
 # The record
@@ -290,6 +298,9 @@ class RunRecord:
     train_dataset: dict
     sections: dict = field(default_factory=dict)
     episodes: list[dict] = field(default_factory=list)
+    # Set when this run is one rollout of a multi-task sweep, so the sweep can be
+    # summarised as a unit afterwards.
+    sweep: str | None = None
 
     def __post_init__(self) -> None:
         self._started = time.time()
@@ -341,6 +352,7 @@ class RunRecord:
             "total_slow_steps": sum(e.get("slow_steps", 0) for e in eps),
             "total_guided_inferences": sum(e.get("guided_inferences", 0) for e in eps),
             "aborted_episodes": sum(1 for e in eps if e.get("aborted")),
+            "ee_force_n": force_summary(eps),
         }
 
     # -- output -----------------------------------------------------------
@@ -351,6 +363,7 @@ class RunRecord:
             "run": {
                 "run_id": self.run_dir.run_id,
                 "method": self.method,
+                "sweep": self.sweep,
                 "status": self._status,
                 "reason": self._reason,
                 "started_at": stamp(self._started),
@@ -371,6 +384,24 @@ class RunRecord:
         tmp.write_text(json.dumps(doc, indent=2, sort_keys=False))
         tmp.replace(self.run_dir.manifest_path)
         return self.run_dir.manifest_path
+
+
+def force_summary(episodes: list[dict]) -> dict | None:
+    """A run's wrist |F| in newtons, from each episode's `ee_force_n`.
+
+    mean/median/p95/max are each the mean over episodes of that episode's
+    statistic, as multi-fast's eval_fast.py reports them; `peak` is the largest
+    single reading. None when no episode recorded force: a run from before it
+    was recorded, or an arm whose NUC server does not publish it yet.
+    """
+    rows = [e["ee_force_n"] for e in episodes if e.get("ee_force_n")]
+    if not rows:
+        return None
+    out = {k: round(sum(r[k] for r in rows) / len(rows), 4)
+           for k in ("mean", "median", "p95", "max")}
+    out["peak"] = max(r["max"] for r in rows)
+    out["episodes"] = len(rows)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -419,3 +450,37 @@ def resolve_train_dataset(flag: str | None, from_checkpoint: str | None,
         # The recording need not still be on this machine to roll a policy out.
         out["local"] = {"resolved": False, "reason": repr(exc)}
     return out
+
+
+# ---------------------------------------------------------------------------
+# Reading a run back
+# ---------------------------------------------------------------------------
+
+def osc_settings(environment: dict | None) -> dict | None:
+    """The OSC a sim run ran: kp, damping ratio, and the largest position step one
+    env step may command, in cm.
+
+    From `environment.osc`, which libero_bridge/rollout.py reads off the live
+    controller. None when the manifest predates that record; those runs used
+    robosuite's stock OSC (baselines/LIBERO_SIM.md, "Traps").
+    """
+    osc = (environment or {}).get("osc")
+    if not osc:
+        return None
+
+    def one(values) -> str:
+        # Position and rotation gains are equal unless someone set them apart.
+        vals = [float(v) for v in values]
+        return f"{vals[0]:g}" if len(set(vals)) == 1 else "/".join(f"{v:g}" for v in vals)
+
+    return {"kp": one(osc["kp"]), "damping_ratio": one(osc["damping_ratio"]),
+            "step_limit_cm": round(100.0 * float(osc["output_max"][0]), 3)}
+
+
+def osc_text(environment: dict | None) -> str | None:
+    """`kp 300, damping 0.5, step limit 100 cm`, or None when not recorded."""
+    s = osc_settings(environment)
+    if s is None:
+        return None
+    return (f"kp {s['kp']}, damping {s['damping_ratio']}, "
+            f"step limit {s['step_limit_cm']:g} cm")

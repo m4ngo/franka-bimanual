@@ -25,6 +25,10 @@ with ours. Follow the steps in order.
 
 Everything below assumes the workspace venv is active (`~/franka_ws/.venv`).
 
+Steps 1 and 2, plus the residual pipeline's own base policy, run as one job from
+one yaml -- see **One command for the whole training side** below. The
+individual commands remain the way to run a single piece.
+
 ## 0. One-time setup
 
 The two upstream projects are git submodules (`sail/`, `bspline_policy/`) and
@@ -86,7 +90,8 @@ then precision labels; skipped when already present, `--relabel` redoes them)
 and prints the fraction of steps labelled precise per demo -- if that is near
 0% or 100%, tune `--err-threshold` before spending a training run.
 
-Checkpoints land under `~/franka_data/policies/<dataset>/`:
+Checkpoints land under `~/franka_data/policies/<dataset>/` (or under the run
+directory when launched through `train_pipeline.py`):
 
 ```
 policies/pickup-bowl/
@@ -103,8 +108,68 @@ python -m baselines.sail_bridge.train    <sail.hdf5>    --epochs 2 --epoch-every
 python -m baselines.bspline_bridge.train <bspline.hdf5> --epochs 2 --checkpoint-every 1
 ```
 
-`--dry-run` on either prints the generated config and the exact command without
-running anything.
+`--resume` continues a training: for B-Spline it names the earlier run directory
+(`<output-dir>/bspline/<timestamp>`) and goes through `bspline_train.py`, which
+reads the epoch out of `checkpoints/latest.ckpt`, trains the epochs left and
+keeps the learning-rate schedule sized to the original count (upstream's own
+`training.resume` would train a whole `num_epochs` more on a mis-sized schedule);
+for SAIL it names a `model_epoch_N.pth` and continues at epoch N+1 into a new
+timestamped directory beside it (weights and EMA; robomimic saves no optimizer
+state). `--dry-run` on either prints the generated config and the exact command without
+running anything. Both log to wandb with `--wandb` (`--wandb-project`,
+`--wandb-name`); SAIL's robomimic also needs an entity, taken from
+`--wandb-entity`, `$WANDB_ENTITY` or the `wandb login` default.
+
+### One command for the whole training side
+
+`scripts/train_pipeline.py` does the conversion and all three trainings --
+the two baselines here plus `lerobot-train` for the residual pipeline's base
+policy -- from one yaml, so nothing has to be started or found by hand:
+
+```bash
+cp pipelines/example.yaml pipelines/pickup-bowl.yaml     # dataset, name, epochs, wandb ...
+python scripts/train_pipeline.py start  pipelines/pickup-bowl.yaml
+python scripts/train_pipeline.py status                  # newest run; or pass its directory
+python scripts/train_pipeline.py summary                 # summary.png: loss curves, paths, links
+python scripts/train_pipeline.py retry sail              # a failed stage again; status shows why it failed
+python scripts/train_pipeline.py stop
+```
+
+`start` converts in the foreground, then launches the trainings detached (they
+outlive the terminal) through a runner that keeps `pipeline.json` and
+`links.md` current and draws `summary.png` when the last one ends. A stage that
+runs out of GPU memory beside the others is re-run on its own once they end;
+any other failure is shown by `status` with its error line and relaunched with
+`retry`, which resumes it from its last checkpoint. Each stage is taken from an
+earlier run of the same recording with the same settings -- linked if that run
+finished it, resumed from its last checkpoint if not -- unless `start --retrain
+<stage>` is passed. One run is one directory:
+
+```
+~/franka_data/pipeline/<dataset>/<timestamp>-<name>/
+  config.yaml  pipeline.json  links.md  summary.png
+  datasets/{sysid,sail,bspline}.hdf5
+  diffusion/checkpoints/last/pretrained_model      run_residual.py --base-policy
+  bspline/<ts>/checkpoints/latest.ckpt             bspline_rollout.sh --ckpt
+  sail/<ts>/models/model_epoch_N.pth               sail_rollout.sh --ckpt
+  logs/{convert,diffusion,bspline,sail,pipeline}.log
+```
+
+Every run converts its own copy of the data on purpose: SAIL's labelling passes
+write into the HDF5 in place, so two runs with different `err_threshold`s must
+not share one. `parallel: false` runs the trainings one after another when
+three at once would not fit on the GPU. `start --dry-run` prints the exact
+commands and `start --no-train` only converts. `wandb.enable: false` silences
+all three; with it on, SAIL takes the entity from `wandb.entity` or the
+`wandb login` default. Checkpoints are about 1 GB each, so keep the save
+frequencies near the template's.
+
+A step should take well under a second. If SAIL sits at several seconds per
+step with the GPU idle, the data pipeline is the bottleneck: the file was
+converted before images were stored one frame per chunk (reconvert), or the
+training is running stock robomimic rather than through
+`sail_bridge/robomimic_train.py` (see [SAIL.md](SAIL.md)). `--data-workers`
+raises the loader's parallelism.
 
 ## 3. Roll out
 
@@ -169,6 +234,83 @@ python scripts/rollout_summary.py pickup-bowl
 Time-to-success is over successes only. `--all` sweeps every task, `--json`
 dumps the manifests.
 
+## The same comparison in simulation (LIBERO)
+
+The same three-way comparison runs on LIBERO, so the result is not only a claim
+about one robot in one room. Three methods go through it: SAIL and B-Spline,
+trained here, and `pi05` -- multi-fast's base policy, pretrained, which needs no
+conversion or training of ours. **[LIBERO_SIM.md](LIBERO_SIM.md) is the full
+description** -- what each stage does, which file does it, and why the awkward
+parts are that way. The short version:
+
+```bash
+# LIBERO demos -> one SAIL file and one B-Spline file per task
+python -m baselines.libero_bridge.dataset ~/libero_data/libero_90 \
+    --out-dir ~/franka_data/baseline_prep/libero_90
+
+# one policy per task per baseline, with the unchanged trainers
+python -m baselines.libero_bridge.train ~/franka_data/baseline_prep/libero_90 \
+    --tasks-file baselines/libero_bridge/teacher_tasks.txt --steps 100000
+
+# roll them out in sim; the sweep prints its own pooled table at the end
+python -m baselines.libero_bridge.evaluate ~/franka_data/baseline_prep/libero_90 \
+    --tasks-file baselines/libero_bridge/teacher_tasks.txt --num-episodes 20 \
+    --save-video
+
+# read any sweep back later by its id
+python scripts/rollout_summary.py --sweep latest
+```
+
+B-Spline's speed knob is swept the same way, one `--sweep-id` per setting so the
+pooled rows stay separate:
+
+```bash
+for s in 1 2 4 8; do
+    python -m baselines.libero_bridge.evaluate ~/franka_data/baseline_prep/libero_90 \
+        --tasks-file baselines/libero_bridge/teacher_tasks.txt --num-episodes 20 \
+        --backend bspline --sweep-id "bsp_${s}x" --extra --speed-up-times "$s"
+done
+```
+
+Steps 2 and 4 of the hardware pipeline above are reused unchanged -- the
+trainers and `rollout_summary.py` read the HDF5, not the robot. What differs:
+
+- **The source is a LIBERO task**, and specifically what
+  `multi-fast/scripts/libero/regenerate_libero_dataset.py` writes rather than
+  raw LIBERO. Its no-ops and failed demos are already filtered, so the baselines
+  learn from exactly the frames our own method does, and it already records
+  `goal_pos` / `goal_ori` -- the reached/commanded split the real converters
+  reconstruct by hand. So the converter is a re-key, not a replay.
+- **The simulator is stock robosuite.** No plant or gripper overrides: the
+  demonstrations were recorded under the shipped model, so a fitted plant would
+  measure a sim2sim gap instead of the policies. The one exception is SAIL's
+  controller, which is stiffer by design (LIBERO_SIM.md, "SAIL's controller").
+- **Three interpreters.** The policy stays in `.venv-sail` / `.venv-bspline`
+  behind the unchanged `*/policy_server.py`; the LIBERO env runs in
+  `multi-fast/.venv`, the only one here with robosuite and libero;
+  `scripts/libero_rollout.sh` starts both.
+- **The policies command absolute poses and LIBERO takes normalised deltas**, so
+  `sim_env.SimTask.action` inverts one into the other through multi-fast's own
+  inverse of the relabeler that wrote the targets.
+- **Episode time is simulated seconds**, so a time-to-success does not depend on
+  the machine.
+- **Tasks are numbered.** Task *i* of a suite is `task_<i>` -- its prep
+  directory, the id on its files, its policies and rollouts -- and every task
+  flag takes the bare index (`--tasks 9 29`). libero_90 was converted before
+  this and keeps full task names; indices find those too.
+- **One sweep is one id.** Every rollout an `evaluate` invocation starts is
+  tagged with the same sweep id and recorded under `run.sweep`, so
+  `rollout_summary.py --sweep <id>` reads the whole set back months later and
+  pools it into one row per backend. That pooled row is the comparison; the
+  per-task rows are for finding which task moved.
+- **`pi05` is a base policy, not multi-fast.** multi-fast is that base plus a
+  FAST residual, and no residual is trained for these tasks yet, so the row is
+  kept under its own method name rather than reported as the whole method.
+
+`scripts/check_libero_sim_rollout.py` is the check that settles the executor: it
+replays a demo's own recorded targets through it and asks whether the task still
+succeeds.
+
 ## Checking without the robot
 
 - `python scripts/check_baseline_rollout_offline.py` runs both rollout loops
@@ -187,6 +329,7 @@ dumps the manifests.
 | Recordings | `~/franka_data/<dataset>/` |
 | Converted HDF5s | `~/franka_data/baseline_prep/<dataset>/` |
 | Trained policies | `~/franka_data/policies/<dataset>/<method>/<run>/` |
+| A `train_pipeline.py` run (datasets, all three policies, logs, links) | `~/franka_data/pipeline/<dataset>/<timestamp>-<name>/` |
 | Rollouts | `~/franka_data/outputs/<dataset>/<timestamp>-<method>/` |
 | Baseline venvs | `~/franka_ws/.venv-sail`, `~/franka_ws/.venv-bspline` |
 | The knobs | `config/policy.yaml`, `baselines:` block |
@@ -231,6 +374,10 @@ already knows. Its later passes run on our file unchanged, from
 
 **The first few frames of every episode are dropped** -- the arm settling into
 its start pose is not part of the demonstration.
+
+**Images are stored one frame per chunk, uncompressed.** Training samples frames
+at random; h5py's default layout put 13 frames in a gzip chunk, so each read
+decompressed a dozen neighbours. Low-dim arrays stay gzip-compressed.
 
 Maps of the two upstream repos: [SAIL.md](SAIL.md), [BSPLINE_POLICY.md](BSPLINE_POLICY.md).
 Everything about running on the arm: [ROLLOUT.md](ROLLOUT.md).

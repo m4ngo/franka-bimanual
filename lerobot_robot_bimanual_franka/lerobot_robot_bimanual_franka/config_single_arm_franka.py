@@ -15,7 +15,7 @@ from lerobot.robots import RobotConfig
 from .bimanual_franka_config import ControlMode
 from .rig_config import profile_arm_fields, profile_cameras, profile_depth_cameras
 
-PROFILE = "single_arm_franka"
+PROFILE = "single_arm_right"
 
 _VALID_ARMS: tuple[str, ...] = tuple(fc.profile(PROFILE).arms)
 

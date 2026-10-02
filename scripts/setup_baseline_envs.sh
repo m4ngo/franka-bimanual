@@ -16,14 +16,18 @@
 #
 # baselines/interpreters.py is what finds these afterwards; $SAIL_PYTHON /
 # $BSPLINE_PYTHON override it.
+#
+# baselines/tillicum/Dockerfile builds the cluster image with this script:
+# BASELINE_GPU_CHECK=0 because a docker build has no GPU, and uv's own
+# $UV_CONSTRAINT pinning every version to this machine's venvs.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PYVER="${BASELINE_PYTHON_VERSION:-3.11}"
 TORCH_INDEX="${BASELINE_TORCH_INDEX:-https://download.pytorch.org/whl/cu128}"
-AWE_REPO="${AWE_REPO:-https://github.com/lucys0/awe.git}"
-PYTORCH3D_REPO="${PYTORCH3D_REPO:-https://github.com/facebookresearch/pytorch3d.git@stable}"
+AWE_REPO="${AWE_REPO:-https://github.com/lucys0/awe.git@9780e4184770688f642c55f25af84954f41cb217}"
+PYTORCH3D_REPO="${PYTORCH3D_REPO:-https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47}"
 
 command -v uv >/dev/null || { echo "uv is required (https://docs.astral.sh/uv/)" >&2; exit 1; }
 
@@ -39,6 +43,10 @@ pip() {           # <python> args... -> uv pip install into that interpreter
 }
 
 cuda_check() {    # <python> <label>
+    if [[ "${BASELINE_GPU_CHECK:-1}" == 0 ]]; then
+        echo "[$2] GPU check skipped (BASELINE_GPU_CHECK=0)"
+        return
+    fi
     "$1" - "$2" <<'PY'
 import sys, torch
 label = sys.argv[1]

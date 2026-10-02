@@ -21,8 +21,8 @@ spacemouse:
   # exactly a normalized +/-1 policy action -- teleop and policy drive the
   # controller through identical units. clip_delta enforces the same bound
   # downstream, so raising them past 0.05/0.5 only saturates earlier.
-  translation_scale: 0.05   # metres per tick at full deflection
-  rotation_scale: 0.5       # radians per tick at full deflection
+  translation_scale: 0.03   # metres per tick at full deflection
+  rotation_scale: 0.1       # radians per tick at full deflection
   # Fraction of full deflection treated as zero, with the remainder rescaled so
   # full deflection still reaches 1.0. The puck cross-talks: twisting to yaw
   # drives the linear axes to ~0.23, which is ~1.2 cm/tick of translation the

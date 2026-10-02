@@ -442,6 +442,7 @@ class ControlLoop:
             shm.S_TAU_CMD: self._last_tau,
             shm.S_TAU_MEAS: np.asarray(state.tau_J, dtype=np.float64),
             shm.S_TAU_EXT: np.asarray(state.tau_ext_hat_filtered, dtype=np.float64),
+            shm.S_F_EXT: np.asarray(state.O_F_ext_hat_K, dtype=np.float64),
             shm.S_SUCCESS_RATE: float(getattr(state, "control_command_success_rate", 1.0)),
             shm.S_CLAMP_TRIPS: float(self.clamp_trips),
             shm.S_TORQUE_TRIP: float(self.torque_trips),

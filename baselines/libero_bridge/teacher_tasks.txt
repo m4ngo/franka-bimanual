@@ -1,0 +1,11 @@
+# The libero_90 tasks multi-fast itself trains and evaluates on
+# (multi-fast/cfg/teacher_sets/20_tasks.yaml, cfg/distill/train.yaml), by index.
+# Comparing on these is what makes the three-way result apples-to-apples.
+9   # KITCHEN_SCENE1_put_the_black_bowl_on_the_plate
+29  # KITCHEN_SCENE5_put_the_black_bowl_in_the_top_drawer_of_the_cabinet
+44  # KITCHEN_SCENE9_turn_on_the_stove
+46  # LIVING_ROOM_SCENE1_pick_up_the_alphabet_soup_and_put_it_in_the_basket
+57  # LIVING_ROOM_SCENE3_pick_up_the_cream_cheese_and_put_it_in_the_tray
+61  # LIVING_ROOM_SCENE4_pick_up_the_chocolate_pudding_and_put_it_in_the_tray
+67  # LIVING_ROOM_SCENE5_put_the_white_mug_on_the_left_plate
+72  # LIVING_ROOM_SCENE6_put_the_white_mug_on_the_plate

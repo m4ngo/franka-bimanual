@@ -304,6 +304,7 @@ class _ArmSession:
         bundle = tuple(float(x) for x in np.concatenate([
             st[shm.S_Q], st[shm.S_DQ], st[shm.S_POS], st[shm.S_QUAT], st[shm.S_TWIST],
             [float(self.recovery_count)], st[shm.S_TAU_CMD], st[shm.S_TAU_MEAS], st[shm.S_TAU_EXT],
+            st[shm.S_F_EXT],
         ]))
         err = None if st[shm.S_ALIVE] == 1.0 else "control process not alive"
         return bundle, err, int(st[shm.S_STATE_SEQ])

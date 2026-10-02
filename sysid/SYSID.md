@@ -194,6 +194,62 @@ ratios misleading: a nullspace-heavy joint reads high while every task direction
 reads low. That combination points at task-space authority (`uncouple_pos_ori`,
 `lambda`), not at friction.
 
+### 4. Gain actions — `excite_panda.py --gain-amp`
+
+Everything above ran at the default gain (normalised `kp = kd = 0`), and so did
+the plant fit. Policies move that channel every step; both stacks remap it
+identically (`kp = 150·10^a_kp`, `ratio = 10^a_kd`, `kd = 2√kp·ratio`, clipped to
+`[0, 1500]` / `[0, 10]`), and this is the check that the fitted plant still
+answers the same actions with the same motion once the gains move.
+
+```
+python sysid/excite_panda.py --gain-amp 0.3 --tag panda_excite_gain --yes
+cd multi-fast && .venv/bin/python scripts/sysid/rollout_fit.py \
+    logs/sysid_fit/<fit> --real-dir ~/sysid/outputs/<run>/ee_pose --out ~/sysid/outputs/<run>/sim
+```
+
+For a fixed gain over the whole run instead, give `--kp`/`--kd` alone
+(`--kp 0.3 --kd -0.2` holds kp 299, ratio 0.63); the sim then replays at that
+constant under variable impedance, and `--gain-amp` adds the oscillation on top
+of whatever centre `--kp`/`--kd` set.
+
+The oscillation is a quadrature sinusoid (`gain_schedule.py`): `a_kp` on sin and
+`a_kd` on cos at one frequency, so the (kp, kd) point traces a circle and every
+quadrant is visited each cycle, ramped in so the first tick is at the centre. A
+sinusoid rather than steps because a gain step is a torque step, and the 800 Nm/s
+rate limit sim lacks would then dominate. ±0.3 is kp 75..300 and ratio 0.5..2.
+
+The record carries `gain_action` (T,2), the normalised action the step sent, and
+the physical `kp`/`kd` (T,6) `resolve_gains` made of it, plus this rig's remap
+constants and `tuning` trims as attrs. The sim replays under
+`impedance_mode=variable` by remapping `gain_action` with its **own** law and
+first checks that this reproduces the recorded `kp`/`kd`; a trim ≠ 1 or another
+base is refused, because a rig deviation is by definition not "same actions".
+A recording whose schedule never moved stays on the fixed-mode path.
+
+Read `by_gain` in `rollout_summary.yaml` (and the table the rollout prints): pos
+RMSE over the low/mid/high terciles of `a_kp` and of `a_kd`. Flat across
+terciles, at the level the default-gain fit already shows, means the contract
+holds; a monotone trend in `a_kp` is a gain-dependent plant mismatch the
+default-gain fit could not see, and the timeseries HTML's gain row shows where
+in the cycle it lands.
+
+The same check runs on a task-shaped trajectory through the rollout path:
+`scripts/real_trajectory_rollout.py --source arm --gain-amp 0.3` re-runs a
+dataset episode with the oscillation added to its own gain columns,
+`multi-fast/scripts/reach/replay_goals_in_sim.sh` follows the episode's
+`gain_action` under variable impedance, and `scripts/plot_episodes.py` writes
+the same `by_gain` into `errors.json`. A policy episode that recorded moving
+gains needs no `--gain-amp`; `sysid/lerobot_to_hdf5.py` also carries them per
+step. Every file in this chain is an episode HDF5 (`EPISODE_HDF5.md`).
+
+`--all` in place of `--episode` records every episode of the dataset into one
+`episodes.hdf5` (rewritten after each episode, so a fault keeps what is done).
+That is the EE_DELTA counterpart of `lerobot_to_hdf5.py`, and the way to put
+task-shaped data recorded on today's controller into the plant fit:
+`sysid/merge_episodes.py` joins it with an excitation run, and the fit re-rows
+the arm-source `post_period` episodes itself.
+
 ### Also available
 
 - `scripts/osc_check/check_osc_axes.py` — commanded-vs-measured per OSC axis, the
@@ -204,15 +260,21 @@ reads low. That combination points at task-space authority (`uncouple_pos_ori`,
 - `sysid/sysid.py` — the older bulk collection entry point (`--mode track` against
   `specs/*.json`, or open-loop replay of a multi-fast sweep file) for the multi-fast
   fitting pipeline. `--dry-run` exercises it with no hardware.
-- `sysid/excite_panda.py` — panda_control's v3/v4 excitation trajectories
-  (`sysid/panda_traj.py` is their generators, ported verbatim). Drives each once and
+- `sysid/excite_panda.py` — panda_control's excitation trajectories: v3_step5d,
+  v4_chirp, step5b and step5c by default (`--specs` picks; `--validate step5c`
+  names the episodes `*_train` / `step5c_validate`, the split the fit's
+  `val_regex` holds out). `sysid/merge_episodes.py` joins runs and
+  `lerobot_to_hdf5.py` conversions into one file, which is how the combined
+  fit dataset is built. `sysid/panda_traj.py` is the generators, ported
+  verbatim. Drives each once and
   writes the SAME run in both action spaces, to `<run>/ee_delta/` and `<run>/ee_pose/`
   — separate directories because `load_real_dir` globs `*.hdf5` and takes the format
   from its caller, not from the file. A probe pass scales the amplitudes until the
   tracking error fits the ±0.05 m / ±0.5 rad delta envelope; without it the two
   spaces stop being equivalent wherever the clip bites. `--selftest` checks the port
-  off-hardware, `--verify <run>` checks the equivalence through the real
-  `OSCGoalBuilder`.
+  and the gain schedule off-hardware, `--verify <run>` checks the equivalence through
+  the real `OSCGoalBuilder` and that the recorded `kp`/`kd` are `resolve_gains` of the
+  recorded `gain_action`.
 
 ## Where the knobs live
 

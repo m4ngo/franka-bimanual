@@ -93,10 +93,9 @@ class OSCGoalBuilder:
         # perturbs the goal; it just no longer decides whether there is one.
         rotation_commanded = bool(np.any(drot))
         if self._use_noise:
-            dpos = dpos + np.random.normal(0.0, self._noise_pos_scale, 3)
-            drot = drot + Rotation.from_euler(
-                "xyz", np.random.normal(0.0, self._noise_rot_scale, 3)
-            ).as_rotvec()
+            noise_pos, noise_rot = self._sample_noise()
+            dpos = dpos + noise_pos
+            drot = drot + noise_rot
 
         # Clip to the envelope a policy could have emitted, THEN apply the hardware
         # fudge. The other order lets clip_delta eat the fudge -- at tf=3 a 0.05 m
@@ -110,11 +109,33 @@ class OSCGoalBuilder:
             self._goal_ori[arm] = Rotation.from_rotvec(drot) * Rotation.from_quat(ee_quat_xyzw)
         return np.asarray(ee_pos, dtype=np.float64) + dpos, self._goal_ori[arm].as_quat()
 
+    def _sample_noise(self) -> tuple[np.ndarray, np.ndarray]:
+        """One draw of the configured action noise: a position offset and a
+        rotation vector. The single definition both goal paths perturb with."""
+        pos = np.random.normal(0.0, self._noise_pos_scale, 3)
+        rot = Rotation.from_euler("xyz", np.random.normal(0.0, self._noise_rot_scale, 3)).as_rotvec()
+        return pos, rot
+
+    def perturb(self, goal: Goal) -> Goal:
+        """EE_POS's share of ``use_noise``: jitter an ABSOLUTE goal by the same
+        draw ``from_delta`` adds to a delta.
+
+        Applied to the composed goal rather than the action, so the recorded
+        action stays what the leader emitted and only the pose the controller
+        pursues carries the noise. No envelope on this path, so the scales in
+        control.yaml bound it directly."""
+        if not self._use_noise:
+            return goal
+        pos, quat = goal
+        noise_pos, noise_rot = self._sample_noise()
+        return pos + noise_pos, (Rotation.from_rotvec(noise_rot) * Rotation.from_quat(quat)).as_quat()
+
     @staticmethod
     def absolute(goal_pos: np.ndarray, goal_quat_xyzw: np.ndarray) -> Goal:
         """EE_POS: the action already carries an absolute pose, so it becomes the
         OSC goal directly -- no envelope, because a pose is not a step, and no
-        latched orientation, because the caller supplies one every step."""
+        latched orientation, because the caller supplies one every step. Noise,
+        when configured, is ``perturb``'s job on the composed goal."""
         quat = np.asarray(goal_quat_xyzw, dtype=np.float64)
         return (
             np.asarray(goal_pos, dtype=np.float64),

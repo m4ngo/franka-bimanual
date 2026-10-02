@@ -49,9 +49,18 @@ def stream(cmd: list[str], cwd: Path, env: dict | None = None,
     assert proc.stdout is not None and proc.stdin is not None
     proc.stdin.write(stdin_text or "")
     proc.stdin.close()
-    for line in proc.stdout:
-        sys.stdout.write(line)
-        sys.stdout.flush()
-        if watch and watch in line:
-            seen = True
+    try:
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            if watch and watch in line:
+                seen = True
+    except KeyboardInterrupt:
+        # Ctrl-C must stop the training, not just this wrapper.
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        raise
     return proc.wait(), seen

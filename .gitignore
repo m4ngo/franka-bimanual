@@ -11,3 +11,5 @@ __pycache__/
 *.png
 *.hdf5
 *.h5
+# Collected rollout report: PNG sheets + videos, regenerable from ~/franka_data.
+libero_report*/

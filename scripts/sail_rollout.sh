@@ -28,7 +28,8 @@ PORT="$(cfg policy.baselines.zmq.sail_port)"
 
 START_SERVER=0
 CKPT=""
-GUIDE=""
+# SAIL's guidance config as its README evaluates; --guide-config "" runs unguided.
+GUIDE="$REPO_ROOT/baselines/sail/robomimic/SAIL/guide_template/base_cfg_weight_1.json"
 RIG=single_arm_franka
 ARGS=()
 while [[ $# -gt 0 ]]; do

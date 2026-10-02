@@ -151,15 +151,17 @@ plant.
 - `scripts/check_reach_workspace.py` — offline sampler validation.
 - `scripts/check_real_reach_offline.py` — real base policy vs fake arm.
 - `scripts/real_reach_rollout.py` — the hardware driver (`--dry-run` available).
-- `scripts/real_reach_viz.py` — animated HTML per episode, written by the
-  rollout and re-renderable offline from a run's `results.json`. Modelled on
-  `sysid/_viz.py`: 3D scene plus time-series panels on one slider. With `--sim`
-  it overlays a sim replay and writes `compare_NNN.html` + `errors.json`.
+- `scripts/plot_episodes.py` — animated HTML per episode, written by the
+  rollout and re-renderable offline from a run's `episodes.hdf5`. Modelled on
+  `sysid/_viz.py`: 3D scene plus time-series panels on one slider. A
+  `sim_replay.hdf5` in the run directory is overlaid and the per-episode
+  summary written to `errors.json`.
 - `lerobot_robot_bimanual_franka/reach_record.py` — the episode record, shared by
-  the rollout and the offline harness so both emit the same artifact.
+  the rollout and the offline harness so both emit the same artifact (the
+  episode HDF5 layout, see `EPISODE_HDF5.md`).
 - `scripts/check_reach_compare_offline.py` — the sim/real comparison against a
   synthesised sim record; no robot, no robosuite.
-- `multi-fast/scripts/reach/replay_real_reach.py` — the sim side. Runs in
+- `multi-fast/scripts/reach/replay_goals_in_sim.py` — the sim side. Runs in
   `multi-fast/.venv`.
 
 ---
@@ -288,12 +290,12 @@ but every goal `send_action` would compose, driven by the real
    Connects, homes, samples, prints goals in both frames, sends nothing.
 5. **First hardware run** — `--episodes 5`, operator at the e-stop. Watch that
    the trace tracks the curve and that no `!! EE under floor` line prints.
-   Traces land in `~/franka_data/real_reach/<timestamp>/`, as `results.json`
-   plus one `episode_NNN.html` each — open those to see the measured trail
+   Traces land in `~/franka_data/real_reach/<timestamp>/`, as `episodes.hdf5`
+   plus one `episode_epNNN.html` each — open those to see the measured trail
    against the commanded curve, the commanded-vs-reached gap, and the floor
-   clearance over time. Everything in `results.json` is world frame now; the
-   2026-09-12 run predates that and stored `goal` in base frame while its
-   siblings were world, which `real_reach_viz.py` converts on the way in.
+   clearance over time. The file is base frame (`EPISODE_HDF5.md`); the figure
+   maps it to world. Runs recorded as `results.json` are translated with
+   `scripts/results_json_to_hdf5.py`.
 6. Multi-segment (section 4), then phase 3 orientation, then phase 4 trace diff.
 
 For phase 4, turn `torque.osc.cross_coupling_compensation` **off** — it is a
@@ -309,17 +311,23 @@ desynchronises every later draw. Measured: same seed with the start 1 cm apart
 moves waypoint 12 by 6 mm; same seed with only the floor applied moves the goal
 from z 0.440 to 0.465.
 
-So **the real run samples and sim replays it**. `results.json` carries a
-base-frame `replay` block — the post-home `qpos0`, the curve, and per step the
-OSC goal that was actually *dispatched* (post `clip_delta`, post fudge, post
-`ActionSafetyScreen`) plus the raw normalised action.
+So **the real run samples and sim replays it**. `episodes.hdf5` carries, per
+episode, the post-home `init_qpos`, the curve, and per step the OSC goal that
+was actually *dispatched* (post `clip_delta`, post fudge, post
+`ActionSafetyScreen`) as `eef_goal_*` plus the raw normalised `policy_action`.
 
 ```
 python scripts/real_reach_rollout.py --episodes 5
-cd multi-fast && ./scripts/reach/replay_real_reach.sh \
-    ~/franka_data/real_reach/<ts>/results.json --episode 0 [--plant sysid_2026_08_28]
-python scripts/real_reach_viz.py ~/franka_data/real_reach/<ts>   # picks up sim_episode_*.json
+cd multi-fast && ./scripts/reach/replay_goals_in_sim.sh \
+    ~/franka_data/real_reach/<ts> --episode 0 [--plant sysid_2026_08_28]
+# the comparison is rendered at the end; plot_episodes.py <run> re-renders it
 ```
+
+A residual run (`residual_wrapper/run_residual.py --residual-policy <FAST .zip> --seed S`)
+gets the closed-loop twin instead: `multi-fast/scripts/reach/rerun_policy_in_sim.py <run>`
+loads the checkpoint named in the run's `meta`, puts sim at the real start joints on
+the real curve, and runs the same policy deterministically through the sim's own
+eval wrappers. Same attempted rollout on both sides; the plant is what differs.
 
 What is replayed is the **absolute OSC goal pose**, not the normalised delta.
 Both sides run EE target-pose control, so re-issuing the goal makes the
@@ -383,9 +391,11 @@ above; the pre-realignment numbers were flattering by a step):
 | `sysid_2026_09_02` | ~13 mm | ~3.3° | between |
 
 **Any LeRobot episode works as the real side too.** `scripts/real_trajectory_rollout.py`
-converts the episode's EE_DELTA actions offline into the absolute OSC goals they
-produced (through `replay_dataset.py::to_ee_pose_actions`, i.e. the robot's own
-goal builder and screen) and writes the same `results.json`, curve-free. Two
+converts the episode's actions offline into the absolute OSC goals they
+produced (through `replay_dataset.py::episode_goals`, i.e. the robot's own
+goal builder and screen: EE_DELTA rows are anchored on the recorded joints,
+EE_POS rows are screened as they are) and writes the same `episodes.hdf5`,
+curve-free. Two
 sources of "real": `--source dataset` uses the recording itself (FK of the
 recorded joints; no arm), `--source arm` re-runs the goals on the arm now. The
 same sim script and figure consume both. Mind which controller "real" means:

@@ -1,0 +1,78 @@
+# One training run of every method from one LeRobot recording:
+#
+#   python scripts/train_pipeline.py start pipelines/example.yaml
+#
+# Copy this file per experiment. Every run gets its own directory,
+# <root>/<dataset>/<timestamp>-<name>/, holding the converted datasets, the
+# three policies, one log per stage, the wandb links and a copy of this file.
+# `python scripts/train_pipeline.py status` reads that directory back.
+
+dataset: HuskyMango/filter-9-19-libero-90-9   # an EE_POS recording, found under ~/franka_data or the HF cache
+name: 9-17-run-1-libero-90-9                  # names the run directory and the wandb runs
+root: ~/franka_data/pipeline
+parallel: true                                # all three trainings at once; false runs them in order
+# One gradient-step budget for all three trainings, so they are compared at equal
+# length: lerobot-train's --steps, and the two bridges turn it into their own epoch
+# counts (SAIL: steps / epoch_every_n_steps; B-Spline: the dataset is built once to
+# measure an epoch). A stage's `epochs` cannot be set alongside it. null: each
+# stage's own steps/epochs below, or its trainer's default.
+steps: 200000
+
+wandb:
+  enable: true
+  project: franka-pipeline
+  entity: null          # null: the `wandb login` default
+
+# scripts/prepare_baseline_datasets.py: one recording -> sysid.hdf5, sail.hdf5, bspline.hdf5
+convert:
+  episodes: null        # e.g. [0, 1, 2]; null takes all
+  image_size: null      # e.g. 84x84; null keeps the recording's resolution
+  trim_start: auto
+  max_trim: 5
+  min_steps: 20
+  skip: []              # any of sysid, sail, bspline
+
+# lerobot-train: the base policy of the residual pipeline (run_residual.py --base-policy)
+diffusion:
+  enabled: true
+  policy_type: diffusion
+  policy_repo_id: HuskyMango/filter-9-19-libero-90-9-diffusion   # pushed to the Hub when done; null skips the push
+  batch_size: 64
+  steps: null           # null: the top-level `steps`, else 200000
+  save_freq: 20000
+  eval_freq: 5000
+  log_freq: 200
+  num_workers: 12
+  args:                 # further lerobot-train overrides, passed through as --key=value
+    policy.noise_scheduler_type: DDIM
+    policy.num_train_timesteps: 100
+    policy.num_inference_steps: 4
+    policy.horizon: 16
+    policy.n_action_steps: 10
+    policy.n_obs_steps: 2
+    policy.device: cuda
+
+# python -m baselines.bspline_bridge.train; null falls back to the workspace config
+bspline:
+  enabled: true
+  epochs: null          # from the top-level `steps`: 200000 / 59 steps per epoch -> 3401 epochs
+  steps: null
+  checkpoint_every: 100 # every 5900 steps
+  batch_size: null
+  num_workers: null
+  seed: 42
+  device: null
+
+# python -m baselines.sail_bridge.train; null falls back to the robomimic template
+sail:
+  enabled: true
+  epochs: null          # from the top-level `steps`: 200000 / 500 -> 400 epochs
+  steps: null
+  epoch_every_n_steps: 500
+  save_every: 100       # every 50000 steps
+  batch_size: null
+  seed: 42
+  data_workers: null
+  err_threshold: 0.02   # AWE waypoint error (m); the log prints the resulting precise fraction
+  num_workers: 6        # AWE worker processes
+  action_key: absolute_actions_with_precision

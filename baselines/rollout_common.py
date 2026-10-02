@@ -13,6 +13,7 @@ as copied from it are noted at their definitions.
 from __future__ import annotations
 
 import logging
+import math
 import os
 import select
 import sys
@@ -37,8 +38,14 @@ from lerobot.robots import make_robot_from_config  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.lerobot_source import EE_KEYS  # noqa: E402
+from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains  # noqa: E402
 
 from baselines import run_record as rr  # noqa: E402
+from baselines.force_log import ForceLog, WrenchTrace, note as force_note  # noqa: E402
+from baselines.rollout_viz import CHUNKS_FILE, ChunkLog  # noqa: E402
+from baselines.policy_math import (  # noqa: E402,F401  re-exported for the entrypoints
+    lead_goal, propagate_pose, rot6d_to_quat_xyzw, slowdown_mode, tracking_error_low,
+)
 from baselines.zmq_client import PolicyTimeout  # noqa: E402
 
 # The rig -> config-class table, and the exposed key prefix, have exactly one
@@ -248,82 +255,58 @@ def _gains() -> dict:
             "kd": float(fc.policy("sysid.default_kd"))}
 
 
-def ee_pos_action(pos, quat_xyzw, gripper: float) -> dict:
+def gain_action(kp: float | None) -> dict:
+    """kp/kd action channels that put the OSC at stiffness `kp`; None is `_gains()`.
+
+    The inverse of resolve_gains' remap (kp = default_kp * base ** a), so the
+    channel keeps meaning "log-base multiplier on the default" and kp_limits
+    still bind on the arm. The damping ratio stays at its default, 1.0.
+    """
+    gains = _gains()
+    if kp is None:
+        return gains
+    base = float(fc.control("torque.osc.gain_exp_base"))
+    default = float(fc.control("torque.osc.default_kp"))
+    a = math.log(float(kp) / default, base)
+    if not -1.0 <= a <= 1.0:
+        raise ValueError(
+            f"osc kp {kp} is outside the gain channel's reach "
+            f"[{default / base:g}, {default * base:g}]"
+        )
+    return {**gains, "kp": a}
+
+
+def damping_lag(gains: dict) -> np.ndarray:
+    """kd/kp per axis (6,): seconds the OSC trails a goal moving at constant velocity."""
+    kp, kd = resolve_gains(
+        gains["kp"], gains["kd"],
+        fc.control("tuning.kp_ori_scale"), fc.control("tuning.kd_ori_scale"),
+        kp_pos_scale=fc.control("tuning.kp_pos_scale"),
+        kd_pos_scale=fc.control("tuning.kd_pos_scale"),
+    )
+    return kd / kp
+
+
+def ee_pos_action(pos, quat_xyzw, gripper: float, gains: dict | None = None) -> dict:
     """Absolute OSC goal pose. `{arm}_gripper` is absolute in [0, 1]."""
     q = np.asarray(quat_xyzw, dtype=np.float64)
     q = q / max(float(np.linalg.norm(q)), 1e-12)
     vals = (*np.asarray(pos, dtype=np.float64), *q, float(gripper))
-    return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **_gains()}
+    return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **(gains or _gains())}
 
 
-def ee_delta_action(dpos, drotvec, gripper: float) -> dict:
+def ee_delta_action(dpos, drotvec, gripper: float, gains: dict | None = None) -> dict:
     """Per-step delta. Metres and a delta QUATERNION, which is what send_action
     reads -- a normalised value passed through unconverted reads as metres, gets
     clipped to torque.delta.pos_max_m, and looks like a tracking problem."""
     dq = Rotation.from_rotvec(np.asarray(drotvec, dtype=np.float64)).as_quat()
     vals = (*np.asarray(dpos, dtype=np.float64), *dq, float(gripper))
-    return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **_gains()}
+    return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **(gains or _gains())}
 
 
 # ---------------------------------------------------------------------------
 # Ported upstream helpers (numpy/scipy only)
 # ---------------------------------------------------------------------------
-
-def slowdown_mode(prev_acts, cur_act, future_acts, window: int) -> bool:
-    """Port of SAIL/utils/dev_utils.py:get_slowdown_mode_from_model.
-
-    The precision label is the LAST action column. A window of `window` centred
-    on the current step; any label over 0.5 means execute this step slowly.
-    """
-    cur_act = np.asarray(cur_act)
-    if window == 1:
-        return bool(cur_act[-1] > 0.5)
-    future_acts = np.asarray(future_acts)
-    segment = window // 2
-    left_n = min(len(prev_acts), segment)
-    right_n = min(future_acts.shape[0], segment)
-    left = np.asarray(prev_acts[-left_n:]) if left_n else np.empty((0,))
-    left = left[..., -1] if left.shape[0] > 0 else np.zeros(1)
-    return bool(np.any(np.concatenate(
-        [left, cur_act[np.newaxis, -1], future_acts[:right_n, -1]]
-    ) > 0.5))
-
-
-def tracking_error_low(meas_pos, meas_quat_xyzw, desired_pos, desired_rotvec,
-                       pos_teb: float, ori_teb: float) -> bool:
-    """Port of run_trained_agent_receding_horizon.py:check_if_tracking_error_low.
-
-    Upstream reads `controller.ee_pos` / `.ee_ori_mat` off robosuite's OSC
-    object; the measured O_T_EE stands in for both. The error definitions are
-    upstream's: inf-norm on position, arccos((trace-1)/2) on orientation.
-    """
-    pos_err = float(np.linalg.norm(
-        np.asarray(meas_pos, dtype=np.float64) - np.asarray(desired_pos, dtype=np.float64),
-        ord=np.inf,
-    ))
-    real_R = Rotation.from_quat(np.asarray(meas_quat_xyzw, dtype=np.float64)).as_matrix()
-    desired_R = Rotation.from_rotvec(np.asarray(desired_rotvec, dtype=np.float64)).as_matrix()
-    trace = float(np.clip(np.trace(desired_R.T @ real_R), -1.0, 3.0))
-    ori_err = float(np.arccos((trace - 1.0) / 2.0))
-    return pos_err < pos_teb and ori_err < ori_teb
-
-
-def rot6d_to_quat_xyzw(rot6d) -> np.ndarray:
-    """Port of policy_local_utils.py's rotation_6d_to_matrix + rot6d_to_quat_xyzw.
-
-    Gram-Schmidt on the two 3-vectors, then a sign convention on w so successive
-    samples of a spline do not flip hemisphere between ticks.
-    """
-    r = np.asarray(rot6d, dtype=np.float64).reshape(6)
-    b1 = r[:3] / max(float(np.linalg.norm(r[:3])), 1e-12)
-    b2 = r[3:] - float(np.dot(b1, r[3:])) * b1
-    b2 = b2 / max(float(np.linalg.norm(b2)), 1e-12)
-    mat = np.stack((b1, b2, np.cross(b1, b2)), axis=-2)
-    quat = Rotation.from_matrix(mat).as_quat()
-    if quat[3] < 0.0:
-        np.negative(quat, out=quat)
-    return quat
-
 
 # ---------------------------------------------------------------------------
 # Dispatch
@@ -346,7 +329,9 @@ class Dispatcher:
     def __init__(self, controller, dry_run: bool = False) -> None:
         self.controller = controller
         self.dry_run = dry_run
+        self.wrench = WrenchTrace(ARM_KEY)
         self.steps = 0
+        self.chunks: list[tuple[int, np.ndarray]] = []
         self.last_action: dict | None = None
         self._deadline = time.perf_counter()
         self._prev_send = 0.0
@@ -372,10 +357,15 @@ class Dispatcher:
         self._gaps.clear()
         self._all_gaps.clear()
 
+    def chunk(self, poses) -> None:
+        """Log a new plan, (N, 7) base-frame [xyz, quat_xyzw], at the step it arrived."""
+        self.chunks.append((self.steps, np.asarray(poses, dtype=np.float32)))
+
     def send(self, action: dict, hz: float) -> None:
         t_send = time.perf_counter()
         if not self.dry_run:
             self.controller.send_action(action)
+            self.wrench.sample(self.controller)
         self.last_action = action
         self.steps += 1
         self._window_steps += 1
@@ -683,30 +673,15 @@ class Episode:
 
     max_lead_m: float = 0.0
     max_lead_rad: float = 0.0
+    # |F| at the EE over the goals dispatched (force_log.force_stats), from
+    # libfranka's estimated external wrench.
+    ee_force_n: dict | None = None
     homed: bool | None = None
     aborted: str | None = None
     notes: dict = field(default_factory=dict)   # per-method extras
 
     def as_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items()}
-
-
-def propagate_pose(pos, quat_xyzw, deltas) -> tuple[np.ndarray, np.ndarray]:
-    """Compose (dpos, drotvec) rows onto a pose, in EE_DELTA's own convention.
-
-    `goal = measured + dpos` and `goal_rot = drot * measured_rot`, matching
-    OSCGoalBuilder.from_delta -- so propagating an anchor through the deltas that
-    were actually commanded gives the pose the arm WOULD be at under perfect
-    tracking. That is what makes a cumulative tracking error well defined on the
-    delta path, where each individual delta is relative to its own step's
-    measured pose and so carries no tracking information at all.
-    """
-    p = np.asarray(pos, dtype=np.float64).copy()
-    r = Rotation.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
-    for row in np.asarray(deltas, dtype=np.float64):
-        p = p + row[:3]
-        r = Rotation.from_rotvec(row[3:6]) * r
-    return p, r.as_quat()
 
 
 # ---------------------------------------------------------------------------
@@ -830,6 +805,11 @@ def sail_parameters(args, meta: dict, control_mode) -> dict:
         "eag_horizon": meta.get("fac_horizon"),
         "inf_delay": int(fc.policy("baselines.sail.inf_delay")),
         "execute_n_actions": int(fc.policy("baselines.sail.execute_n_actions")),
+        "osc_kp": (float(fc.policy("baselines.sail.osc_kp"))
+                   if fc.policy("baselines.sail.osc_kp") is not None
+                   else float(fc.control("torque.osc.default_kp"))),
+        "osc_kp_source": ("baselines.sail.osc_kp" if fc.policy("baselines.sail.osc_kp") is not None
+                          else "torque.osc.default_kp"),
         "slowdown_window_size": int(fc.policy("baselines.sail.slowdown_window_size")),
         "pos_teb": float(fc.policy("baselines.sail.pos_teb")),
         "ori_teb": float(fc.policy("baselines.sail.ori_teb")),
@@ -925,6 +905,9 @@ def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
     kw = home_kwargs(args)
     dataset = None
     encoder = None
+    forces = ForceLog(run_dir.force_profiles_path)
+    chunks = ChunkLog(run_dir.path / CHUNKS_FILE)
+    record.set("outputs", force_profiles=str(run_dir.force_profiles_path))
     try:
         if not args.no_record:
             from lerobot.datasets.video_utils import VideoEncodingManager
@@ -970,17 +953,21 @@ def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
                 if ep.wall_time_s > 0:
                     ep.achieved_fps = round(ep.steps / ep.wall_time_s, 2)
                 ep.send_gap_ms_mean, ep.send_gap_ms_max = dispatcher.gap_stats()
+                ep.ee_force_n = forces.add_trace(idx, dispatcher.wrench)
+                chunks.add(idx, dispatcher.chunks)
                 if dataset is not None:
                     ep.frames_recorded = frames_in_progress(dataset)
                     ep.dataset_episode_index = dataset.num_episodes
                 record.add_episode(ep)
 
             print(f"\r\nepisode {idx}: {ep.verdict.upper()} "
-                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps\r", flush=True)
+                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps{force_note(ep.ee_force_n)}\r", flush=True)
             if dataset is not None:
                 dataset.save_episode()
-            if idx < args.num_episodes - 1:
-                homed = home(controller, kw)
+            # After the last episode too, so a completed run leaves the arm at home.
+            # Not on Ctrl-C: that raises out of the loop, and an operator who stopped
+            # the run does not want the arm to move again on its own.
+            homed = home(controller, kw)
     finally:
         if dataset is not None:
             if encoder is not None:

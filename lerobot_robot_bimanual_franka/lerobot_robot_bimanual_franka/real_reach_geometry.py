@@ -218,9 +218,10 @@ def sim_ee_to_robot_ee(pos: np.ndarray, quat_xyzw: np.ndarray,
 def sample_episode(arm: str, start_base: np.ndarray, rng: np.random.Generator) -> dict:
 	"""One episode's task: goal + dense waypoint curve, in BASE frame.
 
-	`start_base` is the arm's current EE position in base frame. Mirrors the
-	single-segment branch of Reach._sample_episode_curves, including its
-	velocity profile, so a real episode is drawn the same way a sim one is.
+	`start_base` is the arm's current EE position in base frame. Mirrors
+	Reach._sample_episode_curves, both branches and the velocity profile, so a
+	real episode is drawn the way a sim one is -- with one addition: the whole
+	curve is checked against this rig's workspace and redrawn if it leaves it.
 
 	The samplers default `base_pos` to the SIM's world-frame Franka mount, which
 	is where their reachability check measures from -- in base frame that origin
@@ -230,11 +231,12 @@ def sample_episode(arm: str, start_base: np.ndarray, rng: np.random.Generator) -
 	cfg = fc.section("reach")
 	curve, orient, ws = cfg["curve"], cfg["orientation"], cfg["workspace"]
 	n_segments = int(curve["n_segments"])
-	if n_segments != 1:
-		raise NotImplementedError(
-			"only n_segments=1 is ported. The multi-segment branch lives in "
-			"Reach._sample_episode_curves; extract it into reach_sampling.py "
-			"rather than restating it here, or real and sim will drift."
+	node_v = [S._resolve_velocity(v) for v in curve["node_velocities"]]
+	peak_v = S._resolve_velocity(curve["segment_peak_velocity"])
+	if len(node_v) != n_segments + 1:
+		raise ValueError(
+			f"reach.curve.node_velocities has {len(node_v)} entries; n_segments="
+			f"{n_segments} needs one per node, {n_segments + 1}"
 		)
 
 	bounds = workspace_bounds_base(arm)
@@ -266,6 +268,7 @@ def sample_episode(arm: str, start_base: np.ndarray, rng: np.random.Generator) -
 			)
 	n_waypoints = int(curve["n_waypoints"])
 	attempts = int(curve["max_sample_attempts"])
+	control_offset = float(curve["control_offset"])
 
 	# Bounding the endpoints does NOT bound the curve: sample_dense_curve offsets
 	# its Bezier control point by control_offset, so waypoints bulge outside the
@@ -275,18 +278,33 @@ def sample_episode(arm: str, start_base: np.ndarray, rng: np.random.Generator) -
 	# checked, and a bulging one is redrawn rather than clipped -- clipping would
 	# kink the curve the base policy is tracking.
 	for _ in range(attempts):
-		goal = S.sample_goal(
-			start, bounds,
-			min_dist=float(curve["min_goal_dist_m"]),
-			max_attempts=attempts,
-			reachable_radius=radius, base_pos=origin, rng=rng,
-		)
-		waypoints = S.sample_dense_curve(
-			start, goal,
-			n_points=n_waypoints,
-			control_offset=float(curve["control_offset"]),
-			rng=rng,
-		)
+		if n_segments > 1:
+			# Dense count scales with the segment count so the per-segment
+			# spacing the cursor was tuned for stays put.
+			waypoints, goal, velocities = S.sample_multi_segment_curve(
+				start, bounds,
+				n_segments=n_segments,
+				n_points_total=min(n_waypoints * n_segments, S.MAX_WAYPOINTS),
+				control_offset=control_offset,
+				reachable_radius=radius, base_pos=origin, max_attempts=attempts,
+				node_velocities=node_v, segment_peak_velocity=peak_v, rng=rng,
+			)
+		else:
+			goal = S.sample_goal(
+				start, bounds,
+				min_dist=float(curve["min_goal_dist_m"]),
+				max_attempts=attempts,
+				reachable_radius=radius, base_pos=origin, rng=rng,
+			)
+			waypoints = S.sample_dense_curve(
+				start, goal, n_points=n_waypoints, control_offset=control_offset, rng=rng,
+			)
+			velocities = np.asarray(
+				S._build_dense_velocities(node_v, n_waypoints, peak=peak_v), dtype=np.float32
+			)[:n_waypoints]
+			if velocities.shape[0] < n_waypoints:
+				velocities = np.concatenate([velocities, np.full(
+					n_waypoints - velocities.shape[0], node_v[-1], dtype=np.float32)])
 		if curve_is_safe(waypoints, bounds, radius, arm=arm, keep_out=keep_out):
 			break
 	else:
@@ -295,17 +313,6 @@ def sample_episode(arm: str, start_base: np.ndarray, rng: np.random.Generator) -
 			f"{attempts} attempts. The start is probably too near a bound -- the "
 			f"Bezier needs ~control_offset of room on every side."
 		)
-
-	# Per-node [1.0, 0.0]: full speed at the start, decelerating into the goal.
-	velocities = np.asarray(
-		S._build_dense_velocities([1.0, 0.0], n_waypoints, peak=1.0), dtype=np.float32
-	)
-	if velocities.shape[0] < n_waypoints:
-		velocities = np.concatenate(
-			[velocities, np.full(n_waypoints - velocities.shape[0], 0.0, dtype=np.float32)]
-		)
-	elif velocities.shape[0] > n_waypoints:
-		velocities = velocities[:n_waypoints]
 
 	quats = None
 	if float(orient["delta_max_deg"]) > 0.0:

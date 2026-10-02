@@ -1917,6 +1917,44 @@ def test_action_noise_does_not_defeat_the_orientation_hold():
         "steps with use_noise set; the hold is being re-anchored every step")
 
 
+def test_ee_pos_noise_jitters_the_goal_at_the_configured_scales():
+    """use_noise reaches EE_POS too: the COMPOSED goal is perturbed at the
+    control.yaml scales while the action -- what a recording stores -- is left as
+    the leader emitted it. Off, an absolute pose passes through exactly."""
+    rng = np.random.default_rng(21)
+    case = make_case(rng)
+    target_p = case["ee_pos"] + rng.uniform(-0.05, 0.05, 3)
+    target_r = Rotation.from_rotvec(rng.uniform(-0.3, 0.3, 3)) * Rotation.from_matrix(case["R"])
+    tq = target_r.as_quat()
+    action = {"r_x": target_p[0], "r_y": target_p[1], "r_z": target_p[2],
+              "r_qx": tq[0], "r_qy": tq[1], "r_qz": tq[2], "r_qw": tq[3],
+              "r_gripper": 0.0, "kp": 0.0, "kd": 0.0}
+
+    clean = make_robot(case, mode=ControlMode.EE_POS)
+    clean.send_action(dict(action))
+    gp, gq = clean.robot_manager.osc_goals[-1]["r"][:2]
+    assert np.allclose(gp, target_p) and 1.0 - abs(float(gq @ tq)) < 1e-12
+
+    pos_sigma, rot_sigma = 2e-3, 5e-3
+    noisy = make_robot(case, mode=ControlMode.EE_POS, use_noise=True,
+                       noise_pos_scale=pos_sigma, noise_rot_scale=rot_sigma)
+    np.random.seed(21)
+    n = 2000
+    dpos, drot = np.empty((n, 3)), np.empty((n, 3))
+    for i in range(n):
+        returned = noisy.send_action(dict(action))
+        assert all(returned[k] == action[k] for k in action), "send_action altered the action"
+        gp, gq = noisy.robot_manager.osc_goals[-1]["r"][:2]
+        dpos[i] = gp - target_p
+        drot[i] = (Rotation.from_quat(gq) * target_r.inv()).as_rotvec()
+    assert np.allclose(dpos.std(axis=0), pos_sigma, rtol=0.1), dpos.std(axis=0)
+    assert np.allclose(drot.std(axis=0), rot_sigma, rtol=0.1), drot.std(axis=0)
+    assert np.abs(dpos.mean(axis=0)).max() < 4 * pos_sigma / np.sqrt(n)
+    assert np.abs(drot.mean(axis=0)).max() < 4 * rot_sigma / np.sqrt(n)
+    return (f"pos std {dpos.std(axis=0).mean():.2e} (set {pos_sigma:.0e}), "
+            f"rot std {drot.std(axis=0).mean():.2e} (set {rot_sigma:.0e})")
+
+
 def test_publish_rate_bounds_the_ee_delta_anchor():
     """EE_DELTA rebuilds goal = ee_pos + delta from the last PUBLISHED state, so
     the publish period is the floor on anchor staleness -- no re-read can beat it.

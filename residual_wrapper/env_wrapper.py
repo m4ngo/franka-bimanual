@@ -8,12 +8,20 @@ import franka_config as fc
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig
+from lerobot_robot_bimanual_franka import (
+    SingleArmFranka, SingleArmFrankaConfig, SingleArmRight, SingleArmRightConfig,
+)
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 
 _PROFILE = "single_arm_franka"
 _ARM_KEY = fc.profile(_PROFILE).depth_center_arm
+
+# Rig profile -> robot class. Which physical arm each drives is in config/rig.yaml.
+_RIGS = {
+    "single_arm_franka": (SingleArmFranka, SingleArmFrankaConfig),
+    "single_arm_right": (SingleArmRight, SingleArmRightConfig),
+}
 
 _RES_POS_GAIN = fc.policy("residual.res_pos_gain")
 _RES_ROT_GAIN = fc.policy("residual.res_rot_gain")
@@ -228,18 +236,115 @@ def build_action(chunk_step: np.ndarray, kp: float, kd: float) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Chunk-start-relative targets: the reach executor's stages, for an EE_POS base
+# ---------------------------------------------------------------------------
+# A LeRobot base trained on an EE_POS recording emits ABSOLUTE base-frame poses.
+# run_residual.py runs them the way reach_residual.py runs the analytic reach
+# base (multi-fast's ActionChunkWrapper in goal_mode="target"): the chunk is
+# expressed relative to the pose the base planned from, the residual is summed
+# in that normalised space, the sum is turned back into absolute targets, and
+# each target is executed as the one-step delta from the pose measured at that
+# step. Position and rotation are both target-typed here (a pose recording
+# carries both), unlike reach's position-only curve.
+
+def chunk_to_relative(chunk: np.ndarray, anchor_pos: np.ndarray,
+                      anchor_quat_xyzw: np.ndarray) -> np.ndarray:
+    """(T, 10) absolute targets [x,y,z,qx,qy,qz,qw,grip,kp,kd] -> (T, 9)
+    chunk-start-relative normalised [pos/_POS_SCALE, rotvec/_ROT_SCALE, grip, kp, kd].
+
+    The residual's action_chunk, and the space base and residual are summed in;
+    reach_residual.chunk_poses inverted. `anchor` is the measured pose at the
+    observation the base inferred on.
+    """
+    anchor_rot = Rotation.from_quat(np.asarray(anchor_quat_xyzw, dtype=np.float64))
+    chunk = np.asarray(chunk, dtype=np.float64)
+    out = np.empty((len(chunk), 9), dtype=np.float32)
+    out[:, 0:3] = (chunk[:, 0:3] - np.asarray(anchor_pos, dtype=np.float64)) / _POS_SCALE
+    out[:, 3:6] = (Rotation.from_quat(chunk[:, 3:7]) * anchor_rot.inv()).as_rotvec() / _ROT_SCALE
+    out[:, 6:9] = chunk[:, 7:10]
+    return out
+
+
+def relative_to_poses(rel: np.ndarray, anchor_pos: np.ndarray,
+                      anchor_quat_xyzw: np.ndarray) -> np.ndarray:
+    """(T, 9) chunk-start-relative normalised -> (T+1, 7) [xyz, xyzw] absolute
+    base-frame poses, the anchor first (reach_residual.chunk_poses)."""
+    anchor_pos = np.asarray(anchor_pos, dtype=np.float64)
+    anchor_rot = Rotation.from_quat(np.asarray(anchor_quat_xyzw, dtype=np.float64))
+    rel = np.asarray(rel, dtype=np.float64)
+    pos = anchor_pos + rel[:, 0:3] * _POS_SCALE
+    rot = Rotation.from_rotvec(rel[:, 3:6] * _ROT_SCALE) * anchor_rot
+    return np.vstack([np.concatenate([anchor_pos, anchor_rot.as_quat()]),
+                      np.hstack([pos, rot.as_quat()])])
+
+
+def compose_chunk(base_rel: np.ndarray, res_chunk: np.ndarray, bound: float) -> np.ndarray:
+    """final = clip(base + residual, -bound, bound) per normalised channel: the
+    FAST composition (ResidualSACPolicy.get_final_action), whose bound for
+    chunk-start-relative targets is the chunk length -- a target K steps out
+    sits up to K units from the anchor, so 1.0 would clip the base itself.
+
+    `res_chunk` rows are the residual's [damping, stiffness, dpos(3), drot(3),
+    dgrip] (multi-fast's gains-first layout) and cover the first len(res_chunk)
+    steps; the rest of the chunk is the base alone. res_pos_gain / res_rot_gain
+    scale the correction before the sum and are no-ops at 1.0. The gripper slot
+    is an absolute normalised position; send_action clips it to [0, 1].
+    """
+    final = np.array(base_rel, dtype=np.float32, copy=True)
+    k = min(len(res_chunk), len(base_rel))
+    if k == 0:
+        return final
+    res = np.asarray(res_chunk[:k], dtype=np.float32)
+    final[:k, 0:3] = np.clip(base_rel[:k, 0:3] + res[:, 2:5] * _RES_POS_GAIN, -bound, bound)
+    final[:k, 3:6] = np.clip(base_rel[:k, 3:6] + res[:, 5:8] * _RES_ROT_GAIN, -bound, bound)
+    final[:k, 6] = np.clip(base_rel[:k, 6] + res[:, 8], -bound, bound)
+    final[:k, 7] = np.clip(base_rel[:k, 7] + res[:, 1], -bound, bound)   # kp
+    final[:k, 8] = np.clip(base_rel[:k, 8] + res[:, 0], -bound, bound)   # kd
+    return final
+
+
+def target_to_delta(target_pose: np.ndarray, ee_pos: np.ndarray,
+                    ee_quat_xyzw: np.ndarray) -> np.ndarray:
+    """An absolute target pose -> the normalised [dpos/_POS_SCALE, drotvec/_ROT_SCALE]
+    that lands on it from the pose measured now, clipped to one step
+    (reach_residual.target_to_delta, ActionChunkWrapper's second stage). The
+    clip is the delta envelope's own saturation, not a new limit layer: a target
+    further than one step away is approached at full step."""
+    goal_rot = Rotation.from_quat(np.asarray(target_pose[3:7], dtype=np.float64))
+    ee_rot = Rotation.from_quat(np.asarray(ee_quat_xyzw, dtype=np.float64))
+    return np.concatenate([
+        np.clip((np.asarray(target_pose[:3], dtype=np.float64) - ee_pos) / _POS_SCALE, -1.0, 1.0),
+        np.clip((goal_rot * ee_rot.inv()).as_rotvec() / _ROT_SCALE, -1.0, 1.0),
+    ])
+
+
+def delta_action(delta_norm: np.ndarray, gripper: float, kp: float, kd: float) -> dict:
+    """Normalised [dpos(3), drot(3)] -> the EE_DELTA RobotAction send_action
+    takes: metres and a delta quaternion (RealReach._action_to_delta)."""
+    dpos = np.asarray(delta_norm[:3], dtype=np.float64) * _POS_SCALE
+    dquat = Rotation.from_rotvec(np.asarray(delta_norm[3:6], dtype=np.float64) * _ROT_SCALE).as_quat()
+    action = {k: float(v) for k, v in zip(_EE_ACTION_KEYS, (*dpos, *dquat, gripper))}
+    action["kp"] = float(kp)
+    action["kd"] = float(kd)
+    return action
+
+
+# ---------------------------------------------------------------------------
 # Robot connection
 # ---------------------------------------------------------------------------
 
-def start_controller(with_cameras: bool = True) -> SingleArmFranka:
+def start_controller(with_cameras: bool = True, rig: str = _PROFILE) -> SingleArmFranka:
     """with_cameras=False skips the camera rig entirely (no GigE connects, no
     per-tick reads) for kinematics-only consumers like sysid collection.
 
-    All hardware addressing comes from the `single_arm_franka` rig profile.
+    All hardware addressing comes from the `rig` profile in config/rig.yaml.
     """
-    config = SingleArmFrankaConfig(
+    if fc.profile(rig).depth_center_arm != _ARM_KEY:
+        raise ValueError(f"rig {rig!r} does not expose the {_ARM_KEY!r} key prefix")
+    robot_cls, config_cls = _RIGS[rig]
+    config = config_cls(
         **({} if with_cameras else {"cameras": {}, "depth_cam": {}, "depth": False}),
     )
-    robot = SingleArmFranka(config)
+    robot = robot_cls(config)
     robot.connect()
     return robot

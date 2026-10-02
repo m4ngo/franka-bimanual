@@ -83,7 +83,7 @@ That last point is load-bearing: pure translation commands must keep the current
 
 This mode interprets the action as an absolute pose. `BimanualFranka._osc_goal_absolute()` converts the pose directly into an OSC goal, optionally ignoring the action and parking on the current pose when `ignore_action=True`.
 
-The same cached residual delta offsets from `cache_delta()` are applied here too.
+The same cached residual delta offsets from `cache_delta()` are applied here too, and `OSCGoalBuilder.perturb()` then adds the configured action noise (`control.yaml` `noise:`) when `use_noise` is set -- the same draw the delta path adds to its delta, applied here to the composed goal. The action the recording stores is the leader's; only the goal the arm pursues carries the noise.
 
 #### `JOINT_POS`
 

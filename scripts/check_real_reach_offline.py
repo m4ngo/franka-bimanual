@@ -14,7 +14,6 @@ hardware is for.
 """
 
 import argparse
-import json
 import sys
 from pathlib import Path
 
@@ -34,7 +33,9 @@ from lerobot_robot_bimanual_franka.real_reach import RealReach  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach_geometry import (  # noqa: E402
 	_home_key, base_to_world, keep_out_sphere, safety_z_floor_world,
 )
+from real_reach_rollout import flush, run_metadata  # noqa: E402
 from utils.base_policy_utils import ReachBaseWrapper  # noqa: E402
+from utils.sysid import episode_hdf5  # noqa: E402
 
 
 class FakeArm:
@@ -83,6 +84,11 @@ class FakeArm:
 			raise TypeError(f"home() got no q for key {self.k!r}")
 		self._home()
 
+	@property
+	def last_ee_wrench(self):
+		# |F| equals the number of goals sent so far.
+		return {self.k: np.array([0.0, 0.0, float(len(self.sent)), 0.0, 0.0, 0.0])}
+
 	def current_kinematic_state_batch(self, arms):
 		# Registered under the key prefix; echoing back any key would hide a
 		# wrong-key lookup, which is exactly what it did.
@@ -125,7 +131,7 @@ def main() -> int:
 	ap.add_argument("--arm", default="left", choices=("left", "right"),
 					help="physical arm to sample for; the key prefix stays r_ either way")
 	ap.add_argument("--out", default=None,
-						help="write a results.json here, in the hardware schema, so the "
+						help="write an episodes.hdf5 here, in the hardware layout, so the "
 							 "sim replay can be exercised with no arm")
 	args = ap.parse_args()
 
@@ -207,6 +213,13 @@ def main() -> int:
 	print(f"deltas over envelope : {clipped}  (must be 0)")
 	print(f"min goal clearance   : {min(floor_clear):+.4f} m above safety floor "
 	      f"({sum(c < 0 for c in floor_clear)} would trip the screen)")
+	# Every step carries the wrench read with its pose, and the layout validator
+	# accepts the episode with it.
+	force_ok = all("ee_force" in a and a["ee_force"].shape == (at["num_samples"], 3)
+				   and np.all(np.diff(a["ee_force"][:, 2]) == 1)
+				   and not episode_hdf5.validate_episode(n, a, at, c)
+				   for n, a, at, c in results)
+	print(f"EE force recorded    : {'every step, validator clean' if force_ok else 'MISSING or invalid'}")
 	keep_ok = True
 	if keep_out is not None:
 		n_keep_bad = sum(c < 0 for c in keep_clear)
@@ -216,11 +229,12 @@ def main() -> int:
 
 	if args.out:
 		out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
-		(out / "results.json").write_text(json.dumps(results, indent=1))
-		print(f"\nwrote {len(results)} episodes -> {out / 'results.json'}")
+		meta = {**run_metadata(args.arm, args.seed), "fake_arm": True}
+		path = flush(out, results, meta, "scripts/check_real_reach_offline.py")
+		print(f"\nwrote {len(results)} episodes -> {path}")
 
 	ok = (clipped == 0 and n_success == args.episodes and min(floor_clear) >= 0
-	      and keep_ok)
+	      and keep_ok and force_ok)
 	print("\nPASS" if ok else "\nFAIL")
 	return 0 if ok else 1
 

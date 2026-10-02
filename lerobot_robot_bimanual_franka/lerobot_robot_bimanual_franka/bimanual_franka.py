@@ -438,7 +438,10 @@ class BimanualFranka(Robot):
         else:
             target = self._action_vec(action, arm, EE_AXIS_KEYS)
             goal = self._goals.absolute(target[:3], target[3:])
-        return self._goals.offset(goal, self.delta_pos, self.delta_rot)
+        goal = self._goals.offset(goal, self.delta_pos, self.delta_rot)
+        # Last, so it lands on the goal the arm is told to hold -- the residual
+        # included -- as from_delta's noise does on the delta path.
+        return self._goals.perturb(goal)
 
     @staticmethod
     def _action_vec(action: RobotAction, arm: str, keys: tuple[str, ...]) -> np.ndarray:
@@ -584,6 +587,14 @@ class BimanualFranka(Robot):
     @property
     def kin(self) -> dict[str, KinematicSnapshot] | None:
         return self._cached_kin_state
+
+    @property
+    def last_ee_wrench(self) -> dict[str, np.ndarray | None]:
+        """Per arm, libfranka's estimated external wrench at the EE from the latest
+        state read (get_observation's, or send_action's re-read): force (N) then
+        torque (Nm), base frame. None for an arm whose NUC server predates it.
+        Read-only diagnostics, like _last_osc_goal."""
+        return {arm: self.robot_manager.ee_wrench(arm) for arm in self.active_arms}
 
     @property
     def base_in_world(self):

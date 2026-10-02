@@ -57,7 +57,7 @@ profiles:
     arms:
       r: right
     teleop_device: right
-    cameras: [cam_3, cam_4, cam_2]
+    cameras: [cam_3, cam_2]
     depth_cameras: [cam_2]
     depth: true
     depth_center_arm: r

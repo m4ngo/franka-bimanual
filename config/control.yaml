@@ -77,6 +77,12 @@ franka:
   max_joint_accel_rad_s2: [15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0]
   joint_velocity_safety_factor: 0.9
   joint_accel_safety_factor: 0.75
+  # FR3 joint ranges (franka_description robots/fr3/joint_limits.yaml). These are
+  # the FR3's, not the Panda's -- joint 6 differs by half a radian. Read only by
+  # scripts/plot_dataset_coverage.py to show how much of the range a dataset
+  # covers; nothing in the control path bounds q against them.
+  joint_position_min_rad: [-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159]
+  joint_position_max_rad: [2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159]
 
 # deploy_nuc_server.sh resolves this block into nuc_control_config.py on the NUC.
 # Change a number and REDEPLOY -- the workstation copy is not what runs the loop.
@@ -236,8 +242,7 @@ torque:
   # Do not re-measure the wrist below torque.loop.publish_decimation: 2 -- at 100 Hz
   # the launch transient is shorter than a few samples and j7's two rotation
   # directions disagreed 43%, against 5% at 500 Hz.
-  rotor_inertia_kg_m2: [0.0, 0.0, 0.0, 0.0, 0.0774, 0.1078, 0.0863]
-
+  rotor_inertia_kg_m2: [0.775, 0.760, 0.704, 0.757, 0.0774, 0.1078, 0.0863]
   limits:
     # The ONLY bound on what reaches the joints: rate limit, then clamp, in the
     # response path. Nothing else rescales tau.
@@ -414,6 +419,9 @@ gripper:
     close_join_timeout_s: 1.0
 
 noise:
-  # Action noise injected by the follower when use_noise is set.
-  pos_scale_m: 0.00
-  rot_scale_rad: 0.0
+  # Gaussian action noise the follower adds when use_noise is set, std dev per
+  # axis per step. EE_DELTA adds it to the delta before clip_delta; EE_POS adds
+  # it to the composed goal, after the residual and before the worktable screen.
+  # The recorded action is the leader's; only the goal the arm pursues carries it.
+  pos_scale_m: 0.01
+  rot_scale_rad: 0.03

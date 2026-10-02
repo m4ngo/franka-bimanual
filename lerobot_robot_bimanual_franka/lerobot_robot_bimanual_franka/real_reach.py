@@ -61,7 +61,7 @@ class _RobotView:
 	"""
 
 	def __init__(self):
-		self.controller = _ControllerView(np.full(6, 150.0), np.full(6, 24.494897))
+		self.controller = _ControllerView(*resolve_gains(0.0, 0.0))
 		self.recent_ee_vel = _RecentEEVelView()
 
 
@@ -101,6 +101,7 @@ class RealReach:
 		self._curve_len = 0
 		self.timestep = 0
 		self._last_q = None
+		self._last_dq = None
 		self._last_pos = None
 		# The post-home measured q. A sim replay starts from this, and it is NOT
 		# qpos[0] of the recorded trace -- that one is already a step old.
@@ -132,10 +133,11 @@ class RealReach:
 		# The driver registry is keyed by the exposed key prefix, not the physical
 		# arm name -- self.arm is for config lookups only.
 		snap = self.robot.robot_manager.current_kinematic_state_batch([self.k])[self.k]
-		q, _, _, pos, quat_xyzw, twist = snap
+		q, dq, _, pos, quat_xyzw, twist = snap
 		# Kept for `step`'s info: q is not in the obs (the sim's obs has no joint
 		# key) and pos is the anchor the next commanded goal is built on.
 		self._last_q = np.asarray(q, dtype=np.float64)
+		self._last_dq = np.asarray(dq, dtype=np.float64)
 		self._last_pos = np.asarray(pos, dtype=np.float64)
 		return (self._last_pos.copy(),
 				np.asarray(quat_xyzw, dtype=np.float64),
@@ -143,7 +145,11 @@ class RealReach:
 
 	# ------------------------------------------------------------------ gym
 
-	def reset(self) -> dict:
+	def reset(self, seed=None) -> dict:
+		"""`seed` reseeds the curve sampler first, so two resets with the same
+		seed from the same homed pose draw the same episode."""
+		if seed is not None:
+			self.rng = np.random.default_rng(seed)
 		# home() takes one q per key prefix; the q itself is the PHYSICAL arm's.
 		q = {"l": None, "r": None}
 		q[self.k] = fc.home_q(key=_home_key(self.arm))
@@ -170,11 +176,15 @@ class RealReach:
 		self._curve_len = len(self._waypoints)
 		self._next_waypoint_idx = 0
 		self.timestep = 0
+		self.robots[0].controller = _ControllerView(*resolve_gains(0.0, 0.0))
 		self.robots[0].recent_ee_vel.current = np.zeros(6, dtype=np.float32)
 		return self._observation(pos, quat)
 
-	def step(self, action) -> tuple[dict, float, bool, dict]:
+	def step(self, action, gain_action=(0.0, 0.0)) -> tuple[dict, float, bool, dict]:
+		"""`action` is the normalised OSC 7-vector; `gain_action` the normalised
+		[a_kp, a_kd] send_action remaps the same way the sim does (0 = defaults)."""
 		dpos, dquat = self._action_to_delta(np.asarray(action, dtype=np.float64))
+		a_kp, a_kd = (float(g) for g in gain_action)
 
 		cmd = {f"{self.k}_{ax}": float(v) for ax, v in zip("xyz", dpos)}
 		cmd.update({f"{self.k}_{ax}": float(v)
@@ -183,9 +193,9 @@ class RealReach:
 		# but send_action reads {arm}_gripper as an ABSOLUTE normalised position
 		# -- passing that 0 through would drive the gripper shut. Hold it open.
 		cmd[f"{self.k}_gripper"] = self.gripper_norm
-		cmd["kp"] = 0.0        # normalised: 0 -> default_kp via the exp remap
-		cmd["kd"] = 0.0
+		cmd["kp"], cmd["kd"] = a_kp, a_kd
 		self.robot.send_action(cmd)
+		self.robots[0].controller = _ControllerView(*resolve_gains(a_kp, a_kd))
 		# Read at the END of the period, not right after the send: read immediately,
 		# the arm has not responded yet and every observation is one step stale --
 		# which put real one step behind sim in the first trajectory diff.
@@ -197,6 +207,8 @@ class RealReach:
 			self._t_sent = max(deadline, now)
 		self.timestep += 1
 		pos, quat, twist = self._ee()
+		# From the same state read as pos; None until the NUC publishes it.
+		wrench = self.robot.last_ee_wrench.get(self.k)
 		self._advance_cursor(pos)
 		self.robots[0].recent_ee_vel.current = twist.astype(np.float32)
 
@@ -214,7 +226,12 @@ class RealReach:
 				# rather than folded into the goal.
 				"osc_anchor_pos": anchor_pos,
 				"action": np.asarray(action, dtype=np.float64).copy(),
-				"qpos": self._last_q.copy()}
+				"gain_action": np.array([a_kp, a_kd], dtype=np.float64),
+				"qpos": self._last_q.copy(), "qvel": self._last_dq.copy(),
+				# libfranka's estimated external wrench at the EE, base frame: the arm's
+				# counterpart of the sim env's info["ee_force"] (eval_fast.py).
+				"ee_force": None if wrench is None else np.array(wrench[:3]),
+				"ee_torque": None if wrench is None else np.array(wrench[3:6])}
 		return self._observation(pos, quat), 0.0, done, info
 
 	# ------------------------------------------------------------ internals

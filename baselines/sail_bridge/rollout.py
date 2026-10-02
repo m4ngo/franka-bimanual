@@ -11,9 +11,12 @@ SAIL's own executor is not released and is robosuite-bound, so this is the loop
 written from its description (baselines/SAIL.md, pass 5). It implements all three
 of its eval-time mechanisms:
 
-  * receding horizon -- execute `inf_delay` steps of the PREVIOUS prediction
-    before switching to `execute_n_actions` of the new one, so inference latency
-    is modelled rather than hidden;
+  * receding horizon -- keep executing the PREVIOUS prediction while the new
+    one is inferred (at least `inf_delay` rows, upstream's fixed latency model;
+    more if inference actually takes longer), then enter the new one at the row
+    matching the rows that went out since its observation. Row 0 of a chunk is
+    the pose the arm was OBSERVED at (the targets are reached poses), so entering
+    earlier than that sends the arm back to where it was seen;
   * precision speed modulation -- the last action column is a precision label;
     any label set inside a window around the current step drops that step from
     fast_fps to slow_fps;
@@ -29,8 +32,10 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -42,6 +47,7 @@ import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
 from baselines import run_record as rr  # noqa: E402
+from baselines.rollout_viz import render_after_run  # noqa: E402
 from baselines.zmq_client import PolicyClient  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 
@@ -86,6 +92,12 @@ def _decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
     return row[:3].astype(np.float64), row[3:6].astype(np.float64), float(row[6])
 
 
+def _timed_request(client: PolicyClient, payload: dict) -> tuple[dict, float]:
+    t0 = time.perf_counter()
+    rep = client.request(payload)
+    return rep, time.perf_counter() - t0
+
+
 def make_episode_fn(client: PolicyClient, meta: dict, args,
                     control_mode: ControlMode, shapes: dict, run_dir):
     precision = meta["precision_column"] and not args.no_precision
@@ -102,6 +114,8 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
     fast_fps = float(args.exec_fps or fc.policy("baselines.exec.fast_fps"))
     slow_fps = float(args.slow_fps or fc.policy("baselines.exec.slow_fps"))
     o_fps = float(args.obs_fps or rc.obs_fps())
+    osc_kp = fc.policy("baselines.sail.osc_kp")
+    gains = rc.gain_action(None if osc_kp is None else float(osc_kp))
 
     if horizon < inf_delay + execute_n:
         raise ValueError(
@@ -112,9 +126,10 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
         )
     logger.info(
         "mode=%s precision=%s eag=%s fast/slow=%.0f/%.0f Hz obs=%.0f Hz "
-        "inf_delay=%d execute_n=%d horizon=%d",
+        "inf_delay=%d execute_n=%d horizon=%d osc_kp=%s",
         control_mode.value, precision, eag, fast_fps, slow_fps, o_fps,
         inf_delay, execute_n, horizon,
+        "default" if osc_kp is None else f"{float(osc_kp):g}",
     )
 
     def episode_fn(controller, dispatcher, dataset, ep, stopper) -> None:
@@ -137,7 +152,39 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
         # the first plan has produced a reference.
         anchor: tuple[np.ndarray, np.ndarray] = (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
         committed: list[np.ndarray] = []
+        # The observation one dispatched step before the one an inference is
+        # made from: the policy's frame stack wants consecutive steps, as
+        # upstream's FrameStackWrapper gives it, not consecutive inferences.
+        obs_prev: dict | None = None
 
+        def dispatch(src: np.ndarray, idx: int, obs: dict, max_hz: float) -> None:
+            """One row of a chunk -> one goal on the arm, plus its bookkeeping."""
+            nonlocal goal
+            row = src[idx]
+            # Append BEFORE the window check, as upstream does: its
+            # traj["executed_actions"].append(a) precedes the
+            # get_slowdown_mode_from_model call, so the current row sits
+            # in the left window too. Appending after shifts the whole
+            # left window one step further back and can flip the verdict.
+            executed.append(row)
+            slow = precision and rc.slowdown_mode(executed, row, src[idx:], window)
+            a = row[:-1] if precision else row
+            dpos_or_pos, rot, grip = _decode(a)
+            if control_mode is ControlMode.EE_POS:
+                quat = Rotation.from_rotvec(rot).as_quat()
+                action = rc.ee_pos_action(dpos_or_pos, quat, grip, gains)
+                goal = (dpos_or_pos, quat)
+            else:
+                action = rc.ee_delta_action(dpos_or_pos, rot, grip, gains)
+            committed.append(np.concatenate([dpos_or_pos, rot]))
+            if slow:
+                ep.slow_steps += 1
+            dispatcher.send(action, min(slow_fps if slow else fast_fps, max_hz))
+            if dataset is not None:
+                rc.add_frame(dataset, obs, action, args.task, controller.cameras)
+
+        max_hz = math.inf
+        pool = ThreadPoolExecutor(max_workers=1)
         try:
             while True:
                 verdict = stopper.check()
@@ -179,57 +226,62 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
                         ep.guided_inferences += 1
 
                 t_infer = time.perf_counter()
-                rep = client.request({"obs": rc.sail_obs(m, shapes), "guide_actions": guide})
+                frames = [rc.sail_obs(m, shapes)]
+                if obs_prev is not None:
+                    frames.insert(0, rc.sail_obs(rc.measure(obs_prev), shapes))
+                future = pool.submit(_timed_request, client,
+                                     {"obs": frames, "guide_actions": guide})
+                anchor = (m.pos.copy(), m.quat_xyzw.copy())
+                committed.clear()
+
+                # The old plan carries on while the new one is computed: at least
+                # inf_delay rows, then for as long as the inference takes, until
+                # the chunk runs out. Each row that goes out is one step the new
+                # chunk's observation ages by.
+                entry = 0
+                if prev_chunk is not None:
+                    while prev_index < len(prev_chunk) and (entry < inf_delay or not future.done()):
+                        dispatch(prev_chunk, prev_index, obs, max_hz)
+                        prev_index += 1
+                        entry += 1
+
+                rep, took = future.result()
+                # The paper's latency bound (Sec. 4.4): rows slow enough that a plan outlasts the next inference.
+                max_hz = (horizon - execute_n) / (2.0 * took)
                 if "error" in rep:
                     raise RuntimeError(f"policy server: {rep['error']}")
                 chunk = np.asarray(rep["chunk"], dtype=np.float64)
                 ep.inferences += 1
-                anchor = (m.pos.copy(), m.quat_xyzw.copy())
-                committed: list[np.ndarray] = []
+                rows = chunk[:, :-1] if precision else chunk
+                if control_mode is ControlMode.EE_POS:
+                    dispatcher.chunk(np.hstack([rows[:, :3],
+                                                Rotation.from_rotvec(rows[:, 3:6]).as_quat()]))
+                else:
+                    dispatcher.chunk([np.concatenate(rc.propagate_pose(*anchor, rows[:k + 1, :6]))
+                                      for k in range(len(rows))])
+                # Round-trip to the policy server, summed; with `inferences` that
+                # is the latency each chunk's observation aged by.
+                ep.notes["inference_s"] = round(ep.notes.get("inference_s", 0.0) + took, 3)
 
-                # Upstream's index bookkeeping: current_action_index advances through
-                # the inf_delay phase too, so the new chunk is entered at inf_delay
-                # rather than 0 -- that is what makes the horizon recede.
-                current_index = 0
-                plan: list[tuple[np.ndarray, int]] = []
-                if prev_chunk is not None:
-                    for i in range(inf_delay):
-                        if prev_index + i >= len(prev_chunk):
-                            break
-                        plan.append((prev_chunk, prev_index + i))
-                        current_index += 1
-                entry = current_index
+                # Entered at `entry`, the row matching the rows dispatched since the
+                # observation it was made from -- never at 0 with a plan in hand,
+                # because row 0 is that observation's own pose.
+                current_index = entry
+                n_new = 0
+                obs_prev = None
                 for j in range(execute_n):
-                    if entry + j >= len(chunk):
+                    if current_index >= len(chunk):
                         break
-                    plan.append((chunk, entry + j))
+                    if j == execute_n - 1 or current_index == len(chunk) - 1:
+                        # The frame before the next observation's, for the stack.
+                        obs_prev = controller.get_observation()
+                    dispatch(chunk, current_index, obs, max_hz)
                     current_index += 1
-
-                for src, idx in plan:
-                    row = src[idx]
-                    # Append BEFORE the window check, as upstream does: its
-                    # traj["executed_actions"].append(a) precedes the
-                    # get_slowdown_mode_from_model call, so the current row sits
-                    # in the left window too. Appending after shifts the whole
-                    # left window one step further back and can flip the verdict.
-                    executed.append(row)
-                    slow = (precision
-                            and rc.slowdown_mode(executed, row, src[idx:], window))
-                    a = row[:-1] if precision else row
-                    dpos_or_pos, rot, grip = _decode(a)
-                    if control_mode is ControlMode.EE_POS:
-                        quat = Rotation.from_rotvec(rot).as_quat()
-                        action = rc.ee_pos_action(dpos_or_pos, quat, grip)
-                        goal = (dpos_or_pos, quat)
-                    else:
-                        action = rc.ee_delta_action(dpos_or_pos, rot, grip)
-                    committed.append(np.concatenate([dpos_or_pos, rot]))
-                    if slow:
-                        ep.slow_steps += 1
-                    dispatcher.send(action, slow_fps if slow else fast_fps)
-
-                    if dataset is not None:
-                        rc.add_frame(dataset, obs, action, args.task, controller.cameras)
+                    n_new += 1
+                if n_new == 0:
+                    logger.warning(
+                        "inference took %d rows of a %d-row chunk; nothing left to execute. "
+                        "Lower --exec-fps or speed the policy up.", entry, len(chunk))
 
                 if video_dir is not None:
                     for cam, img in m.images.items():
@@ -252,6 +304,7 @@ def make_episode_fn(client: PolicyClient, meta: dict, args,
                 if spare > 0:
                     time.sleep(spare)
         finally:
+            pool.shutdown(wait=True)
             for w in writers.values():
                 w.release()
 
@@ -317,6 +370,7 @@ def main() -> int:
         print(f"\r\nrun written to {run_dir.path}\r", flush=True)
         controller.disconnect()
         client.close()
+        render_after_run(run_dir.path)
     return 0
 
 

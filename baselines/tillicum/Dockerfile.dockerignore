@@ -1,0 +1,7 @@
+*
+!scripts/setup_baseline_envs.sh
+!baselines
+**/.git
+**/__pycache__
+**/*.egg-info
+baselines/sail/docs

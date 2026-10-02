@@ -9,12 +9,12 @@ code path against a fake arm.
   python scripts/real_reach_rollout.py --episodes 1 --dry-run   # no motion
 
 Traces land in ~/franka_data/real_reach/<timestamp>/ (never in the repo), as
-results.json plus one animated episode_NNN.html per episode. Everything in
-results.json is WORLD frame; scripts/real_reach_viz.py re-renders it.
+episodes.hdf5 (base frame, see EPISODE_HDF5.md; run metadata in its root attrs)
+plus one animated episode_NNN.html per episode. scripts/plot_episodes.py
+re-renders it.
 """
 
 import argparse
-import json
 import subprocess
 import sys
 from datetime import datetime
@@ -38,6 +38,8 @@ from lerobot_robot_bimanual_franka.real_reach_geometry import (  # noqa: E402
 	workspace_bounds_base,
 )
 from utils.base_policy_utils import ReachBaseWrapper  # noqa: E402
+from utils.sysid import episode_hdf5  # noqa: E402
+from baselines.force_log import force_attrs, force_stats, note as force_note  # noqa: E402
 
 
 def build_base(cfg):
@@ -91,31 +93,45 @@ def run_metadata(arm: str, seed: int) -> dict:
 	}
 
 
-def flush(run_dir: Path, results: list) -> None:
-	"""Rewrite results.json after every episode.
+def flush(run_dir: Path, episodes: list, meta: dict, producer: str) -> Path:
+	"""Rewrite episodes.hdf5 after every episode.
 
 	A hardware run is expensive and a fault mid-run used to lose all of it: the
-	file was written once, after the loop. tmp+rename so a reader never sees a
-	half-written file (same reason sysid.save_sysid_hdf5 does it).
+	file was written once, after the loop. The writer is tmp+rename, so a reader
+	never sees a half-written file. `meta` (what the arm was running) goes into
+	the root attrs, so the run is one file.
 	"""
-	tmp = run_dir / "results.json.tmp"
-	tmp.write_text(json.dumps(results, indent=1))
-	tmp.replace(run_dir / "results.json")
+	return Path(episode_hdf5.write_episodes(
+		run_dir / episode_hdf5.REAL_FILE, episodes,
+		root_attrs={"meta": meta, "arm": meta["arm"]}, producer=producer))
 
 
-def write_viz(run_dir: Path, results: list, stride: int) -> None:
-	"""One animated HTML per episode, next to results.json.
+def warn_off_limits(pos_w: np.ndarray, floor: float, keep_out) -> None:
+	"""Say so when the measured EE is somewhere the sampler promised it never
+	would be -- under the floor means ActionSafetyScreen fired and the executed
+	trace is no longer the commanded curve."""
+	if pos_w[2] < floor:
+		print(f"  !! EE at world z {pos_w[2]:.4f}, under floor {floor:.4f}")
+	if keep_out is not None:
+		gap = float(np.linalg.norm(pos_w - keep_out[0]))
+		if gap < keep_out[1]:
+			print(f"  !! EE {gap:.4f} m from keep-out centre, inside {keep_out[1]:.4f} m")
 
-	Imported late on purpose: results.json is already written by the time this
+
+def write_viz(run_dir: Path, stride: int) -> None:
+	"""One animated HTML per episode, next to episodes.hdf5.
+
+	Imported late on purpose: the episodes are already written by the time this
 	runs, so a missing plotly costs the rendering and not the traces.
 	"""
 	try:
-		from real_reach_viz import save_run_html
-		for path in save_run_html(run_dir, results, frame_stride=stride):
+		from plot_episodes import load_run, save_run_html
+		_, episodes = load_run(run_dir)
+		for path in save_run_html(run_dir, episodes, frame_stride=stride):
 			print(f"viz -> {path}")
 	except Exception as e:
 		print(f"viz skipped ({type(e).__name__}: {e}); render later with\n"
-			  f"  python scripts/real_reach_viz.py {run_dir}")
+			  f"  python scripts/plot_episodes.py {run_dir}")
 
 
 def main() -> int:
@@ -128,7 +144,7 @@ def main() -> int:
 	ap.add_argument("--arm", default="left", choices=("left", "right"),
 					help="physical arm to drive; the key prefix stays r_ either way")
 	ap.add_argument("--no-viz", action="store_true",
-					help="write results.json only, no episode HTML")
+					help="write episodes.hdf5 only, no episode HTML")
 	ap.add_argument("--viz-stride", type=int, default=1,
 					help="animate every Nth step in the HTML")
 	args = ap.parse_args()
@@ -164,8 +180,9 @@ def main() -> int:
 		run_dir.mkdir(parents=True, exist_ok=True)
 		# Written before the arm moves, so a session that faults on episode 0 still
 		# says what it was running.
-		(run_dir / "meta.json").write_text(json.dumps(run_metadata(arm, args.seed), indent=1))
+		meta = run_metadata(arm, args.seed)
 		results = []
+		flush(run_dir, results, meta, "scripts/real_reach_rollout.py")
 
 		recorder = ReachEpisodeRecorder(arm, args.seed)
 		for ep in range(args.episodes):
@@ -177,7 +194,7 @@ def main() -> int:
 			if args.dry_run:
 				print("  dry run — curve sampled, no action sent")
 				results.append(recorder.dry_run())
-				flush(run_dir, results)
+				flush(run_dir, results, meta, "scripts/real_reach_rollout.py")
 				continue
 
 			while not done:
@@ -186,30 +203,25 @@ def main() -> int:
 				for a in np.asarray(base(batched))[0]:
 					seen = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
 					obs, _, done, info = env.step(a)
-					pos_w = recorder.record_reach(seen, obs, info)
-					if pos_w[2] < floor:
-						print(f"  !! EE at world z {pos_w[2]:.4f}, under floor {floor:.4f}")
-					if keep_out is not None:
-						gap = float(np.linalg.norm(pos_w - keep_out[0]))
-						if gap < keep_out[1]:
-							print(f"  !! EE {gap:.4f} m from keep-out centre, "
-								  f"inside {keep_out[1]:.4f} m")
+					warn_off_limits(recorder.record_reach(seen, obs, info), floor, keep_out)
 					if done:
 						break
 
 			ok = info.get("success", False)
+			name, arrays, attrs, curve = recorder.finish_reach(info)
+			stats = force_stats(arrays["ee_force"]) if "ee_force" in arrays else None
 			print(f"  {'SUCCESS' if ok else 'timeout'} in {info['episode_steps']} steps, "
-				  f"cursor {info['next_waypoint_idx']}/{env._curve_len}")
-			results.append(recorder.finish_reach(info))
-			flush(run_dir, results)
+				  f"cursor {info['next_waypoint_idx']}/{env._curve_len}{force_note(stats)}")
+			results.append((name, arrays, {**attrs, **force_attrs(arrays)}, curve))
+			flush(run_dir, results, meta, "scripts/real_reach_rollout.py")
 
-		done_eps = [r for r in results if not r.get("dry_run")]
+		done_eps = [r for r in results if not r[2].get("dry_run")]
 		if done_eps:
-			n_ok = sum(r["success"] for r in done_eps)
+			n_ok = sum(r[2]["success"] for r in done_eps)
 			print(f"\n{n_ok}/{len(done_eps)} succeeded")
-		print(f"traces -> {run_dir}")
+		print(f"traces -> {run_dir / episode_hdf5.REAL_FILE}")
 		if not args.no_viz:
-			write_viz(run_dir, results, args.viz_stride)
+			write_viz(run_dir, args.viz_stride)
 	finally:
 		robot.disconnect()
 	return 0
