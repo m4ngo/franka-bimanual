@@ -123,6 +123,14 @@ baselines:
     # plan, our stand-in for upstream's servo speed-up. It also adds
     # lead*(change in velocity) at every stitch; false sends the plan as sampled.
     goal_lead: true
+    # OSC gains on the arm, sent on the kp/kd action channels like SAIL's.
+    # null = stock (kp 150, damping 1.0), the controller the demos were sent to.
+    # osc_kp "speed" = 150 * speed_up_times**2: the stock response, speed_up_times
+    # faster, as upstream speeds its servo up with the plan (set_ik_dt_scale).
+    # Capped at the gain channel's reach (1500), so 4x tracks like ~3.2x. With it
+    # the goal lead is ~0 by itself; set goal_lead false to drop it entirely.
+    osc_kp: null
+    osc_damping_ratio: null
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7

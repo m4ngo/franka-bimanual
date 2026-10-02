@@ -281,6 +281,17 @@ def gain_action(kp: float | None, damping_ratio: float | None = None) -> dict:
     return gains
 
 
+def bspline_osc(speed_up_times: float) -> tuple[float | None, float | None]:
+    """(kp, damping ratio) the B-Spline rollout runs at; None is the stock value."""
+    kp = fc.policy("baselines.bspline.osc_kp")
+    if kp == "speed":
+        default = float(fc.control("torque.osc.default_kp"))
+        reach = default * float(fc.control("torque.osc.gain_exp_base"))
+        kp = min(default * speed_up_times ** 2, reach)
+    ratio = fc.policy("baselines.bspline.osc_damping_ratio")
+    return (None if kp is None else float(kp)), (None if ratio is None else float(ratio))
+
+
 def damping_lag(gains: dict) -> np.ndarray:
     """kd/kp per axis (6,): seconds the OSC trails a goal moving at constant velocity."""
     kp, kd = resolve_gains(
@@ -833,6 +844,8 @@ def bspline_parameters(args, meta: dict, planner_kwargs: dict) -> dict:
         "action_format": meta.get("action_format"),
         "act_dim": meta.get("act_dim"),
         "goal_lead": bool(fc.policy("baselines.bspline.goal_lead")),
+        "osc_kp": bspline_osc(planner_kwargs["speed_up_times"])[0],
+        "osc_damping_ratio": bspline_osc(planner_kwargs["speed_up_times"])[1],
     }
 
 

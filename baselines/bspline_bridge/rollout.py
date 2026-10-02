@@ -64,14 +64,19 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
     o_fps = float(args.obs_fps or rc.obs_fps())
     per_obs = max(1, int(round(exec_fps / o_fps)))
     dt = 1.0 / exec_fps
-    # Holds the arm's lag behind a sped-up plan at the demos' 1x lag, as upstream's servo scaling does.
-    lead = rc.damping_lag(rc.gain_action(None)) * (1.0 - 1.0 / planner_kwargs["speed_up_times"])
+    speed = planner_kwargs["speed_up_times"]
+    kp, ratio = rc.bspline_osc(speed)
+    gains = rc.gain_action(kp, ratio)
+    # Holds the arm's lag behind a sped-up plan at the demos' 1x lag (stock gains),
+    # as upstream's servo scaling does; ~0 when the gains already scale with speed.
+    lead = rc.damping_lag(gains) - rc.damping_lag(rc.gain_action(None)) / speed
     if not fc.policy("baselines.bspline.goal_lead"):
         lead = np.zeros(6)
     logger.info("EE_POS at %.0f Hz, observations at %.0f Hz (%d goals per obs), "
-                "speed_up=%.2f origin_time_scale=%.1f goal lead %.3f s",
-                exec_fps, o_fps, per_obs,
-                planner_kwargs["speed_up_times"], planner_kwargs["origin_time_scale"], lead[0])
+                "speed_up=%.2f origin_time_scale=%.1f osc kp=%s damping=%s goal lead %.3f s",
+                exec_fps, o_fps, per_obs, speed, planner_kwargs["origin_time_scale"],
+                "stock" if kp is None else f"{kp:g}", "stock" if ratio is None else f"{ratio:g}",
+                lead[0])
 
     def episode_fn(controller, dispatcher, dataset, ep, stopper) -> None:
         client.reset()
@@ -120,7 +125,7 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
                         pos, quat, grip = decode(sample)
                         pos, quat = rc.lead_goal(pos, quat, *decode(planner.peek(dt))[:2], dt, lead)
                         goal = (pos, quat, grip)
-                    action = rc.ee_pos_action(*goal)
+                    action = rc.ee_pos_action(*goal, gains)
                     dispatcher.send(action, exec_fps)
                     if dataset is not None:
                         rc.add_frame(dataset, obs, action, args.task, controller.cameras)

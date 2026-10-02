@@ -332,6 +332,14 @@ velocity (`rollout_common.damping_lag`, `policy_math.lead_goal`), which puts the
 lag back to the demonstrations' 1x lag. At 1x the lead is zero. `baselines.bspline.goal_lead:
 false` turns it off; each run's manifest records which ran.
 
+The closer match to upstream is to speed the controller up instead:
+`baselines.bspline.osc_kp: speed` sends kp `150 * speed_up_times**2` at damping
+1.0 on the kp action channel, which is the stock response played `speed_up_times`
+faster. The arm then trails a sped-up plan exactly as far as it trailed the 1x
+plan, and the goal lead works out to zero (kp 600 at 2x). The channel stops at
+kp 1500, so 4x tracks like about 3.2x and a small lead covers the rest. Both
+gains are recorded in the manifest.
+
 The B-Spline server runs inference the way upstream deploys it: 10 DDIM steps
 (`--num-inference-steps`), the whole denoising loop replayed as one CUDA graph
 (upstream's `CudaGraphDDIMSampler`), and one warm-up at startup instead of one
