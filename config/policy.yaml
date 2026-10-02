@@ -108,7 +108,11 @@ baselines:
     # a misconfiguration. Measured in scripts/check_baseline_rollout_offline.py.
     origin_time_scale: null
     speed_up_times: 1.0
-    predict_before_end: 0.06
+    # Wall-clock seconds of plan left when the next spline is requested.
+    # Upstream's documented rollout command (inference/README.md) uses 0.1;
+    # 0.06 is only its argparse default. Checked once per observation (50 ms),
+    # so 0.06 let a request go out with as little as 10 ms left.
+    predict_before_end: 0.1
     time_align_error_threshold: 0.1
     time_align_larger_t: 0.2
     gripper_slowdown_enabled: false
