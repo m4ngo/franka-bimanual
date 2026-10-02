@@ -114,7 +114,11 @@ baselines:
     # so 0.06 let a request go out with as little as 10 ms left.
     predict_before_end: 0.1
     time_align_error_threshold: 0.1
-    time_align_larger_t: 0.2
+    # How far into a new spline the alignment search may look, as a fraction
+    # of its length. The paper's appendix uses 0.5 (half a segment); 0.2 is
+    # only upstream's code default, and at 2x/4x the old plan's pose often
+    # lies past it.
+    time_align_larger_t: 0.5
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7
