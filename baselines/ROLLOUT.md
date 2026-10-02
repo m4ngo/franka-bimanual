@@ -329,7 +329,8 @@ up to 0.9 of replans at 4x. Upstream avoids this by speeding its servo up with
 the plan (`set_ik_dt_scale`). Here the gains stay as they are; instead each
 sample is moved `(kd/kp)·(1 - 1/s)` seconds further along the plan's own
 velocity (`rollout_common.damping_lag`, `policy_math.lead_goal`), which puts the
-lag back to the demonstrations' 1x lag. At 1x the lead is zero.
+lag back to the demonstrations' 1x lag. At 1x the lead is zero. `baselines.bspline.goal_lead:
+false` turns it off; each run's manifest records which ran.
 
 The B-Spline server runs inference the way upstream deploys it: 10 DDIM steps
 (`--num-inference-steps`), the whole denoising loop replayed as one CUDA graph

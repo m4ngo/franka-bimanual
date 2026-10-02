@@ -119,6 +119,10 @@ baselines:
     # only upstream's code default, and at 2x/4x the old plan's pose often
     # lies past it.
     time_align_larger_t: 0.5
+    # Move each sampled goal (kd/kp)*(1 - 1/speed_up_times) s further along the
+    # plan, our stand-in for upstream's servo speed-up. It also adds
+    # lead*(change in velocity) at every stitch; false sends the plan as sampled.
+    goal_lead: true
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7

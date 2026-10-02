@@ -832,6 +832,7 @@ def bspline_parameters(args, meta: dict, planner_kwargs: dict) -> dict:
         **{k: v for k, v in planner_kwargs.items() if not k.startswith("_")},
         "action_format": meta.get("action_format"),
         "act_dim": meta.get("act_dim"),
+        "goal_lead": bool(fc.policy("baselines.bspline.goal_lead")),
     }
 
 

@@ -66,6 +66,8 @@ def make_episode_fn(client: PolicyClient, meta: dict, args, planner_kwargs: dict
     dt = 1.0 / exec_fps
     # Holds the arm's lag behind a sped-up plan at the demos' 1x lag, as upstream's servo scaling does.
     lead = rc.damping_lag(rc.gain_action(None)) * (1.0 - 1.0 / planner_kwargs["speed_up_times"])
+    if not fc.policy("baselines.bspline.goal_lead"):
+        lead = np.zeros(6)
     logger.info("EE_POS at %.0f Hz, observations at %.0f Hz (%d goals per obs), "
                 "speed_up=%.2f origin_time_scale=%.1f goal lead %.3f s",
                 exec_fps, o_fps, per_obs,

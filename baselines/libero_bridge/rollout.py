@@ -356,6 +356,8 @@ def bspline_episode(stepper: Stepper, client: PolicyClient, planner_kwargs: dict
     # Holds the arm's lag behind a sped-up plan at the demos' 1x lag, as upstream's servo scaling does.
     c = stepper.task.controller
     lead = np.asarray(c.kd) / np.asarray(c.kp) * (1.0 - 1.0 / planner_kwargs["speed_up_times"])
+    if not fc.policy("baselines.bspline.goal_lead"):
+        lead = np.zeros(6)
     # Synchronous, on the sim clock: an inference that overlapped stepping would
     # make the plan's phase depend on how fast this GPU is.
     planner = SplinePlanner(client, clock=lambda: stepper.sim_time,
@@ -564,7 +566,9 @@ def main() -> int:
     settings = sail_settings(meta, args, fast_fps) if args.backend == "sail" else {}
     planner_kwargs = (bspline_planner_kwargs(meta, args, fast_fps)
                       if args.backend == "bspline" else {})
-    params = {"sail": settings, "bspline": {**planner_kwargs, "fast_fps": fast_fps},
+    params = {"sail": settings,
+              "bspline": {**planner_kwargs, "fast_fps": fast_fps,
+                          "goal_lead": bool(fc.policy("baselines.bspline.goal_lead"))},
               "pi05": {"chunk_size": chunk_size}}
     record.set("parameters", **params[args.backend])
 
