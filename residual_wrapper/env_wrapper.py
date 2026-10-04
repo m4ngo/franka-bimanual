@@ -278,17 +278,33 @@ def relative_to_poses(rel: np.ndarray, anchor_pos: np.ndarray,
                       np.hstack([pos, rot.as_quat()])])
 
 
+def gripper_to_sim(g):
+    """Real gripper [0, 1] (1 = open) -> robosuite's [-1, 1] (-1 = open)."""
+    return 1.0 - 2.0 * np.asarray(g)
+
+
+def gripper_to_real(g):
+    """robosuite's [-1, 1] (-1 = open) -> real gripper [0, 1] (1 = open)."""
+    return (1.0 - np.asarray(g)) / 2.0
+
+
+def residual_input(base_rel: np.ndarray) -> np.ndarray:
+    """The base chunk as the student saw it in sim: gripper column in robosuite units."""
+    out = np.array(base_rel, dtype=np.float32, copy=True)
+    out[:, 6] = gripper_to_sim(out[:, 6])
+    return out
+
+
 def compose_chunk(base_rel: np.ndarray, res_chunk: np.ndarray, bound: float) -> np.ndarray:
-    """final = clip(base + residual, -bound, bound) per normalised channel: the
-    FAST composition (ResidualSACPolicy.get_final_action), whose bound for
-    chunk-start-relative targets is the chunk length -- a target K steps out
-    sits up to K units from the anchor, so 1.0 would clip the base itself.
+    """multi-fast's StudentPredictor composition: final = clip(base + residual,
+    -bound, bound) per normalised channel, with the base contributing zero gains
+    (_augment_base). `bound` is the teacher's composed_action_bound.
 
     `res_chunk` rows are the residual's [damping, stiffness, dpos(3), drot(3),
     dgrip] (multi-fast's gains-first layout) and cover the first len(res_chunk)
     steps; the rest of the chunk is the base alone. res_pos_gain / res_rot_gain
-    scale the correction before the sum and are no-ops at 1.0. The gripper slot
-    is an absolute normalised position; send_action clips it to [0, 1].
+    scale the correction before the sum and are no-ops at 1.0. The gripper is
+    summed in robosuite units and returned in the real [0, 1].
     """
     final = np.array(base_rel, dtype=np.float32, copy=True)
     k = min(len(res_chunk), len(base_rel))
@@ -297,9 +313,9 @@ def compose_chunk(base_rel: np.ndarray, res_chunk: np.ndarray, bound: float) -> 
     res = np.asarray(res_chunk[:k], dtype=np.float32)
     final[:k, 0:3] = np.clip(base_rel[:k, 0:3] + res[:, 2:5] * _RES_POS_GAIN, -bound, bound)
     final[:k, 3:6] = np.clip(base_rel[:k, 3:6] + res[:, 5:8] * _RES_ROT_GAIN, -bound, bound)
-    final[:k, 6] = np.clip(base_rel[:k, 6] + res[:, 8], -bound, bound)
-    final[:k, 7] = np.clip(base_rel[:k, 7] + res[:, 1], -bound, bound)   # kp
-    final[:k, 8] = np.clip(base_rel[:k, 8] + res[:, 0], -bound, bound)   # kd
+    final[:k, 6] = gripper_to_real(np.clip(gripper_to_sim(base_rel[:k, 6]) + res[:, 8], -bound, bound))
+    final[:k, 7] = np.clip(res[:, 1], -bound, bound)   # kp
+    final[:k, 8] = np.clip(res[:, 0], -bound, bound)   # kd
     return final
 
 

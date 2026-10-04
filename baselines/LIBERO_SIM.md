@@ -441,11 +441,11 @@ true, `output_max` 0.05 m / 0.5 rad, `control_freq` 20 Hz.
 ## SAIL's controller
 
 SAIL rolls out under its own OSC gains,
-[`baselines.sail.sim_osc`](../config/policy.yaml#L88): kp 300 (stock 150) and
+[`baselines.sail.sim_osc`](../config/policy.yaml#L71): kp 300 (stock 150) and
 damping ratio 0.5 (stock 1.0). Everything else is stock, including LIBERO's 5 cm
 limit on how far one env step may move the position target, which every method
 runs under. B-Spline and pi05 keep the stock gains
-([`baselines.bspline.sim_osc`](../config/policy.yaml#L117) is null). Each run's
+([`baselines.bspline.sim_osc`](../config/policy.yaml#L101) is null). Each run's
 manifest records what the controller actually ran as `environment.osc`, and
 `rollout_summary.py` and the report sheets print it as
 `kp 300, damping 0.5, step limit 5 cm`.

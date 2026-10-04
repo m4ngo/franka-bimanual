@@ -104,6 +104,12 @@ def check_sail(client: PolicyClient, meta: dict, args, res: Results) -> None:
         if res.check("error" not in rep, f"guided request: no error ({rep.get('error', '')})"):
             chunk = np.asarray(rep["chunk"])
             res.check(chunk.shape == (horizon, act_dim), f"guided request: chunk {chunk.shape}")
+        # A clamped +-1 output round-trips to just past +-1; the server must not assert on it.
+        sat = np.array(ref, dtype=np.float64)
+        sat[:, -2:] = 1.001
+        rep = client.request({"obs": obs, "guide_actions": sat})
+        res.check("error" not in rep,
+                  f"guided request with a saturated reference: no error ({rep.get('error', '')})")
 
 
 def check_bspline(client: PolicyClient, meta: dict, args, res: Results) -> None:

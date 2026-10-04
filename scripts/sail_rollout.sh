@@ -8,11 +8,11 @@
 # start it yourself and point --port at it. $SAIL_PYTHON overrides which
 # interpreter runs the server (baselines/interpreters.py).
 #
-# The control mode is resolved from the checkpoint, not chosen here -- see
-# baselines/ROLLOUT.md.
+# --speed N runs SAIL's fast steps at N times the demonstrations' rate; precision
+# steps stay at 1x. See baselines/ROLLOUT.md.
 #
 #   ./scripts/sail_rollout.sh --start-server --ckpt ~/franka_data/sail/best.pth \
-#       --rig=single_arm_right --num-episodes 10
+#       --rig=single_arm_right --speed 2 --num-episodes 10
 #
 # Everything not consumed below is passed through to the python entrypoint.
 
@@ -76,7 +76,7 @@ if [[ "$START_SERVER" == 1 ]]; then
     python "$(dirname "$0")/_wait_policy_server.py" sail "$PORT"
 fi
 
-echo "sail rollout on ${RIG} (goals faster than ${CONTROL_FPS} Hz; see --exec-fps)"
+echo "sail rollout on ${RIG}"
 cd "$REPO_ROOT"
 STATUS=0
 python -m baselines.sail_bridge.rollout --port "$PORT" "${ARGS[@]}" || STATUS=$?

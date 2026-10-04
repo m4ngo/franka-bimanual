@@ -177,14 +177,16 @@ Each rollout is two processes: the policy server in its venv, the arm in ours.
 The wrapper starts both and stops the server when it exits:
 
 ```bash
-./scripts/sail_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 \
+./scripts/sail_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 --speed 1 \
     --ckpt ~/franka_data/policies/pickup-bowl/sail/<ts>/models/model_epoch_1000.pth \
     --guide-config baselines/sail/robomimic/SAIL/guide_template/base_cfg_weight_1.json
 
-./scripts/bspline_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 \
-    --ckpt ~/franka_data/policies/pickup-bowl/bspline/<ts>/checkpoints/latest.ckpt \
-    --speed-up-times 1.0
+./scripts/bspline_rollout.sh --start-server --rig=single_arm_right --num-episodes 10 --speed 1 \
+    --ckpt ~/franka_data/policies/pickup-bowl/bspline/<ts>/checkpoints/latest.ckpt
 ```
+
+`--speed 2` / `--speed 3` are the faster settings; ROLLOUT.md, "How each method
+runs", says what the flag means for each.
 
 Before the first rollout of any new checkpoint, prove the server answers
 sanely without touching the arm -- start it yourself, then:

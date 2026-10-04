@@ -30,14 +30,13 @@ needed in run_residual.py.
 
 Because the conversion needs the joint configuration used as the seed for FK
 integration, and OpenPI's `observation/state` is also joint-based, this
-wrapper reads `r_joint_1..7` directly off the raw obs dict passed to infer()
+wrapper reads `r_joint_1..7` directly off the newest raw obs dict in the window
 (same dict run_residual.py already builds via strip_depth(obs)) rather than
 taking a separately-threaded current_q argument -- matching the calling
-convention `base_policy.infer(obs_no_depth)` uses in run_residual.py's loop.
+convention `base_policy.infer(base_policy.window())` uses in run_residual.py's loop.
 """
 
 import logging
-from typing import Optional
 
 import numpy as np
 
@@ -50,6 +49,7 @@ from env_wrapper import (
     to_sim_world_pose,
 )
 from env_wrapper_openpi_ext import ee_deltas_to_ee_chunk, quat2axisangle
+from policy_wrapper import ObservationHistory
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,10 @@ def _format_libero_image(img: np.ndarray) -> np.ndarray:
     return img.astype(np.uint8)
 
 
-class OpenPIBasePolicy:
+class OpenPIBasePolicy(ObservationHistory):
     """BasePolicy-compatible wrapper around a remote pi05_libero server.
 
-    Mirrors policy_wrapper.BasePolicy: reset() and infer(obs) -> (T, 10)
+    Mirrors policy_wrapper.BasePolicy: reset(), observe(obs) and infer(window) -> (T, 10)
     np.ndarray in the EE-delta chunk format process_chunk/build_action expect.
     """
 
@@ -141,13 +141,14 @@ class OpenPIBasePolicy:
         # internal action queue on the client side -- run_residual.py's
         # chunk_used/_CHUNK_EXEC bookkeeping already handles open-loop
         # chunk execution). Nothing to reset client-side.
-        pass
+        super().reset()
 
-    def infer(self, obs: dict) -> np.ndarray:
+    def infer(self, window: list[dict]) -> np.ndarray:
         """Run one inference pass against the remote pi05_libero server.
 
         Args:
-            obs: raw obs dict as passed to base_policy.infer() in
+            window: ObservationHistory.window(); pi05 plans from its last entry, the
+                raw obs dict as observed in
                 run_residual.py (i.e. obs_no_depth = strip_depth(obs));
                 must contain the joint/gripper obs keys needed by
                 current_ee_pose() (r_joint_1..7, r_gripper) for FK,
@@ -160,6 +161,7 @@ class OpenPIBasePolicy:
             policy_wrapper.BasePolicy.infer() returns, ready for
             process_chunk()/build_action() unchanged.
         """
+        obs = window[-1]
         # LIBERO proprio convention: EE position (3) + axis-angle orientation (3)
         # + two-finger gripper qpos in metres (2) = 8, NOT joint angles + 1
         # gripper scalar. pi05_libero was trained on robosuite's OSC_POSE state,
@@ -174,7 +176,6 @@ class OpenPIBasePolicy:
         ee_pose = to_sim_world_pose(
             ee_pose_to_world(ee_pose, self._r_base_in_world, self._t_base_in_world)
         )
-        print(ee_pose)
         axis_angle = quat2axisangle(ee_pose[3:7])
         g = float(ee_pose[7]) * _PANDA_FINGER_MAX_M
         state = np.concatenate([

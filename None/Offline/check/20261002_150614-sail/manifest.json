@@ -1,0 +1,85 @@
+{
+  "schema_version": 1,
+  "run": {
+    "run_id": "20261002_150614-sail",
+    "method": "sail",
+    "sweep": null,
+    "status": "running",
+    "reason": null,
+    "started_at": "2026-10-02T15:06:14-0700",
+    "updated_at": "2026-10-02T15:06:16-0700",
+    "duration_s": 1.607
+  },
+  "train_dataset": {
+    "repo_id": "Offline/check",
+    "resolved_from": "flag",
+    "flag": "Offline/check",
+    "checkpoint_says": null,
+    "agrees": null
+  },
+  "environment": {
+    "git": {
+      "commit": "cf40a4adbcff55789de5436e912153650a8a265e",
+      "branch": "main",
+      "dirty": true,
+      "dirty_files": [
+        "None/",
+        "baselines/sail_bridge/rollout.py",
+        "config/cameras.yaml",
+        "config/control.yaml",
+        "frames/camera/live_feed.py",
+        "multi-fast",
+        "scripts/check_baseline_rollout_offline.py"
+      ]
+    },
+    "machine": {
+      "host": "deepblue.cs.washington.edu",
+      "user": "franka",
+      "python": "3.12.13",
+      "executable": "/home/franka/franka_ws/.venv/bin/python",
+      "cwd": "/home/franka/franka_ws",
+      "argv": [
+        "x"
+      ]
+    }
+  },
+  "outputs": {
+    "run_dir": "None/Offline/check/20261002_150614-sail",
+    "manifest": "None/Offline/check/20261002_150614-sail/manifest.json",
+    "episodes": "None/Offline/check/20261002_150614-sail/episodes.jsonl",
+    "force_profiles": "None/Offline/check/20261002_150614-sail/force_profiles.npz",
+    "dataset": {
+      "recorded": false,
+      "repo_id": null,
+      "path": null,
+      "fps": 200
+    },
+    "videos_dir": null
+  },
+  "summary": {
+    "episodes": 1,
+    "successes": 0,
+    "success_rate": 0.0,
+    "verdicts": {
+      "timeout": 1
+    },
+    "mean_time_to_success_s": null,
+    "median_time_to_success_s": null,
+    "min_time_to_success_s": null,
+    "max_time_to_success_s": null,
+    "total_episode_time_s": 1.5687203770503402,
+    "total_steps": 200,
+    "total_inferences": 17,
+    "total_slow_steps": 0,
+    "total_guided_inferences": 0,
+    "aborted_episodes": 0,
+    "ee_force_n": {
+      "mean": 100.5,
+      "median": 100.5,
+      "p95": 190.05,
+      "max": 200.0,
+      "peak": 200.0,
+      "episodes": 1
+    }
+  }
+}

@@ -182,7 +182,12 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   therefore not what keeps the EE_DELTA anchor fresh — `torque.loop.publish_decimation`
   is, because the anchor can never be newer than the last published state.
   EE_DELTA anchors on the measured pose, so a stale anchor silently eats part of
-  the commanded delta.
+  the commanded delta. A caller that computes its delta from its own read passes
+  that read back, `send_action(action, anchor=robot.read_kinematic_state())`, and
+  the goal is composed on exactly that pose. `run_residual.py` does this every
+  step: a delta computed against one pose and applied to a re-read one moves the
+  goal by however far the arm travelled in between, cutting effective damping to
+  `kd - kp·Δt`.
 - [franka_process.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_process.py)
   — the RPyC client. Ships *goals*, not per-tick commands: `send_osc_goal`,
   `send_joint_goal` and `send_joint_velocity` are non-blocking pushes, and
@@ -454,8 +459,8 @@ groups every real/sim record, replay and compare entry point by purpose.
 | `prepare_baseline_datasets.py` | One EE_POS recording → sysid / SAIL / B-Spline HDF5s | — |
 | `train_pipeline.py start <pipelines/*.yaml>` | Convert a recording and train all three policies (diffusion base, B-Spline, SAIL) from one yaml, detached, into one run directory; each stage reuses, or resumes from the checkpoint of, an earlier run's same training unless `--retrain <stage>`; `status` (shows a failed stage's error line) / `summary` / `stop` / `retry <stage>` (resumes from the stage's last checkpoint; an OOM beside the other trainings is retried on its own automatically) | — |
 | `../baselines/{sail,bspline}_bridge/train.py` | Train a baseline on its HDF5 in its own venv (`python -m baselines.sail_bridge.train`) | — |
-| `sail_rollout.sh` | Roll a trained SAIL policy out; starts its policy server in `.venv-sail` | per ckpt |
-| `bspline_rollout.sh` | Roll a trained B-Spline policy out; starts its server in `.venv-bspline` | EE |
+| `sail_rollout.sh` | Roll a trained SAIL policy out with upstream's receding-horizon loop at `--speed N`; starts its policy server in `.venv-sail` | EE_POS |
+| `bspline_rollout.sh` | Roll a trained B-Spline policy out with upstream's spline loop at `--speed N`; starts its server in `.venv-bspline` | EE_POS |
 | `check_policy_server.py <sail\|bspline>` | Handshake + one synthetic inference against a running policy server; the preflight for a new checkpoint | — |
 | `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers, plus the servers' request handling under a stubbed robomimic | — |
 | `check_residual_executor_offline.py` | `run_residual.py`'s EE_POS-base executor against `reach_residual.py`'s own functions and a fake arm: chunk-relative targets, FAST's composition, one-step deltas, the delta-checkpoint refusal | — |

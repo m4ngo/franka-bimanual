@@ -1,13 +1,13 @@
 """Shared machinery for the two baseline hardware rollouts.
 
-Everything here is common to `sail_bridge/rollout.py` and
-`bspline_bridge/rollout.py`: robot construction, the observation both backends
-are built from, the action dict, the rate-varying goal dispatcher, and the
-recording/metrics side. No torch and no upstream imports -- the policy lives in
-another process (see zmq_client).
+Robot construction, the observation both backends are built from, the action
+dict, the goal clock, and the recording/metrics side. No torch and no upstream
+imports -- the policy lives in another process (see zmq_client).
 
-The structural reference is residual_wrapper/run_residual.py; the pieces marked
-as copied from it are noted at their definitions.
+Three threads run during an episode: the method's control loop (the caller),
+`ObservationPump` reading the robot, and `Recorder` writing the dataset. The
+camera reads block for a new frame, so keeping them off the control thread is
+what lets goals go out on an even clock, as they do upstream.
 """
 
 from __future__ import annotations
@@ -18,8 +18,10 @@ import os
 import select
 import sys
 import termios
+import threading
 import time
 import tty
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,13 +40,12 @@ from lerobot.robots import make_robot_from_config  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.lerobot_source import EE_KEYS  # noqa: E402
-from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains  # noqa: E402
 
 from baselines import run_record as rr  # noqa: E402
 from baselines.force_log import ForceLog, WrenchTrace, note as force_note  # noqa: E402
 from baselines.rollout_viz import CHUNKS_FILE, ChunkLog  # noqa: E402
 from baselines.policy_math import (  # noqa: E402,F401  re-exported for the entrypoints
-    lead_goal, propagate_pose, rot6d_to_quat_xyzw, slowdown_mode, tracking_error_low,
+    rot6d_to_quat_xyzw, slowdown_mode, tracking_error_low,
 )
 from baselines.zmq_client import PolicyTimeout  # noqa: E402
 
@@ -56,10 +57,8 @@ logger = logging.getLogger("baselines.rollout")
 
 NUM_JOINTS = fc.num_joints()
 
-# EE_KEYS is the EE_POS action schema itself (lerobot_source), which is what
-# arm_prefix() validates a recording against -- not a restatement of it. Keeping
-# these identical to run_residual.py's is what makes a baseline rollout readable
-# by the same tooling as a residual one.
+# EE_KEYS is the EE_POS action schema itself (lerobot_source). Identical to
+# run_residual.py's, so one set of tooling reads all three methods' runs.
 EE_ACTION_KEYS = tuple(f"{ARM_KEY}_{ax}" for ax in EE_KEYS)
 ACTION_KEYS = (*EE_ACTION_KEYS, "kp", "kd")
 STATE_OBS_KEYS = (
@@ -72,22 +71,20 @@ STATE_OBS_KEYS = (
 # Config
 # ---------------------------------------------------------------------------
 
-def obs_fps() -> int:
-    """Observation/inference rate; null in policy.yaml means control_fps()."""
-    return int(fc.policy("baselines.exec.obs_fps") or fc.control_fps())
+def data_fps() -> float:
+    """The rate the demonstrations were recorded at: upstream's `data_freq`."""
+    return float(fc.control_fps())
 
 
 def origin_time_scale() -> float:
-    """B-Spline knot-index -> seconds, i.e. the rate the demos were RECORDED at.
+    """B-Spline knot-index units per second, i.e. the recording rate; null -> data_fps()."""
+    return float(fc.policy("baselines.bspline.origin_time_scale") or data_fps())
 
-    The spline's knots count frames, and `t` advances at this many index units
-    per second, so this must be the recording fps. null in policy.yaml means
-    control_fps(). Upstream defaults it to 10.0, their own rate; left there
-    against 20 Hz data `t` advances at half the needed rate and every plan plays
-    at 0.5x -- twice the wall clock, which reads as a sluggish controller rather
-    than as a misconfiguration.
-    """
-    return float(fc.policy("baselines.bspline.origin_time_scale") or fc.control_fps())
+
+def record_fps(args) -> int:
+    """Dataset frame rate. Integer: the video encoder builds a Fraction from it."""
+    fps = getattr(args, "record_fps", None) or fc.policy("baselines.exec.record_fps") or data_fps()
+    return int(round(float(fps)))
 
 
 # ---------------------------------------------------------------------------
@@ -97,23 +94,18 @@ def origin_time_scale() -> float:
 def build_robot(rig: str, control_mode: ControlMode, depth: bool = False):
     """Connectable robot for one rig profile, in an explicit control mode.
 
-    `control_mode` is passed rather than inherited: both single-arm profiles
-    declare EE_DELTA in config/rig.yaml, and B-Spline needs EE_POS.
-
-    depth=False by default -- neither baseline consumes a point cloud, so the
-    FRAMOS cloud crop is per-tick cost for nothing.
+    Both single-arm profiles declare EE_DELTA in config/rig.yaml; both baselines
+    need EE_POS, so the mode is passed rather than inherited.
     """
     if rig not in RIGS:
         raise ValueError(f"unknown rig {rig!r}; choose from {sorted(RIGS)}")
     arm_key = next(iter(fc.profile(rig).arms))
     if arm_key != ARM_KEY:
-        # The guard teleop_single_arm.py has and the record script does not.
         raise ValueError(
             f"rig {rig!r} exposes key {arm_key!r}, not {ARM_KEY!r}; the action "
             "keys and gripper wiring assume the latter."
         )
-    # Banner: RIGHT_ARM_RIG_HANDOFF.md's rule is that a wrong rig name here means
-    # the flag did not take and the OTHER arm is about to move.
+    # A wrong rig name here means the flag did not take and the OTHER arm moves.
     logger.info("rig %s -> physical arm %r, control mode %s",
                 rig, fc.profile(rig).arms[arm_key], control_mode.value)
     return make_robot_from_config(
@@ -138,11 +130,8 @@ class Measured:
 def measure(obs: dict) -> Measured:
     """Robot observation -> Measured.
 
-    The pose is O_T_EE via `eef_poses_from_qpos`, which is what
-    baselines/common.py built every training observation from. NOT
-    residual_wrapper's `current_ee_pose`: that applies a different correction
-    (grip-site position, hand-body orientation) for sim-trained students, and
-    feeding it here would put both baselines off-distribution by 45 degrees.
+    The pose is `eef_poses_from_qpos`, the function baselines/common.py built
+    every training observation from -- not residual_wrapper's current_ee_pose.
     """
     q = np.array([obs[f"{ARM_KEY}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)],
                  dtype=np.float64)
@@ -151,23 +140,21 @@ def measure(obs: dict) -> Measured:
         q=q,
         pos=pos[0],
         quat_xyzw=quat[0],
-        # Reported in the same normalised [0, 1] the converter stored, so there
-        # is no unit conversion on this channel in either direction.
         gripper=float(obs[f"{ARM_KEY}_gripper"]),
         images={k: v for k, v in obs.items()
                 if isinstance(v, np.ndarray) and v.ndim == 3},
     )
 
 
-def _images(m: Measured, shapes: dict) -> dict:
-    """Camera frames under the policy's own `<cam>_image` keys, resized.
+def fresh_pose(controller) -> tuple[np.ndarray, np.ndarray]:
+    """(pos, quat_xyzw) from a state read made now, not from the last camera-paced observation."""
+    kin = controller.robot_manager.current_kinematic_state_batch([ARM_KEY])
+    pos, quat = eef_poses_from_qpos(np.asarray(kin[ARM_KEY][0], dtype=np.float64)[None])
+    return pos[0], quat[0]
 
-    The converter names them `obs/<cam>_image`, so the policy key for camera
-    `cam_2` is `cam_2_image`. Sizes come from the checkpoint (the meta
-    handshake), because SAIL's HDF5 carries full-resolution frames while its
-    config expects 84x84 -- nothing else in the stack would catch the mismatch.
-    Both servers want HWC uint8 and do their own scaling and transpose.
-    """
+
+def _images(m: Measured, shapes: dict) -> dict:
+    """Camera frames under the policy's `<cam>_image` keys, resized to the checkpoint's shapes."""
     out = {}
     for key, shape in shapes.items():
         if not key.endswith("_image"):
@@ -175,8 +162,6 @@ def _images(m: Measured, shapes: dict) -> dict:
         cam = key[: -len("_image")]
         img = m.images.get(cam)
         if img is None:
-            # Never silently omitted -- check_camera_coverage refuses the run up
-            # front, before the arm has homed.
             raise KeyError(
                 f"the checkpoint wants {key!r} but the rig has no camera {cam!r}"
             )
@@ -190,13 +175,9 @@ def _images(m: Measured, shapes: dict) -> dict:
 def check_camera_coverage(meta: dict, controller, allow_missing: bool = False) -> dict:
     """Refuse a checkpoint whose camera keys the rig cannot supply.
 
-    The two single-arm profiles expose DIFFERENT cameras -- `single_arm_franka`
-    has cam_1/cam_5/cam_2 and `single_arm_right` has cam_3/cam_4/cam_2 -- so a
-    checkpoint trained on one rig names keys the other does not have. Left to the
-    observation builder this surfaces as a KeyError inside the policy server
-    after the arm has already homed, blaming the wrong layer.
-
-    Returns the shape map to hand to sail_obs/bspline_obs.
+    The single-arm profiles expose different cameras, so a checkpoint trained on
+    one rig can name keys the other lacks. Returns the shape map for
+    sail_obs/bspline_obs.
     """
     shapes = dict(meta["obs_key_shapes"])
     wanted = {k[: -len("_image")] for k in shapes if k.endswith("_image")}
@@ -205,11 +186,9 @@ def check_camera_coverage(meta: dict, controller, allow_missing: bool = False) -
     if missing and not allow_missing:
         raise ValueError(
             f"checkpoint needs camera(s) {missing} that this rig does not have "
-            f"(it has {sorted(have)}). The single-arm profiles expose different "
-            "cameras, so a checkpoint trained on one rig cannot roll out on the "
-            "other unedited -- pick the matching --rig, or pass "
-            "--allow-missing-cameras to send blank frames for the missing ones "
-            "and accept that the policy is off-distribution."
+            f"(it has {sorted(have)}). Pick the matching --rig, or pass "
+            "--allow-missing-cameras to send blank frames and accept that the "
+            "policy is off-distribution."
         )
     for cam in missing:
         logger.warning("no camera %r on this rig; sending blank frames", cam)
@@ -241,27 +220,130 @@ def bspline_obs(m: Measured, shapes: dict) -> dict:
     }
 
 
+@dataclass
+class Snapshot:
+    """One completed `get_observation`, stamped when its arm-state read began."""
+    seq: int
+    t: float
+    obs: dict
+    m: Measured
+
+
+class ObservationPump:
+    """Reads the robot on its own thread; `latest()` never blocks.
+
+    Upstream's loops read a fresh state and the camera's newest frame every
+    control tick. Here a camera read blocks until the next frame and
+    `get_observation` waits for every camera (~15-20 Hz measured), so the read
+    lives on this thread and the control loop takes the newest snapshot.
+    """
+
+    _MIN_PERIOD_S = 0.002   # a read that returns at once must not spin a core
+
+    def __init__(self, controller) -> None:
+        self._controller = controller
+        self._cond = threading.Condition()
+        self._snap: Snapshot | None = None
+        self._history: deque[Snapshot] = deque(maxlen=32)
+        self._error: BaseException | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self, timeout_s: float = 5.0) -> Snapshot:
+        self._stop.clear()
+        self._snap, self._error = None, None
+        self._history.clear()
+        self._thread = threading.Thread(target=self._run, name="obs-pump", daemon=True)
+        self._thread.start()
+        return self.wait_newer(0, timeout_s)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        seq = 0
+        while not self._stop.is_set():
+            t = time.perf_counter()
+            try:
+                obs = self._controller.get_observation()
+                m = measure(obs)
+            except BaseException as exc:  # surfaced to the control loop by latest()
+                with self._cond:
+                    self._error = exc
+                    self._cond.notify_all()
+                return
+            seq += 1
+            with self._cond:
+                self._snap = Snapshot(seq, t, obs, m)
+                self._history.append(self._snap)
+                self._cond.notify_all()
+            spare = self._MIN_PERIOD_S - (time.perf_counter() - t)
+            if spare > 0:
+                time.sleep(spare)
+
+    def latest(self) -> Snapshot:
+        with self._cond:
+            if self._error is not None:
+                raise RuntimeError("observation pump failed") from self._error
+            return self._snap
+
+    def peek(self) -> Snapshot | None:
+        """The newest snapshot, or None; never raises."""
+        return self._snap
+
+    def window(self, n: int, spacing_s: float) -> list[Snapshot]:
+        """The policy's observation window, oldest first, ending at the newest snapshot.
+
+        Each earlier entry is the distinct snapshot nearest `spacing_s` before the
+        next one -- the training frames' spacing. Seeded with copies of the first
+        when the episode is younger than the window, as FrameStackWrapper does.
+        """
+        with self._cond:
+            if self._error is not None:
+                raise RuntimeError("observation pump failed") from self._error
+            snaps = list(self._history)
+        out = [snaps[-1]]
+        older = snaps[:-1]
+        while len(out) < n and older:
+            target = out[0].t - spacing_s
+            i = min(range(len(older)), key=lambda j: abs(older[j].t - target))
+            out.insert(0, older[i])
+            older = older[:i]
+        while len(out) < n:
+            out.insert(0, out[0])
+        return out
+
+    def wait_newer(self, seq: int, timeout_s: float) -> Snapshot:
+        deadline = time.perf_counter() + timeout_s
+        with self._cond:
+            while self._error is None and (self._snap is None or self._snap.seq <= seq):
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    raise TimeoutError(f"no observation within {timeout_s:.1f}s")
+                self._cond.wait(remaining)
+            if self._error is not None:
+                raise RuntimeError("observation pump failed") from self._error
+            return self._snap
+
+
 # ---------------------------------------------------------------------------
 # Action
 # ---------------------------------------------------------------------------
 
 def _gains() -> dict:
-    """kp/kd action channels.
-
-    Normalised zero, which the exponential remap turns into
-    torque.osc.default_kp -- neither baseline predicts gains.
-    """
+    """Normalised zero on both gain channels: torque.osc.default_kp at the default damping ratio."""
     return {"kp": float(fc.policy("sysid.default_kp")),
             "kd": float(fc.policy("sysid.default_kd"))}
 
 
 def gain_action(kp: float | None, damping_ratio: float | None = None) -> dict:
-    """kp/kd action channels that put the OSC at stiffness `kp` and `damping_ratio`;
-    None leaves that channel at `_gains()`.
+    """kp/kd action channels for stiffness `kp` and `damping_ratio`; None keeps the default.
 
-    The inverse of resolve_gains' remap (kp = default_kp * base ** a_kp, ratio =
-    default_damping_ratio * base ** a_kd), so each channel keeps meaning
-    "log-base multiplier on the default" and the limits still bind on the arm.
+    The inverse of resolve_gains' remap (kp = default_kp * base ** a_kp), so the
+    arm's kp_limits still bind.
     """
     base = float(fc.control("torque.osc.gain_exp_base"))
 
@@ -281,26 +363,18 @@ def gain_action(kp: float | None, damping_ratio: float | None = None) -> dict:
     return gains
 
 
-def bspline_osc(speed_up_times: float) -> tuple[float | None, float | None]:
-    """(kp, damping ratio) the B-Spline rollout runs at; None is the stock value."""
-    kp = fc.policy("baselines.bspline.osc_kp")
-    if kp == "speed":
-        default = float(fc.control("torque.osc.default_kp"))
-        reach = default * float(fc.control("torque.osc.gain_exp_base"))
-        kp = min(default * speed_up_times ** 2, reach)
-    ratio = fc.policy("baselines.bspline.osc_damping_ratio")
-    return (None if kp is None else float(kp)), (None if ratio is None else float(ratio))
+def stock_gains() -> dict:
+    """The controller multi-fast runs and the demonstrations were recorded under."""
+    return _gains()
 
 
-def damping_lag(gains: dict) -> np.ndarray:
-    """kd/kp per axis (6,): seconds the OSC trails a goal moving at constant velocity."""
-    kp, kd = resolve_gains(
-        gains["kp"], gains["kd"],
-        fc.control("tuning.kp_ori_scale"), fc.control("tuning.kd_ori_scale"),
-        kp_pos_scale=fc.control("tuning.kp_pos_scale"),
-        kd_pos_scale=fc.control("tuning.kd_pos_scale"),
-    )
-    return kd / kp
+def sail_kp() -> float:
+    """SAIL's stiffness: baselines.sail.osc_kp_scale times the stock kp, at the stock damping ratio."""
+    return float(fc.policy("baselines.sail.osc_kp_scale")) * float(fc.control("torque.osc.default_kp"))
+
+
+def sail_gains() -> dict:
+    return gain_action(sail_kp())
 
 
 def ee_pos_action(pos, quat_xyzw, gripper: float, gains: dict | None = None) -> dict:
@@ -311,35 +385,29 @@ def ee_pos_action(pos, quat_xyzw, gripper: float, gains: dict | None = None) -> 
     return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **(gains or _gains())}
 
 
-def ee_delta_action(dpos, drotvec, gripper: float, gains: dict | None = None) -> dict:
-    """Per-step delta. Metres and a delta QUATERNION, which is what send_action
-    reads -- a normalised value passed through unconverted reads as metres, gets
-    clipped to torque.delta.pos_max_m, and looks like a tracking problem."""
-    dq = Rotation.from_rotvec(np.asarray(drotvec, dtype=np.float64)).as_quat()
-    vals = (*np.asarray(dpos, dtype=np.float64), *dq, float(gripper))
-    return {**{k: float(v) for k, v in zip(EE_ACTION_KEYS, vals)}, **(gains or _gains())}
-
-
 # ---------------------------------------------------------------------------
-# Ported upstream helpers (numpy/scipy only)
+# Clock and dispatch
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Dispatch
-# ---------------------------------------------------------------------------
+def sleep_until(deadline: float) -> None:
+    """Coarse sleep, then upstream's 0.1 ms spin for the last 2 ms."""
+    while True:
+        remaining = deadline - time.perf_counter()
+        if remaining <= 0:
+            return
+        time.sleep(remaining - 0.002 if remaining > 0.003 else 0.0001)
+
 
 class LeadExceeded(RuntimeError):
     """The commanded goal has run too far ahead of the arm."""
 
 
 class Dispatcher:
-    """Pushes OSC goals on an absolute-deadline clock at a per-step rate.
+    """Sends goals to the arm and keeps the per-episode dispatch bookkeeping.
 
-    The rate is an argument to `send`, not to the constructor: SAIL's precision
-    modulation changes it step by step. Sleeping to an absolute clock (the
-    pattern in run_residual.py) lets the idle slack of ordinary steps absorb the
-    few ms an inference step overruns, so the loop averages its target instead of
-    accumulating per-step deficits.
+    `send` is upstream B-Spline's `env.step(action)`: the caller owns the clock.
+    `step` is upstream SAIL's `env.step(a, control_freq=hz)`: the goal is held
+    for 1/hz before the next one may go out.
     """
 
     def __init__(self, controller, dry_run: bool = False) -> None:
@@ -349,35 +417,16 @@ class Dispatcher:
         self.steps = 0
         self.chunks: list[tuple[int, np.ndarray]] = []
         self.last_action: dict | None = None
-        self._deadline = time.perf_counter()
+        # run_episodes points this at the recorder: rollout_viz draws chunks against recorded frames.
+        self.frame_index = lambda: self.steps
+        self._hold_until = 0.0
         self._prev_send = 0.0
-        self._gaps: list[float] = []          # current log window, cleared each second
-        self._all_gaps: list[float] = []      # whole episode, for the episode log
+        self._all_gaps: list[float] = []
+        self._window_gaps: list[float] = []
         self._window_start = time.perf_counter()
         self._window_steps = 0
 
-    def gap_stats(self) -> tuple[float | None, float | None]:
-        """(mean, max) interval between consecutive goals, in ms, over the whole
-        episode. The max is the number that matters for smoothness: it is how
-        long the OSC loop sat on one goal."""
-        if not self._all_gaps:
-            return None, None
-        return (round(sum(self._all_gaps) / len(self._all_gaps), 3),
-                round(max(self._all_gaps), 3))
-
-    def start(self) -> None:
-        self._deadline = time.perf_counter()
-        self._prev_send = 0.0
-        self._window_start = time.perf_counter()
-        self._window_steps = 0
-        self._gaps.clear()
-        self._all_gaps.clear()
-
-    def chunk(self, poses) -> None:
-        """Log a new plan, (N, 7) base-frame [xyz, quat_xyzw], at the step it arrived."""
-        self.chunks.append((self.steps, np.asarray(poses, dtype=np.float32)))
-
-    def send(self, action: dict, hz: float) -> None:
+    def send(self, action: dict) -> None:
         t_send = time.perf_counter()
         if not self.dry_run:
             self.controller.send_action(action)
@@ -387,40 +436,45 @@ class Dispatcher:
         self._window_steps += 1
         if self._prev_send:
             gap = (t_send - self._prev_send) * 1000.0
-            self._gaps.append(gap)
             self._all_gaps.append(gap)
+            self._window_gaps.append(gap)
         self._prev_send = t_send
-
         self._log_window()
-        # Ordering is run_residual.py's: sleep to THIS step's deadline, then
-        # advance. Incrementing first instead delays the FIRST goal by a whole
-        # period (measured 100 ms at 10 Hz) and makes the resync below land on
-        # `now` rather than `now + dt`, double-counting a period after a stall.
-        # Sub-period jitter is absorbed either way.
+
+    def wait_hold(self) -> None:
+        sleep_until(self._hold_until)
+
+    def step(self, action: dict, hz: float) -> None:
+        self.wait_hold()
+        t = time.perf_counter()
+        self.send(action)
         dt = 1.0 / float(hz)
-        sleep_s = self._deadline - time.perf_counter()
-        if sleep_s > 0:
-            time.sleep(sleep_s)
-        self._deadline += dt
-        if self._deadline < time.perf_counter():
-            # Only a stall longer than one period lands here. After a large one
-            # (episode-start warmup, an operator pause) resync rather than racing
-            # to repay an unpayable debt.
-            self._deadline = time.perf_counter() + dt
+        # Keep the chain through sub-period jitter; restart it after a longer wait.
+        base = self._hold_until if 0.0 <= t - self._hold_until < dt else t
+        self._hold_until = base + dt
+
+    def chunk(self, poses) -> None:
+        """Log a new plan, (N, 7) base-frame [xyz, quat_xyzw]."""
+        self.chunks.append((int(self.frame_index()), np.asarray(poses, dtype=np.float32)))
+
+    def gap_stats(self) -> tuple[float | None, float | None]:
+        """(mean, max) ms between consecutive goals over the episode."""
+        if not self._all_gaps:
+            return None, None
+        return (round(sum(self._all_gaps) / len(self._all_gaps), 3),
+                round(max(self._all_gaps), 3))
 
     def _log_window(self) -> None:
         now = time.perf_counter()
         span = now - self._window_start
-        if span < 1.0 or not self._gaps:
+        if span < 1.0 or not self._window_gaps:
             return
-        # send-gap max is the number that matters: it is how long the OSC loop
-        # sat on one goal, and a spike there is the visible hitch.
-        logger.info("exec %.1f Hz over %.1fs  send-gap avg/max %.1f/%.1f ms",
+        logger.info("goals %.1f Hz over %.1fs  send-gap avg/max %.1f/%.1f ms",
                     self._window_steps / span, span,
-                    sum(self._gaps) / len(self._gaps), max(self._gaps))
+                    sum(self._window_gaps) / len(self._window_gaps), max(self._window_gaps))
         self._window_start = now
         self._window_steps = 0
-        self._gaps.clear()
+        self._window_gaps.clear()
 
 
 def lead(goal_pos, goal_quat_xyzw, m: Measured) -> tuple[float, float]:
@@ -433,17 +487,7 @@ def lead(goal_pos, goal_quat_xyzw, m: Measured) -> tuple[float, float]:
 
 
 def check_lead(goal_pos, goal_quat_xyzw, m: Measured) -> tuple[float, float]:
-    """Abort the episode when an absolute goal has outrun the arm.
-
-    An ABORT, never a clamp. EE_POS has no delta envelope and that is faithful to
-    osc.py; clamping the goal here would be the third limit layer CLAUDE.md
-    forbids, and it would silently eat exactly the lead a sped-up plan is
-    supposed to have. Checked at observation ticks only -- a 15 cm divergence
-    does not appear and vanish inside one 50 ms period.
-
-    Meaningless in EE_DELTA, where the goal is rebuilt from the measured pose
-    every step and the lead is structurally one clipped delta.
-    """
+    """Abort the episode when an absolute goal has outrun the arm. An abort, never a clamp."""
     pos_err, rot_err = lead(goal_pos, goal_quat_xyzw, m)
     max_m = float(fc.policy("baselines.exec.max_lead_m"))
     max_rad = float(fc.policy("baselines.exec.max_lead_rad"))
@@ -451,15 +495,13 @@ def check_lead(goal_pos, goal_quat_xyzw, m: Measured) -> tuple[float, float]:
         raise LeadExceeded(
             f"goal leads the arm by {pos_err:.3f} m / {rot_err:.3f} rad, over "
             f"baselines.exec.max_lead_{{m,rad}} ({max_m} / {max_rad}). The arm is "
-            "not tracking the plan; lower --speed-up-times or --exec-fps."
+            "not tracking the plan; lower --speed."
         )
     return pos_err, rot_err
 
 
 # ---------------------------------------------------------------------------
-# Keyboard  (copied from residual_wrapper/run_residual.py:55-92, plus left-arrow.
-# Deliberate: importing run_residual pulls in viz, policy_wrapper, torch and
-# multi-fast, none of which belong in a process whose policy is a ZMQ peer.)
+# Keyboard  (copied from residual_wrapper/run_residual.py, plus left-arrow)
 # ---------------------------------------------------------------------------
 
 def stdin_key_pressed() -> bool:
@@ -469,8 +511,7 @@ def stdin_key_pressed() -> bool:
 def read_key() -> str:
     """'right', 'left', 'ctrl_c', or ''. Caller must be in raw mode.
 
-    os.read exclusively (never sys.stdin.read) so Python's text-mode buffer
-    cannot swallow the CSI tail bytes before we inspect them.
+    os.read, never sys.stdin.read: the text buffer would swallow the CSI tail.
     """
     time.sleep(0.03)
     data = os.read(sys.stdin.fileno(), 16)
@@ -516,9 +557,7 @@ class raw_stdin:
 # ---------------------------------------------------------------------------
 
 def home_kwargs(args) -> dict:
-    """`home_q` is keyed by the EXPOSED prefix, matching how the recordings this
-    policy trained on were homed (lerobot_record_homed_single_arm.py), not by the
-    physical arm as RealReach does."""
+    """`home_q` keyed by the EXPOSED prefix, as the training recordings were homed."""
     if getattr(args, "home_q", None) is not None:
         q = np.asarray(args.home_q, dtype=np.float64)
         gripper = args.home_gripper
@@ -531,12 +570,7 @@ def home_kwargs(args) -> dict:
 
 
 def home(controller, kwargs: dict) -> bool:
-    """Non-convergence warns and proceeds, as every other entrypoint here does.
-
-    The verdict is returned rather than swallowed: an episode that started from
-    a pose the arm never reached is not comparable to one that did, and the
-    manifest is where that has to be visible.
-    """
+    """Non-convergence warns and proceeds; the verdict goes into the episode row."""
     ok = bool(controller.home(**kwargs))
     if not ok:
         logger.warning("homing did not converge; proceeding anyway")
@@ -547,36 +581,8 @@ def home(controller, kwargs: dict) -> bool:
 # Recording
 # ---------------------------------------------------------------------------
 
-def dataset_fps(args) -> int:
-    """The rate frames are WRITTEN at, which is the dispatch rate, not obs_fps.
-
-    One frame per dispatched goal: the action stream is what a replay needs, and
-    it advances faster than the observations. Images therefore repeat within an
-    observation period -- they compress to nearly nothing and the alternative
-    (one frame per observation) would drop most of the commanded actions.
-
-    For SAIL this is the nominal FAST rate: precision modulation makes the true
-    per-step rate vary, so no single fps is exactly right there. `slow_steps` in
-    the metrics is how many steps ran at the slow rate.
-
-    Integer, because the video encoder builds a Fraction from it and a float
-    crashes the encoder thread mid-episode.
-    """
-    fps = float(getattr(args, "exec_fps", None) or fc.policy("baselines.exec.fast_fps"))
-    if abs(fps - round(fps)) > 1e-9:
-        logger.warning(
-            "--exec-fps %.3f is not an integer; the dataset will be labelled %d Hz. "
-            "Its timestamps will drift against the real dispatch rate.", fps, round(fps))
-    return int(round(fps))
-
-
 def build_dataset(args, controller, root: Path):
-    """Mirrors run_residual.py:_build_dataset, so a baseline rollout carries the
-    same `observation.state` / `action` features as a residual one.
-
-    `root` is the run directory's own `dataset/`, so a run is one directory you
-    can archive or delete whole.
-    """
+    """Same `observation.state` / `action` features as run_residual.py's recordings."""
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     features = {
@@ -600,22 +606,18 @@ def build_dataset(args, controller, root: Path):
         },
     }
     n_cams = len(controller.cameras)
-    common = dict(batch_encoding_size=1, vcodec="auto", streaming_encoding=True,
-                  encoder_queue_maxsize=8, encoder_threads=2,
+    # Frames arrive in one burst after the episode (Recorder.flush); a streaming
+    # encoder drops what its queue cannot take, so encode at save_episode instead.
+    common = dict(batch_encoding_size=1, vcodec="auto", streaming_encoding=False,
                   image_writer_processes=0, image_writer_threads=4 * n_cams)
     return LeRobotDataset.create(
-        args.repo_id, dataset_fps(args), root=root,
+        args.repo_id, record_fps(args), root=root,
         robot_type=controller.name, features=features, use_videos=True, **common,
     )
 
 
 def frames_in_progress(dataset) -> int:
-    """Frames added to the current, not-yet-saved episode.
-
-    `dataset.num_frames` only advances on save_episode(), so the per-episode
-    count has to come off the writer's buffer -- which is where an interrupted
-    episode's frames are, too.
-    """
+    """Frames added to the current, not-yet-saved episode (num_frames only moves on save)."""
     if dataset is None:
         return 0
     try:
@@ -639,8 +641,7 @@ def add_frame(dataset, obs: dict, action: dict, task: str, cameras) -> None:
 
 
 def write_video_frame(writers, video_dir, stem, fps, cam, img, step_idx):
-    """Copied from run_residual.py:155-175. Frame index == dispatch step, so two
-    runs at the same rate are time-aligned for side-by-side stitching."""
+    """One mp4 per camera with the frame index and time burned in."""
     w = writers.get(cam)
     if w is None:
         video_dir.mkdir(parents=True, exist_ok=True)
@@ -656,6 +657,66 @@ def write_video_frame(writers, video_dir, stem, fps, cam, img, step_idx):
     w.write(frame)
 
 
+class Recorder:
+    """Every 1/fps s, from its own thread: the newest observation and the goal last sent.
+
+    Upstream B-Spline's `record_stride` writer. Frames are only buffered during
+    the episode and written by `flush` after it: the dataset's video encoder
+    holds the GIL for ~1 s when an episode's first frame arrives, which froze
+    the goal stream at the start of every episode.
+    """
+
+    def __init__(self, pump: ObservationPump, dispatcher: Dispatcher, fps: int) -> None:
+        self.pump = pump
+        self.dispatcher = dispatcher
+        self.fps = int(fps)
+        self.buffer: list[tuple[dict, dict]] = []
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def frames(self) -> int:
+        return len(self.buffer)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="recorder", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
+
+    def _run(self) -> None:
+        period = 1.0 / self.fps
+        t0 = time.perf_counter()
+        k = 0
+        while not self._stop.wait(max(0.0, t0 + k * period - time.perf_counter())):
+            k += 1
+            snap = self.pump.peek()
+            action = self.dispatcher.last_action
+            if snap is not None and action is not None:
+                self.buffer.append((snap.obs, action))
+
+    def flush(self, dataset, task: str, cameras, video_dir: Path | None, video_stem: str) -> int:
+        """Write the buffered frames; returns how many went into `dataset`."""
+        writers: dict = {}
+        try:
+            for i, (obs, action) in enumerate(self.buffer):
+                if dataset is not None:
+                    add_frame(dataset, obs, action, task, cameras)
+                if video_dir is not None:
+                    for cam in cameras:
+                        img = obs.get(cam)
+                        if isinstance(img, np.ndarray) and img.ndim == 3:
+                            write_video_frame(writers, video_dir, video_stem, self.fps, cam, img, i)
+        finally:
+            for w in writers.values():
+                w.release()
+        return len(self.buffer) if dataset is not None else 0
+
+
 # ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
@@ -665,8 +726,7 @@ class Episode:
     """One rollout attempt, as written to episodes.jsonl.
 
     `success` is operator-marked: right arrow ends the episode as a success,
-    left arrow as a failure, and a timeout is a failure. Without that verdict
-    there is no time-to-success to compare the methods on.
+    left arrow as a failure, and a timeout is a failure.
     """
     episode: int
     success: bool = False
@@ -682,15 +742,14 @@ class Episode:
     slow_steps: int = 0                 # SAIL precision modulation
     guided_inferences: int = 0          # SAIL EAG fired
 
-    exec_fps: float | None = None       # nominal dispatch rate
+    exec_fps: float | None = None       # nominal goal rate
     achieved_fps: float | None = None   # steps / wall_time
     send_gap_ms_mean: float | None = None
     send_gap_ms_max: float | None = None
 
     max_lead_m: float = 0.0
     max_lead_rad: float = 0.0
-    # |F| at the EE over the goals dispatched (force_log.force_stats), from
-    # libfranka's estimated external wrench.
+    # |F| at the EE over the goals dispatched, from libfranka's estimated external wrench.
     ee_force_n: dict | None = None
     homed: bool | None = None
     aborted: str | None = None
@@ -713,10 +772,9 @@ def add_common_args(p, *, policy_name: str) -> None:
                         "the policy server is what actually loads it")
     p.add_argument("--port", type=int, default=None)
     p.add_argument("--host", default="localhost")
-    p.add_argument("--exec-fps", type=float, default=None,
-                   help="goal-push rate when not slowed; default baselines.exec.fast_fps")
-    p.add_argument("--obs-fps", type=float, default=None,
-                   help="observation/inference rate; default baselines.exec.obs_fps")
+    p.add_argument("--record-fps", type=float, default=None,
+                   help="dataset frame rate; default baselines.exec.record_fps "
+                        "(null = the demonstrations' rate)")
     p.add_argument("--dry-run", action="store_true",
                    help="connect, infer and log, but never send an action")
     p.add_argument("--allow-missing-cameras", action="store_true",
@@ -736,12 +794,7 @@ def add_common_args(p, *, policy_name: str) -> None:
 
 
 def environment(args, controller) -> dict:
-    """The rig this run actually drove, resolved rather than assumed.
-
-    Records the PHYSICAL arm alongside the profile: the key prefix is `r_` on
-    both single-arm profiles and says nothing about which FR3 moved, which is
-    exactly the confusion a manifest has to settle months later.
-    """
+    """The rig this run actually drove, PHYSICAL arm included (the key prefix is `r_` on both)."""
     profile = fc.profile(args.rig)
     arm_name = profile.arms[ARM_KEY]
     spec = fc.arm(arm_name)
@@ -768,15 +821,15 @@ def environment(args, controller) -> dict:
         "home_q_override": list(args.home_q) if args.home_q else None,
         "torque": {
             "default_kp": fc.control("torque.osc.default_kp"),
+            "default_damping_ratio": fc.control("torque.osc.default_damping_ratio"),
             "gain_exp_base": fc.control("torque.osc.gain_exp_base"),
             "uncouple_pos_ori": fc.control("torque.osc.uncouple_pos_ori"),
             "cross_coupling_compensation": fc.control(
                 "torque.osc.cross_coupling_compensation", None),
+            "rotor_inertia_kg_m2": list(fc.control("torque.rotor_inertia_kg_m2")),
             "delta_pos_max_m": fc.control("torque.delta.pos_max_m"),
             "delta_rot_max_rad": fc.control("torque.delta.rot_max_rad"),
         },
-        # The per-rig trims are what a sim/real comparison turns on, so they are
-        # part of the run, not of the machine.
         "tuning": {
             "ee_translation_fudge": fc.control("tuning.ee_translation_fudge"),
             "ee_rotation_fudge": fc.control("tuning.ee_rotation_fudge"),
@@ -798,8 +851,8 @@ def environment(args, controller) -> dict:
 
 def _shared_parameters(args) -> dict:
     return {
-        "exec_fps": float(args.exec_fps or fc.policy("baselines.exec.fast_fps")),
-        "obs_fps": float(args.obs_fps or obs_fps()),
+        "data_fps": data_fps(),
+        "record_fps": record_fps(args),
         "num_episodes": args.num_episodes,
         "episode_time_s": args.episode_time_s,
         "task": args.task,
@@ -807,45 +860,48 @@ def _shared_parameters(args) -> dict:
     }
 
 
-def sail_parameters(args, meta: dict, control_mode) -> dict:
-    """Every knob SAIL's executor resolved, and where each came from."""
-    precision = bool(meta.get("precision_column")) and not args.no_precision
-    eag = bool(meta.get("guided") and meta.get("fac_enabled")) and not args.no_eag
+def _osc(gains: dict) -> dict:
+    base = float(fc.control("torque.osc.gain_exp_base"))
+    return {"osc_kp": float(fc.control("torque.osc.default_kp")) * base ** gains["kp"],
+            "osc_damping_ratio": float(fc.control("torque.osc.default_damping_ratio"))
+            * base ** gains["kd"],
+            "gain_action": [gains["kp"], gains["kd"]]}
+
+
+def sail_parameters(args, meta: dict, settings: dict) -> dict:
+    """Every knob SAIL's executor resolved."""
     return {
         **_shared_parameters(args),
-        "slow_fps": float(args.slow_fps or fc.policy("baselines.exec.slow_fps")),
-        "precision_modulation": precision,
+        "speed_up_times": settings["speed"],
+        "exec_fps": settings["fast_hz"],
+        "fast_fps": settings["fast_hz"],
+        "slow_fps": settings["slow_hz"],
+        "precision_modulation": settings["precision"],
         "precision_available": bool(meta.get("precision_column")),
-        "eag": eag,
+        "eag": settings["eag"],
         "eag_available": bool(meta.get("fac_enabled")),
         "eag_horizon": meta.get("fac_horizon"),
-        "inf_delay": int(fc.policy("baselines.sail.inf_delay")),
-        "execute_n_actions": int(fc.policy("baselines.sail.execute_n_actions")),
-        "osc_kp": (float(fc.policy("baselines.sail.osc_kp"))
-                   if fc.policy("baselines.sail.osc_kp") is not None
-                   else float(fc.control("torque.osc.default_kp"))),
-        "osc_kp_source": ("baselines.sail.osc_kp" if fc.policy("baselines.sail.osc_kp") is not None
-                          else "torque.osc.default_kp"),
-        "osc_damping_ratio": float(fc.policy("baselines.sail.osc_damping_ratio")
-                                   or fc.control("torque.osc.default_damping_ratio")),
-        "slowdown_window_size": int(fc.policy("baselines.sail.slowdown_window_size")),
-        "pos_teb": float(fc.policy("baselines.sail.pos_teb")),
-        "ori_teb": float(fc.policy("baselines.sail.ori_teb")),
+        "inf_delay": settings["inf_delay"],
+        "execute_n_actions": settings["execute_n"],
+        "slowdown_window_size": settings["window"],
+        "pos_teb": settings["pos_teb"],
+        "ori_teb": settings["ori_teb"],
         "action_horizon": meta.get("action_horizon"),
         "prediction_horizon": meta.get("prediction_horizon"),
+        **_osc(settings["gains"]),
     }
 
 
-def bspline_parameters(args, meta: dict, planner_kwargs: dict) -> dict:
+def bspline_parameters(args, meta: dict, planner_kwargs: dict, control_freq: float) -> dict:
     """Every knob the spline planner resolved."""
     return {
         **_shared_parameters(args),
+        "exec_fps": control_freq,
+        "control_freq": control_freq,
         **{k: v for k, v in planner_kwargs.items() if not k.startswith("_")},
         "action_format": meta.get("action_format"),
         "act_dim": meta.get("act_dim"),
-        "goal_lead": bool(fc.policy("baselines.bspline.goal_lead")),
-        "osc_kp": bspline_osc(planner_kwargs["speed_up_times"])[0],
-        "osc_damping_ratio": bspline_osc(planner_kwargs["speed_up_times"])[1],
+        **_osc(stock_gains()),
     }
 
 
@@ -874,20 +930,13 @@ def open_run(args, method: str, train_dataset: dict) -> tuple[rr.RunDir, rr.RunR
                         root=args.outputs_root or rr.DEFAULT_ROOT)
     record = rr.RunRecord(run_dir, method, train_dataset)
     if args.repo_id is None:
-        # Derived so two runs of the same method on the same task never collide,
-        # and so the dataset says what produced it.
         args.repo_id = f"{Path(train_dataset['repo_id']).name}-{run_dir.run_id}"
     logger.info("run directory: %s", run_dir.path)
     return run_dir, record
 
 
 class Stopper:
-    """Episode termination: operator verdict, or a timeout counted as failure.
-
-    Right arrow ends the episode as a SUCCESS, left arrow as a FAILURE. That
-    verdict is the whole point -- run_residual.py has no success detection, and
-    without one there is no time-to-success to compare the baselines on.
-    """
+    """Episode termination: operator verdict, or a timeout counted as failure."""
 
     def __init__(self, episode_time_s: float | None) -> None:
         self.limit = episode_time_s
@@ -900,9 +949,7 @@ class Stopper:
     def check(self) -> str | None:
         """-> 'success' | 'failure' | 'timeout' | None. Raises on Ctrl-C.
 
-        LATCHED, because a keypress is consumed by reading it: callers that poll
-        more than once per step (the B-Spline loop polls between observations)
-        would otherwise see the verdict once and then lose it.
+        Latched: a keypress is consumed by reading it.
         """
         if self.verdict is not None:
             return self.verdict
@@ -917,11 +964,11 @@ class Stopper:
         return self.verdict
 
 
-def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
+def run_episodes(args, controller, run_dir, record, episode_fn, *, nominal_hz: float) -> None:
     """Outer harness: home, wait for the operator, run, record, repeat.
 
-    `episode_fn(controller, dispatcher, dataset, ep, stopper)` runs one episode
-    and fills in `ep`. Shared so the three methods differ only in their loop.
+    `episode_fn(controller, dispatcher, pump, ep, stopper)` runs one episode and
+    fills in `ep`; the pump and the recorder run only while it does.
     """
     kw = home_kwargs(args)
     dataset = None
@@ -939,7 +986,7 @@ def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
             "recorded": dataset is not None,
             "repo_id": args.repo_id if dataset is not None else None,
             "path": str(run_dir.dataset_dir) if dataset is not None else None,
-            "fps": dataset_fps(args),
+            "fps": record_fps(args),
         }, videos_dir=str(run_dir.video_dir) if args.save_videos else None)
 
         homed = home(controller, kw)
@@ -950,44 +997,59 @@ def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
             print(f"\r\nrunning ({args.episode_time_s:.0f}s max). "
                   f"RIGHT = success, LEFT = failure, Ctrl-C = abort\r", flush=True)
 
-            ep = Episode(episode=idx, homed=homed,
-                         started_at=rr.stamp(), exec_fps=dataset_fps(args))
+            ep = Episode(episode=idx, homed=homed, started_at=rr.stamp(), exec_fps=nominal_hz)
             dispatcher = Dispatcher(controller, dry_run=args.dry_run)
-            stopper = Stopper(args.episode_time_s)
+            pump = ObservationPump(controller)
+            recorder = Recorder(pump, dispatcher, record_fps(args))
+            dispatcher.frame_index = lambda r=recorder: r.frames
+            stopper = None
+            interrupted = False
             try:
+                pump.start()
+                recorder.start()
+                stopper = Stopper(args.episode_time_s)
                 with raw_stdin():
-                    episode_fn(controller, dispatcher, dataset, ep, stopper)
+                    episode_fn(controller, dispatcher, pump, ep, stopper)
             except (LeadExceeded, PolicyTimeout) as exc:
-                # Both end THIS episode and neither ends the run: a lead abort is
-                # a tracking verdict and a timeout means one inference was lost.
-                # The operator can still place the scene and try again, and the
-                # episode is recorded as a failure with the reason attached.
+                # The episode is a failure with the reason attached; the run goes on.
                 ep.aborted = f"{type(exc).__name__}: {exc}"
                 ep.verdict = "aborted"
                 logger.error("episode %d aborted: %s", idx, exc)
+            except KeyboardInterrupt:
+                interrupted = True
+                raise
             finally:
+                recorder.stop()
+                pump.stop()
                 ep.steps = dispatcher.steps
-                if not ep.wall_time_s:
+                if stopper is not None and not ep.wall_time_s:
                     ep.wall_time_s = stopper.elapsed()
                 ep.ended_at = rr.stamp()
-                ep.verdict = ep.verdict or stopper.verdict or "incomplete"
+                ep.verdict = ep.verdict or (stopper.verdict if stopper else None) or "incomplete"
                 if ep.wall_time_s > 0:
                     ep.achieved_fps = round(ep.steps / ep.wall_time_s, 2)
                 ep.send_gap_ms_mean, ep.send_gap_ms_max = dispatcher.gap_stats()
                 ep.ee_force_n = forces.add_trace(idx, dispatcher.wrench)
                 chunks.add(idx, dispatcher.chunks)
+                if not interrupted:
+                    ep.frames_recorded = recorder.flush(
+                        dataset, args.task, controller.cameras,
+                        run_dir.video_dir if args.save_videos else None,
+                        f"{record.method}_ep{idx:03d}")
                 if dataset is not None:
-                    ep.frames_recorded = frames_in_progress(dataset)
-                    ep.dataset_episode_index = dataset.num_episodes
+                    ep.dataset_episode_index = dataset.num_episodes if ep.frames_recorded else None
                 record.add_episode(ep)
 
             print(f"\r\nepisode {idx}: {ep.verdict.upper()} "
-                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps{force_note(ep.ee_force_n)}\r", flush=True)
+                  f"in {ep.wall_time_s:.2f}s, {ep.steps} steps{force_note(ep.ee_force_n)}\r",
+                  flush=True)
             if dataset is not None:
-                dataset.save_episode()
-            # After the last episode too, so a completed run leaves the arm at home.
-            # Not on Ctrl-C: that raises out of the loop, and an operator who stopped
-            # the run does not want the arm to move again on its own.
+                if ep.frames_recorded:
+                    # In-process: NVENC cannot initialise CUDA in a forked encoder.
+                    dataset.save_episode(parallel_encoding=False)
+                else:
+                    logger.warning("episode %d recorded no frames; not saved", idx)
+            # Not on Ctrl-C: that raises out of the loop, and the operator stopped the arm.
             homed = home(controller, kw)
     finally:
         if dataset is not None:
@@ -1010,7 +1072,4 @@ def run_episodes(args, controller, run_dir, record, episode_fn) -> None:
         if args.save_videos and run_dir.video_dir.is_dir():
             record.set("outputs",
                        videos=sorted(p.name for p in run_dir.video_dir.glob("*.mp4")))
-        # The manifest is otherwise only rewritten per episode, so the dataset
-        # description gathered above would never reach disk for a caller that
-        # does not go on to call record.finish().
         record.write()

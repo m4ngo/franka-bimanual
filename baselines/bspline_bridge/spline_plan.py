@@ -128,9 +128,11 @@ class SplinePlanner:
         self.max_t = 0.0
         self.last_obs_time_to_predict: float | None = None
         self.last_t_normalized: float | None = None
+        self.plan_start_t = 0.0  # where the installed plan was entered (the stitch point)
         self._sampled = None    # (predictor, t, max_t) of the last poll_action sample
         self.getting_spline = False
         self.plans = 0
+        self.failures = 0
         self.align_errors: list[float] = []
         self._epoch = 0
         self._accumulated_t = 0.0
@@ -188,14 +190,24 @@ class SplinePlanner:
 
     # -- stepping ----------------------------------------------------------
 
-    def step(self, obs: dict) -> np.ndarray | None:
-        """Feed one observation, then sample. None until a plan exists."""
-        self.obs_history.append(obs)
-        if len(self.obs_history) >= self.n_obs_steps * self.obs_stride:
+    def step(self, obs, obs_time: float | None = None) -> np.ndarray | None:
+        """Upstream's `step`: feed one observation, or the whole observation window
+        as a list, then sample. None until a plan exists.
+
+        `obs_time` is when the newest observation was read; upstream reads it in
+        the same tick and uses the request time.
+        """
+        if isinstance(obs, (list, tuple)):
+            sequence = list(obs)
+            if len(sequence) < self.n_obs_steps:
+                return None
+        else:
+            self.obs_history.append(obs)
+            if len(self.obs_history) < self.n_obs_steps * self.obs_stride:
+                return None
             sequence = [self.obs_history[i]
-                        for i in range(self.obs_stride - 1, len(self.obs_history),
-                                       self.obs_stride)]
-            self._request_if_needed(sequence)
+                        for i in range(self.obs_stride - 1, len(self.obs_history), self.obs_stride)]
+        self._request_if_needed(sequence, obs_time)
         return self.poll_action()
 
     def poll_action(self) -> np.ndarray | None:
@@ -228,13 +240,14 @@ class SplinePlanner:
             return np.asarray(predictor(np.array([t])), dtype=np.float64).squeeze()
 
     def plan_samples(self, step: float = 1.0) -> np.ndarray:
-        """The installed plan sampled every `step` knot units over its whole support."""
+        """The installed plan sampled every `step` knot units from where it was entered to its end."""
         with self.lock:
-            return np.asarray(self.predictor(np.arange(self.min_t, self.max_t + 1e-9, step)))
+            start = min(max(self.plan_start_t, self.min_t), self.max_t)
+            return np.asarray(self.predictor(np.arange(start, self.max_t + 1e-9, step)))
 
     # -- planning ----------------------------------------------------------
 
-    def _request_if_needed(self, sequence) -> None:
+    def _request_if_needed(self, sequence, obs_time: float | None = None) -> None:
         with self.lock:
             if self.getting_spline:
                 return
@@ -256,7 +269,7 @@ class SplinePlanner:
             epoch = self._epoch
         req = {
             "obs": [dict(o) for o in sequence],
-            "obs_time": self._clock(),
+            "obs_time": self._clock() if obs_time is None else float(obs_time),
             "epoch": epoch,
         }
         if self._synchronous:
@@ -292,6 +305,7 @@ class SplinePlanner:
         except Exception:
             logger.exception("spline request failed")
             with self.lock:
+                self.failures += 1
                 self.getting_spline = False
 
     def _install(self, bspline: np.ndarray, req: dict) -> None:
@@ -306,7 +320,7 @@ class SplinePlanner:
                     or self.last_t_normalized is None):
                 self._flush(bspline)
                 self.last_obs_time_to_predict = self._clock()
-                t_new, error = self.min_t, 0.0
+                t_new, error = 0.0, 0.0
             else:
                 old = np.asarray(
                     self.predictor(np.array([self.last_t_normalized])), dtype=np.float64
@@ -314,8 +328,8 @@ class SplinePlanner:
                 self._flush(bspline)
                 t_new, error = self._align(old, req["obs_time"])
                 if self.restart_on_time_align_error and error > self.time_align_error_threshold:
-                    logger.warning("time-align error %.6f too large; restarting at min_t", error)
-                    t_new = self.min_t
+                    logger.warning("time-align error %.6f too large; restarting at t=0", error)
+                    t_new = 0.0
                 self.last_obs_time_to_predict = (
                     self._clock()
                     - t_new / self.speed_up_times / self.origin_time_scale
@@ -327,6 +341,7 @@ class SplinePlanner:
             if self.gripper_slowdown_enabled:
                 self._accumulated_t = float(t_new)
                 self._last_step_time = self._clock()
+            self.plan_start_t = float(t_new)
             self.plans += 1
             self.getting_spline = False
 

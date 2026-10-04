@@ -103,7 +103,8 @@ def _normalize_guide_actions(actions, policy):
     assert len(stats.keys()) == 1, "Only one action key is supported for now"
     key = list(stats.keys())[0]
     stats = TensorUtils.to_float(TensorUtils.to_device(TensorUtils.to_tensor(stats), device))
-    return ObsUtils.normalize_dict({key: actions}, normalization_stats=stats)[key]
+    # A clamped +-1 output comes back as 1.0000002 and trips step_classifier_free_guidance's assert.
+    return ObsUtils.normalize_dict({key: actions}, normalization_stats=stats)[key].clamp(-1.0, 1.0)
 
 
 def _load_guide_config(path: str | None, policy):

@@ -109,6 +109,8 @@ class EpisodeRecorder:
         self.chunk_events: list[dict] = []
         # Per-inference network-input clouds (post crop/downsample/re-centering).
         self.policy_pcd_events: list[dict] = []
+        # --viz-latency-debug: per chunk, inference timing and robot-frame positions.
+        self.latency_events: list[dict] = []
         # Reach-task target, world frame; None for every other base policy.
         self.reach_waypoints: np.ndarray | None = None   # (N, 3)
         self.reach_goal: np.ndarray | None = None        # (3,)
@@ -497,6 +499,81 @@ def _reference_frame_points(
     if cam_in_world_translation is not None:
         pts.append(np.asarray(cam_in_world_translation, dtype=np.float32).reshape(1, 3))
     return pts
+
+
+_LATENCY_POINTS = (
+    # key, legend name, colour, symbol
+    ("anchor_pos", "latency: pose at observation", "gray", "circle"),
+    ("start_pos", "latency: pose at inference start", "green", "circle"),
+    ("end_pos", "latency: pose when inference returned", "red", "circle"),
+    ("send_pos", "latency: pose first goal sent from", "orange", "circle"),
+    ("target_pos", "latency: chunk's first target", "royalblue", "x"),
+    ("goal_pos", "latency: goal actually commanded", "purple", "diamond"),
+)
+
+
+def _latency_traces(events: list[dict], R_r2w, t_r2w) -> list[go.Scatter3d]:
+    """Static WORLD-frame markers for --viz-latency-debug, one point per chunk per
+    stage, plus each chunk's path observation -> start -> returned -> sent and the
+    jump from the sent-from pose to the goal it was given."""
+    if not events:
+        return []
+
+    def hover(e):
+        f = lambda k: f"{e[k]:.1f}" if e.get(k) is not None else "-"
+        return (f"step {e['step']}<br>base {f('base_ms')} ms, residual {f('residual_ms')} ms, "
+                f"total {f('total_ms')} ms<br>obs->send {f('obs_to_send_ms')} ms<br>"
+                f"drift {f('drift_mm')} mm, backtrack {f('backtrack_mm')} mm")
+
+    traces = []
+    for key, name, colour, symbol in _LATENCY_POINTS:
+        rows = [(e[key], hover(e)) for e in events if e.get(key) is not None]
+        if not rows:
+            continue
+        pts = _apply_robot_to_world(np.array([r[0] for r in rows], dtype=np.float32), R_r2w, t_r2w)
+        traces.append(go.Scatter3d(
+            x=pts[:, 0], y=pts[:, 1], z=pts[:, 2], mode="markers",
+            marker=dict(size=5, color=colour, symbol=symbol), name=name,
+            text=[r[1] for r in rows], hoverinfo="text+name", legendgroup="latency"))
+    for keys, colour, name in ((("anchor_pos", "start_pos", "end_pos", "send_pos"), "dimgray",
+                                "latency: arm path during inference"),
+                               (("send_pos", "goal_pos"), "purple", "latency: first goal jump")):
+        xs, ys, zs = [], [], []
+        for e in events:
+            seg = [e[k] for k in keys if e.get(k) is not None]
+            if len(seg) < 2:
+                continue
+            seg = _apply_robot_to_world(np.array(seg, dtype=np.float32), R_r2w, t_r2w)
+            xs += [*seg[:, 0], None]
+            ys += [*seg[:, 1], None]
+            zs += [*seg[:, 2], None]
+        if xs:
+            traces.append(go.Scatter3d(x=xs, y=ys, z=zs, mode="lines",
+                                       line=dict(color=colour, width=4), name=name,
+                                       hoverinfo="skip", legendgroup="latency"))
+    return traces
+
+
+def save_latency_html(events: list[dict], path: str, title: str = "inference latency") -> None:
+    """Per-chunk timing and how far the arm moved while the chunk was inferred."""
+    if not events:
+        return
+    steps = [e["step"] for e in events]
+    col = lambda k: [e.get(k) for e in events]
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.08,
+                        subplot_titles=("inference time per chunk (ms)",
+                                        "arm motion during inference (mm)"))
+    fig.add_trace(go.Bar(x=steps, y=col("base_ms"), name="base"), row=1, col=1)
+    fig.add_trace(go.Bar(x=steps, y=col("residual_ms"), name="residual"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=steps, y=col("obs_to_send_ms"), mode="lines+markers",
+                             name="observation -> first goal sent"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=steps, y=col("drift_mm"), mode="lines+markers",
+                             name="drift: observation -> first send"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=steps, y=col("backtrack_mm"), mode="lines+markers",
+                             name="backtrack: first goal behind the arm"), row=2, col=1)
+    fig.update_layout(barmode="stack", title=title)
+    fig.update_xaxes(title_text="step", row=2, col=1)
+    fig.write_html(path, include_plotlyjs="cdn")
 
 
 def _skeleton_trace(pts: np.ndarray) -> go.Scatter3d:
@@ -1147,6 +1224,9 @@ def save_episode_html(
         fig.add_trace(_trail_trace(reference, color="darkorange", name=reference_name,
                                    dash="dash", width=3, marker_size=2), row=1, col=1)
 
+    for trace in _latency_traces(recorder.latency_events, R_r2w, t_r2w):
+        fig.add_trace(trace, row=1, col=1)
+
     fig.write_html(path, include_plotlyjs="cdn")
 
 
@@ -1494,6 +1574,9 @@ def save_rollout_html(
     if reference is not None and len(reference) > 0:
         fig.add_trace(_trail_trace(reference, color="darkorange", name=reference_name,
                                    dash="dash", width=3, marker_size=2), row=1, col=1)
+
+    for trace in _latency_traces(recorder.latency_events, R_r2w, t_r2w):
+        fig.add_trace(trace, row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")
 

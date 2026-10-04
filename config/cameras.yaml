@@ -31,8 +31,8 @@ defaults:
     # `blob_filter_min_neighbors` others. Off by default — it changes what the
     # policy sees, so enabling it is a per-run decision.
     blob_filter: false
-    blob_filter_min_neighbors: 20
-    blob_filter_radius_m: 0.01
+    blob_filter_min_neighbors: 100
+    blob_filter_radius_m: 0.02
   arv:
     pixel_format: Mono8
 
@@ -64,10 +64,11 @@ cameras:
       distortion_coeffs: [2.18422004e-02, 7.00473072e-01, 1.69082283e-03, -5.82597153e-04, -2.69227978e+00]
       # camera -> calibration frame
       r_cam_in_calib:
-        - [-0.01259874, 0.61255121, -0.79033049]
-        - [0.99989204, 0.00174045, -0.01459044]
-        - [-0.00756186, -0.79042898, -0.61250701]
-      t_cam_in_calib: [0.80685067, 0.04568331, 0.72051993]
+        - [-0.35982169, 0.75057596, -0.55422385]
+        - [0.93160186, 0.32177194, -0.16905853]
+        - [0.05144241, -0.57714690, -0.81501849]
+      t_cam_in_calib: [0.53740284, 0.50428987, 0.83421789]
+
 
   cam_3:
     type: arv

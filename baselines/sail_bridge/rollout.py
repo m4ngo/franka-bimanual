@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 """Roll a trained SAIL policy out on the bimanual_franka hardware (single arm).
 
-    # in the SAIL conda env, first:
+    # in the SAIL venv, first:
     python baselines/sail_bridge/policy_server.py --ckpt-path <CKPT.pth> --port 5556
 
     # then, in the workspace venv:
-    python -m baselines.sail_bridge.rollout --rig single_arm_right --num-episodes 10
+    python -m baselines.sail_bridge.rollout --rig single_arm_right --speed 2 --num-episodes 10
 
-SAIL's own executor is not released and is robosuite-bound, so this is the loop
-written from its description (baselines/SAIL.md, pass 5). It implements all three
-of its eval-time mechanisms:
+The episode loop is upstream's `rollout_diffusion_policy`
+(SAIL/run_trained_agent_receding_horizon.py) line for line, with `env.step(a,
+control_freq=f)` realised as "send the goal, hold it 1/f s":
 
-  * receding horizon -- keep executing the PREVIOUS prediction while the new
-    one is inferred (at least `inf_delay` rows, upstream's fixed latency model;
-    more if inference actually takes longer), then enter the new one at the row
-    matching the rows that went out since its observation. Row 0 of a chunk is
-    the pose the arm was OBSERVED at (the targets are reached poses), so entering
-    earlier than that sends the arm back to where it was seen;
-  * precision speed modulation -- the last action column is a precision label;
-    any label set inside a window around the current step drops that step from
-    fast_fps to slow_fps;
-  * error-adaptive guidance -- condition the next prediction on the tail of the
-    current plan, but only while the arm is actually tracking it.
+  * receding horizon: infer from the observation after the last executed step,
+    execute `inf_delay` rows of the PREVIOUS plan, then `execute_n_actions` rows
+    of the new one starting at row `inf_delay`. Upstream's simulator stops while
+    the policy thinks; here inference runs while those `inf_delay` rows execute,
+    and if it is still running after them the arm holds the last goal until it
+    returns, so the plan indexing is upstream's exactly. The frame stack is the
+    newest observation and the one a demonstration step before it
+    (ObservationPump.window): a camera cannot deliver a frame per control step;
+  * precision speed modulation: a step runs at the slow rate when any precision
+    label in the window around it is set (`get_slowdown_mode_from_model`);
+  * error-adaptive guidance: condition the next prediction on the next
+    `future_action_condition.horizon` rows of the current plan, but only when the
+    arm is within `pos_teb` / `ori_teb` of the first of them.
 
-The control mode is resolved from the checkpoint, not chosen here: SAIL's
-training template trains on absolute poses while our converter also writes a
-delta `actions` key, and only the checkpoint knows which it learned.
+Speed: `--speed s` sets upstream's `fast_control_freq` to s times the rate the
+demonstrations were recorded at; `slow_control_freq` stays at
+baselines.exec.slow_fps (upstream's 20 Hz, i.e. 1x). The OSC runs at
+baselines.sail.osc_kp_scale times the stock kp.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
-import math
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -54,42 +56,49 @@ from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 logger = logging.getLogger("baselines.sail")
 
 POLICY = "sail"
-# Action-key -> control mode. `actions` is the delta our converter derives with
-# OSCGoalBuilder.delta_from_absolute; anything naming `absolute_actions` --
-# reached or commanded, with or without the precision label -- is a pose.
-_DELTA_KEY = "actions"
+# Upstream evaluates absolute poses with control_delta False; `actions` is our converter's delta.
 _ABS_MARKER = "absolute_actions"
 
 
-def resolve_control_mode(meta: dict, override: str) -> ControlMode:
-    if override == "ee_delta":
-        return ControlMode.EE_DELTA
-    if override == "ee_pos":
-        return ControlMode.EE_POS
+def resolve_control_mode(meta: dict) -> ControlMode:
     keys = list(meta.get("action_keys") or [])
-    if len(keys) != 1:
+    if len(keys) != 1 or _ABS_MARKER not in keys[0]:
         raise ValueError(
-            f"checkpoint declares action_keys={keys}; exactly one is supported. "
-            "Pass --control-mode to choose explicitly."
+            f"checkpoint declares action_keys={keys}; SAIL's evaluation executes one "
+            f"absolute pose key (one containing {_ABS_MARKER!r}) under control_delta "
+            "False. Retrain on absolute_actions_with_precision."
         )
-    key = keys[0]
-    # The absolute check comes first: "actions" is a substring of the absolute keys.
-    if _ABS_MARKER in key:
-        return ControlMode.EE_POS
-    if key == _DELTA_KEY:
-        return ControlMode.EE_DELTA
-    raise ValueError(
-        f"cannot tell the action space from action_keys={keys!r}. Expected "
-        f"{_DELTA_KEY!r} (delta) or a key containing {_ABS_MARKER!r} (absolute); "
-        "pass --control-mode to override."
-    )
+    return ControlMode.EE_POS
 
 
-def _decode(row: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
-    """One action row -> (xyz, rotvec, gripper), the layout every converter here
-    writes (baselines/common.py:pos_rotvec_gripper). The precision label, if any,
-    has already been stripped by the caller."""
-    return row[:3].astype(np.float64), row[3:6].astype(np.float64), float(row[6])
+def settings(meta: dict, args) -> dict:
+    """Upstream's kwargs literal, from config/policy.yaml and the checkpoint."""
+    precision = bool(meta["precision_column"]) and not args.no_precision
+    eag = bool(meta["guided"] and meta["fac_enabled"]) and not args.no_eag
+    s = {
+        "speed": float(args.speed),
+        "fast_hz": float(args.speed) * rc.data_fps(),
+        "slow_hz": float(fc.policy("baselines.exec.slow_fps")),
+        "precision": precision,
+        "eag": eag,
+        "t_f": int(meta["fac_horizon"]) if eag else 0,
+        "horizon": int(meta["action_horizon"]),
+        "frame_stack": int(meta.get("frame_stack") or meta["n_obs_steps"]),
+        "inf_delay": int(fc.policy("baselines.sail.inf_delay")),
+        "execute_n": int(fc.policy("baselines.sail.execute_n_actions")),
+        "window": int(fc.policy("baselines.sail.slowdown_window_size")),
+        "pos_teb": float(fc.policy("baselines.sail.pos_teb")),
+        "ori_teb": float(fc.policy("baselines.sail.ori_teb")),
+        "gains": rc.sail_gains(),
+    }
+    # Steady state reads rows [inf_delay + execute_n, + max(inf_delay, t_f)) of a plan.
+    need = s["inf_delay"] + s["execute_n"] + max(s["inf_delay"], s["t_f"])
+    if s["horizon"] < need:
+        raise ValueError(
+            f"checkpoint's action_horizon is {s['horizon']}, but inf_delay "
+            f"{s['inf_delay']} + execute_n_actions {s['execute_n']} reads {need} rows"
+        )
+    return s
 
 
 def _timed_request(client: PolicyClient, payload: dict) -> tuple[dict, float]:
@@ -98,217 +107,122 @@ def _timed_request(client: PolicyClient, payload: dict) -> tuple[dict, float]:
     return rep, time.perf_counter() - t0
 
 
-def make_episode_fn(client: PolicyClient, meta: dict, args,
-                    control_mode: ControlMode, shapes: dict, run_dir):
-    precision = meta["precision_column"] and not args.no_precision
-    eag = meta["guided"] and meta["fac_enabled"] and not args.no_eag
-    t_f = int(meta["fac_horizon"])
-    horizon = int(meta["action_horizon"])
-
-    inf_delay = int(fc.policy("baselines.sail.inf_delay"))
-    execute_n = int(fc.policy("baselines.sail.execute_n_actions"))
-    window = int(fc.policy("baselines.sail.slowdown_window_size"))
-    pos_teb = float(fc.policy("baselines.sail.pos_teb"))
-    ori_teb = float(fc.policy("baselines.sail.ori_teb"))
-
-    fast_fps = float(args.exec_fps or fc.policy("baselines.exec.fast_fps"))
-    slow_fps = float(args.slow_fps or fc.policy("baselines.exec.slow_fps"))
-    o_fps = float(args.obs_fps or rc.obs_fps())
-    osc_kp = fc.policy("baselines.sail.osc_kp")
-    osc_damping = fc.policy("baselines.sail.osc_damping_ratio")
-    gains = rc.gain_action(osc_kp, osc_damping)
-
-    if horizon < inf_delay + execute_n:
-        raise ValueError(
-            f"checkpoint's action_horizon is {horizon} but the receding horizon "
-            f"consumes inf_delay + execute_n_actions = {inf_delay + execute_n} "
-            "actions per inference. Lower them in config/policy.yaml "
-            "(baselines.sail) or retrain with a longer horizon."
-        )
-    logger.info(
-        "mode=%s precision=%s eag=%s fast/slow=%.0f/%.0f Hz obs=%.0f Hz "
-        "inf_delay=%d execute_n=%d horizon=%d osc_kp=%s damping=%s",
-        control_mode.value, precision, eag, fast_fps, slow_fps, o_fps,
-        inf_delay, execute_n, horizon,
-        "default" if osc_kp is None else f"{float(osc_kp):g}",
-        "default" if osc_damping is None else f"{float(osc_damping):g}",
-    )
-
-    def episode_fn(controller, dispatcher, dataset, ep, stopper) -> None:
+def make_episode_fn(client: PolicyClient, s: dict, shapes: dict):
+    def episode_fn(controller, dispatcher, pump, ep, stopper) -> None:
         client.reset()
-        dispatcher.start()
-
-        prev_chunk: np.ndarray | None = None
-        prev_index = 0
-        ref: np.ndarray | None = None       # unnormalised reference for EAG
         executed: list[np.ndarray] = []
+        prev_act: np.ndarray | None = None
+        prev_action_index = 0
+        guide_actions_unnorm: np.ndarray | None = None
         goal: tuple[np.ndarray, np.ndarray] | None = None
-        writers: dict = {}
-        video_dir = run_dir.video_dir if args.save_videos else None
-        # One frame per OBSERVATION, indexed by written frames. Writing per
-        # dispatched step and labelling at fast_fps mislabels every slow step,
-        # and the two baselines' videos would not line up.
-        video_frames = 0
-        # The pose the live plan was formed at, and the deltas commanded from it
-        # since. Only read on the delta path's EAG check, which cannot run before
-        # the first plan has produced a reference.
-        anchor: tuple[np.ndarray, np.ndarray] = (np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0]))
-        committed: list[np.ndarray] = []
-        # The observation one dispatched step before the one an inference is
-        # made from: the policy's frame stack wants consecutive steps, as
-        # upstream's FrameStackWrapper gives it, not consecutive inferences.
-        obs_prev: dict | None = None
+        spacing = 1.0 / rc.data_fps()
+        cache: dict[int, dict] = {}
+        took_s: list[float] = []
+        waits = 0
+        wait_s = 0.0
 
-        def dispatch(src: np.ndarray, idx: int, obs: dict, max_hz: float) -> None:
-            """One row of a chunk -> one goal on the arm, plus its bookkeeping."""
+        def done() -> bool:
+            verdict = stopper.check()
+            if verdict is not None and not ep.wall_time_s:
+                ep.success = verdict == "success"
+                ep.wall_time_s = stopper.elapsed()
+            return verdict is not None
+
+        def end_of_step() -> None:
+            """The current goal's hold is over; the lead monitor reads the newest snapshot."""
+            dispatcher.wait_hold()
+            if goal is not None:
+                pos_err, rot_err = rc.check_lead(goal[0], goal[1], pump.latest().m)
+                ep.max_lead_m = max(ep.max_lead_m, pos_err)
+                ep.max_lead_rad = max(ep.max_lead_rad, rot_err)
+
+        def frames() -> list[dict]:
+            """FrameStackWrapper's stack: the newest observation and the one a
+            demonstration step before it, as the policy was trained on."""
+            nonlocal cache
+            snaps = pump.window(s["frame_stack"], spacing)
+            cache = {sn.seq: cache.get(sn.seq) or rc.sail_obs(sn.m, shapes) for sn in snaps}
+            return [cache[sn.seq] for sn in snaps]
+
+        def env_step(act: np.ndarray, index: int) -> None:
             nonlocal goal
-            row = src[idx]
-            # Append BEFORE the window check, as upstream does: its
-            # traj["executed_actions"].append(a) precedes the
-            # get_slowdown_mode_from_model call, so the current row sits
-            # in the left window too. Appending after shifts the whole
-            # left window one step further back and can flip the verdict.
-            executed.append(row)
-            slow = precision and rc.slowdown_mode(executed, row, src[idx:], window)
-            a = row[:-1] if precision else row
-            dpos_or_pos, rot, grip = _decode(a)
-            if control_mode is ControlMode.EE_POS:
-                quat = Rotation.from_rotvec(rot).as_quat()
-                action = rc.ee_pos_action(dpos_or_pos, quat, grip, gains)
-                goal = (dpos_or_pos, quat)
+            end_of_step()
+            a = act[index]
+            executed.append(a)
+            if s["precision"]:
+                slow = rc.slowdown_mode(executed, a, act[index:], s["window"])
+                a = a[:-1]
             else:
-                action = rc.ee_delta_action(dpos_or_pos, rot, grip, gains)
-            committed.append(np.concatenate([dpos_or_pos, rot]))
-            if slow:
-                ep.slow_steps += 1
-            dispatcher.send(action, min(slow_fps if slow else fast_fps, max_hz))
-            if dataset is not None:
-                rc.add_frame(dataset, obs, action, args.task, controller.cameras)
+                slow = False
+            pos, rotvec, grip = a[:3], a[3:6], float(a[6])
+            quat = Rotation.from_rotvec(rotvec).as_quat()
+            dispatcher.step(rc.ee_pos_action(pos, quat, grip, s["gains"]),
+                            s["slow_hz"] if slow else s["fast_hz"])
+            goal = (pos, quat)
+            ep.slow_steps += int(slow)
 
-        max_hz = math.inf
         pool = ThreadPoolExecutor(max_workers=1)
         try:
-            while True:
-                verdict = stopper.check()
-                if verdict is not None:
-                    ep.success = verdict == "success"
-                    ep.wall_time_s = stopper.elapsed()
-                    break
-
-                obs = controller.get_observation()
-                m = rc.measure(obs)
-
-                # EE_POS only: EE_DELTA re-anchors every step, so its lead is
-                # structurally one clipped delta and there is nothing to monitor.
-                if goal is not None and control_mode is ControlMode.EE_POS:
-                    pos_err, rot_err = rc.check_lead(goal[0], goal[1], m)
-                    ep.max_lead_m = max(ep.max_lead_m, pos_err)
-                    ep.max_lead_rad = max(ep.max_lead_rad, rot_err)
-
+            while not done():
+                end_of_step()
                 guide = None
-                if eag and ref is not None and len(ref):
-                    if control_mode is ControlMode.EE_POS:
-                        want_pos, want_rot = ref[0][:3], ref[0][3:6]
-                    else:
-                        # The reference rows are deltas, each relative to its own
-                        # step's measured pose, so row 0 on its own carries no
-                        # tracking information. Propagate the anchor through the
-                        # deltas already commanded from this plan to recover the pose
-                        # perfect tracking would have reached -- see
-                        # rollout_common.propagate_pose.
-                        p, q = rc.propagate_pose(anchor[0], anchor[1], committed)
-                        want_pos = p + ref[0][:3]
-                        want_rot = (
-                            Rotation.from_rotvec(ref[0][3:6])
-                            * Rotation.from_quat(q)
-                        ).as_rotvec()
-                    if rc.tracking_error_low(m.pos, m.quat_xyzw, want_pos, want_rot,
-                                             pos_teb, ori_teb):
-                        guide = ref
+                if guide_actions_unnorm is not None:
+                    desired = guide_actions_unnorm[0]
+                    pos, quat = rc.fresh_pose(controller)
+                    if rc.tracking_error_low(pos, quat, desired[:3], desired[3:6],
+                                             s["pos_teb"], s["ori_teb"]):
+                        guide = guide_actions_unnorm
                         ep.guided_inferences += 1
-
-                t_infer = time.perf_counter()
-                frames = [rc.sail_obs(m, shapes)]
-                if obs_prev is not None:
-                    frames.insert(0, rc.sail_obs(rc.measure(obs_prev), shapes))
                 future = pool.submit(_timed_request, client,
-                                     {"obs": frames, "guide_actions": guide})
-                anchor = (m.pos.copy(), m.quat_xyzw.copy())
-                committed.clear()
+                                     {"obs": frames(), "guide_actions": guide})
 
-                # The old plan carries on while the new one is computed: at least
-                # inf_delay rows, then for as long as the inference takes, until
-                # the chunk runs out. Each row that goes out is one step the new
-                # chunk's observation ages by.
-                entry = 0
-                if prev_chunk is not None:
-                    while prev_index < len(prev_chunk) and (entry < inf_delay or not future.done()):
-                        dispatch(prev_chunk, prev_index, obs, max_hz)
-                        prev_index += 1
-                        entry += 1
+                current_action_index = 0
+                if prev_act is not None:
+                    # Executed while the new plan is inferred: upstream's inference delay.
+                    for _ in range(s["inf_delay"]):
+                        if done():
+                            break
+                        env_step(prev_act, prev_action_index)
+                        prev_action_index += 1
+                        current_action_index += 1
 
+                dispatcher.wait_hold()
+                t_wait = time.perf_counter()
+                late = prev_act is not None and not future.done()
                 rep, took = future.result()
-                # The paper's latency bound (Sec. 4.4): rows slow enough that a plan outlasts the next inference.
-                max_hz = (horizon - execute_n) / (2.0 * took)
+                if late:
+                    waits += 1
+                    wait_s += time.perf_counter() - t_wait
                 if "error" in rep:
                     raise RuntimeError(f"policy server: {rep['error']}")
-                chunk = np.asarray(rep["chunk"], dtype=np.float64)
+                act = np.asarray(rep["chunk"], dtype=np.float64)
                 ep.inferences += 1
-                rows = chunk[:, :-1] if precision else chunk
-                if control_mode is ControlMode.EE_POS:
-                    dispatcher.chunk(np.hstack([rows[:, :3],
-                                                Rotation.from_rotvec(rows[:, 3:6]).as_quat()]))
-                else:
-                    dispatcher.chunk([np.concatenate(rc.propagate_pose(*anchor, rows[:k + 1, :6]))
-                                      for k in range(len(rows))])
-                # Round-trip to the policy server, summed; with `inferences` that
-                # is the latency each chunk's observation aged by.
-                ep.notes["inference_s"] = round(ep.notes.get("inference_s", 0.0) + took, 3)
+                took_s.append(took)
+                # Logged from the first row this plan executes; rows before it are the observed past.
+                rows = act[current_action_index:]
+                dispatcher.chunk(np.hstack([rows[:, :3],
+                                            Rotation.from_rotvec(rows[:, 3:6]).as_quat()]))
+                if done():
+                    break
 
-                # Entered at `entry`, the row matching the rows dispatched since the
-                # observation it was made from -- never at 0 with a plan in hand,
-                # because row 0 is that observation's own pose.
-                current_index = entry
-                n_new = 0
-                obs_prev = None
-                for j in range(execute_n):
-                    if current_index >= len(chunk):
+                for _ in range(s["execute_n"]):
+                    if done():
                         break
-                    if j == execute_n - 1 or current_index == len(chunk) - 1:
-                        # The frame before the next observation's, for the stack.
-                        obs_prev = controller.get_observation()
-                    dispatch(chunk, current_index, obs, max_hz)
-                    current_index += 1
-                    n_new += 1
-                if n_new == 0:
-                    logger.warning(
-                        "inference took %d rows of a %d-row chunk; nothing left to execute. "
-                        "Lower --exec-fps or speed the policy up.", entry, len(chunk))
+                    env_step(act, current_action_index)
+                    current_action_index += 1
 
-                if video_dir is not None:
-                    for cam, img in m.images.items():
-                        rc.write_video_frame(writers, video_dir,
-                                             f"{POLICY}_ep{ep.episode:03d}",
-                                             o_fps, cam, img, video_frames)
-                    video_frames += 1
-
-                prev_index = current_index
-                prev_chunk = chunk
-                # The reference is what this plan is ABOUT to execute next, sliced at
-                # the post-execution index exactly as upstream does.
-                ref = chunk[current_index:current_index + t_f] if eag else None
-
-                # Hold the obs cadence. Normally a no-op: execute_n steps at
-                # fast_fps already exceed one obs period, and the per-step sleeps
-                # happen in the dispatcher. This only pads a degenerately short plan
-                # so a stub or truncated chunk cannot spin the camera reads flat out.
-                spare = 1.0 / o_fps - (time.perf_counter() - t_infer)
-                if spare > 0:
-                    time.sleep(spare)
+                prev_action_index = current_action_index
+                prev_act = act
+                if s["eag"]:
+                    guide_actions_unnorm = act[prev_action_index:prev_action_index + s["t_f"]]
         finally:
             pool.shutdown(wait=True)
-            for w in writers.values():
-                w.release()
+            if took_s:
+                ep.notes["inference_ms_mean"] = round(1e3 * float(np.mean(took_s)), 1)
+                ep.notes["inference_ms_max"] = round(1e3 * float(np.max(took_s)), 1)
+            # Inferences still running after the inf_delay rows: the arm held its goal meanwhile.
+            ep.notes["inference_waits"] = waits
+            ep.notes["inference_wait_s"] = round(wait_s, 3)
 
     return episode_fn
 
@@ -317,12 +231,11 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     rc.add_common_args(p, policy_name=POLICY)
-    p.add_argument("--control-mode", choices=("auto", "ee_delta", "ee_pos"), default="auto",
-                   help="auto resolves it from the checkpoint's train.action_keys")
-    p.add_argument("--slow-fps", type=float, default=None,
-                   help="goal-push rate on precision steps; default baselines.exec.slow_fps")
+    p.add_argument("--speed", type=float, default=1.0,
+                   help="fast_control_freq as a multiple of the demonstrations' rate "
+                        "(1, 2, 3 ...); precision steps run at baselines.exec.slow_fps")
     p.add_argument("--no-precision", action="store_true",
-                   help="ignore the precision label and run at a single rate")
+                   help="ignore the precision label and run every step at the fast rate")
     p.add_argument("--no-eag", action="store_true", help="disable error-adaptive guidance")
     args = p.parse_args()
 
@@ -334,33 +247,34 @@ def main() -> int:
         p.error(f"server on port {port} is a {meta.get('backend')!r} server, not sail")
     logger.info("checkpoint: %s", meta)
 
-    control_mode = resolve_control_mode(meta, args.control_mode)
     try:
+        control_mode = resolve_control_mode(meta)
+        s = settings(meta, args)
         train_dataset = rr.resolve_train_dataset(
             args.train_dataset, meta.get("train_dataset"), meta.get("training_hdf5"))
     except ValueError as exc:
         p.error(str(exc))
+    logger.info("speed %.2fx: fast/slow %.0f/%.0f Hz, precision=%s eag=%s, "
+                "inf_delay=%d execute_n=%d horizon=%d, osc kp %.0f",
+                s["speed"], s["fast_hz"], s["slow_hz"], s["precision"], s["eag"],
+                s["inf_delay"], s["execute_n"], s["horizon"], rc.sail_kp())
     run_dir, record = rc.open_run(args, POLICY, train_dataset)
 
     record.set("policy",
                checkpoint=rr.file_provenance(args.ckpt),
                server={"host": args.host, "port": port, **{k: v for k, v in meta.items()}},
                control_mode=control_mode.value,
-               control_mode_source=args.control_mode,
-               control_mode_reason=("checkpoint action_keys" if args.control_mode == "auto"
-                                    else "--control-mode"))
-    record.set("parameters", **rc.sail_parameters(args, meta, control_mode))
+               control_mode_source="checkpoint action_keys")
+    record.set("parameters", **rc.sail_parameters(args, meta, s))
 
     controller = rc.build_robot(args.rig, control_mode)
     controller.connect()
     status, reason = "completed", None
     try:
         record.set("environment", **rc.environment(args, controller))
-        # Before homing, not inside the loop: a camera the rig lacks would
-        # otherwise surface as a KeyError in the policy server mid-episode.
         shapes = rc.check_camera_coverage(meta, controller, args.allow_missing_cameras)
         rc.run_episodes(args, controller, run_dir, record,
-                        make_episode_fn(client, meta, args, control_mode, shapes, run_dir))
+                        make_episode_fn(client, s, shapes), nominal_hz=s["fast_hz"])
     except KeyboardInterrupt:
         status, reason = "interrupted", "KeyboardInterrupt at the robot"
         print("\r\ninterrupted\r", flush=True)

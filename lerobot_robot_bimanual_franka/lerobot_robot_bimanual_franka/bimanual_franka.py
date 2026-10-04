@@ -328,11 +328,16 @@ class BimanualFranka(Robot):
 
     # ------------------------------------------------------------------ actions
 
-    def send_action(self, action: RobotAction, ignore_action: bool = False) -> RobotAction:
+    def send_action(self, action: RobotAction, ignore_action: bool = False,
+                    anchor: dict[str, KinematicSnapshot] | None = None) -> RobotAction:
         """Push this policy step's goal to the arms' 1 kHz torque loops.
 
         Mirrors robosuite's split: this is ``set_goal`` (once per policy step),
         while ``run_controller`` runs server-side every tick.
+
+        ``anchor`` is the snapshot the caller computed an EE_DELTA against
+        (``read_kinematic_state``); the goal is composed on exactly that pose,
+        as osc.py's set_goal reads the same state its delta was computed from.
         """
         # Consumed at most once, whether or not this mode needs it: a snapshot held
         # into the next step would silently anchor that step's delta on this step's
@@ -345,8 +350,13 @@ class BimanualFranka(Robot):
             # nothing to anchor and the RPyC round-trip would be pure latency.
             self._command_joints(action)
         else:
-            self._command_osc(action, self._kinematic_state(cached), ignore_action)
+            kin = anchor if anchor is not None else self._kinematic_state(cached)
+            self._command_osc(action, kin, ignore_action)
         return action
+
+    def read_kinematic_state(self) -> dict[str, KinematicSnapshot]:
+        """Every active arm's state, read now."""
+        return self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
 
     def _kinematic_state(self, cached: dict[str, KinematicSnapshot] | None):
         """The snapshot this step's goal is anchored on.
@@ -361,7 +371,7 @@ class BimanualFranka(Robot):
             if time.perf_counter() - self._cached_kin_ts <= _KIN_CACHE_MAX_AGE_S:
                 return cached
             self._kin_cache_stale += 1
-        return self.robot_manager.current_kinematic_state_batch(list(self.active_arms))
+        return self.read_kinematic_state()
 
     def _command_grippers(self, action: RobotAction) -> None:
         """``{arm}_gripper`` is an ABSOLUTE normalized position in [0, 1].

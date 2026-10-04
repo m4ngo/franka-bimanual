@@ -77,6 +77,7 @@ class FakeArm:
         self.sent: list[dict] = []
         self.send_times: list[float] = []
         self.clipped = 0
+        self.frames = 0
         self.freeze = False      # stop tracking, to force the lead monitor to fire
 
     # -- lifecycle
@@ -115,10 +116,13 @@ class FakeArm:
         return {self.k: np.array([0.0, 0.0, float(len(self.sent)), 0.0, 0.0, 0.0])}
 
     def get_observation(self) -> dict:
+        # Paced like a 30 fps camera read; every pixel carries the frame counter.
+        time.sleep(1.0 / 30.0)
+        self.frames += 1
         obs = {f"{self.k}_joint_{i + 1}": float(v) for i, v in enumerate(self.q)}
         obs[f"{self.k}_gripper"] = self.gripper
         for cam in self.cameras:
-            obs[cam] = np.zeros((*_IMG, 3), dtype=np.uint8)
+            obs[cam] = np.full((*_IMG, 3), self.frames % 256, dtype=np.uint8)
         return obs
 
     def send_action(self, action: dict) -> None:
@@ -178,19 +182,21 @@ class FakeSail(_Server):
     """Chunks tagged so the receding-horizon bookkeeping is reconstructable.
 
     Row j of chunk k carries gripper = k + j/100, which passes through
-    `ee_pos_action`/`ee_delta_action` untouched. Reading it back off the dispatched
+    `ee_pos_action` untouched. Reading it back off the dispatched
     action dicts says exactly which (chunk, index) each goal came from.
     """
 
     def __init__(self, port, *, action_keys, act_dim, precision,
-                 action_horizon=16, fac_horizon=4, guided=False):
+                 action_horizon=16, fac_horizon=4, guided=False, delay_s=0.0):
         super().__init__(port)
+        self.delay_s = delay_s
         self.action_keys, self.act_dim = action_keys, act_dim
         self.precision, self.action_horizon = precision, action_horizon
         self.fac_horizon, self.guided = fac_horizon, guided
         self.chunk_id = -1
         self.guide_seen: list = []
         self.frames_seen: list = []
+        self.frame_ids: list[list[int]] = []
 
     def handle(self, req):
         if "meta" in req:
@@ -209,11 +215,13 @@ class FakeSail(_Server):
         self.calls += 1
         self.chunk_id += 1
         self.guide_seen.append(req.get("guide_actions"))
+        time.sleep(self.delay_s)
         absolute = not self.action_keys[0] == "actions"
         chunk = np.zeros((self.action_horizon, self.act_dim))
         # A list is consecutive frames, oldest first; the newest is the anchor.
         obs = req["obs"][-1] if isinstance(req["obs"], (list, tuple)) else req["obs"]
         self.frames_seen.append(len(req["obs"]) if isinstance(req["obs"], (list, tuple)) else 1)
+        self.frame_ids.append([int(o["cam_2_image"][0, 0, 0]) for o in req["obs"]])
         base = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
         for j in range(self.action_horizon):
             if absolute:
@@ -237,6 +245,7 @@ class FakeBSpline(_Server):
         super().__init__(port)
         self.span = self.SPAN if span is None else span
         self.travel = float(travel)   # metres of x the plan sweeps
+        self.frames_seen: list[list[int]] = []
 
     def handle(self, req):
         if "meta" in req:
@@ -248,6 +257,8 @@ class FakeBSpline(_Server):
         if "reset" in req:
             return {}
         self.calls += 1
+        self.frames_seen.append([int(o["cam_2_image"][0, 0, 0]) for o in req["obs"]
+                                 if "cam_2_image" in o])
         obs = req["obs"][-1] if isinstance(req["obs"], (list, tuple)) else req["obs"]
         return {"bspline": self.make(np.asarray(obs["arm_pos"], dtype=np.float64),
                                      np.asarray(obs["arm_quat"], dtype=np.float64))}
@@ -322,7 +333,7 @@ def _args(**kw):
     """Namespace matching the entrypoints' argparse, defaults filled in."""
     ns = argparse.Namespace(
         rig="single_arm_franka", ckpt=None, port=None, host="localhost",
-        exec_fps=None, obs_fps=None, dry_run=False,
+        record_fps=None, dry_run=False,
         allow_missing_cameras=True,   # the fake rig's cameras are its own
         num_episodes=1, episode_time_s=1.0, task="offline check",
         train_dataset="Offline/check", outputs_root=None, repo_id=None,
@@ -331,8 +342,8 @@ def _args(**kw):
         home_gripper=fc.control("homing.gripper_norm"),
         home_max_time_s=fc.control("homing.max_time_s"),
         home_tol_rad=fc.control("homing.tol_rad"),
-        control_mode="auto", slow_fps=None, no_precision=False, no_eag=True,
-        speed_up_times=None, origin_time_scale=None, predict_before_end=None,
+        speed=1.0, no_precision=False, no_eag=True,
+        control_freq=None, origin_time_scale=None, predict_before_end=None,
         degree=3, gripper_slowdown=False, restart_on_time_align_error=False,
         consider_gripper_during_align=False, disable_time_align=False,
     )
@@ -405,39 +416,34 @@ def check_pure(res: Results) -> None:
         worst = max(worst, (Rotation.from_quat(q) * R.inv()).magnitude())
     res.check(worst < 1e-9, "rot6d_to_quat_xyzw round-trips", f"worst {worst:.2e} rad")
 
-    # the delta action really is a quaternion in metres
-    d = rc.ee_delta_action([0.01, -0.02, 0.03], [0.1, -0.2, 0.05], 0.4)
+    # the absolute action is a unit quaternion in metres, with the gain channels it was given
+    d = rc.ee_pos_action([0.4, -0.02, 0.3], [0.0, 0.0, 0.0, 2.0], 0.4)
     q = np.array([d[f"{rc.ARM_KEY}_q{c}"] for c in "xyzw"])
-    res.check(np.allclose(Rotation.from_quat(q).as_rotvec(), [0.1, -0.2, 0.05])
-              and d[f"{rc.ARM_KEY}_x"] == 0.01,
-              "ee_delta_action converts rotvec -> delta quat, keeps metres")
+    res.check(np.allclose(q, [0, 0, 0, 1]) and d[f"{rc.ARM_KEY}_x"] == 0.4
+              and d["kp"] == 0.0 and d["kd"] == 0.0,
+              "ee_pos_action normalises the quaternion; stock gains are normalised 0")
 
-    # gains are normalised zero, i.e. the sim default
-    res.check(d["kp"] == 0.0 and d["kd"] == 0.0, "kp/kd dispatched as normalised 0")
+    # SAIL runs osc_kp_scale x the stock kp at the stock damping ratio; B-Spline runs stock
+    g = rc.sail_gains()
+    kp = float(fc.control("torque.osc.default_kp")) * float(fc.control("torque.osc.gain_exp_base")) ** g["kp"]
+    res.check(abs(kp - 2.0 * float(fc.control("torque.osc.default_kp"))) < 1e-9 and g["kd"] == 0.0,
+              "SAIL's gain channels resolve to 2x the stock kp at the stock damping ratio",
+              f"kp {kp:.1f}, a_kp {g['kp']:.4f}, a_kd {g['kd']}")
+    res.check(rc.stock_gains() == {"kp": 0.0, "kd": 0.0},
+              "B-Spline's gain channels are the stock controller's")
 
-    # control-mode auto-detection, all three key variants
-    cases = {"actions": ControlMode.EE_DELTA,
-             "absolute_actions": ControlMode.EE_POS,
-             "absolute_actions_with_precision": ControlMode.EE_POS}
-    ok = all(sail_rollout.resolve_control_mode({"action_keys": [k]}, "auto") is v
-             for k, v in cases.items())
-    override = (sail_rollout.resolve_control_mode({"action_keys": ["actions"]}, "ee_pos")
-                is ControlMode.EE_POS)
-    unknown = False
-    try:
-        sail_rollout.resolve_control_mode({"action_keys": ["mystery"]}, "auto")
-    except ValueError:
-        unknown = True
-    res.check(ok and override and unknown,
-              "control mode resolves from action_keys, overrides, and refuses unknown")
-
-    # propagate_pose composes in EE_DELTA's own convention
-    p0, q0 = np.zeros(3), np.array([0.0, 0.0, 0.0, 1.0])
-    deltas = [[0.01, 0, 0, 0, 0, 0.1], [0.01, 0, 0, 0, 0, 0.1]]
-    p, qq = rc.propagate_pose(p0, q0, deltas)
-    res.check(np.allclose(p, [0.02, 0, 0])
-              and abs(Rotation.from_quat(qq).as_rotvec()[2] - 0.2) < 1e-12,
-              "propagate_pose accumulates deltas the way from_delta composes them")
+    # SAIL executes absolute poses only, as upstream's evaluation does
+    ok = all(sail_rollout.resolve_control_mode({"action_keys": [k]}) is ControlMode.EE_POS
+             for k in ("absolute_actions", "absolute_actions_with_precision",
+                       "commanded_absolute_actions_with_precision"))
+    refused = 0
+    for keys in (["actions"], ["mystery"], ["absolute_actions", "actions"]):
+        try:
+            sail_rollout.resolve_control_mode({"action_keys": keys})
+        except ValueError:
+            refused += 1
+    res.check(ok and refused == 3,
+              "SAIL takes an absolute action key and refuses deltas, unknown and multiple keys")
 
     # Stopper latches its verdict: reading a keypress consumes it, so a second
     # poll must not come back empty.
@@ -590,39 +596,58 @@ def check_force(res: Results, run_dir, ep: dict) -> None:
 
 
 def check_dispatch(res: Results) -> None:
-    print("\n[dispatch] the goal-push clock holds its rate")
+    print("\n[dispatch] env.step(a, control_freq): each goal held for its own 1/hz")
 
     class Sink:
         last_ee_wrench: dict = {}
 
-        def send_action(self, a):
-            pass
+        def __init__(self):
+            self.t: list[float] = []
 
-    # Sub-period jitter must not accumulate: the recorded dataset is labelled at
-    # the dispatch rate, so a loop that silently runs slow mislabels every replay.
+        def send_action(self, a):
+            self.t.append(time.perf_counter())
+
+    # Each goal is held for ITS OWN step's period: SAIL's slow steps must not
+    # land one step late.
+    sink = Sink()
+    d = rc.Dispatcher(sink)
+    rates = [100.0, 20.0, 100.0, 100.0, 20.0, 20.0, 100.0, 50.0]
+    t0 = time.perf_counter()
+    for hz in rates:
+        d.step({}, hz)
+    d.wait_hold()
+    gaps = np.diff(sink.t + [time.perf_counter()])
+    want = 1.0 / np.array(rates)
+    res.check(sink.t[0] - t0 < 0.005, "the first goal goes out at once",
+              f"{(sink.t[0] - t0) * 1e3:.2f} ms")
+    res.check(bool(np.all(np.abs(gaps - want) < 0.004)),
+              "every goal is held for 1/hz of its own step",
+              " ".join(f"{g * 1e3:.0f}/{w * 1e3:.0f}" for g, w in zip(gaps, want)))
+
+    # Sub-period jitter does not accumulate.
     hz, n = 200.0, 80
     d = rc.Dispatcher(Sink())
-    d.start()
     t0 = time.perf_counter()
     for i in range(n):
         if i % 2 == 0:
             time.sleep(0.4 / hz)
-        d.send({}, hz)
+        d.step({}, hz)
+    d.wait_hold()
     elapsed, ideal = time.perf_counter() - t0, n / hz
     res.check(abs(elapsed - ideal) < 0.05 * ideal,
-              "the achieved rate holds under sub-period jitter",
+              "the rate holds under sub-period jitter",
               f"{elapsed * 1e3:.1f} ms for {n} steps, ideal {ideal * 1e3:.1f} ms")
 
-    # The one thing the ordering actually fixes, and it is worth a check: the old
-    # increment-then-sleep order delayed the first goal by a full period
-    # (measured 100 ms at 10 Hz), which at episode start is a visible lurch.
-    d2 = rc.Dispatcher(Sink())
-    d2.start()
-    t0 = time.perf_counter()
-    d2.send({}, 10.0)
-    first = time.perf_counter() - t0
-    res.check(first < 0.02, "the first goal is not delayed by a full period",
-              f"{first * 1e3:.2f} ms")
+    # After a wait longer than a period (an inference) the next goal still gets its full hold.
+    sink = Sink()
+    d = rc.Dispatcher(sink)
+    d.step({}, 100.0)
+    time.sleep(0.05)
+    d.step({}, 100.0)
+    d.step({}, 100.0)
+    res.check(abs((sink.t[2] - sink.t[1]) - 0.01) < 0.003,
+              "a goal sent after a long wait is held for a full period, not rushed",
+              f"{(sink.t[2] - sink.t[1]) * 1e3:.1f} ms")
 
 
 def check_timing(res: Results) -> None:
@@ -656,308 +681,275 @@ def check_timing(res: Results) -> None:
                     "config/policy.yaml warns about)")
 
 
-def check_sail(res: Results, port: int) -> None:
-    print("\n[sail] receding horizon, precision column, rate switching")
-    inf_delay = int(fc.policy("baselines.sail.inf_delay"))
-    execute_n = int(fc.policy("baselines.sail.execute_n_actions"))
+def _sail_expected_tags(n: int, inf_delay: int, execute_n: int) -> list[tuple[int, int]]:
+    """Upstream's (chunk, row) order: chunk 0 from row 0, then per inference
+    inf_delay rows of the previous chunk and execute_n of the new one from row inf_delay."""
+    out = [(0, j) for j in range(execute_n)]
+    prev, k = execute_n, 1
+    while len(out) < n:
+        out += [(k - 1, prev + i) for i in range(inf_delay)]
+        out += [(k, inf_delay + j) for j in range(execute_n)]
+        prev, k = inf_delay + execute_n, k + 1
+    return out[:n]
 
-    # --- absolute path, precision label present
-    srv = FakeSail(port, action_keys=["absolute_actions_with_precision"],
-                   act_dim=8, precision=True)
+
+def _run_sail(port, args, **server_kw):
+    srv = FakeSail(port, action_keys=["absolute_actions_with_precision"], act_dim=8,
+                   precision=True, **server_kw)
     srv.start()
     try:
         client = _client(port)
         meta = client.meta()
-        res.check(meta["precision_column"] is True and meta["act_dim"] == 8,
-                  "meta handshake reports the precision column")
-        mode = sail_rollout.resolve_control_mode(meta, "auto")
-        res.check(mode is ControlMode.EE_POS, "absolute key -> EE_POS")
-
-        args = _args(exec_fps=200.0, slow_fps=50.0, obs_fps=20.0, episode_time_s=1.2)
-        arm = FakeArm(mode)
+        s = sail_rollout.settings(meta, args)
+        arm = FakeArm(sail_rollout.resolve_control_mode(meta))
         run_dir, record = _open_run(args, "sail")
+        record.set("environment", **rc.environment(args, arm))
+        record.set("policy", control_mode=ControlMode.EE_POS.value)
         with operator():
             rc.run_episodes(args, arm, run_dir, record,
                             sail_rollout.make_episode_fn(
-                                client, meta, args, mode,
-                                rc.check_camera_coverage(meta, arm, True), run_dir))
-        ep = record.episodes[0]
-
-        tags = _tags(arm)
-        # First inference: execute_n rows of chunk 0, from index 0.
-        first = tags[:execute_n]
-        res.check(first == [(0, j) for j in range(execute_n)],
-                  "first inference executes execute_n rows from index 0",
-                  f"{first[:4]}...")
-        # Second: chunk 0 carries on from execute_n while chunk 1 is inferred --
-        # at least inf_delay rows, more only if the fake server was slower than
-        # that -- and chunk 1 is entered at the row matching how many went out,
-        # never at 0: the horizon receding, with the observation's age honoured.
-        rest = tags[execute_n:]
-        entry = next((i for i, t in enumerate(rest) if t[0] == 1), len(rest))
-        old_rows = rest[:entry]
-        new_rows = rest[entry:entry + execute_n]
-        res.check(entry >= inf_delay
-                  and old_rows == [(0, execute_n + i) for i in range(entry)]
-                  and new_rows == [(1, entry + j) for j in range(execute_n)],
-                  "receding horizon: prev chunk while inferring, new chunk entered at the rows elapsed",
-                  f"entry {entry} (inf_delay {inf_delay}); got {rest[:6]}...")
-        res.check(ep["steps"] == len(arm.sent) and ep["steps"] > 0,
-                  "every dispatched goal is counted", f"{ep["steps"]} steps")
-        check_force(res, run_dir, ep)
-        # The frame stack is fed consecutive STEPS: the first inference has only
-        # its own observation, every later one also gets the frame taken one
-        # dispatch before it.
-        res.check(srv.frames_seen[:1] == [1] and all(n == 2 for n in srv.frames_seen[1:]),
-                  "frame stack fed the step before each observation",
-                  f"frames per request {srv.frames_seen[:5]}...")
-
-        # The precision label must never reach the arm. With act_dim 8, row[6] is
-        # the gripper tag and row[7] the label (only ever 0.0 or 1.0). If the
-        # strip were off by one, every dispatched gripper would be 0 or 1 -- so a
-        # nonzero row fraction is only possible if the right column was read.
-        grips = [a[f"{rc.ARM_KEY}_gripper"] for a in arm.sent]
-        res.check(any(t[1] != 0 for t in tags)
-                  and not all(g in (0.0, 1.0) for g in grips)
-                  and all(0 <= t[1] < meta["action_horizon"] for t in tags),
-                  "precision label stripped; gripper is the chunk's own column",
-                  f"{len(set(grips))} distinct gripper values dispatched")
-
-        # Chunk 1 has labels on rows 2..4, which are inside the executed window,
-        # so some steps must have run slow and some fast.
-        gaps = np.diff(arm.send_times)
-        res.check(ep["slow_steps"] > 0, "precision labels produced slow steps",
-                  f"{ep["slow_steps"]} of {ep["steps"]}")
-        fast_p = float(np.percentile(gaps, 10)) if len(gaps) else 0.0
-        slow_p = float(np.max(gaps)) if len(gaps) else 0.0
-        res.check(fast_p < 1.0 / 100.0 and slow_p > 1.0 / 100.0,
-                  "dispatch actually switched rate",
-                  f"p10 gap {fast_p * 1e3:.1f} ms, max {slow_p * 1e3:.1f} ms")
+                                client, s, rc.check_camera_coverage(meta, arm, True)),
+                            nominal_hz=s["fast_hz"])
+        return srv, arm, s, run_dir, record.episodes[0]
     finally:
         srv.stop()
 
-    # --- delta path, no precision column
-    srv2 = FakeSail(port + 1, action_keys=["actions"], act_dim=7, precision=False)
-    srv2.start()
+
+def check_sail(res: Results, port: int) -> None:
+    print("\n[sail] upstream's receding horizon, precision rates, EAG, gains")
+    inf_delay = int(fc.policy("baselines.sail.inf_delay"))
+    execute_n = int(fc.policy("baselines.sail.execute_n_actions"))
+    window = int(fc.policy("baselines.sail.slowdown_window_size"))
+
+    # --- instant inference, precision on, 2x
+    args = _args(speed=2.0, episode_time_s=2.0)
+    srv, arm, s, run_dir, ep = _run_sail(port, args)
+    res.check(s["fast_hz"] == 2.0 * rc.data_fps() and s["slow_hz"] == float(fc.policy("baselines.exec.slow_fps")),
+              "--speed 2 sets fast_control_freq to 2x the demonstrations' rate; slow stays 1x",
+              f"{s['fast_hz']:.0f}/{s['slow_hz']:.0f} Hz")
+    tags = _tags(arm)
+    want = _sail_expected_tags(len(tags), inf_delay, execute_n)
+    first_bad = next((i for i, (a, b) in enumerate(zip(tags, want)) if a != b), None)
+    res.check(len(tags) > 3 * (inf_delay + execute_n) and first_bad is None,
+              "rows execute in upstream's order: inf_delay old rows, then the new chunk from row inf_delay",
+              f"{len(tags)} steps" if first_bad is None else
+              f"step {first_bad}: got {tags[first_bad]}, want {want[first_bad]}")
+    kp = {round(a["kp"], 6) for a in arm.sent}
+    res.check(kp == {round(rc.sail_gains()["kp"], 6)} and {a["kd"] for a in arm.sent} == {0.0},
+              "every goal carries SAIL's 2x-kp gain channels")
+    spacing = [b - a for a, b in srv.frame_ids[1:]]
+    res.check(all(n == 2 for n in srv.frames_seen) and bool(spacing)
+              and all(1 <= d <= 3 for d in spacing),
+              "frame stack is two distinct camera frames ~one demonstration step apart",
+              f"camera-frame spacing {sorted(set(spacing))}")
+
+    # Each dispatched row's own rate, recomputed with upstream's slowdown rule.
+    executed, rates = [], []
+    for k, j in tags:
+        row = np.zeros(8)
+        row[7] = 1.0 if (k % 2 == 1 and 2 <= j <= 4) else 0.0
+        fut = np.zeros((16 - j, 8))
+        fut[:, 7] = [1.0 if (k % 2 == 1 and 2 <= jj <= 4) else 0.0 for jj in range(j, 16)]
+        executed.append(row)
+        slow = rc.slowdown_mode(executed, row, fut, window)
+        rates.append(s["slow_hz"] if slow else s["fast_hz"])
+    gaps = np.diff(arm.send_times)
+    want_gaps = 1.0 / np.array(rates[:-1])
+    close = np.abs(gaps - want_gaps) < 0.006
+    res.check(ep["slow_steps"] == sum(r == s["slow_hz"] for r in rates) and ep["slow_steps"] > 0,
+              "slow steps are exactly the ones upstream's window marks",
+              f"{ep['slow_steps']} of {ep['steps']}")
+    res.check(close.mean() > 0.9,
+              "each goal is held 1/hz of its own step's rate",
+              f"{close.mean():.0%} within 6 ms; median gap fast "
+              f"{1e3 * np.median(gaps[np.array(rates[:-1]) == s['fast_hz']]):.1f} ms, slow "
+              f"{1e3 * np.median(gaps[np.array(rates[:-1]) == s['slow_hz']]):.1f} ms")
+    res.check(ep["steps"] == len(arm.sent) and ep["steps"] > 0,
+              "every dispatched goal is counted", f"{ep['steps']} steps")
+    check_force(res, run_dir, ep)
+    grips = [a[f"{rc.ARM_KEY}_gripper"] for a in arm.sent]
+    res.check(not all(g in (0.0, 1.0) for g in grips),
+              "precision label stripped; gripper is the chunk's own column")
+
+    # --- EAG, and an inference slower than the inf_delay rows
+    t_f = 4
+    args = _args(speed=2.0, episode_time_s=2.5, no_eag=False, no_precision=True)
+    srv, arm, s, run_dir, ep = _run_sail(port + 1, args, fac_horizon=t_f, guided=True, delay_s=0.15)
+    tags = _tags(arm)
+    want = _sail_expected_tags(len(tags), inf_delay, execute_n)
+    res.check(tags == want and len(tags) > inf_delay + execute_n,
+              "a slow inference holds the arm instead of re-indexing the plan",
+              f"{ep['notes'].get('inference_waits')} waits, {ep['notes'].get('inference_wait_s')} s held")
+    res.check(ep["notes"].get("inference_waits", 0) > 0,
+              "inference slower than inf_delay rows is counted")
+    sent = [(i, np.asarray(g)) for i, g in enumerate(srv.guide_seen) if g is not None]
+    ok = bool(sent)
+    for i, g in sent:
+        start = execute_n if i == 1 else inf_delay + execute_n
+        got = [(int(round(x * 100)) // 100, int(round(x * 100)) % 100) for x in g[:, 6]]
+        ok &= g.shape == (t_f, 8) and got == [(i - 1, start + r) for r in range(t_f)]
+    res.check(ok and ep["guided_inferences"] == len(sent),
+              "guidance is the previous plan's next fac_horizon rows, full width",
+              f"{len(sent)} of {len(srv.guide_seen)} inferences guided")
+
+    # --- the recorded run renders, each chunk drawn from the row it took over at
+    from baselines import rollout_viz
+    import pandas as pd
+    args = _args(speed=2.0, episode_time_s=2.0, no_record=False, train_dataset="Offline/sail-viz")
+    _, _, s, run_dir, ep = _run_sail(port + 2, args)
+    pages = rollout_viz.render_run(run_dir.path)
+    res.check([q.name for q in pages] == ["episode_000.html"], "the run renders its episode page")
+    df = pd.read_parquet(sorted((run_dir.dataset_dir / "data").glob("*/*.parquet"))[0])
+    goal = np.stack(df["action"].values)[:, :3]
+    with np.load(run_dir.path / "chunks.npz") as z:
+        steps, poses = z["chunk_step_000"], z["chunk_pose_000"]
+    reach = int(np.ceil(s["fast_hz"] / rc.data_fps()))
+    rows = [p[~np.isnan(p[:, 0]), :3] for p in poses]     # chunks are NaN-padded to one length
+    # chunk_step is the next frame recorded, 0-1 recorder periods after the take-over.
+    lag = [int(np.argmin(np.linalg.norm(rows[k] - goal[st], axis=1)))
+           for k, st in enumerate(steps) if st < len(goal)]
+    res.check(bool(lag) and max(lag) <= reach,
+              "each chunk is logged from the row it takes over at",
+              f"goal at the chunk's frame is row {sorted(set(lag))} of the logged chunk")
+
+
+def _run_bspline(port, args, arm=None, **server_kw):
+    srv = FakeBSpline(port, **server_kw)
+    srv.start()
     try:
-        client = _client(port + 1)
+        client = _client(port)
         meta = client.meta()
-        mode = sail_rollout.resolve_control_mode(meta, "auto")
-        res.check(mode is ControlMode.EE_DELTA, "'actions' key -> EE_DELTA")
-        args = _args(exec_fps=200.0, obs_fps=20.0, episode_time_s=0.8)
-        arm = FakeArm(mode)
-        run_dir, record = _open_run(args, "sail")
-        with operator(verdict_after=2):
+        control_freq = float(args.control_freq or fc.policy("baselines.bspline.control_freq"))
+        kwargs = bsp_rollout.planner_settings(meta, args, control_freq)
+        arm = arm or FakeArm(ControlMode.EE_POS)
+        run_dir, record = _open_run(args, "bspline")
+        record.set("environment", **rc.environment(args, arm))
+        record.set("policy", control_mode=ControlMode.EE_POS.value)
+        with operator():
             rc.run_episodes(args, arm, run_dir, record,
-                            sail_rollout.make_episode_fn(
-                                client, meta, args, mode,
-                                rc.check_camera_coverage(meta, arm, True), run_dir))
-        ep = record.episodes[0]
-        res.check(ep["success"], "operator success verdict recorded")
-        res.check(ep["wall_time_s"] > 0 and ep["inferences"] > 0,
-                  "time-to-success and inference count recorded",
-                  f"{ep["wall_time_s"]:.2f}s, {ep["inferences"]} inferences")
-        res.check(arm.clipped == 0, "no EE_DELTA command exceeded torque.delta.pos_max_m",
-                  f"{arm.clipped} clipped")
-        res.check(ep["max_lead_m"] == 0.0,
-                  "lead monitor is inert in EE_DELTA (goal re-anchors every step)")
+                            bsp_rollout.make_episode_fn(
+                                client, kwargs, control_freq,
+                                rc.check_camera_coverage(meta, arm, True)),
+                            nominal_hz=control_freq)
+        return srv, meta, arm, kwargs, run_dir, record
     finally:
-        srv2.stop()
+        srv.stop()
 
 
 def check_bspline(res: Results, port: int) -> None:
-    print("\n[bspline] EE_POS dispatch, decode, replanning")
-    srv = FakeBSpline(port)
-    srv.start()
+    print("\n[bspline] upstream's control loop: fixed rate, stride, no goal before a plan")
+    rejected = False
     try:
-        client = _client(port)
-        meta = client.meta()
-        res.check(meta["act_dim"] == 10,
-                  "meta reports the 10-dim rot6d action our converter produces")
+        bsp_rollout.decode(np.zeros(7))
+    except ValueError:
+        rejected = True
+    res.check(rejected, "decode refuses an action that is not 10-dim")
 
-        # decode() must reject a wrong-width action rather than silently reading
-        # the gripper out of a rotation column.
-        rejected = False
-        try:
-            bsp_rollout.decode(np.zeros(7))
-        except ValueError:
-            rejected = True
-        res.check(rejected, "decode refuses an action that is not 10-dim")
+    control_freq = 100.0
+    args = _args(control_freq=control_freq, episode_time_s=1.5, speed=1.0)
+    srv, meta, arm, kwargs, run_dir, record = _run_bspline(port, args)
+    ep = record.episodes[0]
+    res.check(meta["act_dim"] == 10, "meta reports the 10-dim rot6d action our converter produces")
+    res.check(kwargs["origin_time_scale"] == rc.data_fps(),
+              "origin_time_scale is the demonstrations' rate", f"{kwargs['origin_time_scale']}")
+    res.check(ep["steps"] > 0 and ep["inferences"] >= 2,
+              "goals dispatched and the plan replanned", f"{ep['steps']} goals, {ep['inferences']} plans")
 
-        args = _args(exec_fps=100.0, obs_fps=20.0, episode_time_s=1.5,
-                     speed_up_times=1.0)
-        kwargs = dict(degree=3, n_obs_steps=1, obs_stride=1,
-                      origin_time_scale=rc.origin_time_scale(), speed_up_times=1.0,
-                      predict_before_end=float(fc.policy("baselines.bspline.predict_before_end")),
-                      time_align_error_threshold=float(
-                          fc.policy("baselines.bspline.time_align_error_threshold")),
-                      time_align_larger_t=fc.policy("baselines.bspline.time_align_larger_t"),
-                      disable_time_align=False, restart_on_time_align_error=False,
-                      consider_gripper_during_align=False,
-                      gripper_slowdown_enabled=False,
-                      gripper_slowdown_threshold=0.08, gripper_slowdown_steps=7,
-                      gripper_index=9, compare_dim=9)
-        arm = FakeArm(ControlMode.EE_POS)
-        run_dir, record = _open_run(args, "bspline")
-        with operator():
-            rc.run_episodes(args, arm, run_dir, record,
-                            bsp_rollout.make_episode_fn(
-                                client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True), run_dir))
-        ep = record.episodes[0]
-        res.check(ep["steps"] > 0, "goals dispatched", f"{ep["steps"]} steps")
-        res.check(ep["inferences"] >= 2, "the plan was replanned at least once",
-                  f"{ep["inferences"]} plans")
+    home_pos, _ = eef_poses_from_qpos(fc.home_q(key=rc.ARM_KEY)[None])
+    first = np.array([arm.sent[0][f"{rc.ARM_KEY}_{a}"] for a in "xyz"])
+    res.check(np.linalg.norm(first - home_pos[0]) < 0.005,
+              "the first goal is the first plan's start, sent only once a plan exists",
+              f"{1e3 * np.linalg.norm(first - home_pos[0]):.2f} mm from the homed pose")
 
-        # Before the first plan lands, the goal must be the homed pose -- not a
-        # zero goal, which would command the base-frame origin.
-        first = arm.sent[0]
-        res.check(np.linalg.norm([first[f"{rc.ARM_KEY}_{a}"] for a in "xyz"]) > 0.1,
-                  "no zero goal dispatched while waiting for the first plan",
-                  f"|p| = {np.linalg.norm([first[f'{rc.ARM_KEY}_{a}'] for a in 'xyz']):.3f} m")
-
-        gaps = np.diff(arm.send_times)
-        med = float(np.median(gaps)) if len(gaps) else 0.0
-        res.check(abs(med - 1.0 / 100.0) < 0.004, "exec rate held at --exec-fps",
-                  f"median gap {med * 1e3:.2f} ms, target 10.00 ms")
-        res.check(ep["max_lead_m"] < float(fc.policy("baselines.exec.max_lead_m")),
-                  "tracking arm stayed inside the lead bound",
-                  f"max lead {ep["max_lead_m"]:.4f} m")
-    finally:
-        srv.stop()
+    gaps = np.diff(arm.send_times)
+    med = float(np.median(gaps)) if len(gaps) else 0.0
+    res.check(abs(med - 1.0 / control_freq) < 0.002, "goals go out at --control-freq",
+              f"median gap {med * 1e3:.2f} ms, target {1e3 / control_freq:.2f} ms, "
+              f"max {1e3 * float(np.max(gaps)):.1f} ms")
+    res.check({a["kp"] for a in arm.sent} == {0.0} and {a["kd"] for a in arm.sent} == {0.0},
+              "every goal carries the stock gain channels")
+    spacing = [b - a for fr in srv.frames_seen if len(fr) == 2 for a, b in [fr]]
+    res.check(bool(spacing) and all(1 <= d <= 3 for d in spacing),
+              "the policy's two observations are distinct frames ~one demonstration step apart",
+              f"camera-frame spacing {sorted(set(spacing))}")
+    res.check(ep["max_lead_m"] < float(fc.policy("baselines.exec.max_lead_m")),
+              "tracking arm stayed inside the lead bound", f"max lead {ep['max_lead_m']:.4f} m")
 
     # --- the lead monitor must ABORT, not clamp
     bound = float(fc.policy("baselines.exec.max_lead_m"))
-    srv2 = FakeBSpline(port + 1, travel=bound * 2.5)
-    srv2.start()
-    try:
-        client = _client(port + 1)
-        meta = client.meta()
-        args = _args(exec_fps=100.0, obs_fps=20.0, episode_time_s=3.0)
-        arm = FakeArm(ControlMode.EE_POS)
-        arm.freeze = True          # the arm stops tracking; the plan runs on
-        kwargs = dict(degree=3, n_obs_steps=1, obs_stride=1,
-                      origin_time_scale=rc.origin_time_scale(), speed_up_times=1.0,
-                      predict_before_end=0.06, time_align_error_threshold=0.1,
-                      time_align_larger_t=0.2, disable_time_align=False,
-                      restart_on_time_align_error=False,
-                      consider_gripper_during_align=False,
-                      gripper_slowdown_enabled=False, gripper_slowdown_threshold=0.08,
-                      gripper_slowdown_steps=7, gripper_index=9, compare_dim=9)
-        run_dir, record = _open_run(args, "bspline")
-        with operator():
-            rc.run_episodes(args, arm, run_dir, record,
-                            bsp_rollout.make_episode_fn(
-                                client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True), run_dir))
-        ep = record.episodes[0]
-        aborted = ep["aborted"] is not None
-        res.check(aborted, "a frozen arm aborts the episode",
-                  (ep["aborted"] or "")[:70])
-        if aborted:
-            # A clamp would have kept the commanded goal near the arm; an abort
-            # leaves the last goal where the plan put it.
-            last = np.array([arm.sent[-1][f"{rc.ARM_KEY}_{a}"] for a in "xyz"])
-            pos, _ = arm._pose()
-            res.check(np.linalg.norm(last - pos) > bound,
-                      "the goal was never rescaled toward the arm (abort, not clamp)",
-                      f"final divergence {np.linalg.norm(last - pos):.4f} m")
-    finally:
-        srv2.stop()
+    arm = FakeArm(ControlMode.EE_POS)
+    arm.freeze = True          # the arm stops tracking; the plan runs on
+    args = _args(control_freq=control_freq, episode_time_s=3.0)
+    _, _, arm, _, _, record = _run_bspline(port + 1, args, arm=arm, travel=bound * 2.5)
+    ep = record.episodes[0]
+    aborted = ep["aborted"] is not None
+    res.check(aborted, "a frozen arm aborts the episode", (ep["aborted"] or "")[:70])
+    if aborted:
+        last = np.array([arm.sent[-1][f"{rc.ARM_KEY}_{a}"] for a in "xyz"])
+        pos, _ = arm._pose()
+        res.check(np.linalg.norm(last - pos) > bound,
+                  "the goal was never rescaled toward the arm (abort, not clamp)",
+                  f"final divergence {np.linalg.norm(last - pos):.4f} m")
 
 
 def check_dataset(res: Results, port: int) -> None:
     print("\n[dataset] recorded rollout is readable and correctly labelled")
-    srv = FakeBSpline(port)
-    srv.start()
-    try:
-        client = _client(port)
-        meta = client.meta()
-        exec_fps = 40.0
-        args = _args(exec_fps=exec_fps, obs_fps=20.0, episode_time_s=0.6,
-                     num_episodes=2, no_record=False,
-                     train_dataset="Offline/dataset-check")
-        kwargs = dict(degree=3, n_obs_steps=1, obs_stride=1,
-                      origin_time_scale=rc.origin_time_scale(), speed_up_times=1.0,
-                      predict_before_end=0.06, time_align_error_threshold=0.1,
-                      time_align_larger_t=0.2, disable_time_align=False,
-                      restart_on_time_align_error=False,
-                      consider_gripper_during_align=False,
-                      gripper_slowdown_enabled=False, gripper_slowdown_threshold=0.08,
-                      gripper_slowdown_steps=7, gripper_index=9, compare_dim=9)
-        arm = FakeArm(ControlMode.EE_POS)
-        run_dir, record = _open_run(args, "bspline")
-        with operator():
-            rc.run_episodes(args, arm, run_dir, record,
-                            bsp_rollout.make_episode_fn(
-                                client, meta, args, kwargs,
-                                rc.check_camera_coverage(meta, arm, True), run_dir))
+    fps = rc.record_fps(_args())
+    args = _args(control_freq=100.0, episode_time_s=0.8, num_episodes=2, no_record=False,
+                 train_dataset="Offline/dataset-check")
+    _, _, arm, _, run_dir, record = _run_bspline(port, args)
 
-        from lerobot.datasets.lerobot_dataset import LeRobotDataset
-        d = LeRobotDataset(repo_id=args.repo_id, root=str(run_dir.dataset_dir))
-        info = d.meta.info["features"]
-        res.check(d.num_episodes == 2 and d.num_frames == sum(e["steps"] for e in record.episodes),
-                  "every dispatched goal became a recorded frame",
-                  f"{d.num_episodes} eps, {d.num_frames} frames")
-        # The fps must be the DISPATCH rate, not obs_fps: a dataset labelled
-        # 20 Hz but written at 40 replays at half speed with nothing to say why.
-        res.check(float(d.fps) == exec_fps, "dataset fps is the dispatch rate",
-                  f"{d.fps} vs exec_fps {exec_fps:.0f}")
-        res.check(list(info["action"]["names"][0]) == list(rc.ACTION_KEYS)
-                  and list(info["observation.state"]["names"][0]) == list(rc.STATE_OBS_KEYS),
-                  "recorded feature names match run_residual.py's")
-        res.check(sorted(d.meta.camera_keys)
-                  == sorted(f"observation.images.{c}" for c in arm.cameras),
-                  "both cameras encoded")
-        act = d[0]["action"].numpy()
-        res.check(abs(act[8]) < 1e-9 and abs(act[9]) < 1e-9 and act[7] > 0.0,
-                  "first recorded action carries normalised gains and a real gripper")
-        # Metrics are written after every episode, so an interrupted run keeps
-        # the episodes that did finish.
-        res.check(run_dir.manifest_path.is_file() and run_dir.episodes_path.is_file(),
-                  "manifest and episodes written into the run directory",
-                  str(run_dir.path.relative_to(_RUN_ROOT)))
-        doc = json.loads(run_dir.manifest_path.read_text())
-        res.check(doc["outputs"]["dataset"]["repo_id"] == args.repo_id
-                  and doc["outputs"]["dataset"]["episodes"] == 2,
-                  "manifest records the dataset it produced",
-                  f'{doc["outputs"]["dataset"]["episodes"]} episodes')
-        res.check(doc["summary"]["episodes"] == 2
-                  and len(run_dir.episodes_path.read_text().strip().splitlines()) == 2,
-                  "one episodes.jsonl line per episode")
-        # num_frames only advances on save_episode, so this has to come off the
-        # writer's in-progress buffer -- it was silently 0 before.
-        res.check(all(e["frames_recorded"] == e["steps"] > 0 for e in record.episodes)
-                  and [e["dataset_episode_index"] for e in record.episodes] == [0, 1],
-                  "per-episode frame counts and dataset indices are recorded",
-                  f'{[e["frames_recorded"] for e in record.episodes]} frames')
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    d = LeRobotDataset(repo_id=args.repo_id, root=str(run_dir.dataset_dir))
+    info = d.meta.info["features"]
+    res.check(float(d.fps) == fps == rc.data_fps(),
+              "dataset is written at the demonstrations' rate, off the control loop",
+              f"{d.fps} fps")
+    per_ep = [e["frames_recorded"] for e in record.episodes]
+    expect = [e["wall_time_s"] * fps for e in record.episodes]
+    res.check(d.num_episodes == 2 and d.num_frames == sum(per_ep)
+              and all(0.6 * x - 2 <= n <= x + 2 for n, x in zip(per_ep, expect)),
+              "one frame per 1/record_fps of the episode",
+              f"{per_ep} frames for {[round(x, 1) for x in expect]} expected")
+    res.check(list(info["action"]["names"][0]) == list(rc.ACTION_KEYS)
+              and list(info["observation.state"]["names"][0]) == list(rc.STATE_OBS_KEYS),
+              "recorded feature names match run_residual.py's")
+    res.check(sorted(d.meta.camera_keys)
+              == sorted(f"observation.images.{c}" for c in arm.cameras),
+              "both cameras encoded")
+    act = d[0]["action"].numpy()
+    res.check(abs(act[8]) < 1e-9 and abs(act[9]) < 1e-9 and 0.0 <= act[7] <= 1.0,
+              "a recorded action carries the stock gains and an absolute gripper")
+    res.check(run_dir.manifest_path.is_file() and run_dir.episodes_path.is_file(),
+              "manifest and episodes written into the run directory",
+              str(run_dir.path.relative_to(_RUN_ROOT)))
+    doc = json.loads(run_dir.manifest_path.read_text())
+    res.check(doc["outputs"]["dataset"]["repo_id"] == args.repo_id
+              and doc["outputs"]["dataset"]["episodes"] == 2,
+              "manifest records the dataset it produced",
+              f'{doc["outputs"]["dataset"]["episodes"]} episodes')
+    res.check(doc["summary"]["episodes"] == 2
+              and len(run_dir.episodes_path.read_text().strip().splitlines()) == 2,
+              "one episodes.jsonl line per episode")
+    res.check([e["dataset_episode_index"] for e in record.episodes] == [0, 1],
+              "dataset indices are recorded per episode")
+    with np.load(run_dir.path / "chunks.npz") as z:
+        steps = z["chunk_step_000"]
+    res.check(len(steps) == record.episodes[0]["inferences"] and steps.max() <= per_ep[0],
+              "chunks are indexed by recorded frame, as rollout_viz draws them",
+              f"{list(steps)}")
 
-        # Finding 9: frames are written once per observation and indexed by
-        # WRITTEN frame, so the burned-in clock matches wall time. Indexing by
-        # dispatch step made it run per_obs x fast.
-        args2 = _args(exec_fps=exec_fps, obs_fps=20.0, episode_time_s=0.6,
-                      num_episodes=1, save_videos=True,
-                      train_dataset="Offline/video-check")
-        arm2 = FakeArm(ControlMode.EE_POS)
-        run_dir2, record2 = _open_run(args2, "bspline")
-        with operator():
-            rc.run_episodes(args2, arm2, run_dir2, record2,
-                            bsp_rollout.make_episode_fn(
-                                client, meta, args2, kwargs,
-                                rc.check_camera_coverage(meta, arm2, True), run_dir2))
-        vids = run_dir2.video_dir
-        files = sorted(vids.glob("*.mp4")) if vids.is_dir() else []
-        res.check(len(files) == len(arm2.cameras),
-                  "one mp4 per camera written", f"{[f.name for f in files]}")
-        per_obs = round(exec_fps / 20.0)
-        frames = record2.episodes[0]["steps"] / per_obs
-        res.check(frames <= record2.episodes[0]["steps"] / max(per_obs - 0.5, 1),
-                  "video frames counted per observation, not per dispatched goal",
-                  f"~{frames:.0f} frames for {record2.episodes[0]["steps"]} goals "
-                  f"({per_obs} goals/obs)")
-    finally:
-        srv.stop()
-
+    args2 = _args(control_freq=100.0, episode_time_s=0.8, num_episodes=1, save_videos=True,
+                  train_dataset="Offline/video-check")
+    _, _, arm2, _, run_dir2, record2 = _run_bspline(port + 1, args2)
+    files = sorted(run_dir2.video_dir.glob("*.mp4")) if run_dir2.video_dir.is_dir() else []
+    import cv2
+    counts = [int(cv2.VideoCapture(str(f)).get(cv2.CAP_PROP_FRAME_COUNT)) for f in files]
+    res.check(len(files) == len(arm2.cameras), "one mp4 per camera written",
+              f"{[f.name for f in files]}")
+    res.check(bool(counts) and all(abs(c - counts[0]) <= 1 for c in counts) and counts[0] > 0,
+              "video frames are written on the recorder's clock",
+              f"{counts} frames over {record2.episodes[0]['wall_time_s']:.2f} s at {fps} fps")
 
 
 def check_servers(res: Results) -> None:
@@ -1076,13 +1068,6 @@ def check_servers(res: Results) -> None:
     flat = server._prepare(obs(6))
     res.check(flat["robot0_eef_pos"].shape == (3,), "frame_stack 1 passes single frames through")
 
-    # Control-mode resolution for every key the labeller can produce.
-    for key, mode in (("actions", ControlMode.EE_DELTA),
-                      ("absolute_actions", ControlMode.EE_POS),
-                      ("absolute_actions_with_precision", ControlMode.EE_POS),
-                      ("commanded_absolute_actions_with_precision", ControlMode.EE_POS)):
-        res.check(sail_rollout.resolve_control_mode({"action_keys": [key]}, "auto") is mode,
-                  f"action key {key!r} -> {mode.value}")
 
     # B-Spline server: the checkpoint's cfg is the authority for the dataset
     # path (relative to the checkpoint's ancestors) and for n_obs_steps.

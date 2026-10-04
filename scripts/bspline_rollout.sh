@@ -14,7 +14,7 @@
 # per-tick round trip lands between the state read and the goal write.
 #
 #   ./scripts/bspline_rollout.sh --start-server --ckpt ~/franka_data/bsp/latest.ckpt \
-#       --rig=single_arm_right --speed-up-times 1.0 --num-episodes 10
+#       --rig=single_arm_right --speed 2 --num-episodes 10
 #
 # Everything not consumed below is passed through to the python entrypoint.
 
@@ -70,7 +70,7 @@ if [[ "$START_SERVER" == 1 ]]; then
     python "$(dirname "$0")/_wait_policy_server.py" bspline "$PORT"
 fi
 
-echo "bspline rollout on ${RIG} in EE_POS (goals faster than ${CONTROL_FPS} Hz; see --exec-fps)"
+echo "bspline rollout on ${RIG} in EE_POS"
 cd "$REPO_ROOT"
 STATUS=0
 python -m baselines.bspline_bridge.rollout --port "$PORT" "${ARGS[@]}" || STATUS=$?

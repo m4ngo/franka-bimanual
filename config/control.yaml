@@ -242,7 +242,7 @@ torque:
   # Do not re-measure the wrist below torque.loop.publish_decimation: 2 -- at 100 Hz
   # the launch transient is shorter than a few samples and j7's two rotation
   # directions disagreed 43%, against 5% at 500 Hz.
-  rotor_inertia_kg_m2: [0.775, 0.760, 0.704, 0.757, 0.0774, 0.1078, 0.0863]
+  rotor_inertia_kg_m2: [1.25, 0.625, 0.417, 0.313, 0.125, 0.104, 0.0893] # [0.775, 0.760, 0.704, 0.757, 0.0774, 0.1078, 0.0863]
   limits:
     # The ONLY bound on what reaches the joints: rate limit, then clamp, in the
     # response path. Nothing else rescales tau.

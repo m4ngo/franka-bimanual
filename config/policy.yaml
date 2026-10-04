@@ -35,102 +35,63 @@ baselines:
     recv_timeout_ms: 15000
 
   exec:
-    # Observation/inference rate. null -> control_fps(). Goals are pushed faster
-    # than this (fast_fps/slow_fps); the NUC torque law runs at 500 Hz either way.
-    obs_fps: null
+    # Upstream SAIL's fast_control_freq / slow_control_freq (Hz). The sim rollout
+    # runs at these; the real SAIL rollout takes fast = --speed x control_fps()
+    # and keeps slow_fps, upstream's 1x.
     fast_fps: 100
     slow_fps: 20
-    # Goal-vs-measured divergence that ABORTS the episode. NOT a clamp: EE_POS
-    # has no delta envelope and adding one here would be the third limit layer
-    # CLAUDE.md forbids. A sped-up plan leads the arm on purpose; this only says
-    # when it has stopped being a rollout and started being a drag.
+    # Real rollouts' dataset frame rate. null -> control_fps(), the demonstrations' rate.
+    record_fps: null
+    # Goal-vs-measured divergence that ABORTS the episode. Not a clamp: EE_POS
+    # has no delta envelope, and a sped-up plan leads the arm on purpose.
     max_lead_m: 0.15
     max_lead_rad: 0.5
 
   sail:
-    # Upstream's kwargs dict literal at the bottom of
-    # run_trained_agent_receding_horizon.py, which carries a "move these
-    # somewhere else" TODO. This is somewhere else.
+    # Upstream's kwargs literal (run_trained_agent_receding_horizon.py).
     execute_n_actions: 8
-    # Rows of the PREVIOUS plan executed while the new one is inferred. Upstream
-    # runs in sim, where inference takes no sim time, so this fixed count IS its
-    # latency model. Here inference takes real time, and the old plan keeps
-    # going for as long as it does: at least this many rows, more if inference
-    # is slower than that, until the old chunk runs out. The new chunk is then
-    # entered at the row matching the rows that went out since its observation
-    # -- its row 0 is that observation's own pose (the targets are the reached
-    # poses), so entering earlier commands the arm back to where it was seen.
+    # Rows of the PREVIOUS plan executed while the new one is inferred; the new
+    # plan is entered at this row. On the arm, inference runs during these rows
+    # and the arm holds its goal if it is still running after them.
     inf_delay: 4
     slowdown_window_size: 6
     # EAG tracking-error bounds: guidance is dropped for an inference when the
-    # arm is further than this from the plan. These are upstream's values, which
-    # go with its kp 600 controller (lag ~1 cm, ~1.5 deg). At kp 150 the arm's
-    # steady lag on a 20 Hz plan is 21 mm / 3 deg median, so they drop guidance
-    # on 3 of 4 inferences; osc_kp below is what keeps the arm inside them.
+    # arm is further than this from the next goal of the current plan.
     pos_teb: 0.02             # m, inf-norm
     ori_teb: 0.05             # rad
-    # OSC stiffness the rollout runs under. Upstream evaluates under
-    # robosuite_configs/osc_pose_SAIL.json -- kp 600, damping ratio 1 -- and its
-    # reached-pose targets and pos_teb assume the arm gets there: at the law's
-    # default 150 the arm trails a 20 Hz plan by ~2 cm (kd/kp = 0.16 s at
-    # 0.12 m/s), over pos_teb, so guidance is dropped on nearly every inference.
-    # null = torque.osc.default_kp. Sent on the kp action channel through the
-    # log-base remap, so kp_limits still bind on the arm.
-    osc_kp: 300
-    # Damping ratio on the arm, on the kd channel by the same remap. null =
-    # torque.osc.default_damping_ratio (1.0). 0.5 matches the sim default below.
-    osc_damping_ratio: 0.5
+    # OSC stiffness on the arm, as a multiple of torque.osc.default_kp, at the
+    # default damping ratio. Upstream evaluates under a stiffer controller than it
+    # records with (osc_pose_SAIL.json); here twice the stock kp.
+    osc_kp_scale: 2.0
     # The sim rollout's OSC gains (baselines/libero_bridge/rollout.py), merged
     # over robosuite's osc_pose.json; null keeps the stock value. LIBERO's 5 cm
-    # per-step limit is never changed. SAIL trains on the poses the arm reached
-    # and swaps the teleop controller for a stiff one to play them faster than
-    # recorded (SAIL paper Sec. 4.2): twice the stock kp at half the damping.
-    # SAIL is also evaluated at kp 1000/2000/3000 with --osc-kp and
-    # --osc-damping-ratio; see LIBERO_SIM.md, "SAIL's controller".
+    # per-step limit is never changed. SAIL is also evaluated at kp
+    # 1000/2000/3000 with --osc-kp and --osc-damping-ratio; see LIBERO_SIM.md,
+    # "SAIL's controller".
     sim_osc:
       kp: 300
       damping_ratio: 0.5
 
   bspline:
-    # Fallback only: the server reports the checkpoint's own n_obs_steps and
-    # the client uses that; this is what an older server without it gets.
+    # Fallback only: the server reports the checkpoint's own n_obs_steps.
     n_obs_steps: 2
-    # Hardware only. Upstream defaults this to 20, calibrated for their 10 Hz
-    # data / 200 Hz control split. Here observations arrive at obs_fps and 20
-    # would buffer 40 of them before the first plan. The sim rollout derives its
-    # own (fast_fps / 20) so the policy's frames stay one demo frame apart.
-    obs_stride: 1
-    # Index-space knots -> seconds, i.e. the rate the demonstrations were
-    # RECORDED at: t advances at this many knot-index units per second, and the
-    # knots count frames. null -> control_fps(). Upstream's 10.0 against 20 Hz
-    # data advances t at half the needed rate, so every plan plays at 0.5x --
-    # twice the wall clock, and it reads as a sluggish controller rather than as
-    # a misconfiguration. Measured in scripts/check_baseline_rollout_offline.py.
+    # Real rollout goal rate: upstream's --control-freq (its README runs 200).
+    control_freq: 200
+    # Knot-index units per second, i.e. the rate the demonstrations were
+    # RECORDED at. null -> control_fps(). Upstream's 10.0 is its own 10 Hz data;
+    # against 20 Hz data it would play every plan at 0.5x.
     origin_time_scale: null
     speed_up_times: 1.0
-    # Wall-clock seconds of plan left when the next spline is requested.
-    # Upstream's documented rollout command (inference/README.md) uses 0.1;
-    # 0.06 is only its argparse default. Checked once per observation (50 ms),
-    # so 0.06 let a request go out with as little as 10 ms left.
+    # Upstream's README rollout command: --predict-before-end 0.1.
     predict_before_end: 0.1
     time_align_error_threshold: 0.1
-    # How far into a new spline the alignment search may look, as a fraction
-    # of its length. The paper's appendix uses 0.5 (half a segment); 0.2 is
-    # only upstream's code default, and at 2x/4x the old plan's pose often
-    # lies past it.
+    # How far into a new spline the alignment search may look, as a fraction of
+    # its length. 0.2 is upstream's code default; 0.5 is the paper appendix's
+    # half segment. Shared with the sim rollout.
     time_align_larger_t: 0.5
-    # Move each sampled goal (kd/kp)*(1 - 1/speed_up_times) s further along the
-    # plan, our stand-in for upstream's servo speed-up. It also adds
-    # lead*(change in velocity) at every stitch; false sends the plan as sampled.
+    # Sim rollout only: lead each sampled goal by (kd/kp)*(1 - 1/speed_up_times) s.
+    # The real rollout sends the plan as sampled.
     goal_lead: true
-    # OSC gains on the arm, sent on the kp/kd action channels like SAIL's.
-    # null = stock (kp 150, damping 1.0), the controller the demos were sent to.
-    # osc_kp "speed" = 150 * speed_up_times**2: the stock response, speed_up_times
-    # faster, as upstream speeds its servo up with the plan (set_ik_dt_scale).
-    # Capped at the gain channel's reach (1500), so 4x tracks like ~3.2x. With it
-    # the goal lead is ~0 by itself; set goal_lead false to drop it entirely.
-    osc_kp: null
-    osc_damping_ratio: null
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7
