@@ -252,6 +252,108 @@ Measured on Tillicum, one H200 per unit:
 | `training did not produce a checkpoint (exit 0, failed=False)` | SAIL's budget ended between checkpoints, which an image from before the last-epoch save could not handle; pull the image again |
 | `getpwuid(): uid not found` | the image run under docker `--user` with no passwd entry; apptainer adds one |
 
+## Evaluating on Tillicum
+
+The sweeps run on Tillicum too, so they stop holding the workstation's GPU.
+Each unit is one task at one setting, e.g. task_3 at SAIL kp 1000. Several units
+share one GPU at once, because a rollout is mostly mujoco on the CPU. The
+rollouts land in the cluster's `~/franka_data/outputs`, at the same paths as
+here.
+
+It uses its own image, `franka-sim-eval`. That image holds the two policy envs,
+copied from the local `franka-baselines:latest` so checkpoints trained in it
+load, plus multi-fast's sim env (robosuite, libero, openpi). Rebuild it after
+changing code in `baselines/`, `multi-fast/` or `config/`, because the code is
+baked in. Only the last layers rebuild. On the workstation:
+
+```bash
+cd ~/franka_ws
+TAG=$(git describe --always --dirty)
+docker build -f baselines/tillicum/Dockerfile.eval --build-arg FRANKA_WS_IMAGE=$TAG \
+    -t atsai06/franka-sim-eval:$TAG .
+docker tag atsai06/franka-sim-eval:$TAG atsai06/franka-sim-eval:latest
+docker push atsai06/franka-sim-eval:$TAG && docker push atsai06/franka-sim-eval:latest
+rsync -a --mkpath baselines/tillicum/ atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/atsai06/tillicum/
+```
+
+On a Tillicum compute node, with the same `APPTAINER_*` exports as the training pull:
+
+```bash
+apptainer pull --force /gpfs/scrubbed/$USER/containers/franka-sim-eval.sif docker://atsai06/franka-sim-eval:latest
+```
+
+The prep HDF5s and the policies must already be on the cluster. They are if the
+suite trained there. pi05 downloads its checkpoint (12 GB) into the cluster's
+`~/.cache/openpi` the first time it runs. To skip that, copy it up once:
+
+```bash
+rsync -a --mkpath --info=progress2 ~/.cache/openpi/ \
+    atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/atsai06/franka_home/.cache/openpi/
+```
+
+On the login node, run a smoke test first: 1 episode of one task per method,
+written to a separate outputs tree:
+
+```bash
+bash /gpfs/scrubbed/$USER/tillicum/submit_libero_eval.sh libero_goal --tasks 0 --episodes 1 \
+    --prefix smoke --sail-gains 300:0.5 --bspline-speeds 2 --apply \
+    -- --output-root /home/franka/franka_data/outputs_smoke
+```
+
+Then the full sweep. With no flags it runs pi05, SAIL at its four gain settings
+and B-Spline at 1x, 2x, 4x and 8x, with 50 episodes per task. The sweep ids are
+`libero_report_ep50`'s: `ep50_pi05`, `ep50_sail_kp300_d050` ... `ep50_bsp_8x`.
+Drop `--apply` to print the units first.
+
+```bash
+bash /gpfs/scrubbed/$USER/tillicum/submit_libero_eval.sh libero_goal --apply
+
+squeue -u $USER
+for f in /gpfs/scrubbed/$USER/franka_home/franka_data/baseline_prep/libero_goal/rollout_logs_ep50_*/*.log; do
+    printf '%-50s %s\n' "${f##*rollout_logs_}" "$(grep -o '\[[0-9]*/[0-9]* = [0-9]*%\]' "$f" | tail -1)"
+done
+```
+
+Back on the workstation, fetch the runs, then [read them](#read-results) as usual:
+
+```bash
+rsync -a --info=progress2 \
+    atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/atsai06/franka_home/franka_data/outputs/libero_goal/ \
+    ~/franka_data/outputs/libero_goal/
+python scripts/rollout_report.py --sweep ep50_pi05 ep50_sail_kp300_d050 ep50_bsp_2x
+```
+
+Other flags: `--methods`, `--sail-gains "kp:ratio ..."`, `--bspline-speeds`,
+`--tasks`, `--episodes`, `--prefix` (default `ep<episodes>`), `--per-gpu`
+(default 4) and `--save-video`. Anything after `--` goes to every rollout.
+A SAIL or B-Spline unit is left out, with a warning, until its policy has a
+`.trained.json`.
+
+How it works:
+
+- [eval_libero.slurm](tillicum/eval_libero.slurm) starts each unit as the
+  unchanged `evaluate --tasks <i> --backend <b> --sweep-id <id>`. The same home
+  mount as training puts the cluster data at `/home/franka`, so the run
+  directories and manifests copy back unchanged. Each unit gets its own policy
+  port, and the job skips node g011, whose EGL stalls at startup
+  ([EGL_STARTUP_STALL.md](../multi-fast/docs/EGL_STARTUP_STALL.md)).
+- **Resubmitting is safe.** `evaluate --resume` skips a unit whose sweep already
+  has a completed run. An unfinished run is moved to `outputs_unfinished/` and
+  the unit runs again, so the sweep counts each episode once
+  ([`sweep_runs`](libero_bridge/evaluate.py#L49)). A preempted job requeues the
+  same way.
+- **Units started in the same second do not clash.** The second run takes the
+  next second's directory ([`RunDir`](run_record.py#L239)).
+- Manifests record the image tag as `environment.git.image`, because the image
+  has no `.git`.
+
+| symptom | cause |
+|---|---|
+| `no .../franka-sim-eval.sif` | the pull step |
+| `not trained, left out: task_3:sail` | no `.trained.json` for that policy on the cluster |
+| `port N is already held by pid P` | another job on the node holds that port; resubmit and the unit runs again |
+| `ModuleNotFoundError` in a unit log | the image predates the code change; rebuild, push and pull |
+
 ## Speed
 
 Each method has its own knob; they are not interchangeable.
@@ -322,7 +424,7 @@ backend ran more than one suite
 ([`render_sweep`](../scripts/rollout_summary.py#L89)). `--sweep latest` takes the
 newest. Every run recorded since 2026-10-01 shows the OSC it ran in its notes,
 e.g. `[kp 300, damping 0.5, step limit 5 cm]`
-([`osc_text`](run_record.py#L480)); the step limit is the largest position step
+([`osc_text`](run_record.py#L489)); the step limit is the largest position step
 one env step may command. Only rollouts started through `evaluate` carry an id unless you pass
 `--sweep-id` yourself. `--json` emits manifests instead of the table.
 
@@ -569,9 +671,7 @@ python -m baselines.libero_bridge.evaluate ~/franka_data/baseline_prep/libero_10
 python scripts/rollout_summary.py --sweep $SWEEP
 ```
 
-To run several settings at once, give each its own `--port` after `--extra`, and
-start them a few seconds apart: two runs of one task and method that start in
-the same second refuse to share a run directory.
+To run several settings at once, give each its own `--port` after `--extra`.
 
 **What still limits SAIL's speed: the precision labels.** Rows near a gripper
 event or a dense cluster of waypoints play at `slow_fps`, 20 Hz, which is demo
@@ -971,6 +1071,9 @@ mujoco, no policy, no GPU, ~1 min for five demos.
 | [tillicum/train_libero.slurm](tillicum/train_libero.slurm) | one array element: stage, mount, train |
 | [tillicum/progress.sh](tillicum/progress.sh) | each unit's epoch, rate and time left, read from its training log |
 | [tillicum/Dockerfile](tillicum/Dockerfile) | the image, both envs pinned to this machine's |
+| [tillicum/submit_libero_eval.sh](tillicum/submit_libero_eval.sh) | the evaluation sweep on Tillicum, several units per GPU |
+| [tillicum/eval_libero.slurm](tillicum/eval_libero.slurm) | one array element: its units, each its own `evaluate` |
+| [tillicum/Dockerfile.eval](tillicum/Dockerfile.eval) | the evaluation image: both policy envs plus multi-fast's sim env |
 | [zmq_client.py](zmq_client.py) | the client for both policy servers |
 | [interpreters.py](interpreters.py) | which python runs each baseline |
 | [policy_math.py](policy_math.py) | helpers shared by sim and hardware loops |

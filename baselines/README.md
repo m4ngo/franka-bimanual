@@ -274,6 +274,15 @@ for s in 1 2 4 8; do
 done
 ```
 
+Both training and these sweeps also run on Tillicum, so they stay off the
+workstation's GPU. One command runs pi05, SAIL at four gain settings and
+B-Spline at four speeds on every task of a suite (LIBERO_SIM.md, "Evaluating on
+Tillicum"):
+
+```bash
+bash /gpfs/scrubbed/$USER/tillicum/submit_libero_eval.sh libero_goal --apply
+```
+
 Steps 2 and 4 of the hardware pipeline above are reused unchanged -- the
 trainers and `rollout_summary.py` read the HDF5, not the robot. What differs:
 

@@ -156,12 +156,16 @@ def git_state(repo: Path = _REPO_ROOT) -> dict:
     # took the first character off the first filename.
     status = run("status", "--porcelain", strip=False)
     files = [l[3:] for l in (status or "").splitlines() if len(l) > 3]
-    return {
+    state = {
         "commit": run("rev-parse", "HEAD"),
         "branch": run("rev-parse", "--abbrev-ref", "HEAD"),
         "dirty": bool(files) if status is not None else None,
         "dirty_files": sorted(files)[:50],
     }
+    # A container has no .git; its build stamps the `git describe` it came from.
+    if os.environ.get("FRANKA_WS_IMAGE"):
+        state["image"] = os.environ["FRANKA_WS_IMAGE"]
+    return state
 
 
 def machine_state() -> dict:
@@ -244,19 +248,24 @@ class RunDir:
         if self.method not in METHODS:
             raise ValueError(f"method must be one of {METHODS}, got {self.method!r}")
         self.root = Path(self.root).expanduser()
-        stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.when))
-        self.run_id = f"{stamp}-{self.method}"
-        self.path = self.root / _safe_segment(self.train_dataset) / self.run_id
-        try:
-            # Never exist_ok: a run directory is the record of one rollout, and
-            # silently merging two of them would interleave their episodes.jsonl.
-            self.path.mkdir(parents=True, exist_ok=False)
-        except FileExistsError as exc:
-            raise FileExistsError(
-                f"{self.path} already exists. Two runs of {self.method!r} on "
-                f"{self.train_dataset!r} within the same second cannot be told "
-                "apart; wait a second and start again."
-            ) from exc
+        for attempt in range(30):
+            stamp = time.strftime("%Y%m%d_%H%M%S", time.localtime(self.when))
+            self.run_id = f"{stamp}-{self.method}"
+            self.path = self.root / _safe_segment(self.train_dataset) / self.run_id
+            try:
+                # Never exist_ok: a run directory is the record of one rollout, and
+                # silently merging two of them would interleave their episodes.jsonl.
+                self.path.mkdir(parents=True, exist_ok=False)
+                return
+            except FileExistsError as exc:
+                # Parallel sweep units collide here; they take the next second.
+                if self.when is not None or attempt == 29:
+                    raise FileExistsError(
+                        f"{self.path} already exists. Two runs of {self.method!r} on "
+                        f"{self.train_dataset!r} within the same second cannot be told "
+                        "apart; wait a second and start again."
+                    ) from exc
+                time.sleep(1.0)
 
     @property
     def dataset_dir(self) -> Path:

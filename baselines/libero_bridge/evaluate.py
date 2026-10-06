@@ -18,7 +18,9 @@ and multi-fast's for the env. Read the results afterwards with
 from __future__ import annotations
 
 import argparse
+import json
 import logging
+import shutil
 import subprocess
 import sys
 import time
@@ -30,7 +32,8 @@ sys.path.insert(0, str(_REPO_ROOT))
 from baselines.libero_bridge.train import (  # noqa: E402
     BACKENDS, checkpoint_for, finished_steps, prep_suite, task_dirs,
 )
-from baselines.run_record import read_source_repo_id  # noqa: E402
+from baselines.libero_bridge.sim_env import tag_index  # noqa: E402
+from baselines.run_record import DEFAULT_ROOT, read_source_repo_id  # noqa: E402
 
 logger = logging.getLogger("baselines.libero.evaluate")
 
@@ -41,6 +44,25 @@ ROLLOUT_SH = _REPO_ROOT / "scripts" / "libero_rollout.sh"
 # nothing to gate on -- it just runs.
 EVAL_BACKENDS = (*BACKENDS, "pi05")
 PRETRAINED = ("pi05",)
+
+
+def sweep_runs(root: Path, sweep_id: str, suite: str, task_dir: Path,
+               backend: str) -> list[tuple[Path, str | None]]:
+    """(run dir, status) of every run of this task and backend tagged `sweep_id`."""
+    index = tag_index(task_dir.name)
+    found = []
+    for manifest in root.rglob("manifest.json"):
+        try:
+            m = json.loads(manifest.read_text())
+        except (OSError, ValueError):
+            continue
+        run, env = m.get("run") or {}, m.get("environment") or {}
+        same_task = (env.get("task_index") == index if index is not None
+                     else env.get("task") == task_dir.name)
+        if (run.get("sweep") == sweep_id and run.get("method") == backend
+                and env.get("suite") == suite and same_task):
+            found.append((manifest.parent, run.get("status")))
+    return found
 
 
 def summarise_sweep(sweep_id: str) -> None:
@@ -76,6 +98,10 @@ def main() -> int:
                    help="tag every rollout of this invocation with this id; default "
                         "sweep_<timestamp>. Recall it later with "
                         "rollout_summary.py --sweep <id>")
+    p.add_argument("--resume", action="store_true",
+                   help="skip a task and backend this sweep already completed, and move "
+                        "an unfinished run of it to <outputs>_unfinished/ before rerunning "
+                        "it, so the sweep's pooled rows count each episode once")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[],
                    help="everything after this is passed to each rollout")
@@ -103,9 +129,27 @@ def main() -> int:
     logger.info("sweep id %s -- recall with: python scripts/rollout_summary.py --sweep %s",
                 sweep_id, sweep_id)
 
+    extra = list(args.extra)
+    out_root = (Path(extra[extra.index("--output-root") + 1]).expanduser()
+                if "--output-root" in extra[:-1] else DEFAULT_ROOT)
+
     failed, missing, ran = [], 0, 0
     for i, (task_dir, backend) in enumerate(jobs, 1):
         label = f"{task_dir.name}/{backend}"
+        if args.resume:
+            runs = sweep_runs(out_root, sweep_id, suite, task_dir, backend)
+            done_run = next((d for d, status in runs if status == "completed"), None)
+            if done_run is not None:
+                logger.info("[%d/%d] %s: %s already completed this sweep, skipping",
+                            i, len(jobs), label, done_run.name)
+                continue
+            for d, status in runs:
+                dest = out_root.parent / f"{out_root.name}_unfinished" / d.relative_to(out_root)
+                logger.warning("[%d/%d] %s: moving %s run %s to %s", i, len(jobs), label,
+                               status, d.name, dest)
+                if not args.dry_run:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(d), str(dest))
         ckpt = done = None
         if backend not in PRETRAINED:
             hdf5 = task_dir / f"{backend}.hdf5"

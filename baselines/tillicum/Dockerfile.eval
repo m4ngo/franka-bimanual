@@ -1,0 +1,95 @@
+# The LIBERO sim evaluation environment, for Tillicum (baselines/LIBERO_SIM.md,
+# "Evaluating on Tillicum"). Build from the repo root:
+#
+#   docker build -f baselines/tillicum/Dockerfile.eval \
+#       --build-arg FRANKA_WS_IMAGE=$(git describe --always --dirty) \
+#       -t atsai06/franka-sim-eval:$(git describe --always --dirty) .
+#
+# Three interpreters, laid out where scripts/libero_rollout.sh looks for them:
+# .venv-sail and .venv-bspline copied from the training image, so checkpoints
+# trained there load here, and multi-fast's own env (robosuite, libero, openpi
+# for pi05) at multi-fast/.venv. Build the training image first; this one reads
+# atsai06/franka-baselines:latest.
+
+ARG BASELINES_IMAGE=atsai06/franka-baselines:latest
+FROM ${BASELINES_IMAGE} AS baselines
+
+FROM nvidia/cuda:12.2.2-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+# multi-fast's own list (its Dockerfile) for mujoco, robosuite and the builds
+# uv runs; iproute2 gives libero_rollout.sh `ss` for its port check.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates git git-lfs build-essential clang cmake iproute2 \
+        patchelf libgl1-mesa-dev libglfw3 libglew2.2 \
+        libosmesa6 libosmesa6-dev libglu1-mesa-dev \
+        libegl1 libgles2-mesa-dev libglib2.0-0 \
+        libsm6 libxrender1 libx11-6 libxext6 libxi6 libxmu6 \
+        libxrandr2 libxxf86vm1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install --skip-smudge
+
+COPY --from=ghcr.io/astral-sh/uv:0.11.3 /uv /uvx /bin/
+# apptainer runs as the submitting user, who cannot read /root.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+ENV UV_HTTP_TIMEOUT=600
+
+WORKDIR /opt/franka_ws
+
+# The policy envs, with the python they link to and the upstream trees they
+# install editable from.
+COPY --from=baselines /opt/uv-python /opt/uv-python
+COPY --from=baselines /opt/franka_ws/.venv-sail .venv-sail
+COPY --from=baselines /opt/franka_ws/.venv-bspline .venv-bspline
+COPY --from=baselines /opt/franka_ws/baselines/sail baselines/sail
+COPY --from=baselines /opt/franka_ws/baselines/bspline_policy baselines/bspline_policy
+
+# The sim env, from multi-fast's lockfile. Its submodules install editable, so
+# they are copied to where they stay.
+COPY multi-fast/LIBERO multi-fast/LIBERO
+COPY multi-fast/robosuite multi-fast/robosuite
+COPY multi-fast/openpi multi-fast/openpi
+COPY multi-fast/stable-baselines3 multi-fast/stable-baselines3
+COPY multi-fast/robomimic multi-fast/robomimic
+COPY multi-fast/diffusion_policy multi-fast/diffusion_policy
+COPY multi-fast/pyproject.toml multi-fast/uv.lock multi-fast/
+RUN cd multi-fast \
+    && GIT_LFS_SKIP_SMUDGE=1 UV_LINK_MODE=copy UV_PROJECT_ENVIRONMENT=/opt/franka_ws/multi-fast/.venv \
+        uv sync --frozen --no-install-project --python 3.11 \
+    && rm -rf /root/.cache
+
+# LIBERO's config, so its first import does not prompt for one.
+ENV LIBERO_CONFIG_PATH=/opt/libero
+RUN mkdir -p /opt/libero && printf '%s\n' \
+        'benchmark_root: /opt/franka_ws/multi-fast/LIBERO/libero/libero' \
+        'bddl_files: /opt/franka_ws/multi-fast/LIBERO/libero/libero/bddl_files' \
+        'init_states: /opt/franka_ws/multi-fast/LIBERO/libero/libero/init_files' \
+        'datasets: /opt/franka_ws/multi-fast/data/libero_raw/datasets' \
+        'assets: /opt/franka_ws/multi-fast/LIBERO/libero/libero/assets' \
+        > /opt/libero/config.yaml
+
+# Headless rendering on NVIDIA's EGL, not mesa's (multi-fast's Dockerfile).
+RUN mkdir -p /usr/share/glvnd/egl_vendor.d \
+    && [ -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json ] \
+    || printf '{"file_format_version": "1.0.0", "ICD": {"library_path": "libEGL_nvidia.so.0"}}\n' \
+        > /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+ENV __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+    MUJOCO_GL=egl PYOPENGL_PLATFORM=egl PYTHONUNBUFFERED=1
+
+# Code last, so an edit rebuilds only these layers.
+COPY multi-fast/utils multi-fast/utils
+COPY multi-fast/cfg multi-fast/cfg
+COPY multi-fast/scripts multi-fast/scripts
+COPY multi-fast/*.py multi-fast/
+COPY config/ config/
+COPY franka_config/ franka_config/
+COPY scripts/ scripts/
+COPY baselines/ baselines/
+
+# `python` is the workspace interpreter libero_rollout.sh calls for config and
+# the policy handshake; multi-fast's env has everything those need.
+ENV PATH=/opt/franka_ws/multi-fast/.venv/bin:$PATH \
+    PYTHONPATH=/opt/franka_ws/franka_config
+# Recorded in each run's manifest, since the image carries no .git.
+ARG FRANKA_WS_IMAGE=unknown
+ENV FRANKA_WS_IMAGE=$FRANKA_WS_IMAGE

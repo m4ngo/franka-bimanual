@@ -1,0 +1,720 @@
+{
+  "runs": [
+    {
+      "run": "20261001_165525-multifast",
+      "family": "base only",
+      "episodes": 20,
+      "residual": null,
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": null
+    },
+    {
+      "run": "20261002_143734-multifast",
+      "family": "base + residual",
+      "episodes": 2,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261002_145139-multifast",
+      "family": "base + residual",
+      "episodes": 2,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261002_145428-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261002_145650-multifast",
+      "family": "base + residual",
+      "episodes": 4,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261003_132904-multifast",
+      "family": "base only",
+      "episodes": 1,
+      "residual": null,
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": null
+    },
+    {
+      "run": "20261003_132956-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261003_144614-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261003_145358-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261003_150437-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 2,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    },
+    {
+      "run": "20261003_155259-multifast",
+      "family": "base + residual",
+      "episodes": 1,
+      "residual": "/home/franka/checkpoints/357a8e1d/checkpoint/best.pt",
+      "base": "/home/franka/franka_data/pipeline/HuskyMango/filter-9-19-libero-90-9/20260918_000917-9-17-run-1-libero-90-9/diffusion/checkpoints/200000/pretrained_model",
+      "infer_lead": 1,
+      "residual_params": {
+        "chunk_exec": 5,
+        "horizon": 10,
+        "pos_scale_m": 0.05,
+        "rot_scale_rad": 0.5,
+        "gains_mag": 0.5,
+        "residual_mag": 0.2,
+        "residual_trans_mag": 0.2,
+        "residual_rot_mag": 0.2,
+        "res_pos_gain": 1.0,
+        "res_rot_gain": 1.0
+      }
+    }
+  ],
+  "families": {
+    "demos": {
+      "episodes": 30,
+      "frames": 3775,
+      "successes": null,
+      "length_median": 121.5,
+      "gripper_closes_per_episode": {
+        "mean": 1.0,
+        "max": 1
+      },
+      "nn_m": {
+        "median": 0.00678444110830868,
+        "p95": 0.023995052028093853,
+        "mean": 0.008865821581661295
+      },
+      "nn_within": {
+        "1cm": 0.6956291390728477,
+        "2cm": 0.9210596026490067,
+        "5cm": 0.9994701986754967
+      },
+      "dtw_m": {
+        "median": 0.02583293637420689,
+        "p95": 0.035945680777318065,
+        "mean": 0.02661860326360964
+      },
+      "dtw_median_over_demo_floor": 1.0,
+      "cmd_pos_m": {
+        "median": 0.03317989220590446,
+        "p95": 0.05072627746279791,
+        "mean": 0.03292424774339752
+      },
+      "cmd_rot_rad": {
+        "median": 0.06582208729143534,
+        "p95": 0.1626965033986607,
+        "mean": 0.07315244013175871
+      },
+      "step_pos_m": {
+        "median": 0.005753535251745631,
+        "p95": 0.011367506811530705,
+        "mean": 0.005976091102936418
+      },
+      "step_rot_rad": {
+        "median": 0.00888541776491951,
+        "p95": 0.02820886267495663,
+        "mean": 0.011204186666467228
+      },
+      "accel_m": {
+        "median": 0.0027854645848942976,
+        "p95": 0.007441801224085009,
+        "mean": 0.0034747280881285533
+      },
+      "events": {
+        "start": {
+          "n": 30,
+          "mean": [
+            0.4516,
+            -0.0004,
+            0.2608
+          ],
+          "std": [
+            0.0019,
+            0.0007,
+            0.0014
+          ]
+        },
+        "grasp": {
+          "n": 30,
+          "mean": [
+            0.3803,
+            -0.0704,
+            0.1727
+          ],
+          "std": [
+            0.0247,
+            0.0237,
+            0.0191
+          ]
+        },
+        "release": {
+          "n": 30,
+          "mean": [
+            0.5585,
+            0.0423,
+            0.2143
+          ],
+          "std": [
+            0.0408,
+            0.0301,
+            0.0236
+          ]
+        }
+      }
+    },
+    "base only": {
+      "episodes": 21,
+      "frames": 3280,
+      "successes": 20,
+      "length_median": 154.0,
+      "gripper_closes_per_episode": {
+        "mean": 2.4285714285714284,
+        "max": 12
+      },
+      "nn_m": {
+        "median": 0.0050809767502192574,
+        "p95": 0.011390583241184667,
+        "mean": 0.005592409516421024
+      },
+      "nn_within": {
+        "1cm": 0.9024390243902439,
+        "2cm": 0.998780487804878,
+        "5cm": 1.0
+      },
+      "dtw_m": {
+        "median": 0.021194761014288455,
+        "p95": 0.025132999397044414,
+        "mean": 0.02130602629586605
+      },
+      "dtw_median_over_demo_floor": 0.8204549690855331,
+      "cmd_pos_m": {
+        "median": 0.025390038312058976,
+        "p95": 0.04171665826422585,
+        "mean": 0.025202121022283433
+      },
+      "cmd_rot_rad": {
+        "median": 0.06278252500365664,
+        "p95": 0.1249255601507619,
+        "mean": 0.0664965856759116
+      },
+      "step_pos_m": {
+        "median": 0.0036264634633546176,
+        "p95": 0.010470674990619992,
+        "mean": 0.004215904499581614
+      },
+      "step_rot_rad": {
+        "median": 0.0035020438268979215,
+        "p95": 0.013519318120582595,
+        "mean": 0.004868008906407766
+      },
+      "accel_m": {
+        "median": 0.0013206279205282378,
+        "p95": 0.008350648576475748,
+        "mean": 0.002614336631045462
+      },
+      "events": {
+        "start": {
+          "n": 21,
+          "mean": [
+            0.452,
+            -0.0006,
+            0.2611
+          ],
+          "std": [
+            0.0004,
+            0.0004,
+            0.0007
+          ]
+        },
+        "grasp": {
+          "n": 21,
+          "mean": [
+            0.3764,
+            -0.0771,
+            0.1715
+          ],
+          "std": [
+            0.0105,
+            0.0133,
+            0.0053
+          ]
+        },
+        "release": {
+          "n": 21,
+          "mean": [
+            0.549,
+            0.0493,
+            0.2283
+          ],
+          "std": [
+            0.0375,
+            0.0249,
+            0.0071
+          ]
+        }
+      },
+      "event_offset_from_demos_m": {
+        "start": [
+          0.0004,
+          -0.0001,
+          0.0003
+        ],
+        "grasp": [
+          -0.004,
+          -0.0067,
+          -0.0012
+        ],
+        "release": [
+          -0.0096,
+          0.007,
+          0.014
+        ]
+      }
+    },
+    "base + residual": {
+      "episodes": 14,
+      "frames": 3141,
+      "successes": 9,
+      "length_median": 227.0,
+      "gripper_closes_per_episode": {
+        "mean": 4.285714285714286,
+        "max": 10
+      },
+      "nn_m": {
+        "median": 0.006729226573557912,
+        "p95": 0.025171077637894463,
+        "mean": 0.009188904814760993
+      },
+      "nn_within": {
+        "1cm": 0.6905444126074498,
+        "2cm": 0.8923909582935371,
+        "5cm": 1.0
+      },
+      "dtw_m": {
+        "median": 0.027930798178848745,
+        "p95": 0.04583542300699527,
+        "mean": 0.029542556711021493
+      },
+      "dtw_median_over_demo_floor": 1.0812088015954888,
+      "cmd_pos_m": {
+        "median": 0.012481940379113586,
+        "p95": 0.03417913191176593,
+        "mean": 0.015013959250417985
+      },
+      "cmd_rot_rad": {
+        "median": 0.043817857932497005,
+        "p95": 0.1122770319405569,
+        "mean": 0.052321753212198556
+      },
+      "step_pos_m": {
+        "median": 0.004156753477611807,
+        "p95": 0.012585079846979515,
+        "mean": 0.005194327798522728
+      },
+      "step_rot_rad": {
+        "median": 0.010515082597760194,
+        "p95": 0.03717456752343896,
+        "mean": 0.014138357313058014
+      },
+      "accel_m": {
+        "median": 0.0034814885087905726,
+        "p95": 0.011494853816129476,
+        "mean": 0.004537891802038959
+      },
+      "events": {
+        "start": {
+          "n": 14,
+          "mean": [
+            0.4518,
+            -0.0007,
+            0.2613
+          ],
+          "std": [
+            0.0005,
+            0.001,
+            0.0006
+          ]
+        },
+        "grasp": {
+          "n": 10,
+          "mean": [
+            0.3875,
+            -0.0656,
+            0.146
+          ],
+          "std": [
+            0.0097,
+            0.0128,
+            0.0103
+          ]
+        },
+        "release": {
+          "n": 10,
+          "mean": [
+            0.5445,
+            0.0457,
+            0.206
+          ],
+          "std": [
+            0.0327,
+            0.0225,
+            0.0215
+          ]
+        }
+      },
+      "event_offset_from_demos_m": {
+        "start": [
+          0.0002,
+          -0.0003,
+          0.0005
+        ],
+        "grasp": [
+          0.0071,
+          0.0048,
+          -0.0266
+        ],
+        "release": [
+          -0.014,
+          0.0034,
+          -0.0083
+        ]
+      }
+    }
+  },
+  "per_run": {
+    "20261001_165525-multifast": {
+      "family": "base only",
+      "dtw_cm": [
+        2.0,
+        1.63,
+        2.33,
+        2.45,
+        1.86,
+        2.04,
+        1.87,
+        1.94,
+        1.88,
+        3.0,
+        2.16,
+        2.15,
+        2.16,
+        2.04,
+        1.58,
+        2.27,
+        2.12,
+        2.05,
+        2.51,
+        2.5
+      ],
+      "success": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        true
+      ],
+      "gripper_closes": [
+        6,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1,
+        1,
+        12,
+        1,
+        2,
+        2,
+        1,
+        2,
+        2,
+        3,
+        2,
+        2,
+        2
+      ]
+    },
+    "20261003_132904-multifast": {
+      "family": "base only",
+      "dtw_cm": [
+        2.2
+      ],
+      "success": [
+        true
+      ],
+      "gripper_closes": [
+        1
+      ]
+    },
+    "20261002_143734-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        2.05,
+        2.73
+      ],
+      "success": [
+        true,
+        false
+      ],
+      "gripper_closes": [
+        3,
+        0
+      ]
+    },
+    "20261002_145139-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        2.91,
+        2.11
+      ],
+      "success": [
+        true,
+        true
+      ],
+      "gripper_closes": [
+        5,
+        6
+      ]
+    },
+    "20261002_145428-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        5.42
+      ],
+      "success": [
+        true
+      ],
+      "gripper_closes": [
+        0
+      ]
+    },
+    "20261002_145650-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        2.4,
+        2.34,
+        2.62,
+        2.31
+      ],
+      "success": [
+        true,
+        false,
+        false,
+        true
+      ],
+      "gripper_closes": [
+        5,
+        0,
+        6,
+        5
+      ]
+    },
+    "20261003_132956-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        3.13
+      ],
+      "success": [
+        false
+      ],
+      "gripper_closes": [
+        0
+      ]
+    },
+    "20261003_144614-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        3.07
+      ],
+      "success": [
+        true
+      ],
+      "gripper_closes": [
+        6
+      ]
+    },
+    "20261003_145358-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        3.29
+      ],
+      "success": [
+        true
+      ],
+      "gripper_closes": [
+        8
+      ]
+    },
+    "20261003_150437-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        2.86
+      ],
+      "success": [
+        false
+      ],
+      "gripper_closes": [
+        10
+      ]
+    },
+    "20261003_155259-multifast": {
+      "family": "base + residual",
+      "dtw_cm": [
+        4.13
+      ],
+      "success": [
+        true
+      ],
+      "gripper_closes": [
+        6
+      ]
+    }
+  }
+}

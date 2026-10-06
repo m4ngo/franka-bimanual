@@ -110,8 +110,8 @@ class BasePolicy(ObservationHistory):
         self.policy.reset()
 
     def action_space(self) -> str:
-        """`EE_POS` or `EE_DELTA`, read off the checkpoint's own unnormaliser stats:
-        lerobot_source.action_space's rule, applied to the extremes of the action range."""
+        """`EE_POS`, `EE_DELTA` or `CHUNK_RELATIVE`, read off the checkpoint's own unnormaliser
+        stats: lerobot_source.action_space's rule, applied to the extremes of the action range."""
         from safetensors.numpy import load_file
 
         files = sorted(self.path.glob("policy_postprocessor_step_*_unnormalizer_processor.safetensors"))
@@ -119,6 +119,9 @@ class BasePolicy(ObservationHistory):
             raise FileNotFoundError(f"no unnormaliser stats under {self.path}; cannot tell whether "
                                     "this checkpoint emits poses or deltas")
         stats = load_file(str(files[0]))
+        # 9 wide is lerobot_train_chunkrel.py's [dpos, rotvec, gripper, kp, kd]; its range reads as EE_POS.
+        if any(k.startswith("action.") and v.shape[-1] == 9 for k, v in stats.items()):
+            return "CHUNK_RELATIVE"
         if "action.min" in stats and "action.max" in stats:
             corners = np.stack([stats["action.min"][:3], stats["action.max"][:3]])
         elif "action.mean" in stats and "action.std" in stats:
