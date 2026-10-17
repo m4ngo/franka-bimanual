@@ -12,6 +12,12 @@ step. This launcher reads the epoch out of the checkpoint, sets num_epochs to
 what is left, and keeps the schedule sized to the run's original epoch count,
 so the run ends where a fresh one would. Without --resume it is upstream's entry
 point. The submodule itself is untouched.
+
+Either way, latest.ckpt is written once more when training ends. The workspace
+only saves on epochs divisible by checkpoint_every, so without this a run had to
+be rounded up to k*checkpoint_every+1 epochs to keep its last one, overshooting a
+--steps budget by up to checkpoint_every epochs. The final checkpoint holds the
+advanced epoch counter, so resuming a finished run trains nothing.
 """
 
 from __future__ import annotations
@@ -41,6 +47,21 @@ def checkpoint_epochs(run_dir: pathlib.Path) -> tuple[int, int]:
     return int(dill.loads(payload["pickles"]["epoch"])), int(payload["cfg"].training.num_epochs)
 
 
+def save_on_finish() -> None:
+    import diffusion_policy.workspace.train_diffusion_unet_hybrid_workspace as workspace
+    cls = workspace.TrainDiffusionUnetHybridWorkspace
+    run = cls.run
+
+    def run_then_save(self, *args, **kwargs):
+        out = run(self, *args, **kwargs)
+        if self.cfg.checkpoint.save_last_ckpt:
+            self.save_checkpoint(use_thread=False)
+            print(f"final checkpoint: epoch {self.epoch}, global step {self.global_step}", flush=True)
+        return out
+
+    cls.run = run_then_save
+
+
 def main() -> None:
     argv = sys.argv[1:]
     resume_dir = None
@@ -49,6 +70,7 @@ def main() -> None:
         resume_dir = pathlib.Path(argv[i + 1]).resolve()
         del argv[i:i + 2]
     upstream = load_upstream()
+    save_on_finish()
     if resume_dir is not None:
         epoch, total = checkpoint_epochs(resume_dir)
         # The checkpoint is written after its epoch trains and before the counter

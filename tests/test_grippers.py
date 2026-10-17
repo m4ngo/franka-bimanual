@@ -61,6 +61,7 @@ class _FakeFranka:
         g._pending = None
         g._running = False
         g._inflight = None   # only read by the pre-fix driver
+        g._last_done = None
         self.g = g
 
     def _make(self, label):
@@ -152,12 +153,13 @@ def test_commands_coalesce_instead_of_queueing():
         f.release.clear()
         f.g.move(0.0)
         assert _wait(lambda: len(f.snapshot()) == 1)
-        for i in range(10):                    # burst while the worker is busy
+        for i in range(10):                    # burst while the worker is busy, ending on open
             f.g._last_send = 0.0
-            f.g.move(MAX if i % 2 == 0 else 0.0)
+            f.g.move(0.0 if i % 2 == 0 else MAX)
         f.release.set()
         assert f.idle()
-        assert len(f.snapshot()) == 2, f"expected the burst to coalesce to one: {f.snapshot()}"
+        assert f.snapshot() == ["grasp", "open"], (
+            f"expected the burst to coalesce to one: {f.snapshot()}")
     finally:
         f.close()
     return f"10 commands during one motion -> {len(f.snapshot())} calls"
@@ -180,6 +182,88 @@ def test_position_is_stamped_when_the_motion_starts():
         assert _wait(lambda: "open" in f.snapshot())
         assert f.g._position_ts is not None and f.g._position_ts > queued_ts, (
             "position clock started before the motion did")
+    finally:
+        f.close()
+
+
+class _FakeHand(_FakeFranka):
+    """_FakeFranka whose grasp behaves like the FR3 hand on mario: a grasp issued
+    while it already holds an object stalls, then raises "Command failed!"."""
+
+    STALL_S = 0.4   # 5.3 s on the hardware
+
+    def __init__(self):
+        super().__init__(call_duration_s=0.05)
+        self.holding = False
+        self.failures = 0
+
+        def grasp(*_args):
+            with self._lock:
+                self.calls.append("grasp")
+            self.release.wait(timeout=5.0)
+            if self.holding:
+                time.sleep(self.STALL_S)
+                self.failures += 1
+                raise RuntimeError("libfranka gripper: Command failed!")
+            time.sleep(self._duration)
+            self.holding = True
+
+        def open_(*_args):
+            with self._lock:
+                self.calls.append("open")
+            time.sleep(self._duration)
+            self.holding = False
+
+        self.g._rpc_grasp = grasp
+        self.g._rpc_open = open_
+
+
+def test_flicker_during_a_grasp_does_not_regrasp_a_held_object():
+    """Rollout 20261007_125107 ep 1: the policy's target went close, open, close
+    while the first grasp was still closing. Coalescing replaced the queued open
+    with a second grasp, which ran onto the held bowl, stalled 5.3 s and raised --
+    and the policy's real open, queued behind it, waited out the stall."""
+    f = _FakeHand()
+    try:
+        f.release.clear()                      # first grasp still closing
+        f.g.move(0.0)
+        assert _wait(lambda: f.snapshot() == ["grasp"])
+        f.g._last_send = 0.0
+        f.g.move(MAX)                          # flicker open: queued
+        f.g._last_send = 0.0
+        f.g.move(0.0)                          # back to close: replaces the open
+        f.release.set()
+        assert f.idle()
+        assert f.snapshot() == ["grasp"], f"re-grasped a held object: {f.snapshot()}"
+
+        t0 = time.monotonic()
+        f.g._last_send = 0.0
+        f.g.move(MAX)                          # the real release
+        assert f.idle()
+        took = time.monotonic() - t0
+        assert f.snapshot() == ["grasp", "open"], f.snapshot()
+        assert f.failures == 0 and took < f.STALL_S, (
+            f"open waited {took:.2f}s behind a stalled grasp")
+    finally:
+        f.close()
+    return f"release took {took * 1e3:.0f} ms"
+
+
+def test_a_failed_command_is_not_skipped_on_retry():
+    """Only a command that COMPLETED is skipped when repeated: after a failure the
+    hand's state is unknown, so the same command must be allowed through."""
+    f = _FakeHand()
+    try:
+        f.holding = True                       # hand already closed on something
+        f.g.move(0.0)                          # this grasp stalls and fails
+        assert f.idle()
+        assert f.failures == 1 and f.g._last_done is None
+        f.holding = False
+        f.g._is_open = True                    # policy asks to close again
+        f.g._last_send = 0.0
+        f.g.move(0.0)
+        assert f.idle()
+        assert f.snapshot() == ["grasp", "grasp"], f.snapshot()
     finally:
         f.close()
 

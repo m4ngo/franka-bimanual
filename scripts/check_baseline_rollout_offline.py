@@ -42,7 +42,9 @@ import franka_config as fc  # noqa: E402
 from baselines import rollout_common as rc  # noqa: E402
 from baselines import run_record as rr  # noqa: E402
 from baselines.bspline_bridge import rollout as bsp_rollout  # noqa: E402
+from baselines.policy_math import apply_lead  # noqa: E402
 from baselines.sail_bridge import rollout as sail_rollout  # noqa: E402
+from baselines.sail_bridge.schedule import ScheduledPlan  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian  # noqa: E402
@@ -76,9 +78,13 @@ class FakeArm:
         self.gripper = 1.0
         self.sent: list[dict] = []
         self.send_times: list[float] = []
+        self.anchored = 0        # goals sent with get_observation's state read as their anchor
         self.clipped = 0
         self.frames = 0
-        self.freeze = False      # stop tracking, to force the lead monitor to fire
+        self.freeze = False      # stop tracking: a plan that outruns the arm must not end the episode
+        self.gripper_rate = None  # normalised range/s the fingers move at; None: at once
+        self.gripper_target = self.gripper
+        self.gripper_log: list[tuple[float, float]] = []   # (time, measured gripper)
 
     # -- lifecycle
     def connect(self):
@@ -115,9 +121,16 @@ class FakeArm:
         # |F| equals the number of goals sent so far, so a run's max is its step count.
         return {self.k: np.array([0.0, 0.0, float(len(self.sent)), 0.0, 0.0, 0.0])}
 
+    def read_kinematic_state(self):
+        return self.current_kinematic_state_batch([self.k])
+
     def get_observation(self) -> dict:
         # Paced like a 30 fps camera read; every pixel carries the frame counter.
         time.sleep(1.0 / 30.0)
+        if self.gripper_rate is not None:
+            step = self.gripper_rate / 30.0
+            self.gripper += float(np.clip(self.gripper_target - self.gripper, -step, step))
+        self.gripper_log.append((time.perf_counter(), self.gripper))
         self.frames += 1
         obs = {f"{self.k}_joint_{i + 1}": float(v) for i, v in enumerate(self.q)}
         obs[f"{self.k}_gripper"] = self.gripper
@@ -125,7 +138,8 @@ class FakeArm:
             obs[cam] = np.full((*_IMG, 3), self.frames % 256, dtype=np.uint8)
         return obs
 
-    def send_action(self, action: dict) -> None:
+    def send_action(self, action: dict, anchor=None) -> None:
+        self.anchored += int(anchor is not None)
         self.sent.append(dict(action))
         self.send_times.append(time.perf_counter())
         pos, quat = self._pose()
@@ -139,7 +153,9 @@ class FakeArm:
             goal_rot = Rotation.from_quat(a[3:7]) * Rotation.from_quat(quat)
         else:
             goal_pos, goal_rot = a[:3], Rotation.from_quat(a[3:7])
-        self.gripper = float(np.clip(action[f"{self.k}_gripper"], 0.0, 1.0))
+        self.gripper_target = float(np.clip(action[f"{self.k}_gripper"], 0.0, 1.0))
+        if self.gripper_rate is None:
+            self.gripper = self.gripper_target
         if self.freeze:
             return
         err = np.concatenate([goal_pos - pos,
@@ -241,10 +257,14 @@ class FakeSail(_Server):
 class FakeBSpline(_Server):
     DEG, ACT, SPAN = 3, 10, 20      # 20 knot-index units == 1.0 s at 20 Hz
 
-    def __init__(self, port, span=None, travel=0.03):
+    def __init__(self, port, span=None, travel=0.03, first_knot=0.0, grip=(0.0, 1.0),
+                 grip_dip=False):
         super().__init__(port)
         self.span = self.SPAN if span is None else span
         self.travel = float(travel)   # metres of x the plan sweeps
+        self.first_knot = float(first_knot)   # where each plan's support starts, knot units
+        self.grip = grip              # the gripper command's first and last control points
+        self.grip_dip = grip_dip      # opening command crosses 0.5 up, back down, then up
         self.frames_seen: list[list[int]] = []
 
     def handle(self, req):
@@ -266,7 +286,7 @@ class FakeBSpline(_Server):
     def make(self, pos, quat):
         n_ctrl = 12
         interior = np.linspace(0, self.span, n_ctrl - self.DEG + 1)
-        t = np.concatenate([[0] * self.DEG, interior, [self.span] * self.DEG])
+        t = np.concatenate([[0] * self.DEG, interior, [self.span] * self.DEG]) + self.first_knot
         raw = np.zeros((n_ctrl + self.DEG + 1, 1 + self.ACT))
         raw[:, 0] = t
         M = Rotation.from_quat(quat).as_matrix()
@@ -274,7 +294,9 @@ class FakeBSpline(_Server):
         for i in range(n_ctrl):
             ctrl[i, :3] = pos + np.array([self.travel * i / (n_ctrl - 1), 0.0, 0.0])
             ctrl[i, 3:9] = np.concatenate([M[0], M[1]])
-            ctrl[i, 9] = i / (n_ctrl - 1)
+            ctrl[i, 9] = self.grip[0] + (self.grip[1] - self.grip[0]) * i / (n_ctrl - 1)
+            if self.grip_dip:
+                ctrl[i, 9] = [0.0, 0.0, 0.7, 0.2, 0.7, 1.0, 1.0][min(i * 7 // n_ctrl, 6)]
         raw[:n_ctrl, 1:] = ctrl
         return raw
 
@@ -298,15 +320,17 @@ class Results:
 
 
 @contextlib.contextmanager
-def operator(verdict_after: int | None = None, verdict: str = "success"):
+def operator(verdict_after: int | None = None, verdict: str = "success",
+             first_attempt: str | None = None):
     """Stand in for the person at the robot.
 
     There is no tty here, so raw mode and the arrow keys have to be replaced;
     `verdict_after` makes Stopper.check return a verdict after N polls so the
     success path is exercised rather than only the timeout path.
+    `first_attempt` is a verdict pressed 30 polls into the first attempt only.
     """
     saved = (rc.wait_for_right_arrow, rc.raw_stdin, rc.Stopper.check)
-    calls = {"n": 0}
+    calls = {"n": 0, "stoppers": []}
 
     def fake_check(self):
         # Latched, like the real Stopper: a verdict must survive being polled
@@ -314,7 +338,13 @@ def operator(verdict_after: int | None = None, verdict: str = "success"):
         if getattr(self, "verdict", None) is not None:
             return self.verdict
         calls["n"] += 1
-        if verdict_after is not None and calls["n"] > verdict_after:
+        if self not in calls["stoppers"]:
+            calls["stoppers"].append(self)
+            self._polls = 0
+        self._polls += 1
+        if first_attempt is not None and self is calls["stoppers"][0] and self._polls > 30:
+            self.verdict = first_attempt
+        elif verdict_after is not None and calls["n"] > verdict_after:
             self.verdict = verdict
         elif self.limit is not None and self.elapsed() >= self.limit:
             self.verdict = "timeout"
@@ -339,10 +369,10 @@ def _args(**kw):
         train_dataset="Offline/check", outputs_root=None, repo_id=None,
         no_record=True, push_to_hub=False, save_videos=False,
         home_pose_name=fc.default_home_pose_name(), home_q=None,
-        home_gripper=fc.control("homing.gripper_norm"),
         home_max_time_s=fc.control("homing.max_time_s"),
         home_tol_rad=fc.control("homing.tol_rad"),
-        speed=1.0, no_precision=False, no_eag=True,
+        allow_home_mismatch=False,
+        speed=1.0, no_precision=False, no_eag=True, no_velocity_lead=False,
         control_freq=None, origin_time_scale=None, predict_before_end=None,
         degree=3, gripper_slowdown=False, restart_on_time_align_error=False,
         consider_gripper_during_align=False, disable_time_align=False,
@@ -423,14 +453,36 @@ def check_pure(res: Results) -> None:
               and d["kp"] == 0.0 and d["kd"] == 0.0,
               "ee_pos_action normalises the quaternion; stock gains are normalised 0")
 
-    # SAIL runs osc_kp_scale x the stock kp at the stock damping ratio; B-Spline runs stock
+    # SAIL runs osc_kp_scale x the stock kp at osc_damping_ratio
+    default_kp = float(fc.control("torque.osc.default_kp"))
+    base = float(fc.control("torque.osc.gain_exp_base"))
     g = rc.sail_gains()
-    kp = float(fc.control("torque.osc.default_kp")) * float(fc.control("torque.osc.gain_exp_base")) ** g["kp"]
-    res.check(abs(kp - 2.0 * float(fc.control("torque.osc.default_kp"))) < 1e-9 and g["kd"] == 0.0,
-              "SAIL's gain channels resolve to 2x the stock kp at the stock damping ratio",
-              f"kp {kp:.1f}, a_kp {g['kp']:.4f}, a_kd {g['kd']}")
-    res.check(rc.stock_gains() == {"kp": 0.0, "kd": 0.0},
-              "B-Spline's gain channels are the stock controller's")
+    kp = default_kp * base ** g["kp"]
+    ratio = float(fc.control("torque.osc.default_damping_ratio")) * base ** g["kd"]
+    want = float(fc.policy("baselines.sail.osc_damping_ratio"))
+    res.check(abs(kp - 2.0 * default_kp) < 1e-9 and abs(ratio - want) < 1e-9,
+              "SAIL's gain channels resolve to 2x the stock kp at osc_damping_ratio",
+              f"kp {kp:.1f}, damping ratio {ratio:.2f}")
+    res.check(np.allclose(rc.osc_lag(g), 2.0 * want / np.sqrt(kp)),
+              "SAIL's velocity lead is the OSC's own kd/kp", f"{rc.osc_lag(g)[0]:.4f} s")
+
+    # B-Spline: the stock controller at 1x, sped up with the plan above it
+    res.check(not rc.bspline_lead(1.0).any(),
+              "B-Spline at 1x sends the plan as sampled, to the stock controller")
+    if fc.policy("baselines.bspline.goal_lead"):
+        for speed in (2.0, 3.0, 5.0):
+            lead = rc.bspline_lead(speed)
+            res.check(np.allclose(rc.osc_lag(rc.stock_gains()) * speed - lead * speed,
+                                  rc.osc_lag(rc.stock_gains())),
+                      f"at {speed:g}x the goal lead holds the stock OSC's 1x lag",
+                      f"lead {lead[0] * 1e3:.0f} ms")
+    # A goal led by kd/kp along the target velocity is the PD law with a velocity term.
+    rng = np.random.default_rng(1)
+    x, v, xd, vd = (rng.normal(size=3) for _ in range(4))
+    kpp, kdd = 300.0, 2.0 * np.sqrt(300.0)
+    lead_pos, _ = apply_lead(xd, [0, 0, 0, 1.0], vd, np.zeros(3), np.full(6, kdd / kpp))
+    res.check(np.allclose(kpp * (lead_pos - x) - kdd * v, kpp * (xd - x) + kdd * (vd - v)),
+              "kp*(led goal - x) - kd*v == kp*e_p + kd*e_v")
 
     # SAIL executes absolute poses only, as upstream's evaluation does
     ok = all(sail_rollout.resolve_control_mode({"action_keys": [k]}) is ControlMode.EE_POS
@@ -596,58 +648,129 @@ def check_force(res: Results, run_dir, ep: dict) -> None:
 
 
 def check_dispatch(res: Results) -> None:
-    print("\n[dispatch] env.step(a, control_freq): each goal held for its own 1/hz")
+    print("\n[dispatch] goals go out with the observation's state read as their anchor")
 
     class Sink:
-        last_ee_wrench: dict = {}
+        last_ee_wrench = {rc.ARM_KEY: np.zeros(6)}
 
         def __init__(self):
-            self.t: list[float] = []
+            self.calls: list[dict] = []
 
-        def send_action(self, a):
-            self.t.append(time.perf_counter())
+        def send_action(self, a, **kw):
+            self.calls.append(kw)
 
-    # Each goal is held for ITS OWN step's period: SAIL's slow steps must not
-    # land one step late.
     sink = Sink()
     d = rc.Dispatcher(sink)
-    rates = [100.0, 20.0, 100.0, 100.0, 20.0, 20.0, 100.0, 50.0]
-    t0 = time.perf_counter()
-    for hz in rates:
-        d.step({}, hz)
-    d.wait_hold()
-    gaps = np.diff(sink.t + [time.perf_counter()])
-    want = 1.0 / np.array(rates)
-    res.check(sink.t[0] - t0 < 0.005, "the first goal goes out at once",
-              f"{(sink.t[0] - t0) * 1e3:.2f} ms")
-    res.check(bool(np.all(np.abs(gaps - want) < 0.004)),
-              "every goal is held for 1/hz of its own step",
-              " ".join(f"{g * 1e3:.0f}/{w * 1e3:.0f}" for g, w in zip(gaps, want)))
+    d.send({})
+    d.send({}, anchor={rc.ARM_KEY: "snapshot"})
+    res.check(sink.calls == [{}, {"anchor": {rc.ARM_KEY: "snapshot"}}],
+              "an anchor is passed to send_action only when there is one")
+    res.check(d.steps == 2 and len(d.wrench.force) == 2,
+              "every goal is counted and its wrench sampled")
 
-    # Sub-period jitter does not accumulate.
-    hz, n = 200.0, 80
-    d = rc.Dispatcher(Sink())
-    t0 = time.perf_counter()
-    for i in range(n):
-        if i % 2 == 0:
-            time.sleep(0.4 / hz)
-        d.step({}, hz)
-    d.wait_hold()
-    elapsed, ideal = time.perf_counter() - t0, n / hz
-    res.check(abs(elapsed - ideal) < 0.05 * ideal,
-              "the rate holds under sub-period jitter",
-              f"{elapsed * 1e3:.1f} ms for {n} steps, ideal {ideal * 1e3:.1f} ms")
 
-    # After a wait longer than a period (an inference) the next goal still gets its full hold.
-    sink = Sink()
-    d = rc.Dispatcher(sink)
-    d.step({}, 100.0)
-    time.sleep(0.05)
-    d.step({}, 100.0)
-    d.step({}, 100.0)
-    res.check(abs((sink.t[2] - sink.t[1]) - 0.01) < 0.003,
-              "a goal sent after a long wait is held for a full period, not rushed",
-              f"{(sink.t[2] - sink.t[1]) * 1e3:.1f} ms")
+def check_schedule(res: Results) -> None:
+    print("\n[schedule] SAIL's hardware executor: rows due in time, a fitted spline, its velocity")
+    window = int(fc.policy("baselines.sail.slowdown_window_size"))
+    knot_rows = int(fc.policy("baselines.sail.spline_knot_rows"))
+    n, fast, slow = 16, 40.0, 20.0
+    rows = np.zeros((n, 8))
+    rows[:, 0] = 0.4 + 0.002 * np.arange(n)                  # +x, 2 mm a row
+    rows[:, 2] = 0.3
+    yaw = Rotation.from_rotvec(np.outer(0.02 * np.arange(n), [0.0, 0.0, 1.0]))  # 0.02 rad a row about base z
+    rows[:, 3:6] = (yaw * Rotation.from_rotvec([2.5, 0.0, 0.0])).as_rotvec()
+    rows[:, 6] = np.arange(n) / 100.0                         # gripper tags its row
+    rows[3:6, 7] = 1.0                                        # precision label on rows 3..5
+
+    p = ScheduledPlan(rows, 5.0, fast, slow, precision=True, window=window, knot_rows=knot_rows)
+    want = np.array([rc.slowdown_mode(list(rows[:k + 1]), rows[k], rows[k:], window)
+                     for k in range(n)])
+    gaps = np.diff(p.times)
+    res.check(np.array_equal(p.slow, want) and p.slow[3:6].all() and not p.slow[-4:].any(),
+              "a row is slow exactly where upstream's window says", f"slow rows {np.flatnonzero(p.slow)}")
+    res.check(p.times[0] == 5.0 and np.allclose(gaps, np.where(p.slow[1:], 1 / slow, 1 / fast)),
+              "row k is due at t_obs plus each step's own 1/hz",
+              f"{sorted({round(g * 1e3, 1) for g in gaps})} ms")
+
+    q = ScheduledPlan(rows, 5.0, fast, slow, precision=False, window=window, knot_rows=knot_rows)
+    fit = max(np.linalg.norm(q.pose(t)[0] - r[:3]) for t, r in zip(q.times, rows))
+    v, w = q.velocity(q.times[7] + 0.004)
+    res.check(fit < 1e-9 and np.allclose(v, [0.002 * fast, 0, 0], atol=1e-9),
+              "a straight plan is fitted exactly and its velocity is the rows' rate",
+              f"v {v.round(4)} m/s")
+    res.check(np.allclose(w, [0, 0, 0.02 * fast], atol=1e-6),
+              "angular velocity is in the base frame", f"w {w.round(4)} rad/s")
+    res.check(not np.any(q.velocity(q.end)[0]) and np.allclose(q.pose(q.end + 1.0)[0], rows[-1, :3]),
+              "past its last row a plan holds that row, at rest")
+    res.check(q.entry(q.times[3]) == 3 and q.entry(q.times[3] + 1e-6) == 4
+              and abs(q.index_at(0.5 * (q.times[2] + q.times[3])) - 2.5) < 1e-12,
+              "a plan arriving at t takes over at the first row not yet due")
+    res.check(q.gripper(0.5 * (q.times[2] + q.times[3])) == rows[3, 6],
+              "the gripper is the row being moved toward, as upstream commands it")
+    g = p.rows_at(2.5, 4)
+    res.check(g.shape == (4, 8) and np.allclose(g[:, :7], 0.5 * (rows[2:6, :7] + rows[3:7, :7]))
+              and set(g[:, 7]) <= {0.0, 1.0},
+              "the guide is the plan's own rows at the observation's fraction, labels not blended")
+
+
+def check_home(res: Results) -> None:
+    print("\n[home] a rollout starts where the demonstrations did")
+    import tempfile
+
+    import pandas as pd
+
+    q_home = fc.home_q(fc.default_home_pose_name(), key=rc.ARM_KEY)
+
+    def recording(root: Path, q0: np.ndarray) -> str:
+        (root / "meta").mkdir(parents=True)
+        (root / "data" / "chunk-000").mkdir(parents=True)
+        names = [*(f"{rc.ARM_KEY}_joint_{i}" for i in range(1, fc.num_joints() + 1)),
+                 f"{rc.ARM_KEY}_gripper"]
+        (root / "meta" / "info.json").write_text(
+            json.dumps({"features": {"observation.state": {"names": [names]}}}))
+        frames = [{"observation.state": np.r_[q0 + 0.01 * i, 1.0].astype(np.float32),
+                   "frame_index": i, "episode_index": e} for e in range(3) for i in range(4)]
+        pd.DataFrame(frames).to_parquet(root / "data" / "chunk-000" / "file-000.parquet")
+        return str(root)
+
+    def ns(**kw):
+        base = dict(home_pose_name=None, home_q=None, allow_home_mismatch=False)
+        return argparse.Namespace(**{**base, **kw})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        same = recording(Path(tmp) / "same", q_home)
+        far_q = q_home.copy()
+        far_q[3] += 0.4                                       # elbow: the EE moves ~15 cm
+        far = recording(Path(tmp) / "far", far_q)
+
+        a = ns()
+        got = rc.resolve_home(a, {"repo_id": same})
+        res.check(got["checked"] and got["gap_m"] < 1e-3 and a.home_pose_name is not None,
+                  "without a flag the saved pose nearest the demonstrations' start is homed to",
+                  f"{a.home_pose_name}, {got['gap_m'] * 100:.2f} cm")
+        refused = ""
+        try:
+            rc.resolve_home(ns(), {"repo_id": far})
+        except ValueError as exc:
+            refused = str(exc)
+        res.check("demonstrations started" in refused,
+                  "no saved pose near the start is refused, not guessed", refused[:60])
+        refused = ""
+        try:
+            rc.resolve_home(ns(home_pose_name=fc.default_home_pose_name()), {"repo_id": far})
+        except ValueError as exc:
+            refused = str(exc)
+        res.check("--allow-home-mismatch" in refused,
+                  "an explicit home far from the start is refused too")
+        got = rc.resolve_home(ns(home_pose_name=fc.default_home_pose_name(),
+                                 allow_home_mismatch=True), {"repo_id": far})
+        res.check(got["gap_m"] > float(fc.policy("baselines.exec.home_tolerance_m")),
+                  "--allow-home-mismatch rolls out from it, recording the gap",
+                  f"{got['gap_m'] * 100:.1f} cm")
+        a = ns()
+        got = rc.resolve_home(a, {"repo_id": str(Path(tmp) / "absent")})
+        res.check(not got["checked"] and a.home_pose_name == fc.default_home_pose_name(),
+                  "a recording not on this machine falls back to the default home, unchecked")
 
 
 def check_timing(res: Results) -> None:
@@ -680,20 +803,36 @@ def check_timing(res: Results) -> None:
     res.check(True, "ots=10 against 20 Hz data plays at 0.5x (the misconfiguration "
                     "config/policy.yaml warns about)")
 
+    # A plan whose first knot lies ahead of the elapsed time: upstream jumps to it,
+    # defer_stitch holds the old plan until it is due and then aligns. The request
+    # goes out 0.5 s before the old plan ends, so the old plan covers the wait.
+    srv = FakeBSpline(0, first_knot=4.0)
+    for defer in (False, True):
+        clock = {"t": 0.0}
+        p = SplinePlanner(Direct(srv), degree=3, n_obs_steps=1, obs_stride=1,
+                          origin_time_scale=20.0, speed_up_times=1.0, predict_before_end=0.5,
+                          gripper_index=9, compare_dim=9, defer_stitch=defer,
+                          clock=lambda: clock["t"], synchronous=True)
+        obs = {"arm_pos": np.zeros(3), "arm_quat": np.array([0.0, 0, 0, 1.0])}
+        events = []
+        while clock["t"] < 1.5:
+            before = p.plans
+            p.step(obs)
+            if p.plans != before:
+                events.append((round(clock["t"], 3), p.plans))
+            clock["t"] += 0.005
+        second = next(t for t, n in events if n == 2)
+        if not defer:
+            res.check(not np.isfinite(p.align_errors[0]),
+                      "upstream: a plan that lands before its first knot is entered at that knot, unaligned")
+        else:
+            res.check(p.deferred >= 1 and np.isfinite(p.align_errors[0]),
+                      "defer_stitch: the plan waits for its first knot, then the stitch is searched",
+                      f"second plan installed at {second:.3f} s, {p.deferred} deferral(s)")
+        p.close()
 
-def _sail_expected_tags(n: int, inf_delay: int, execute_n: int) -> list[tuple[int, int]]:
-    """Upstream's (chunk, row) order: chunk 0 from row 0, then per inference
-    inf_delay rows of the previous chunk and execute_n of the new one from row inf_delay."""
-    out = [(0, j) for j in range(execute_n)]
-    prev, k = execute_n, 1
-    while len(out) < n:
-        out += [(k - 1, prev + i) for i in range(inf_delay)]
-        out += [(k, inf_delay + j) for j in range(execute_n)]
-        prev, k = inf_delay + execute_n, k + 1
-    return out[:n]
 
-
-def _run_sail(port, args, **server_kw):
+def _run_sail(port, args, lead: bool = True, **server_kw):
     srv = FakeSail(port, action_keys=["absolute_actions_with_precision"], act_dim=8,
                    precision=True, **server_kw)
     srv.start()
@@ -702,6 +841,8 @@ def _run_sail(port, args, **server_kw):
         meta = client.meta()
         s = sail_rollout.settings(meta, args)
         arm = FakeArm(sail_rollout.resolve_control_mode(meta))
+        if lead:
+            s["lead"] = rc.osc_lag(s["gains"], arm)
         run_dir, record = _open_run(args, "sail")
         record.set("environment", **rc.environment(args, arm))
         record.set("policy", control_mode=ControlMode.EE_POS.value)
@@ -709,94 +850,100 @@ def _run_sail(port, args, **server_kw):
             rc.run_episodes(args, arm, run_dir, record,
                             sail_rollout.make_episode_fn(
                                 client, s, rc.check_camera_coverage(meta, arm, True)),
-                            nominal_hz=s["fast_hz"])
+                            nominal_hz=s["goal_hz"])
         return srv, arm, s, run_dir, record.episodes[0]
     finally:
         srv.stop()
 
 
+def _segments(tags: list[tuple[int, int]]) -> list[tuple[int, list[int]]]:
+    """Dispatched goals grouped by the plan they came from, in dispatch order."""
+    out: list[tuple[int, list[int]]] = []
+    for k, j in tags:
+        if not out or out[-1][0] != k:
+            out.append((k, []))
+        out[-1][1].append(j)
+    return out
+
+
 def check_sail(res: Results, port: int) -> None:
-    print("\n[sail] upstream's receding horizon, precision rates, EAG, gains")
-    inf_delay = int(fc.policy("baselines.sail.inf_delay"))
+    print("\n[sail] the paper's hardware executor: rows due in time, plans switched on arrival")
     execute_n = int(fc.policy("baselines.sail.execute_n_actions"))
-    window = int(fc.policy("baselines.sail.slowdown_window_size"))
+    inf_delay = int(fc.policy("baselines.sail.inf_delay"))
+    goal_hz = float(fc.policy("baselines.sail.goal_hz"))
 
     # --- instant inference, precision on, 2x
     args = _args(speed=2.0, episode_time_s=2.0)
     srv, arm, s, run_dir, ep = _run_sail(port, args)
     res.check(s["fast_hz"] == 2.0 * rc.data_fps() and s["slow_hz"] == float(fc.policy("baselines.exec.slow_fps")),
-              "--speed 2 sets fast_control_freq to 2x the demonstrations' rate; slow stays 1x",
+              "--speed 2 makes fast rows due at 2x the demonstrations' rate; slow rows stay 1x",
               f"{s['fast_hz']:.0f}/{s['slow_hz']:.0f} Hz")
-    tags = _tags(arm)
-    want = _sail_expected_tags(len(tags), inf_delay, execute_n)
-    first_bad = next((i for i, (a, b) in enumerate(zip(tags, want)) if a != b), None)
-    res.check(len(tags) > 3 * (inf_delay + execute_n) and first_bad is None,
-              "rows execute in upstream's order: inf_delay old rows, then the new chunk from row inf_delay",
-              f"{len(tags)} steps" if first_bad is None else
-              f"step {first_bad}: got {tags[first_bad]}, want {want[first_bad]}")
-    kp = {round(a["kp"], 6) for a in arm.sent}
-    res.check(kp == {round(rc.sail_gains()["kp"], 6)} and {a["kd"] for a in arm.sent} == {0.0},
-              "every goal carries SAIL's 2x-kp gain channels")
-    spacing = [b - a for a, b in srv.frame_ids[1:]]
-    res.check(all(n == 2 for n in srv.frames_seen) and bool(spacing)
-              and all(1 <= d <= 3 for d in spacing),
-              "frame stack is two distinct camera frames ~one demonstration step apart",
-              f"camera-frame spacing {sorted(set(spacing))}")
-
-    # Each dispatched row's own rate, recomputed with upstream's slowdown rule.
-    executed, rates = [], []
-    for k, j in tags:
-        row = np.zeros(8)
-        row[7] = 1.0 if (k % 2 == 1 and 2 <= j <= 4) else 0.0
-        fut = np.zeros((16 - j, 8))
-        fut[:, 7] = [1.0 if (k % 2 == 1 and 2 <= jj <= 4) else 0.0 for jj in range(j, 16)]
-        executed.append(row)
-        slow = rc.slowdown_mode(executed, row, fut, window)
-        rates.append(s["slow_hz"] if slow else s["fast_hz"])
     gaps = np.diff(arm.send_times)
-    want_gaps = 1.0 / np.array(rates[:-1])
-    close = np.abs(gaps - want_gaps) < 0.006
-    res.check(ep["slow_steps"] == sum(r == s["slow_hz"] for r in rates) and ep["slow_steps"] > 0,
-              "slow steps are exactly the ones upstream's window marks",
-              f"{ep['slow_steps']} of {ep['steps']}")
-    res.check(close.mean() > 0.9,
-              "each goal is held 1/hz of its own step's rate",
-              f"{close.mean():.0%} within 6 ms; median gap fast "
-              f"{1e3 * np.median(gaps[np.array(rates[:-1]) == s['fast_hz']]):.1f} ms, slow "
-              f"{1e3 * np.median(gaps[np.array(rates[:-1]) == s['slow_hz']]):.1f} ms")
-    res.check(ep["steps"] == len(arm.sent) and ep["steps"] > 0,
-              "every dispatched goal is counted", f"{ep['steps']} steps")
+    res.check(abs(float(np.median(gaps)) - 1.0 / goal_hz) < 0.002,
+              "the plan streams at baselines.sail.goal_hz",
+              f"median gap {1e3 * np.median(gaps):.1f} ms, max {1e3 * gaps.max():.1f} ms")
+    res.check(arm.anchored == len(arm.sent) > 0,
+              "every goal goes out on the observation's state read (one RPyC call, not two)",
+              f"{arm.anchored}/{len(arm.sent)}")
+    segs = _segments(_tags(arm))
+    ids = [k for k, _ in segs]
+    res.check(ids == sorted(set(ids)) and ids[0] == 0,
+              "plans take over in order and an old plan never resumes", f"{len(ids)} plans")
+    res.check(all(rows == sorted(rows) for _, rows in segs),
+              "within a plan, rows go out in schedule order")
+    res.check(all(rows[0] >= 1 for _, rows in segs[1:]),
+              "a new plan takes over at the row due when it lands, never its row 0",
+              f"entry rows {sorted({rows[0] for _, rows in segs[1:]})}")
+    span = [rows[-1] - rows[0] + 1 for _, rows in segs[1:-1]]
+    res.check(bool(span) and all(execute_n - 1 <= n <= execute_n + 3 for n in span),
+              "each plan runs about execute_n_actions rows before the next takes over",
+              f"rows per plan {sorted(set(span))}")
+    res.check(ep["slow_steps"] > 0 and ep["notes"]["plan_exhausted_s"] == 0.0,
+              "precision rows are counted, and an instant inference never runs a plan dry",
+              f"{ep['slow_steps']} slow rows")
+    kp = {round(a["kp"], 6) for a in arm.sent}
+    kd = {round(a["kd"], 6) for a in arm.sent}
+    res.check(kp == {round(rc.sail_gains()["kp"], 6)} and kd == {round(rc.sail_gains()["kd"], 6)},
+              "every goal carries SAIL's gain channels")
+    spacing = [b - a for a, b in srv.frame_ids[1:]]
+    res.check(all(n == 2 for n in srv.frames_seen) and bool(spacing) and all(d >= 1 for d in spacing),
+              "frame stack is two distinct camera frames", f"camera-frame spacing {sorted(set(spacing))}")
     check_force(res, run_dir, ep)
     grips = [a[f"{rc.ARM_KEY}_gripper"] for a in arm.sent]
     res.check(not all(g in (0.0, 1.0) for g in grips),
               "precision label stripped; gripper is the chunk's own column")
 
-    # --- EAG, and an inference slower than the inf_delay rows
+    # --- EAG, and an inference slower than inf_delay rows
     t_f = 4
     args = _args(speed=2.0, episode_time_s=2.5, no_eag=False, no_precision=True)
     srv, arm, s, run_dir, ep = _run_sail(port + 1, args, fac_horizon=t_f, guided=True, delay_s=0.15)
-    tags = _tags(arm)
-    want = _sail_expected_tags(len(tags), inf_delay, execute_n)
-    res.check(tags == want and len(tags) > inf_delay + execute_n,
-              "a slow inference holds the arm instead of re-indexing the plan",
-              f"{ep['notes'].get('inference_waits')} waits, {ep['notes'].get('inference_wait_s')} s held")
-    res.check(ep["notes"].get("inference_waits", 0) > 0,
-              "inference slower than inf_delay rows is counted")
     sent = [(i, np.asarray(g)) for i, g in enumerate(srv.guide_seen) if g is not None]
     ok = bool(sent)
+    starts = []
     for i, g in sent:
-        start = execute_n if i == 1 else inf_delay + execute_n
-        got = [(int(round(x * 100)) // 100, int(round(x * 100)) % 100) for x in g[:, 6]]
-        ok &= g.shape == (t_f, 8) and got == [(i - 1, start + r) for r in range(t_f)]
+        tags = np.round(g[:, 6] * 100).astype(int)       # chunk*100 + row, interpolated
+        ok &= g.shape == (t_f, 8) and bool(np.all(tags // 100 == i - 1))
+        ok &= bool(np.allclose(np.diff(g[:, 6]), 0.01, atol=1e-6))
+        starts.append(float(g[0, 6] * 100 - (i - 1) * 100))
     res.check(ok and ep["guided_inferences"] == len(sent),
-              "guidance is the previous plan's next fac_horizon rows, full width",
-              f"{len(sent)} of {len(srv.guide_seen)} inferences guided")
+              "guidance is the previous plan's rows from the observation on, full width",
+              f"{len(sent)} of {len(srv.guide_seen)} inferences guided, from rows "
+              f"{sorted({round(x, 1) for x in starts})}")
+    res.check(bool(starts) and max(starts) <= s["horizon"] - inf_delay + 1e-6,
+              "a request goes out by row H - inf_delay at the latest")
+    segs = _segments(_tags(arm))
+    ids = [k for k, _ in segs]
+    res.check(ids == sorted(set(ids)) and ep["inferences"] >= 3,
+              "a slow inference still hands over in order", f"{ep['inferences']} plans")
+    res.check(ep["notes"]["plan_exhausted_s"] < 0.25 * ep["wall_time_s"],
+              "with a 150 ms inference the next request goes out early enough to keep the plan fed",
+              f"held the last row {ep['notes']['plan_exhausted_s']:.3f} s of {ep['wall_time_s']:.2f} s")
 
     # --- the recorded run renders, each chunk drawn from the row it took over at
     from baselines import rollout_viz
     import pandas as pd
     args = _args(speed=2.0, episode_time_s=2.0, no_record=False, train_dataset="Offline/sail-viz")
-    _, _, s, run_dir, ep = _run_sail(port + 2, args)
+    _, _, s, run_dir, ep = _run_sail(port + 2, args, lead=False)
     pages = rollout_viz.render_run(run_dir.path)
     res.check([q.name for q in pages] == ["episode_000.html"], "the run renders its episode page")
     df = pd.read_parquet(sorted((run_dir.dataset_dir / "data").glob("*/*.parquet"))[0])
@@ -807,13 +954,13 @@ def check_sail(res: Results, port: int) -> None:
     rows = [p[~np.isnan(p[:, 0]), :3] for p in poses]     # chunks are NaN-padded to one length
     # chunk_step is the next frame recorded, 0-1 recorder periods after the take-over.
     lag = [int(np.argmin(np.linalg.norm(rows[k] - goal[st], axis=1)))
-           for k, st in enumerate(steps) if st < len(goal)]
-    res.check(bool(lag) and max(lag) <= reach,
+           for k, st in enumerate(steps) if st < len(goal) and len(rows[k])]
+    res.check(bool(lag) and max(lag) <= reach + 1,
               "each chunk is logged from the row it takes over at",
               f"goal at the chunk's frame is row {sorted(set(lag))} of the logged chunk")
 
 
-def _run_bspline(port, args, arm=None, **server_kw):
+def _run_bspline(port, args, arm=None, first_attempt=None, **server_kw):
     srv = FakeBSpline(port, **server_kw)
     srv.start()
     try:
@@ -825,11 +972,12 @@ def _run_bspline(port, args, arm=None, **server_kw):
         run_dir, record = _open_run(args, "bspline")
         record.set("environment", **rc.environment(args, arm))
         record.set("policy", control_mode=ControlMode.EE_POS.value)
-        with operator():
+        with operator(first_attempt=first_attempt):
             rc.run_episodes(args, arm, run_dir, record,
                             bsp_rollout.make_episode_fn(
                                 client, kwargs, control_freq,
-                                rc.check_camera_coverage(meta, arm, True)),
+                                rc.check_camera_coverage(meta, arm, True),
+                                rc.stock_gains(), rc.bspline_lead(args.speed, arm)),
                             nominal_hz=control_freq)
         return srv, meta, arm, kwargs, run_dir, record
     finally:
@@ -867,29 +1015,72 @@ def check_bspline(res: Results, port: int) -> None:
               f"median gap {med * 1e3:.2f} ms, target {1e3 / control_freq:.2f} ms, "
               f"max {1e3 * float(np.max(gaps)):.1f} ms")
     res.check({a["kp"] for a in arm.sent} == {0.0} and {a["kd"] for a in arm.sent} == {0.0},
-              "every goal carries the stock gain channels")
+              "at 1x every goal carries the stock gain channels")
+    res.check(arm.anchored == len(arm.sent),
+              "every goal goes out on the observation's state read (one RPyC call, not two)")
     spacing = [b - a for fr in srv.frames_seen if len(fr) == 2 for a, b in [fr]]
     res.check(bool(spacing) and all(1 <= d <= 3 for d in spacing),
               "the policy's two observations are distinct frames ~one demonstration step apart",
               f"camera-frame spacing {sorted(set(spacing))}")
-    res.check(ep["max_lead_m"] < float(fc.policy("baselines.exec.max_lead_m")),
-              "tracking arm stayed inside the lead bound", f"max lead {ep['max_lead_m']:.4f} m")
+    res.check(ep["max_lead_m"] > 0.0, "the goal's lead over the arm is recorded",
+              f"max lead {ep['max_lead_m']:.4f} m")
 
-    # --- the lead monitor must ABORT, not clamp
-    bound = float(fc.policy("baselines.exec.max_lead_m"))
+    # --- sped up, the controller stays stock and the goals lead the plan
+    args = _args(control_freq=control_freq, episode_time_s=1.0, speed=2.0)
+    _, _, arm, _, _, record = _run_bspline(port + 2, args)
+    res.check({a["kp"] for a in arm.sent} == {0.0} and {a["kd"] for a in arm.sent} == {0.0},
+              "at 2x every goal still carries the stock gain channels")
+
+    # --- a grasp holds the arm for grasp_hold_s, then the plan resumes
+    hold_s = float(fc.policy("baselines.bspline.grasp_hold_s"))
+    if hold_s > 0:
+        arm = FakeArm(ControlMode.EE_POS)
+        arm.gripper_rate = 1.5            # ~0.65 s to close, as the WSG
+        args = _args(control_freq=control_freq, episode_time_s=2.5)
+        _, _, arm, _, _, record = _run_bspline(port + 3, args, arm=arm, span=60, travel=0.45,
+                                               grip=(1.0, 0.0))
+        ep = record.episodes[0]
+        g = np.array([[a[f"{rc.ARM_KEY}_{c}"] for c in "xyz"] for a in arm.sent])
+        grip = np.array([a[f"{rc.ARM_KEY}_gripper"] for a in arm.sent])
+        t = np.array(arm.send_times)
+        first = int(np.argmax(grip == 0.0))
+        same = np.all(np.isclose(g[first:], g[first]), axis=1)
+        last = first + int(np.argmin(same)) - 1          # last goal of the hold
+        held = t[last + 1] - t[first]
+        res.check(ep["notes"]["grasp_holds"] == 1 and abs(held - hold_s) < 0.03,
+                  "pause, grasp, unpause: the arm holds for grasp_hold_s with the gripper shut",
+                  f"{held * 1e3:.0f} ms hold")
+        res.check(np.all(grip[first:] == 0.0) and grip[first - 1] > 0.0,
+                  "the gripper is commanded shut through the hold and after it")
+        step_in = np.linalg.norm(g[first - 1] - g[first - 2])
+        jump = np.linalg.norm(g[last + 1] - g[first - 1])
+        res.check(jump < 3 * step_in + 1e-3,
+                  "the plan resumes where it stopped, not the hold's length further on",
+                  f"{jump * 1e3:.1f} mm across the hold")
+
+    # --- a release never pauses, even when its command dips back under the threshold
+    if hold_s > 0:
+        args = _args(control_freq=control_freq, episode_time_s=1.5)
+        _, _, arm, _, _, record = _run_bspline(port + 4, args, span=40, travel=0.3,
+                                               grip=(0.0, 1.0), grip_dip=True)
+        t = np.array(arm.send_times)
+        res.check(record.episodes[0]["notes"]["grasp_holds"] == 0 and np.diff(t).max() < 0.05,
+                  "opening the gripper never pauses the arm, even when the command wobbles",
+                  f"{record.episodes[0]['notes']['grasp_holds']} holds")
+
+    # --- nothing bounds the lead: a plan that outruns a stalled arm keeps going
     arm = FakeArm(ControlMode.EE_POS)
     arm.freeze = True          # the arm stops tracking; the plan runs on
-    args = _args(control_freq=control_freq, episode_time_s=3.0)
-    _, _, arm, _, _, record = _run_bspline(port + 1, args, arm=arm, travel=bound * 2.5)
+    args = _args(control_freq=control_freq, episode_time_s=2.0)
+    _, _, arm, _, _, record = _run_bspline(port + 1, args, arm=arm, travel=0.4)
     ep = record.episodes[0]
-    aborted = ep["aborted"] is not None
-    res.check(aborted, "a frozen arm aborts the episode", (ep["aborted"] or "")[:70])
-    if aborted:
-        last = np.array([arm.sent[-1][f"{rc.ARM_KEY}_{a}"] for a in "xyz"])
-        pos, _ = arm._pose()
-        res.check(np.linalg.norm(last - pos) > bound,
-                  "the goal was never rescaled toward the arm (abort, not clamp)",
-                  f"final divergence {np.linalg.norm(last - pos):.4f} m")
+    last = np.array([arm.sent[-1][f"{rc.ARM_KEY}_{a}"] for a in "xyz"])
+    pos, _ = arm._pose()
+    res.check(ep["aborted"] is None and ep["verdict"] == "timeout",
+              "a stalled arm does not end the episode", ep["verdict"])
+    res.check(np.linalg.norm(last - pos) > 0.15 and ep["max_lead_m"] > 0.15,
+              "the goal was never pulled back toward the arm",
+              f"final divergence {np.linalg.norm(last - pos):.3f} m")
 
 
 def check_dataset(res: Results, port: int) -> None:
@@ -943,6 +1134,19 @@ def check_dataset(res: Results, port: int) -> None:
                   train_dataset="Offline/video-check")
     _, _, arm2, _, run_dir2, record2 = _run_bspline(port + 1, args2)
     files = sorted(run_dir2.video_dir.glob("*.mp4")) if run_dir2.video_dir.is_dir() else []
+    # --- UP retries: the attempt leaves no trace and the episode runs again
+    args3 = _args(control_freq=100.0, episode_time_s=0.8, num_episodes=1, no_record=False,
+                  save_videos=True, train_dataset="Offline/retry-check")
+    _, _, arm3, _, run_dir3, record3 = _run_bspline(port + 2, args3, first_attempt="retry")
+    d3 = LeRobotDataset(repo_id=args3.repo_id, root=str(run_dir3.dataset_dir))
+    with np.load(run_dir3.force_profiles_path) as z:
+        traces = sorted(k for k in z.files if k.startswith("time_"))
+    vids = sorted(run_dir3.video_dir.glob("*.mp4"))
+    res.check(len(record3.episodes) == 1 and record3.episodes[0]["verdict"] == "timeout"
+              and d3.num_episodes == 1 and traces == ["time_000"]
+              and len(vids) == len(arm3.cameras),
+              "UP discards the attempt and reruns the episode: one row, one recorded episode",
+              f"{len(record3.episodes)} row(s), {d3.num_episodes} dataset episode(s), traces {traces}")
     import cv2
     counts = [int(cv2.VideoCapture(str(f)).get(cv2.CAP_PROP_FRAME_COUNT)) for f in files]
     res.check(len(files) == len(arm2.cameras), "one mp4 per camera written",
@@ -1094,7 +1298,7 @@ def check_servers(res: Results) -> None:
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--only", choices=("pure", "outputs", "dispatch", "timing",
+    p.add_argument("--only", choices=("pure", "outputs", "dispatch", "schedule", "home", "timing",
                                       "servers", "sail", "bspline", "dataset"), default=None)
     p.add_argument("--base-port", type=int, default=5701)
     p.add_argument("--tmp", default=None,
@@ -1116,6 +1320,10 @@ def main() -> int:
         check_outputs(res)
     if args.only in (None, "dispatch"):
         check_dispatch(res)
+    if args.only in (None, "schedule"):
+        check_schedule(res)
+    if args.only in (None, "home"):
+        check_home(res)
     if args.only in (None, "timing"):
         check_timing(res)
     if args.only in (None, "servers"):

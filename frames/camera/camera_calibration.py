@@ -33,20 +33,21 @@ Workflow
    ambiguity to resolve, and no interactive click-to-mark step is
    needed at all -- the marker IDs ARE the canonicalization.
 
-Board specification (fill these in for YOUR physical board):
-    SQUARES_X, SQUARES_Y : total squares (black+white) along each edge,
+Board specification: config/calibration.yaml holds one spec per image set,
+`intrinsics_board` and `extrinsics_board`, because the two sets may show
+different physical boards. Each spec has:
+    squares_x, squares_y : total squares (black+white) along each edge,
                             i.e. one more than old "internal corners".
-    SQUARE_LENGTH        : physical size of one checkerboard square (m).
-    MARKER_LENGTH         : physical size of the marker's black-bordered
+    square_length_m      : physical size of one checkerboard square (m).
+    marker_length_m      : physical size of the marker's black-bordered
                             footprint (m) -- NOT the outer white border,
-                            NOT the inner bit grid. On this board:
-                              inner 4x4 bit grid   = 2.6 cm
-                              + black border       = 3.9 cm  <- this one
-                              + outer white margin  = 5.0 cm
-    ARUCO_DICT            : set to a specific cv.aruco.DICT_* if known;
-                            leave as AUTO_DETECT_DICT to let the script
-                            try common dictionaries against your images
-                            and pick whichever detects the most markers.
+                            NOT the inner bit grid.
+    aruco_dict           : a cv.aruco DICT_* name if known; null lets the
+                            script try `aruco.candidate_dicts` against that
+                            board's own images and pick whichever detects
+                            the most markers.
+Only the extrinsics board's square length sets the scale of the camera
+position; the intrinsics are scale-free.
 """
 
 import argparse
@@ -63,20 +64,15 @@ import numpy as np
 # `CAM_NAME` selects which camera in config/cameras.yaml is being calibrated;
 # override it with `--cam cam_6` on the command line.
 # ----------------------------------------------------------------------
-_BOARD = fc.calibration("board")
+INTRINSICS_BOARD = fc.calibration("intrinsics_board")
+EXTRINSICS_BOARD = fc.calibration("extrinsics_board")
+_ARUCO = fc.calibration("aruco")
 _FIT = fc.calibration("fit")
 _PATHS = fc.calibration("paths")
 _WORLD_AXES = fc.calibration("world_axes")
-SQUARES_X = _BOARD["squares_x"]              # total squares (black+white), horizontal
-SQUARES_Y = _BOARD["squares_y"]              # total squares (black+white), vertical
-SQUARE_LENGTH = _BOARD["square_length_m"]    # meters, checkerboard square edge
-MARKER_LENGTH = _BOARD["marker_length_m"]    # meters, marker's black-bordered footprint
 
-# Set to a specific dict, e.g. cv.aruco.DICT_5X5_250, if you know it.
-# Otherwise leave as None and AUTO_DETECT_DICT will probe candidates.
-ARUCO_DICT = _BOARD["aruco_dict"]
-AUTO_DETECT_DICT = _BOARD["auto_detect_dict"]
-CANDIDATE_DICTS = list(_BOARD["candidate_dicts"])
+AUTO_DETECT_DICT = _ARUCO["auto_detect_dict"]
+CANDIDATE_DICTS = list(_ARUCO["candidate_dicts"])
 
 CAM_NAME = "cam_2"
 
@@ -206,9 +202,10 @@ def draw_world_axes(img, mtx, dist, rvec, tvec, length=0.1):
 # ----------------------------------------------------------------------
 # Board / detector setup
 # ----------------------------------------------------------------------
-def build_board(dictionary):
+def build_board(spec, dictionary):
     board = cv.aruco.CharucoBoard(
-        (SQUARES_X, SQUARES_Y), SQUARE_LENGTH, MARKER_LENGTH, dictionary
+        (spec["squares_x"], spec["squares_y"]),
+        spec["square_length_m"], spec["marker_length_m"], dictionary
     )
     return board
 
@@ -223,7 +220,7 @@ def make_detector(board):
 def autodetect_dictionary(sample_images):
     """Try each candidate ArUco dictionary against a handful of sample
     images and return the one that detects the most markers overall."""
-    print("[dict] ARUCO_DICT not set -- probing candidate dictionaries...")
+    print("[dict] aruco_dict not set -- probing candidate dictionaries...")
     best_name, best_count = None, -1
 
     for name in CANDIDATE_DICTS:
@@ -250,26 +247,33 @@ def autodetect_dictionary(sample_images):
     if best_count <= 0:
         raise RuntimeError(
             "No ArUco markers detected with any candidate dictionary. "
-            "Check image paths, lighting, or set ARUCO_DICT explicitly."
+            "Check image paths, lighting, or set the board's aruco_dict explicitly."
         )
 
     print(f"[dict] selected {best_name} ({best_count} total markers across samples)")
     return getattr(cv.aruco, best_name)
 
 
-def resolve_dictionary():
-    if ARUCO_DICT is not None:
-        return cv.aruco.getPredefinedDictionary(ARUCO_DICT)
+def resolve_dictionary(spec, image_glob):
+    """The board's ArUco dictionary, probed from that board's own images
+    when the spec leaves aruco_dict null."""
+    if spec["aruco_dict"] is not None:
+        return cv.aruco.getPredefinedDictionary(getattr(cv.aruco, spec["aruco_dict"]))
 
     if not AUTO_DETECT_DICT:
-        raise RuntimeError("ARUCO_DICT is None and AUTO_DETECT_DICT is False; set one of them.")
+        raise RuntimeError("aruco_dict is null and aruco.auto_detect_dict is false; set one of them.")
 
-    sample_images = glob.glob(INTRINSICS_GLOB)[:8] or glob.glob(EXTRINSICS_GLOB)[:8]
+    sample_images = glob.glob(image_glob)[:8]
     if not sample_images:
-        raise RuntimeError("No images found to auto-detect the ArUco dictionary from.")
+        raise RuntimeError(f"No images at {image_glob} to auto-detect the ArUco dictionary from.")
 
     dict_id = autodetect_dictionary(sample_images)
     return cv.aruco.getPredefinedDictionary(dict_id)
+
+
+def describe_board(label, spec):
+    print(f"[{label}] board {spec['squares_x']}x{spec['squares_y']} squares, "
+          f"square {spec['square_length_m'] * 100:.2f} cm, marker {spec['marker_length_m'] * 100:.2f} cm")
 
 
 def normalize_charuco(corners, ids):
@@ -529,7 +533,7 @@ def calibrate_extrinsics(mtx, dist, detector, board):
             cv.aruco.drawDetectedCornersCharuco(dbg, charuco_corners, charuco_ids)
             # Draw the WORLD axes (per BOARD_TO_WORLD_R) at the origin so
             # you can visually confirm they point where you expect.
-            dbg = draw_world_axes(dbg, mtx, dist, rvec, tvec, length=SQUARE_LENGTH * 2)
+            dbg = draw_world_axes(dbg, mtx, dist, rvec, tvec, length=board.getSquareLength() * 2)
             cv.imshow('extrinsics: detected charuco board + world axes', dbg)
             cv.waitKey(0)
 
@@ -621,11 +625,12 @@ if __name__ == "__main__":
     if args.no_debug_images:
         SHOW_DEBUG_IMAGES = False
 
-    dictionary = resolve_dictionary()
-    board = build_board(dictionary)
-    detector = make_detector(board)
+    describe_board("intrinsics", INTRINSICS_BOARD)
+    intr_board = build_board(INTRINSICS_BOARD, resolve_dictionary(INTRINSICS_BOARD, INTRINSICS_GLOB))
+    mtx, dist, img_shape = calibrate_intrinsics(make_detector(intr_board), intr_board)
 
-    mtx, dist, img_shape = calibrate_intrinsics(detector, board)
-    R_wc, t_wc, R_cw, t_cw = calibrate_extrinsics(mtx, dist, detector, board)
+    describe_board("extrinsics", EXTRINSICS_BOARD)
+    extr_board = build_board(EXTRINSICS_BOARD, resolve_dictionary(EXTRINSICS_BOARD, EXTRINSICS_GLOB))
+    R_wc, t_wc, R_cw, t_cw = calibrate_extrinsics(mtx, dist, make_detector(extr_board), extr_board)
     undistort_sample(mtx, dist)
     emit_cameras_yaml(args.cam, mtx, dist, R_cw, t_cw)

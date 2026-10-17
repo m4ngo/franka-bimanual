@@ -4,9 +4,10 @@ Two residual families, told apart by the checkpoint --residual-policy names:
 
   best.pt (torch)        the point-cloud residual on a LeRobot base policy: the
                          loop in this file, recorded as a LeRobotDataset under a
-                         run directory. The base emits ABSOLUTE poses (EE_POS; a
-                         delta-trained checkpoint is refused). Each chunk is taken
-                         relative to the pose the base planned from, the residual
+                         run directory. The base emits ABSOLUTE poses (EE_POS), or
+                         poses already relative to the pose it planned from
+                         (CHUNK_RELATIVE); a delta-trained checkpoint is refused.
+                         An EE_POS chunk is taken relative to that pose, the residual
                          is summed there, and each target is dispatched as the
                          one-step EE_DELTA from the pose read at that step
                          (env_wrapper, "Chunk-start-relative targets").
@@ -51,6 +52,7 @@ from env_wrapper import (
     delta_action,
     ee_pose_to_world,
     measured_ee_twist_world,
+    normalise_relative,
     relative_to_poses,
     residual_input,
     split_gripper,
@@ -179,16 +181,16 @@ def _check_teacher(residual: ResidualPolicy, allow_plant_mismatch: bool) -> None
 
 
 def _check_base(base_policy, controller, args) -> str:
-    """The base's training action space, which must be EE_POS, on a rig with its cameras."""
+    """The base's training action space, EE_POS or CHUNK_RELATIVE, on a rig with its cameras."""
     try:
         space = base_policy.action_space()
     except (FileNotFoundError, KeyError) as exc:
         raise SystemExit(f"cannot verify the base policy's action space: {exc}") from exc
-    if space != "EE_POS":
+    if space not in ("EE_POS", "CHUNK_RELATIVE"):
         raise SystemExit(
             f"{args.base_policy or args.replay_dataset}: trained on {space} actions, and this "
-            "runner executes absolute EE_POS targets. Train the base on an EE_POS recording "
-            "(or relabel one with scripts/replay_dataset.py --mode ee_pose).")
+            "runner executes absolute or chunk-relative targets. Train the base on an EE_POS "
+            "recording (or relabel one with scripts/replay_dataset.py --mode ee_pose).")
     print(f"base policy action space: {space}")
     cfg = getattr(getattr(base_policy, "policy", None), "config", None)
     missing = [k for k in (getattr(cfg, "image_features", None) or {})
@@ -248,6 +250,7 @@ class ChunkPlanner:
                  dump_dir: Path | None = None, latency_debug: bool = False) -> None:
         self.controller = controller
         self.base = base_policy
+        self.chunk_relative = base_policy.chunk_relative
         self.residual = residual
         self.world = proprio_frame == "world"
         self.sim_convention = sim_convention
@@ -266,7 +269,10 @@ class ChunkPlanner:
         t_base = time.perf_counter()
 
         anchor_pos, anchor_quat = _pose(snap.kin)
-        base_rel = chunk_to_relative(base_chunk, anchor_pos, anchor_quat)
+        if self.chunk_relative:
+            base_rel = normalise_relative(base_chunk)
+        else:
+            base_rel = chunk_to_relative(base_chunk, anchor_pos, anchor_quat)
         res_chunk, network_pcd, bound = np.empty((0, 9)), None, float(len(base_rel))
         if self.residual is not None:
             residual_obs = self._residual_obs(snap, base_rel, gains)
@@ -770,10 +776,16 @@ def _base_policy_dataset(base_policy: str | None) -> str | None:
     if not base_policy:
         return None
     here = Path(base_policy).expanduser()
-    for candidate in (here, here.parent, here.parent.parent):
+    candidates = [c / "train_config.json" for c in (here, here.parent, here.parent.parent)]
+    if not here.exists():  # a Hub repo id: lerobot's push uploads train_config.json with the model
         try:
-            repo_id = (json.loads((candidate / "train_config.json").read_text())
-                       .get("dataset") or {}).get("repo_id")
+            from huggingface_hub import hf_hub_download
+            candidates = [Path(hf_hub_download(base_policy, "train_config.json"))]
+        except Exception:
+            return None
+    for path in candidates:
+        try:
+            repo_id = (json.loads(path.read_text()).get("dataset") or {}).get("repo_id")
         except Exception:
             continue
         if repo_id:
@@ -792,9 +804,9 @@ def _policy_record(args, base_action_space: str) -> dict:
         "base_action_space": base_action_space,
         "control_mode": "EE_DELTA",
         "control_mode_source": "fixed",
-        "control_mode_reason": "the base policy emits absolute EE_POS targets; each is "
-                               "executed as the one-step delta from the pose measured at "
-                               "that step, as the reach executor runs its base",
+        "control_mode_reason": "the base policy emits EE_POS or chunk-relative targets; "
+                               "each is executed as the one-step delta from the pose "
+                               "measured at that step, as the reach executor runs its base",
     }
 
 

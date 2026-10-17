@@ -22,9 +22,16 @@ Usage:
     single output video, with a "traj N" label burned into every tile.
   python stitch_videos.py a.mp4 b.mp4 [c.mp4 d.mp4] -o out.mp4 [--labels A B ...]
     free-form file mode.
+  python stitch_videos.py --runs <base-run> <residual-run> [--cams cam_2 cam_3] [-o out_dir]
+    two run_residual.py run directories (the videos/ and episodes.jsonl of each):
+    episode N of each run as one row of cameras, the runs stacked, with a race
+    bar and a timer per row in the episode's own wall-clock seconds. Writes
+    out_dir/episode_NNN.mp4 per pair and out_dir/all_episodes.mp4 (H.264).
 """
 
 import argparse
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -181,6 +188,162 @@ def _is_trajectory_mode(run: Path) -> bool:
     return has_numbered_subdirs
 
 
+# --------------------------------------------------------------------------
+# --runs: two rollout run directories raced against each other
+# --------------------------------------------------------------------------
+
+RACE_TILE = 360          # px per camera tile (width)
+STAMP_ROWS = 18          # source rows holding run_residual's step/20 stamp; cropped
+RACE_STRIP = 54          # px label/timer strip above each run's row
+RACE_HEADER = 44         # px episode header
+RACE_HOLD_S = 1.5        # hold the final frame after both episodes end
+# BGR: the report's success blue / timeout orange, ink and muted grey.
+RACE_OK, RACE_BAD = (214, 120, 42), (52, 104, 235)
+RACE_INK, RACE_MUTED, RACE_BG = (245, 245, 245), (150, 150, 150), (24, 24, 24)
+FONT = cv2.FONT_HERSHEY_DUPLEX
+
+
+def _run_label(run: Path) -> str:
+    m = json.loads((run / "manifest.json").read_text())
+    pol = m.get("policy") or {}
+    if pol.get("residual_enabled") is True:
+        return "base + residual"
+    if pol.get("residual_enabled") is False:
+        return "base"
+    return m["run"]["method"]
+
+
+def _run_episodes(run: Path) -> dict:
+    return {e["episode"]: e for e in map(json.loads, (run / "episodes.jsonl").read_text().splitlines())}
+
+
+def _cam_role(cam: str) -> str:
+    try:
+        import franka_config as fc
+        return fc.camera(cam).role or cam
+    except Exception:  # noqa: BLE001
+        return cam
+
+
+def _read_all(path: Path) -> list:
+    cap = _open(path)
+    frames = []
+    while True:
+        ok, f = cap.read()
+        if not ok:
+            break
+        f = f[:f.shape[0] - STAMP_ROWS]
+        frames.append(cv2.resize(f, (RACE_TILE, round(RACE_TILE * f.shape[0] / f.shape[1])),
+                                 interpolation=cv2.INTER_CUBIC))
+    cap.release()
+    if not frames:
+        sys.exit(f"no frames in {path}")
+    return frames
+
+
+def _text(img, s, org, scale, color, thick=1, anchor="left"):
+    (w, _), _ = cv2.getTextSize(s, FONT, scale, thick)
+    x = org[0] - w if anchor == "right" else org[0]
+    cv2.putText(img, s, (x, org[1]), FONT, scale, color, thick, cv2.LINE_AA)
+
+
+def _race_row(frames_by_cam, k, ep, label, roles, t_max):
+    """One run's strip (label, timer, race bar) above its camera tiles at frame k."""
+    n = len(frames_by_cam[0])
+    done = k >= n - 1
+    dt = ep["wall_time_s"] / max(ep["steps"], 1)
+    t = min(k, n - 1) * dt if not done else ep["wall_time_s"]
+    width = RACE_TILE * len(frames_by_cam)
+    strip = np.full((RACE_STRIP, width, 3), RACE_BG, np.uint8)
+    good = ep.get("success")
+    color = (RACE_OK if good else RACE_BAD) if done else RACE_INK
+    _text(strip, label, (12, 34), 0.85, RACE_INK, 1)
+    timer = f"{t:5.2f} s" + (f"  {ep.get('verdict', '')}" if done else "")
+    _text(strip, timer, (width - 12, 34), 0.85, color, 2 if done else 1, anchor="right")
+    (tw, _), _ = cv2.getTextSize(timer, FONT, 0.85, 2 if done else 1)
+    _text(strip, f"step {min(k, n - 1)}", (width - 30 - tw, 34), 0.55, RACE_MUTED, 1, anchor="right")
+    # Race bar: both rows share the slower episode's length as full scale.
+    bar = int((width - 24) * min(t / t_max, 1.0))
+    cv2.rectangle(strip, (12, RACE_STRIP - 10), (width - 12, RACE_STRIP - 6), (60, 60, 60), -1)
+    cv2.rectangle(strip, (12, RACE_STRIP - 10), (12 + bar, RACE_STRIP - 6),
+                  color if done else RACE_MUTED, -1)
+    tiles = []
+    for frames, role in zip(frames_by_cam, roles):
+        f = frames[min(k, len(frames) - 1)].copy()
+        if done:
+            f = (f * 0.6).astype(np.uint8)
+        for c, th in ((0, 3), (RACE_INK, 1)):
+            cv2.putText(f, role, (8, 22), FONT, 0.55, (c, c, c) if c == 0 else c, th, cv2.LINE_AA)
+        tiles.append(f)
+    return cv2.vconcat([strip, cv2.hconcat(tiles)])
+
+
+class _H264:
+    """Raw BGR frames piped to ffmpeg: mp4v does not play in a browser or Slack."""
+
+    def __init__(self, path: Path, size: tuple, fps: float):
+        self.p = subprocess.Popen(
+            ["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+             "-s", f"{size[0]}x{size[1]}", "-r", f"{fps:g}", "-i", "-", "-c:v", "libx264",
+             "-pix_fmt", "yuv420p", "-crf", "20", "-movflags", "+faststart", str(path)],
+            stdin=subprocess.PIPE)
+
+    def write(self, frame):
+        self.p.stdin.write(frame.tobytes())
+
+    def close(self):
+        self.p.stdin.close()
+        if self.p.wait():
+            sys.exit(f"ffmpeg failed writing {self.p.args[-1]}")
+
+
+def _run_pair_mode(runs: list, cams, out_dir: Path) -> None:
+    labels = [_run_label(r) for r in runs]
+    eps = [_run_episodes(r) for r in runs]
+    if cams is None:
+        names = [{q.name.split("_", 2)[2][:-4] for q in (r / "videos").glob("episode_*_*.mp4")}
+                 for r in runs]
+        cams = sorted(set.intersection(*names))
+        if not cams:
+            sys.exit("no camera recorded in both runs")
+    roles = [_cam_role(c) for c in cams]
+    shared = sorted(set(eps[0]) & set(eps[1]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    # Play at the loop's measured rate, not the nominal 20 Hz, so the wall-clock
+    # timers keep pace with the viewer's own clock.
+    fps = round(sum(e[i]["steps"] for e in eps for i in shared)
+                / sum(e[i]["wall_time_s"] for e in eps for i in shared), 2)
+    tile_h = len(_read_all(runs[0] / "videos" / f"episode_{shared[0]:03d}_{cams[0]}.mp4")[0])
+    width = RACE_TILE * len(cams)
+    height = RACE_HEADER + len(runs) * (RACE_STRIP + tile_h)
+    height += height % 2
+    compiled = _H264(out_dir / "all_episodes.mp4", (width, height), fps)
+    for i in shared:
+        frames = [[_read_all(r / "videos" / f"episode_{i:03d}_{c}.mp4") for c in cams] for r in runs]
+        pair = [e[i] for e in eps]
+        t_max = max(e["wall_time_s"] for e in pair)
+        n_out = max(len(f[0]) for f in frames) + int(RACE_HOLD_S * fps)
+        head = "  vs  ".join(f"{lab} {e['wall_time_s']:.2f} s" for lab, e in zip(labels, pair))
+        clip = _H264(out_dir / f"episode_{i:03d}.mp4", (width, height), fps)
+        for k in range(n_out):
+            header = np.full((RACE_HEADER, width, 3), (12, 12, 12), np.uint8)
+            _text(header, f"episode {i}", (12, 30), 0.8, RACE_INK, 2)
+            _text(header, head, (width - 12, 30), 0.6, RACE_MUTED, 1, anchor="right")
+            rows = [_race_row(f, k, e, lab, roles, t_max) for f, e, lab in zip(frames, pair, labels)]
+            canvas = cv2.vconcat([header] + rows)
+            if canvas.shape[0] < height:  # libx264 needs even dimensions
+                canvas = cv2.copyMakeBorder(canvas, 0, height - canvas.shape[0], 0, 0,
+                                            cv2.BORDER_CONSTANT, value=RACE_BG)
+            clip.write(canvas)
+            compiled.write(canvas)
+        clip.close()
+        print(f"  episode {i}: " + ", ".join(f"{lab} {e['steps']} steps {e['wall_time_s']:.2f} s "
+                                            f"{e.get('verdict')}" for lab, e in zip(labels, pair)))
+    compiled.close()
+    print(f"wrote {out_dir}/all_episodes.mp4 and {len(shared)} per-episode clips "
+          f"({width}x{height}, {fps:g} fps)")
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("videos", nargs="*", help="2-4 mp4 paths (alternative to --run-dir)")
@@ -190,7 +353,15 @@ def main() -> None:
                    help="episode number for recorded runs (episode_NNN_*); default: free-run naming")
     p.add_argument("--labels", nargs="+", default=None)
     p.add_argument("-o", "--output", default=None)
+    p.add_argument("--runs", nargs=2, default=None, metavar=("BASE_RUN", "RESIDUAL_RUN"),
+                   help="two run_residual.py run directories to race episode by episode")
     args = p.parse_args()
+
+    if args.runs:
+        runs = [Path(r).expanduser() for r in args.runs]
+        out = Path(args.output).expanduser() if args.output else runs[1].parent / "compare_videos"
+        _run_pair_mode(runs, args.cams, out)
+        return
 
     # Bare directory argument == run-dir mode with defaults.
     if len(args.videos) == 1 and Path(args.videos[0]).is_dir() and not args.run_dir:

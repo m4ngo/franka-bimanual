@@ -1,15 +1,26 @@
-# ChArUco board spec and IO layout for frames/camera/camera_calibration.py.
+# ChArUco board specs and IO layout for frames/camera/camera_calibration.py.
 # Editing the board here is enough; the script reads it at startup and writes
 # results back into cameras.yaml via `--write-config`.
 
 version: 2
 
-board:
+# Intrinsics and extrinsics images may show different physical boards, so each
+# image set is detected against its own spec.
+intrinsics_board:
   squares_x: 12              # total squares (black+white), horizontal
   squares_y: 9               # total squares (black+white), vertical
   square_length_m: 0.0645    # checkerboard square edge
   marker_length_m: 0.047     # marker's black-bordered footprint
-  aruco_dict: null           # null -> autodetect from candidate_dicts
+  aruco_dict: null           # e.g. DICT_4X4_100; null -> autodetect
+
+extrinsics_board:
+  squares_x: 11
+  squares_y: 11
+  square_length_m: 0.050
+  marker_length_m: 0.0385
+  aruco_dict: null
+
+aruco:
   auto_detect_dict: true
   candidate_dicts:
     - DICT_4X4_50
@@ -37,7 +48,12 @@ world_axes:
   # sits relative to the world lives in exactly one place —
   # world.yaml: calib_origin_in_world — and is applied at load time, so moving
   # the world origin never requires recalibrating.
-  board_to_world: [X, Y, Z]
+  #
+  # The axes depend on which board extrinsics_board is and how it lies on the
+  # table; re-check them whenever either changes. [-Y, X, Z] is for the 11x11
+  # board as placed for the 2026-10-09 cam_2 photos (+x toward the tape on the
+  # board edge nearest cam_2). The 12x9 board used [X, Y, Z].
+  board_to_world: [-Y, X, Z]
 
 fit:
   reproj_error_threshold_px: 0.5

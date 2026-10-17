@@ -145,6 +145,9 @@ class SAILPolicyServer:
                  guide_config: str | None = None, precision: str = "auto") -> None:
         torch_device = (TorchUtils.get_torch_device(try_to_use_cuda=True)
                         if device is None else torch.device(device))
+        # Builds the UNet and EMA the checkpoint's config describes.
+        from baselines.sail_bridge import recipe_patch
+        recipe_patch.install()
         self.policy, self.ckpt_dict = FileUtils.policy_from_checkpoint(
             ckpt_path=ckpt_path, device=torch_device, verbose=False
         )

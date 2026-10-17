@@ -9,8 +9,9 @@
 
 `start` converts the recording (scripts/prepare_baseline_datasets.py) in the
 foreground, then hands the three trainings -- lerobot-train for the residual
-pipeline's base policy, the B-Spline and SAIL bridges in their own venvs -- to
-a detached runner and returns. The trainings survive the terminal closing.
+pipeline's base policy (through scripts/training/lerobot_train_recipe.py), the
+B-Spline and SAIL bridges in their own venvs -- to a detached runner and
+returns. All three train on one shared recipe, baselines/diffusion_recipe.py. The trainings survive the terminal closing.
 Each stage writes its own log under logs/, the runner collects the wandb links
 into links.md as they appear and draws summary.png (loss curves, checkpoint
 paths, links) when the last training ends. `status` reads progress out of the
@@ -28,7 +29,8 @@ without being asked. The runner takes the request if it is alive; otherwise
 
 No training starts from scratch while an earlier run holds its work. For each
 stage, `start` looks under <root> for an earlier run of the same recording
-that ran the same training (STAGE_IDENTITY names the settings that count). A
+that ran the same training (STAGE_IDENTITY names the settings that count, and
+the run must carry the same diffusion recipe fingerprint). A
 finished one is linked in instead of trained again -- <stage>/ and
 logs/<stage>.log point at the earlier run, and `status` says so. Otherwise
 the newest checkpoint of a stopped or failed one is copied in and the
@@ -65,9 +67,11 @@ import yaml
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from baselines import diffusion_recipe  # noqa: E402
 from baselines.run_record import _safe_segment  # noqa: E402
 
 DEFAULT_ROOT = Path.home() / "franka_data" / "pipeline"
+DIFFUSION_TRAIN = _REPO_ROOT / "scripts" / "training" / "lerobot_train_recipe.py"
 STAGES = ("diffusion", "bspline", "sail")
 STATE_FILE = "pipeline.json"
 # `retry`'s request to the runner; the file's text names the stages to wait for.
@@ -90,7 +94,7 @@ SCHEMA: dict[str | None, dict] = {
     "convert": {"episodes": None, "image_size": None, "trim_start": "auto", "max_trim": 5,
                 "min_steps": 20, "skip": []},
     "diffusion": {"enabled": True, "policy_type": "diffusion", "policy_repo_id": None,
-                  "batch_size": 64, "steps": None, "save_freq": 20_000, "eval_freq": 5_000,
+                  "batch_size": None, "steps": None, "save_freq": 20_000, "eval_freq": 5_000,
                   "log_freq": 200, "num_workers": 12, "args": {}},
     "bspline": {"enabled": True, "epochs": None, "steps": None, "checkpoint_every": None,
                 "batch_size": None, "num_workers": None, "seed": None, "device": None},
@@ -286,6 +290,13 @@ def diffusion_checkpoint(run_dir: Path) -> tuple[Path, int] | None:
     return config, step
 
 
+def diffusion_reads_ee_state(pretrained_dir: Path) -> bool:
+    """Whether a diffusion checkpoint reads the EE-pose state the baselines read; one
+    trained on joint angles predates lerobot_train_recipe.py's conversion."""
+    from lerobot_robot_bimanual_franka.ee_state import uses_ee_state
+    return uses_ee_state(pretrained_dir)
+
+
 def wandb_run_exists(entity: str | None, project: str, run_id: str) -> bool:
     """False only when wandb says the run is gone; any other trouble leaves the decision to lerobot."""
     import wandb
@@ -320,17 +331,19 @@ def diffusion_cmd(cfg: dict, run_dir: Path, dataset_root: Path) -> list[str]:
     if ckpt is not None:
         # A relaunch, or a checkpoint copied from an earlier run. The saved config
         # carries every argument below; lerobot-train restores the step, optimizer
-        # and wandb run from the checkpoint.
-        return [sys.executable, "-m", "lerobot.scripts.lerobot_train",
+        # and wandb run from the checkpoint, the wrapper the live weights and EMA.
+        return [sys.executable, str(DIFFUSION_TRAIN),
                 "--resume=true", f"--config_path={ckpt[0]}", f"--output_dir={run_dir / 'diffusion'}"]
     # root as well as repo_id: a recording under ~/franka_data is not in the HF
     # cache, and a bare id would send lerobot to the Hub for it.
-    cmd = [sys.executable, "-m", "lerobot.scripts.lerobot_train",
+    # lerobot_train_recipe.py adds the shared diffusion recipe's flags ahead of these.
+    cmd = [sys.executable, str(DIFFUSION_TRAIN),
            f"--dataset.repo_id={cfg['dataset']}", f"--dataset.root={dataset_root}",
            f"--policy.type={d['policy_type']}",
            f"--output_dir={run_dir / 'diffusion'}",
            f"--job_name={wandb_name(cfg, 'diffusion')}",
-           f"--batch_size={d['batch_size']}", f"--steps={d['steps']}",
+           *([f"--batch_size={d['batch_size']}"] if d["batch_size"] is not None else []),
+           f"--steps={d['steps']}",
            f"--save_freq={d['save_freq']}", f"--eval_freq={d['eval_freq']}",
            f"--log_freq={d['log_freq']}", f"--num_workers={d['num_workers']}",
            f"--wandb.enable={'true' if w['enable'] else 'false'}",
@@ -464,12 +477,15 @@ def find_earlier(cfg: dict, stage: str) -> tuple[Path, int, bool] | None:
             other = load_config(run_dir / "config.yaml")
         except (OSError, ValueError, SystemExit):
             continue
-        if state.get("dataset") != cfg["dataset"] or identity(other, stage) != want:
+        if (state.get("dataset") != cfg["dataset"] or identity(other, stage) != want
+                or state.get("recipe") != diffusion_recipe.fingerprint()):
             continue
         st = state["stages"][stage]
         over = st["state"] in ("done", "stopped", "failed") or (st["state"] == "running" and not pid_alive(st["pid"]))
         ckpt = stage_checkpoint(run_dir, stage)
         if not over or ckpt is None or (run_dir / stage).is_symlink():
+            continue
+        if stage == "diffusion" and not diffusion_reads_ee_state(ckpt[0].parent):
             continue
         if st["state"] == "done" and not (stage == "diffusion" and ckpt[1] < int(cfg["diffusion"]["steps"])):
             return run_dir, ckpt[1], True
@@ -558,6 +574,8 @@ def cmd_start(args) -> int:
     state = {
         "dataset": cfg["dataset"], "dataset_root": str(dataset_root), "name": cfg["name"],
         "parallel": bool(cfg["parallel"]), "created": now(),
+        # Only a run trained on this same recipe may be reused or resumed from.
+        "recipe": diffusion_recipe.fingerprint(),
         "runner": {"pid": None, "started": None, "ended": None, "rc": None},
         "stages": {"convert": {"state": "pending", "log": "logs/convert.log"}},
     }

@@ -4,6 +4,7 @@
     python scripts/rollout_report.py --sweep bsp_2x
     python scripts/rollout_report.py --sweep sail_100_20 bsp_1x bsp_2x bsp_4x bsp_8x
     python scripts/rollout_report.py --sweep latest --out-dir ~/franka_ws/report
+    python scripts/rollout_report.py --runs <base-run-dir> <residual-run-dir> --out-dir DIR
 
 One sheet per method and suite in each sweep -- `<sweep>.png`, with `.<method>`
 and `.<suite>` appended when one sweep ran several -- plus a comparison sheet per
@@ -12,6 +13,13 @@ runs recorded. Runs that recorded wrist force (force_profiles.npz) add its
 statistics and every episode's |F| profile overlaid. Reads only the manifests,
 episodes.jsonl and force profiles that `baselines.libero_bridge.evaluate` wrote
 (baselines/ROLLOUT.md); nothing here touches the robot or the GPU.
+
+`--runs` takes real-arm run directories (`run_residual.py` and the other rollout
+scripts write the same manifest) instead of a sweep id. Each run is one column,
+named "base" or "base + residual" from the manifest's `residual_enabled` unless
+`--labels` says otherwise. The per-run sheet becomes one `summary.png` with a row per
+run rather than per task, plus `comparison.png`; time is wall-clock seconds and a
+failure is the operator's verdict, not a timeout.
 
 Every sheet is 16:9, 3200 x 1800 px, with no text under 9 pt.
 
@@ -67,6 +75,9 @@ SLOTS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
 # every bar carries its value, so the sub-3:1 green and amber are labelled.
 METHOD_HUES = {"bspline": "#4a3aa7", "sail": "#eda100", "pi05": "#1baf7a"}
 SPARE_HUES = ("#e87ba4", "#008300", "#e34948")
+# One hue per real run (--runs), in run order: never success blue or failure orange,
+# because the same sheet still colours episodes by outcome.
+RUN_HUES = ("#4a3aa7", "#1baf7a", "#e87ba4", "#008300")
 
 # Sheet geometry: 20 x 11.25 in at 160 dpi is 16:9. Layout is in inches from
 # the top-left corner; EDGE is the outer margin.
@@ -107,13 +118,66 @@ def load_runs(root: Path, sweep: str) -> list[dict]:
             continue
         if (doc.get("run") or {}).get("sweep") != sweep:
             continue
-        eps_path = manifest.parent / "episodes.jsonl"
-        doc["_episodes"] = [json.loads(ln) for ln in eps_path.read_text().splitlines()
-                            if ln.strip()] if eps_path.is_file() else []
-        doc["_dir"] = manifest.parent
-        doc["_forces"] = load_forces(manifest.parent)
-        out.append(doc)
+        out.append(attach(doc, manifest.parent))
     return out
+
+
+def attach(doc: dict, run_dir: Path) -> dict:
+    eps_path = run_dir / "episodes.jsonl"
+    doc["_episodes"] = [json.loads(ln) for ln in eps_path.read_text().splitlines()
+                        if ln.strip()] if eps_path.is_file() else []
+    doc["_dir"] = run_dir
+    doc["_forces"] = load_forces(run_dir)
+    return doc
+
+
+def is_real(run: dict) -> bool:
+    """A real-arm manifest names its rig profile; a sim one names its simulator."""
+    return "rig_profile" in (run.get("environment") or {})
+
+
+def run_osc(run: dict) -> tuple[float, float]:
+    """(kp, damping ratio) a real run sent: the rollout's own gains where it
+    recorded them (SAIL's 300 / 0.5), else the controller's defaults."""
+    p, tq = run.get("parameters") or {}, (run.get("environment") or {}).get("torque") or {}
+    kp = p.get("osc_kp", tq.get("default_kp"))
+    ratio = p.get("osc_damping_ratio", tq.get("default_damping_ratio"))
+    return round(float(kp), 3), round(float(ratio), 3)
+
+
+def real_label(run: dict) -> str:
+    residual = (run.get("policy") or {}).get("residual_enabled")
+    return {True: "base + residual", False: "base"}.get(residual, run["run"]["method"])
+
+
+def load_real_runs(dirs: list[Path], labels: list[str] | None) -> dict[str, dict]:
+    """label -> run, for run directories given by path. The manifest's own task
+    string becomes `environment.task`, which the per-task panels key on."""
+    out: dict[str, dict] = {}
+    for i, d in enumerate(dirs):
+        doc = attach(json.loads((d / "manifest.json").read_text()), d)
+        # The training dataset, not the run's own task string: each method writes
+        # its own ("sail rollout", ...), which would split one task into several.
+        doc["environment"]["task"] = ((doc.get("train_dataset") or {}).get("repo_id")
+                                      or (doc.get("parameters") or {}).get("task") or d.name)
+        doc["environment"]["suite"] = "real FR3"
+        doc["run"]["source_method"] = doc["run"]["method"]
+        label = labels[i] if labels else real_label(doc)
+        if label in out:
+            label = f"{label} ({d.name})"
+        out[label] = doc
+    return out
+
+
+def as_column(run: dict, label: str, row: str) -> dict:
+    """A shallow copy of `run` presented as method `label` with task `row`: what
+    lets the sweep panels put one real run in each column or each row."""
+    return {**run, "run": {**run["run"], "method": label},
+            "environment": {**run["environment"], "task": row}}
+
+
+def time_unit(runs: list[dict]) -> str:
+    return "wall-clock" if is_real(runs[0]) else "simulated"
 
 
 def load_forces(run_dir: Path) -> dict[int, tuple[np.ndarray, np.ndarray]]:
@@ -177,7 +241,8 @@ def stats(runs: list[dict]) -> dict:
         "mean_steps_ok": sum(e["steps"] for e in ok) / len(ok) if ok else None,
         "mean_steps_bad": sum(e["steps"] for e in bad) / len(bad) if bad else None,
         "sim_s": sum(e.get("wall_time_s") or 0 for e in eps),
-        "clock_s": sum(e.get("clock_time_s") or 0 for e in eps),
+        "clock_s": (sum(e.get("clock_time_s") or 0 for e in eps)
+                    or sum(r["run"].get("duration_s") or 0 for r in runs)),
         "plans_per_step": (sum(infer) / sum(steps)) if infer and steps else None,
         "slow_steps": sum(e.get("slow_steps") or 0 for e in eps),
         "force": force_summary(eps),
@@ -285,16 +350,16 @@ def legend_above(ax, handles=None, ncol=3):
     return ax.legend(handles=handles, **kw) if handles else ax.legend(**kw)
 
 
-def outcome_key() -> list:
+def outcome_key(bad: str = "timeout") -> list:
     """success/timeout fills and the median/mean marks: one legend per sweep sheet."""
     return [Patch(facecolor=OK, label="success"),
-            Patch(facecolor=BAD, label="timeout"),
+            Patch(facecolor=BAD, label=bad),
             Line2D([], [], color=INK, lw=2, label="median"),
             Line2D([], [], color=INK, marker="D", markerfacecolor=SURFACE,
                    markersize=7, lw=0, label="mean")]
 
 
-def tile(fig, rect, value, label, note=None, color=INK):
+def tile(fig, rect, value, label, note=None, color=INK, size=26):
     """A stat tile: the number leads, the label explains it."""
     ax = fig.add_axes(rect)
     ax.set_facecolor(PANEL)
@@ -302,7 +367,7 @@ def tile(fig, rect, value, label, note=None, color=INK):
     for s in ax.spines.values():
         s.set_color(GRID)
         s.set_linewidth(0.8)
-    ax.text(0.5, 0.62, value, ha="center", va="center", fontsize=26,
+    ax.text(0.5, 0.62, value, ha="center", va="center", fontsize=size,
             fontweight="bold", color=color, transform=ax.transAxes)
     ax.text(0.5, 0.28, label.upper(), ha="center", va="center", fontsize=FS_SMALL,
             color=INK2, transform=ax.transAxes)
@@ -400,7 +465,7 @@ def duration_panel(ax, runs):
 
     dot_panel(ax, runs, lambda e: e.get("wall_time_s") or 0,
               lambda r: (mean(r), med(r)), (("mean", mean), ("med", med)),
-              "episode duration, simulated s", ".2f")
+              f"episode duration, {time_unit(runs)} s", ".2f")
 
 
 def episode_force(e: dict, key: str) -> float | None:
@@ -429,6 +494,9 @@ def task_styles(runs) -> dict[str, tuple[str, str]]:
     """Task -> (colour, linestyle), in sheet order: the eight hues, then the same
     hues dashed for tasks 9-16, then grey."""
     out: dict[str, tuple[str, str]] = {}
+    if is_real(runs[0]):
+        return {r["environment"]["task"]: (RUN_HUES[i % len(RUN_HUES)], "-")
+                for i, r in enumerate(runs)}
     for r in runs:
         t = r["environment"]["task"]
         if t not in out:
@@ -461,7 +529,8 @@ def force_overlay(ax, runs, styles) -> None:
     ax.set_ylim(1.0, peak * 1.4)
     ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:g}"))
     ax.set_xlim(0, None)
-    ax.set_xlabel("simulated seconds since the first action", fontsize=FS_TEXT, color=MUTED)
+    ax.set_xlabel(f"{time_unit(runs)} seconds since the first action", fontsize=FS_TEXT,
+                  color=MUTED)
     ax.set_ylabel("|F|, N (log scale)", fontsize=FS_TEXT, color=MUTED)
     style(ax, grid_axis="y")
 
@@ -475,7 +544,8 @@ def force_key(ax, runs, styles) -> None:
     episodes: dict[str, list[dict]] = {}
     for r in runs:
         episodes.setdefault(r["environment"]["task"], []).extend(r["_episodes"])
-    ax.text(0.04, 0.955, "TASKS", transform=ax.transAxes, fontsize=FS_SMALL,
+    ax.text(0.04, 0.955, "RUNS" if is_real(runs[0]) else "TASKS",
+            transform=ax.transAxes, fontsize=FS_SMALL,
             color=INK, fontweight="bold", va="top")
     for x, head in ((0.80, "p95"), (0.97, "peak")):
         ax.text(x, 0.955, head, transform=ax.transAxes, fontsize=FS_SMALL, color=MUTED,
@@ -546,7 +616,66 @@ def params_panel(ax, runs, sweep):
     if git.get("commit"):
         rows.append(("git", f"{str(git['commit'])[:9]}{' dirty' if git.get('dirty') else ''}"))
     rows.append(("started", str(r0["run"].get("started_at", ""))[:19].replace("T", " ")))
+    param_rows(ax, rows)
 
+
+def real_params_panel(ax, runs):
+    """The real runs' settings: one value where they agree, `a | b` in run order
+    where they do not."""
+    ax.set_facecolor(PANEL)
+    ax.set_xticks([]); ax.set_yticks([])
+    for s in ax.spines.values():
+        s.set_color(GRID); s.set_linewidth(0.8)
+
+    def ckpt(path):
+        parts = Path(path).parts if path else ()
+        if not parts:
+            return "none"
+        # LeRobot: .../<run>/checkpoints/<step>/pretrained_model; else .../<id>/<dir>/<file>.
+        if parts[-1] == "pretrained_model" and len(parts) >= 4:
+            return f"step {parts[-2]}, {parts[-4]}"
+        if len(parts) < 3:
+            return "/".join(parts)   # a hub repo id
+        return f"{parts[-3]}/{parts[-1]}"
+
+    def field(get):
+        vals = [str(get(r)) for r in runs]
+        return vals[0] if len(set(vals)) == 1 else " | ".join(vals)
+
+    env = lambda r: r["environment"]  # noqa: E731
+    par = lambda r: r.get("parameters") or {}  # noqa: E731
+    pol = lambda r: r.get("policy") or {}  # noqa: E731
+    tq = lambda r: env(r).get("torque") or {}  # noqa: E731
+    res = lambda r: par(r).get("residual") or {}  # noqa: E731
+    rows = [
+        ("runs", " | ".join(r["run"]["method"] for r in runs)),
+        ("episodes", " | ".join(str(len(r["_episodes"])) for r in runs)),
+        ("robot", field(lambda r: f"FR3 {env(r).get('physical_arm')} ({env(r).get('rig_profile')})")),
+        ("cameras", field(lambda r: ", ".join(env(r).get("cameras") or []))),
+        ("control rate", field(lambda r: f"{par(r).get('exec_fps', env(r).get('control_fps'))} Hz")),
+        ("episode limit", field(lambda r: f"{par(r).get('episode_time_s')} s")),
+        ("home pose", field(lambda r: env(r).get("home_pose"))),
+        ("control mode", field(lambda r: f"{pol(r).get('control_mode')} "
+                                        f"(base {pol(r).get('base_action_space')})")),
+        ("OSC kp", field(lambda r: f"{run_osc(r)[0]:g}")),
+        ("OSC damping ratio", field(lambda r: f"{run_osc(r)[1]:g}")),
+        ("OSC step limit", field(lambda r: f"{100 * (tq(r).get('delta_pos_max_m') or 0):g} cm")),
+        ("friction_kc", field(lambda r: (env(r).get("tuning") or {}).get("friction_kc"))),
+        ("base checkpoint", field(lambda r: ckpt((pol(r).get("base_policy") or {}).get("path")))),
+        ("residual", field(lambda r: ckpt((pol(r).get("residual_policy") or {}).get("path"))
+                           if pol(r).get("residual_enabled") else "off")),
+        ("residual mag", field(lambda r: res(r).get("residual_mag", "-")
+                               if pol(r).get("residual_enabled") else "-")),
+        ("trained on", field(lambda r: (r.get("train_dataset") or {}).get("repo_id"))),
+        ("git", field(lambda r: f"{str((env(r).get('git') or {}).get('commit'))[:9]}"
+                                f"{' dirty' if (env(r).get('git') or {}).get('dirty') else ''}")),
+        ("started", " | ".join(str(r["run"].get("started_at", ""))[11:16] for r in runs)
+         + f"  {str(runs[0]['run'].get('started_at', ''))[:10]}"),
+    ]
+    param_rows(ax, rows)
+
+
+def param_rows(ax, rows: list[tuple[str, str]]) -> None:
     ax.text(0.04, 0.965, "RUN PARAMETERS", transform=ax.transAxes, fontsize=FS_SMALL,
             color=INK, fontweight="bold", va="top")
     width = text_width(ax.figure, ["0"], FS_SMALL) * 1.2  # a monospace character
@@ -584,15 +713,45 @@ def outcome_hist(ax, ok: list, bad: list, xlabel: str) -> None:
     style(ax, grid_axis="y")
 
 
+def run_hist(ax, series: dict[str, list], xlabel: str) -> None:
+    """One per-episode number per real run, side by side in each bin, in the
+    runs' own hues."""
+    allv = [v for vs in series.values() for v in vs]
+    if not allv:
+        return
+    lo, hi = min(allv), max(allv)
+    if hi == lo:
+        lo, hi = lo - 0.5, hi + 0.5
+    ax.hist(list(series.values()), bins=np.linspace(lo, hi, 16), zorder=3,
+            color=[RUN_HUES[i % len(RUN_HUES)] for i in range(len(series))],
+            label=list(series))
+    ax.set_xlabel(xlabel, fontsize=FS_TEXT, color=MUTED)
+    ax.set_ylabel("episodes", fontsize=FS_TEXT, color=MUTED)
+    ax.yaxis.set_major_locator(matplotlib.ticker.MaxNLocator(integer=True))
+    style(ax, grid_axis="y")
+
+
+def per_run(st, get) -> dict[str, list]:
+    return {r["environment"]["task"]: [v for e in r["_episodes"] if (v := get(e)) is not None]
+            for r in st["runs"]}
+
+
 def length_panel(ax, st):
     """Episode length in steps, successes against timeouts."""
+    if is_real(st["runs"][0]):
+        return run_hist(ax, per_run(st, lambda e: e.get("steps")),
+                        "episode length, control steps")
     outcome_hist(ax, [e["steps"] for e in st["ok"] if e.get("steps")],
                  [e["steps"] for e in st["bad"] if e.get("steps")],
-                 "episode length, env steps")
+                 "episode length, control steps" if is_real(st["runs"][0])
+                 else "episode length, env steps")
 
 
 def peak_force_panel(ax, st):
     """Each episode's largest |F|, successes against timeouts."""
+    if is_real(st["runs"][0]):
+        return run_hist(ax, per_run(st, lambda e: episode_force(e, "max")),
+                        "largest |F| in the episode, N")
     outcome_hist(ax, [v for e in st["ok"] if (v := episode_force(e, "max")) is not None],
                  [v for e in st["bad"] if (v := episode_force(e, "max")) is not None],
                  "largest |F| in the episode, N")
@@ -606,6 +765,8 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     st = stats(runs)
     sweep = runs[0]["run"].get("sweep") or key
     has_force = any(r["_forces"] for r in runs)
+    real = is_real(runs[0])
+    bad = "failure" if real else "timeout"
     fig = new_sheet()
     w, h = SHEET_IN
     method = runs[0]["run"]["method"]
@@ -613,12 +774,23 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     label = f"{method}" + (f"  {knob}x" if knob not in (None, 1.0) else "")
     oscs = {osc_text(r["environment"]) for r in runs}
     osc = oscs.pop() if len(oscs) == 1 else "mixed"
-    header(fig, f"{label} on {runs[0]['environment'].get('suite', 'libero_90')}",
-           f"sweep {sweep}   ·   {st['n_tasks']} tasks   ·   {st['n_eps']} episodes   ·   "
-           f"stock robosuite plant   ·   OSC {osc or 'not recorded'}   ·   "
-           f"time in simulated seconds")
+    if real:
+        # Rows are runs here (as_column), so the task is the source's, not a row name.
+        task = runs[0]["_source_task"]
+        env, tq = runs[0]["environment"], runs[0]["environment"].get("torque") or {}
+        header(fig, f"{' vs '.join(r['environment']['task'] for r in runs)}: {short_task(task)}",
+               f"real FR3 {env.get('physical_arm')} arm ({env.get('rig_profile')})   ·   "
+               f"{' + '.join(str(len(r['_episodes'])) for r in runs)} episodes   ·   "
+               f"OSC kp {' | '.join(f'{run_osc(r)[0]:g}' for r in runs)}, damping "
+               f"{' | '.join(f'{run_osc(r)[1]:g}' for r in runs)}, step limit "
+               f"{100 * tq.get('delta_pos_max_m', 0):g} cm   ·   time in wall-clock seconds")
+    else:
+        header(fig, f"{label} on {runs[0]['environment'].get('suite', 'libero_90')}",
+               f"sweep {sweep}   ·   {st['n_tasks']} tasks   ·   {st['n_eps']} episodes   ·   "
+               f"stock robosuite plant   ·   OSC {osc or 'not recorded'}   ·   "
+               f"time in simulated seconds")
     # One key for every panel: they all draw success/timeout and median/mean alike.
-    fig.legend(handles=outcome_key(), loc="upper right", ncol=4, frameon=False,
+    fig.legend(handles=outcome_key(bad), loc="upper right", ncol=4, frameon=False,
                bbox_to_anchor=((w - EDGE) / w, 1 - 0.3 / h), fontsize=FS_TEXT,
                labelcolor=INK2, handlelength=1.3, columnspacing=1.6, handletextpad=0.5)
 
@@ -636,17 +808,21 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
         (f"{st['plans_per_step']:.3f}" if st["plans_per_step"] else "-",
          "inferences / step", "all episodes", INK),
         (f"{st['clock_s'] / 60:.0f} min", "wall clock",
-         f"{st['sim_s'] / 60:.0f} min simulated", INK),
+         f"{st['sim_s'] / 60:.1f} min of episodes" if real
+         else f"{st['sim_s'] / 60:.0f} min simulated", INK),
     ]
     f = st["force"]
     tiles.append((f"{f['mean']:.1f} N", "mean wrist |F|",
                   f"episode p95 {f['p95']:.0f} · max {f['max']:.0f} N", INK)
                  if f else ("-", "mean wrist |F|", "not recorded", MUTED))
+    if real:
+        tiles = real_tiles(runs)
     gap = 0.25
     tw = (w - 2 * EDGE - gap * (len(tiles) - 1)) / len(tiles)
     for i, (val, lab, note, col) in enumerate(tiles):
         x = EDGE + i * (tw + gap)
-        tile(fig, rect(fig, x, x + tw, 1.08, 2.18), val, lab, note, col)
+        tile(fig, rect(fig, x, x + tw, 1.08, 2.18), val, lab, note, col,
+             size=22 if real else 26)
 
     # Top row: the per-task panels side by side, sharing one column of task names.
     # Bottom row: the histograms and the force overlay. Right: parameters and key.
@@ -656,8 +832,9 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     upper, lower = (2.95, 6.75), (7.9, 10.72)
     top = axes_row(fig, x_tasks, split, *upper,
                    [1.0, 1.3, 1.3] if has_force else [1.0, 1.3], 0.3)
+    rows_are = "run" if real else "task"
     outcome_panel(top[0], runs)
-    title(top[0], "Outcome per task", "timeouts counted inside each bar")
+    title(top[0], f"Outcome per {rows_are}", f"{bad}s counted inside each bar")
     duration_panel(top[1], runs)
     title(top[1], "Episode duration", "one dot per episode; mean and median at right")
     if has_force:
@@ -666,20 +843,27 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     for ax in top[1:]:
         ax.tick_params(axis="y", labelleft=False)
 
-    params_panel(box(fig, right, w - EDGE, upper[0] - 0.58,
-                     7.17 if has_force else lower[1]), runs, sweep)
+    params_box = box(fig, right, w - EDGE, upper[0] - 0.58, 7.17 if has_force else lower[1])
+    if real:
+        real_params_panel(params_box, runs)
+    else:
+        params_panel(params_box, runs, sweep)
 
     bottom = axes_row(fig, EDGE + 0.62, split, *lower,
                       [1.0, 1.0, 1.55] if has_force else [1.0], 0.8)
     length_panel(bottom[0], st)
-    title(bottom[0], "Episode length", "timeouts pile up at the step budget")
+    title(bottom[0], "Episode length",
+          "control steps at 20 Hz; colour is the run" if real
+          else "timeouts pile up at the step budget")
     if has_force:
         peak_force_panel(bottom[1], st)
-        title(bottom[1], "Peak wrist force", "each episode's largest |F|")
+        title(bottom[1], "Peak wrist force",
+              "each episode's largest |F|" + ("; colour is the run" if real else ""))
         styles = task_styles(runs)
         force_overlay(bottom[2], runs, styles)
         title(bottom[2], "Every force profile",
-              "|F| each env step; colour is the task, earliest episode lightest")
+              f"|F| each {'control' if real else 'env'} step; colour is the {rows_are}, "
+              "earliest episode lightest")
         ax = box(fig, right, w - EDGE, *lower)
         force_key(ax, runs, styles)
         title(ax, "Key", "p95: episode p95 |F|, averaged; peak: largest")
@@ -689,6 +873,68 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     fig.savefig(path, facecolor=SURFACE)
     plt.close(fig)
     return path
+
+
+def real_tiles(runs: list[dict]) -> list[tuple]:
+    """Real runs are compared, not pooled: each tile reads first run -> second."""
+    sts = [stats([r]) for r in runs]
+    sep = " → " if len(runs) == 2 else " / "
+    names = sep.join(r["environment"]["task"] for r in runs)
+
+    def join(vals, spec, unit=""):
+        return sep.join("-" if v is None else format(v, spec) for v in vals) + unit
+
+    def change(vals):
+        if len(vals) != 2 or None in vals or not vals[0]:
+            return ""
+        return f"{100 * (vals[1] - vals[0]) / vals[0]:+.0f}%"
+
+    med = [r["summary"].get("median_time_to_success_s") for r in runs]
+    steps = [st["mean_steps_ok"] for st in sts]
+    plans = [st["plans_per_step"] for st in sts]
+    p95 = [(st["force"] or {}).get("p95") for st in sts]
+    mean_f = [(st["force"] or {}).get("mean") for st in sts]
+    peak = [(st["force"] or {}).get("peak") for st in sts]
+    n_bad = sum(st["n_eps"] - st["n_ok"] for st in sts)
+    return [
+        (sep.join(f"{st['n_ok']}/{st['n_eps']}" for st in sts), "success", names,
+         BAD if n_bad else OK),
+        (join(med, ".2f", " s"), "median time to success", change(med), INK),
+        (join(steps, ".0f"), "mean steps, success", change(steps), INK),
+        (join(plans, ".3f"), "inferences / step", "all episodes", INK),
+        (join(p95, ".1f", " N"), "wrist |F| p95", f"mean {join(mean_f, '.1f', ' N')}", INK),
+        (join(peak, ".0f", " N"), "peak wrist |F|", "largest single reading", INK),
+    ]
+
+
+def episode_bars(ax, sweeps: dict[str, list[dict]], value, colors, ylabel, spec) -> None:
+    """Episode i of every real run side by side: the same pairing the race videos
+    use. A failed episode is hatched."""
+    keys = list(sweeps)
+    eps = [{e["episode"]: e for e in sweeps[k][0]["_episodes"]} for k in keys]
+    idx = sorted(set().union(*eps))
+    width = 0.8 / len(keys)
+    for j, (k, by_ep) in enumerate(zip(keys, eps)):
+        xs = [i + (j - (len(keys) - 1) / 2) * width for i in idx if i in by_ep]
+        es = [by_ep[i] for i in idx if i in by_ep]
+        ax.bar(xs, [value(e) or 0 for e in es], width=width * 0.92, color=colors[j],
+               zorder=3, label=k,
+               hatch=None, edgecolor=SURFACE, linewidth=0.6)
+        for x, e in zip(xs, es):
+            if not e.get("success"):
+                ax.bar([x], [value(e) or 0], width=width * 0.92, color="none",
+                       edgecolor=BAD, hatch="///", linewidth=1.2, zorder=4)
+    ax.set_xticks(idx)
+    ax.set_xlabel("episode", fontsize=FS_TEXT, color=MUTED)
+    ax.set_ylabel(ylabel, fontsize=FS_TEXT, color=MUTED)
+    style(ax, grid_axis="y")
+    if len(keys) <= 3:
+        legend_above(ax, ncol=len(keys))
+        return
+    # More runs than the title line holds: a two-row key in headroom left free for it.
+    ax.set_ylim(0, ax.get_ylim()[1] * 1.3)
+    ax.legend(frameon=False, fontsize=FS_TEXT, labelcolor=INK2, handlelength=1.1,
+              ncol=-(-len(keys) // 2), loc="upper center", columnspacing=1.4, handletextpad=0.5)
 
 
 def suite_of(run: dict) -> str:
@@ -713,6 +959,8 @@ def column_labels(sweeps: dict[str, list[dict]]) -> list[str]:
     """`sail`, `bspline 2x`, ...: sweep ids are too long to sit six abreast. Two
     sweeps of one method that would read the same are told apart by their OSC
     gains, and by their ids when those match too."""
+    if is_real(next(iter(sweeps.values()))[0]):
+        return list(sweeps)   # real runs carry the operator's own labels
     labels = []
     for runs in sweeps.values():
         method = runs[0]["run"]["method"]
@@ -734,8 +982,10 @@ def osc_kp(runs: list[dict]) -> float:
 def column_colors(sweeps: dict[str, list[dict]]) -> list[tuple]:
     """One hue per method, so a method reads the same in every panel. A method's
     sweeps are shades of its hue, lightest first: by speed-up, then kp, else sheet
-    order."""
-    methods = [runs[0]["run"]["method"] for runs in sweeps.values()]
+    order. A real run's column is named by its label, so its hue comes from the
+    method it ran."""
+    methods = [runs[0]["run"].get("source_method", runs[0]["run"]["method"])
+               for runs in sweeps.values()]
     speeds = [(runs[0].get("parameters") or {}).get("speed_up_times")
               for runs in sweeps.values()]
     kps = [osc_kp(runs) for runs in sweeps.values()]
@@ -841,14 +1091,21 @@ def comparison_sheet(sweeps: dict[str, list[dict]], out: Path,
     fig = new_sheet()
     w, h = SHEET_IN
     shapes = [f"{sts[k]['n_tasks']}x{len(sts[k]['runs'][0]['_episodes'])}" for k in keys]
-    tail = "   ·   stock plant   ·   time in simulated seconds"
+    tail = ("   ·   real FR3   ·   time in wall-clock seconds" if is_real(sts[keys[0]]["runs"][0])
+            else "   ·   stock plant   ·   time in simulated seconds")
     sub = "  ·  ".join(f"{k} ({s})" for k, s in zip(keys, shapes))
     # Too many ids for one line: the column names say which is which.
     if text_width(fig, [sub + tail], FS_SHEET_SUB) > w - 2 * EDGE:
         prefix = os.path.commonprefix(keys)
         sub = (f"{len(keys)} sweeps{f' {prefix}*' if prefix else ''}, tasks x episodes "
                + (f"{shapes[0]} each" if len(set(shapes)) == 1 else ", ".join(shapes)))
-    header(fig, "Sweep comparison", sub + tail)
+    real_one_task = (is_real(sts[keys[0]]["runs"][0])
+                     and len({r["environment"]["task"] for k in keys for r in sts[k]["runs"]}) == 1)
+    if real_one_task:
+        header(fig, f"Real comparison: {short_task(sts[keys[0]]['runs'][0]['environment']['task'])}",
+               "  ·  ".join(f"{k} ({len(sts[k]['episodes'])} episodes)" for k in keys) + tail)
+    else:
+        header(fig, "Sweep comparison", sub + tail)
 
     # Top row: the pooled numbers, one colour per method throughout. Bottom row:
     # per task, two grids sharing one column of task names, then the force bars.
@@ -867,14 +1124,35 @@ def comparison_sheet(sweeps: dict[str, list[dict]], out: Path,
 
     tasks = [r["environment"]["task"] for r in sts[keys[0]]["runs"]]
     x_tasks = EDGE + min(text_width(fig, [task_label(t) for t in tasks], FS_TASK), 5.0) + 0.15
+    if real_one_task:
+        x_tasks = EDGE + 0.65
     lower = axes_row(fig, x_tasks, w - EDGE, 5.85 + spare, 10.7 - spare,
-                     [1, 1, 1.2] if has_force else [1], [0.3, 1.0])
+                     [1, 1, 1.2] if has_force else [1],
+                     [1.0, 1.0] if real_one_task else [0.3, 1.0])
 
     # Per-task success, one row per task, one column per sweep. A grid of numbers
     # rather than eight grouped bars: at five sweeps the bars are unreadable.
     def success_cell(r):
         rate = r["summary"].get("success_rate") or 0
         return rate, f"{100 * rate:.0f}"
+
+    if real_one_task:
+        # One task: a per-task grid is one cell. Show the episodes instead.
+        episode_bars(lower[0], sweeps, lambda e: e.get("wall_time_s"), colors,
+                     "episode duration, s", ".2f")
+        failed = any(not e.get("success") for k in keys for e in sts[k]["episodes"])
+        title(lower[0], "Duration per episode",
+              "paired by episode index" + ("; failures hatched" if failed else ""))
+        if has_force:
+            episode_bars(lower[1], sweeps, lambda e: episode_force(e, "p95"), colors,
+                         "episode p95 |F|, N", ".1f")
+            title(lower[1], "Wrist force p95 per episode", "higher presses harder")
+            force_bars(lower[2], sts, keys, names, colors)
+            title(lower[2], "Wrist force", "per-episode stats, averaged")
+        path = out / f"{name}.png"
+        fig.savefig(path, facecolor=SURFACE)
+        plt.close(fig)
+        return path
 
     task_grid(lower[0], sts, keys, names, success_cell, OK, light_text_above=0.72)
     title(lower[0], "Success rate per task, %", "darker is better")
@@ -902,11 +1180,43 @@ def comparison_sheet(sweeps: dict[str, list[dict]], out: Path,
     return path
 
 
+def real_report(dirs: list[Path], labels: list[str] | None, out: Path) -> int:
+    """Up to two runs: `summary.png` with a row per run. More: one `<label>.png`
+    per run, as the sim report draws one sheet per sweep -- six runs' headline
+    numbers do not fit one row of tiles. Two or more also get `comparison.png`."""
+    runs = load_real_runs(dirs, labels)
+    tasks = {r["environment"]["task"] for r in runs.values()}
+    if len(tasks) > 1:
+        print(f"note: the runs record different tasks: {sorted(tasks)}", file=sys.stderr)
+    rows = []
+    for label, r in runs.items():
+        row = as_column(r, label, label)
+        row["_source_task"] = r["environment"]["task"]
+        rows.append(row)
+    if len(rows) <= 2:
+        print(sweep_sheet("summary", rows, out))
+    else:
+        for label, row in zip(runs, rows):
+            print(sweep_sheet(label.replace(" ", "_").replace("+", "plus"), [row], out))
+    for label, r in runs.items():
+        st = stats([r])
+        print(f"  {label:<18} {st['n_ok']}/{st['n_eps']} success, median "
+              f"{r['summary'].get('median_time_to_success_s') or float('nan'):.2f} s")
+    if len(runs) > 1:
+        cols = {label: [as_column(r, label, r["environment"]["task"])] for label, r in runs.items()}
+        print(comparison_sheet(cols, out))
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sweep", nargs="+", required=True,
+    p.add_argument("--sweep", nargs="+", default=None,
                    help="one or more sweep ids, or 'latest'")
+    p.add_argument("--runs", nargs="+", type=Path, default=None,
+                   help="real-arm run directories instead of a sweep, one column each")
+    p.add_argument("--labels", nargs="+", default=None,
+                   help="--runs only: column names, default base / base + residual")
     p.add_argument("--root", default=None, help=f"default {DEFAULT_ROOT}")
     p.add_argument("--out-dir", type=Path, default=None,
                    help="default <root>/reports")
@@ -914,9 +1224,13 @@ def main() -> int:
                    help="skip the cross-sweep sheet")
     args = p.parse_args()
 
+    if bool(args.sweep) == bool(args.runs):
+        p.error("pass --sweep or --runs")
     root = Path(args.root or DEFAULT_ROOT).expanduser()
     out = (args.out_dir or root / "reports").expanduser()
     out.mkdir(parents=True, exist_ok=True)
+    if args.runs:
+        return real_report([d.expanduser() for d in args.runs], args.labels, out)
 
     found: dict[str, list[dict]] = {}
     for name in args.sweep:

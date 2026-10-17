@@ -13,6 +13,8 @@ target - anchor (m, base frame), rotation the rotvec of R_target R_anchor^-1 (ra
 gripper/kp/kd unchanged. That is chunk_to_relative before its /pos_scale_m and
 /rot_scale_rad.
 
+It trains on the shared diffusion recipe, as lerobot_train_recipe.py does.
+
   python scripts/training/lerobot_train_chunkrel.py <lerobot-train flags>
   python scripts/training/lerobot_train_chunkrel.py --describe <repo_id>
 """
@@ -25,6 +27,7 @@ import torch
 from scipy.spatial.transform import Rotation
 
 import lerobot.scripts.lerobot_train as lerobot_train
+import lerobot_train_recipe
 from lerobot.datasets.factory import make_dataset
 from lerobot.utils.constants import ACTION, OBS_STATE
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos
@@ -137,5 +140,7 @@ if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--describe":
         describe(sys.argv[2])
         sys.exit(0)
+    sys.argv = lerobot_train_recipe.with_recipe_args(sys.argv)
+    lerobot_train_recipe.install()
     lerobot_train.make_dataset = make_chunkrel_dataset
     lerobot_train.main()

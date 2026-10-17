@@ -80,6 +80,23 @@ Each trainer runs upstream's own training in its own venv, with a config
 generated from the file (camera names, image size, dataset path, output
 directory). Nothing is edited inside the submodules.
 
+Both trainers, and our LeRobot base policy, train on one recipe:
+[diffusion_recipe.py](diffusion_recipe.py), which holds B-Spline's own
+values. That covers the UNet (256/512/1024 channels, step embedding 128), one
+ResNet-18 per camera with a 203 px crop of 224, 10 DDIM inference steps,
+AdamW (betas 0.95/0.999, weight decay 1e-6, no gradient clipping), 1e-4 with a
+500-step warmup and cosine decay stepped per gradient step, EMA
+`1 - (1 + n)^-0.75` capped at 0.9999 (the EMA weights are what inference
+loads), batch 64 and seed 42. Only what each policy reads and predicts
+differs: its observation keys, its action layout and horizon (SAIL 32 rows),
+SAIL's future-action conditioning, and each upstream's input normalization.
+SAIL needs [sail_bridge/recipe_patch.py](sail_bridge/recipe_patch.py) for
+this, because upstream hardcodes the step embedding, the EMA form, the optimizer
+betas and a per-epoch schedule. Our policy needs
+[lerobot_train_recipe.py](../scripts/training/lerobot_train_recipe.py), because
+lerobot-train has no EMA. `--steps` gives all three the same number of gradient
+steps, B-Spline's to within one epoch.
+
 ```bash
 python -m baselines.sail_bridge.train    ~/franka_data/baseline_prep/pickup-bowl/sail.hdf5
 python -m baselines.bspline_bridge.train ~/franka_data/baseline_prep/pickup-bowl/bspline.hdf5
@@ -114,8 +131,8 @@ reads the epoch out of `checkpoints/latest.ckpt`, trains the epochs left and
 keeps the learning-rate schedule sized to the original count (upstream's own
 `training.resume` would train a whole `num_epochs` more on a mis-sized schedule);
 for SAIL it names a `model_epoch_N.pth` and continues at epoch N+1 into a new
-timestamped directory beside it (weights and EMA; robomimic saves no optimizer
-state). `--dry-run` on either prints the generated config and the exact command without
+timestamped directory beside it (weights, EMA, and the learning-rate schedule at
+the step it stopped; robomimic saves no optimizer state). `--dry-run` on either prints the generated config and the exact command without
 running anything. Both log to wandb with `--wandb` (`--wandb-project`,
 `--wandb-name`); SAIL's robomimic also needs an entity, taken from
 `--wandb-entity`, `$WANDB_ENTITY` or the `wandb login` default.

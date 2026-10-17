@@ -176,8 +176,7 @@ mkdir -p /gpfs/scrubbed/$USER/franka_smoke/franka_data/baseline_prep/libero_10
 cp -r /gpfs/scrubbed/$USER/franka_home/franka_data/baseline_prep/libero_10/task_3 \
     /gpfs/scrubbed/$USER/franka_smoke/franka_data/baseline_prep/libero_10/
 CLUSTER_HOME=/gpfs/scrubbed/$USER/franka_smoke SBATCH_TIMELIMIT=00:10:00 \
-    bash /gpfs/scrubbed/$USER/tillicum/submit_libero_train.sh libero_10 --tasks 3 --steps 1000 --apply \
-    -- --extra --checkpoint-every 1
+    bash /gpfs/scrubbed/$USER/tillicum/submit_libero_train.sh libero_10 --tasks 3 --steps 1000 --apply
 ```
 
 It passes when both `slurm_logs/libero_10_*.out` end in `trained 1`, and the
@@ -185,8 +184,8 @@ last `it/s` in `train_logs/task_3.sail.log` is ~18. Three things keep it short:
 
 - task_3's `sail.hdf5` was labelled on the workstation, so SAIL skips its AWE
   pass, which takes ~27 min on Tillicum for an unlabelled task.
-- `--checkpoint-every 1` keeps B-Spline at 1000 steps. At its default of 100
-  epochs it rounds a budget up to the next checkpoint, which is ~16k steps here.
+- B-Spline stops within one epoch of 1000 steps; it saves after its last epoch
+  whatever `checkpoint_every` is.
 - The normal queue runs both units at once; the debug queue ran them one after
   the other.
 
@@ -252,6 +251,174 @@ Measured on Tillicum, one H200 per unit:
 | `training did not produce a checkpoint (exit 0, failed=False)` | SAIL's budget ended between checkpoints, which an image from before the last-epoch save could not handle; pull the image again |
 | `getpwuid(): uid not found` | the image run under docker `--user` with no passwd entry; apptainer adds one |
 
+### A real recording: all three methods on the shared recipe
+
+SAIL and B-Spline train a hardware recording through the same sweep scripts, under
+the suite name `real`. Its converted directory must be named `task_<dataset>`,
+because `submit_libero_train.sh` puts `task_` in front of every `--tasks` entry.
+Our diffusion base policy (what `run_residual.py --base-policy` takes) has its own
+pair, [submit_diffusion_train.sh](tillicum/submit_diffusion_train.sh) and
+[train_diffusion.slurm](tillicum/train_diffusion.slurm). That job runs
+`scripts/training/lerobot_train_recipe.py` inside the stock LeRobot image
+(`atsai06/lerobot-act-train:v0.5.1`, the same lerobot as here). All three train on
+`baselines/diffusion_recipe.py` ([README, Train](README.md#2-train)): batch 64,
+AdamW, a cosine schedule, B-Spline's EMA, and a 203 px crop of 224 that is random
+in training and centered at inference.
+
+**Quickstart for HuskyMango/10-6-bowl-plate**, the unfiltered recording at
+`~/franka_data/10-6-bowl-plate` (30 demos, 6,300 frames).
+
+1. On the workstation. Convert it, and label SAIL's precise steps from gripper
+   events (25% of steps, as for filter-10-6-bowl-plate's 26%) rather than with
+   SAIL's AWE pass, which marked 92% precise on that recording. Labels already
+   present make SAIL skip AWE entirely. The recipe lives in `baselines/`, which
+   the image copies, so rebuild it after any change there:
+
+```bash
+cd ~/franka_ws
+python scripts/prepare_baseline_datasets.py --source-repo-id HuskyMango/10-6-bowl-plate --skip sysid \
+    --out-dir ~/franka_data/baseline_prep/real/task_10-6-bowl-plate
+python -m baselines.sail_bridge.gripper_labels ~/franka_data/baseline_prep/real/task_10-6-bowl-plate/sail.hdf5
+TAG=$(git describe --always --dirty)
+docker build -f baselines/tillicum/Dockerfile -t atsai06/franka-baselines:$TAG .
+docker tag atsai06/franka-baselines:$TAG atsai06/franka-baselines:latest
+docker push atsai06/franka-baselines:$TAG && docker push atsai06/franka-baselines:latest
+bash baselines/tillicum/sync.sh code                                        # these scripts + our wrapper's source
+bash baselines/tillicum/sync.sh real 10-6-bowl-plate                        # sail.hdf5, bspline.hdf5, B-Spline's caches (3.8 GB)
+bash baselines/tillicum/sync.sh lerobot HuskyMango/10-6-bowl-plate   # the recording, for our policy
+```
+
+   The three `sync.sh` lines are what `bash baselines/tillicum/send_datasets.sh
+   <user> ~/franka_data/baseline_prep/real/task_10-6-bowl-plate` runs in one go,
+   and `fetch_policies.sh <user> <repo_id>` is step 6's fetch. The whole loop, up
+   to the real evaluation and its report, is [TRAIN_AND_EVAL.md](../TRAIN_AND_EVAL.md).
+
+2. On Tillicum, on a compute node, pull the images:
+
+```bash
+ssh atsai06@tillicum.hyak.uw.edu
+salloc --qos=debug --gpus=1 --cpus-per-task=8 --mem=64G --time=00:30:00
+export APPTAINER_CACHEDIR=/gpfs/scrubbed/$USER/apptainer_cache APPTAINER_TMPDIR=/gpfs/scrubbed/$USER/tmp
+mkdir -p /gpfs/scrubbed/$USER/containers $APPTAINER_CACHEDIR $APPTAINER_TMPDIR
+apptainer pull --force /gpfs/scrubbed/$USER/containers/franka-baselines.sif docker://atsai06/franka-baselines:latest
+[ -f /gpfs/scrubbed/$USER/containers/lerobot-train.sif ] || \
+    apptainer pull /gpfs/scrubbed/$USER/containers/lerobot-train.sif docker://atsai06/lerobot-act-train:v0.5.1
+exit
+```
+
+3. On the login node, a smoke run of 1000 steps each into a throwaway home. It
+   checks both images, the mounts and the recipe before 200k steps are spent:
+
+```bash
+T=/gpfs/scrubbed/$USER/tillicum
+S=/gpfs/scrubbed/$USER/franka_smoke
+rm -rf $S && mkdir -p $S/franka_data/baseline_prep/real $S/.cache/huggingface/lerobot/HuskyMango
+cp -rp /gpfs/scrubbed/$USER/franka_home/franka_data/baseline_prep/real/task_10-6-bowl-plate $S/franka_data/baseline_prep/real/
+cp -rp /gpfs/scrubbed/$USER/franka_home/.cache/huggingface/lerobot/HuskyMango/10-6-bowl-plate $S/.cache/huggingface/lerobot/HuskyMango/
+CLUSTER_HOME=$S SBATCH_TIMELIMIT=00:30:00 bash $T/submit_libero_train.sh real --tasks 10-6-bowl-plate --steps 1000 --apply
+CLUSTER_HOME=$S SBATCH_TIMELIMIT=00:30:00 bash $T/submit_diffusion_train.sh HuskyMango/10-6-bowl-plate \
+    --steps 1000 --name smoke --apply -- --wandb.enable=false
+CLUSTER_HOME=$S bash $T/progress.sh real
+CLUSTER_HOME=$S bash $T/progress.sh diffusion HuskyMango/10-6-bowl-plate
+```
+
+   It passes when both `progress.sh` calls say `finished` for all three, and these
+   print the recipe's numbers:
+
+```bash
+grep -h "=== training\|steps per epoch" $S/franka_data/baseline_prep/real/train_logs/task_10-6-bowl-plate.*.log
+#   === training (epochs 0..1 x 500 steps = 1000 steps, batch 64) ===
+#   --steps 1000: 6270 samples / batch 64 = 98 steps per epoch -> 11 epochs (1078 steps)
+grep -h "crop (203, 203)\|End of training" $S/franka_data/policies/HuskyMango/10-6-bowl-plate/diffusion/slurm_logs/*.out
+```
+
+4. The real run. Leave off `--apply` for a dry run first:
+
+```bash
+T=/gpfs/scrubbed/$USER/tillicum
+export WANDB_API_KEY=<your wandb key>
+bash $T/submit_libero_train.sh real --tasks 10-6-bowl-plate --steps 200000 --apply \
+    -- --extra --wandb --wandb-project franka-recipe
+bash $T/submit_diffusion_train.sh HuskyMango/10-6-bowl-plate --steps 200000 --name recipe-200k --apply \
+    -- --wandb.project=franka-recipe
+```
+
+   `--policy-repo-id HuskyMango/<new repo>` (with `HF_TOKEN` exported) also pushes
+   our policy to the Hub.
+
+5. Monitor, on the login node:
+
+```bash
+T=/gpfs/scrubbed/$USER/tillicum
+squeue -u $USER                                                   # R running, PD waiting for a GPU
+bash $T/progress.sh real                                          # SAIL and B-Spline: epoch, rate, time left
+bash $T/progress.sh diffusion HuskyMango/10-6-bowl-plate   # ours: step, rate, time left
+sacct -X -S now-2days --format=JobID%18,JobName%34,State,Elapsed,NodeList
+tail -f /gpfs/scrubbed/$USER/franka_home/franka_data/baseline_prep/real/train_logs/task_10-6-bowl-plate.sail.log
+tail -f $(ls -t /gpfs/scrubbed/$USER/franka_home/franka_data/policies/HuskyMango/10-6-bowl-plate/diffusion/slurm_logs/*.out | head -1)
+```
+
+   A job that hits the 12 h limit resumes when you submit the same command again.
+
+6. Back on the workstation:
+
+```bash
+bash baselines/tillicum/sync.sh fetch HuskyMango/10-6-bowl-plate
+```
+
+   The policies are then, under `~/franka_data/policies/HuskyMango/10-6-bowl-plate/`:
+   `diffusion/recipe-200k/checkpoints/last/pretrained_model` (EMA weights, for
+   `run_residual.py --base-policy`), `sail/<timestamp>/models/model_epoch_399.pth`,
+   and `bspline/<timestamp>/checkpoints/latest.ckpt`.
+
+How it works:
+
+- **Our policy's code reaches the cluster without a checkout.** Only
+  `baselines/tillicum/` is synced there, and the LeRobot image has none of this
+  repo. `sync.sh code` ([code](tillicum/sync.sh#L31)) also builds the tree the
+  wrapper imports and sends it to `/gpfs/scrubbed/$USER/franka_src`: our files,
+  B-Spline's `ema_model.py`, `franka_config` with `config/`, and the EE-state
+  step (`ee_state.py` and the three modules it imports) under an empty package
+  `__init__.py`. The real one loads the robot driver, which needs `rpyc`, and the
+  image has none. The job binds that read-only into the image
+  and runs the wrapper with the interpreter `lerobot-train` itself uses
+  ([train_diffusion.slurm](tillicum/train_diffusion.slurm#L87)), and the submit
+  script refuses to queue without it
+  ([`FRANKA_SRC`](tillicum/submit_diffusion_train.sh#L52)).
+- **The crop.** The wrapper sets `crop_shape` from the recording's image size
+  ([`make_policy_with_ema`](../scripts/training/lerobot_train_recipe.py#L110)).
+  LeRobot crops randomly while the policy is in training mode and centrally
+  otherwise, as SAIL's `CropRandomizer` and B-Spline's `eval_fixed_crop` do. On a
+  smoke checkpoint the same image gave different features twice in training mode
+  and identical features at inference.
+- **The old recipe's policies are not reused.** A task whose `.trained.json`
+  predates the recipe, such as filter-10-6-bowl-plate, is trained again
+  ([`trained_on_other_recipe`](libero_bridge/train.py#L90)). The new runs land
+  beside the old ones, and `sail-config.json` is overwritten with the new run's
+  config.
+- **Monitoring our policy.** `progress.sh diffusion` ([diffusion](tillicum/progress.sh#L17))
+  reads the newest Slurm log of each run name and converts tqdm's bar, which
+  restarts from 0 on a resume, back to absolute steps.
+
+Cost. The last real run, 9-16-libero-90-9 at 200k steps on an H200 under the old
+recipes, took 9.5 h for B-Spline and 12.3 h for SAIL, AWE pass included. The
+recipe does not change B-Spline's cost. SAIL now trains at batch 64 instead of
+128 and skips AWE once labels are present, so expect it to take roughly half as
+long. Our
+policy is a quarter of its old size; on the workstation's 5090 one update takes
+0.076 s, about 4.5 h for 200k steps, not yet measured on Tillicum.
+
+| symptom | cause |
+|---|---|
+| `no .../franka_src/...; on the workstation: bash baselines/tillicum/sync.sh code` | the code sync has not run |
+| our log: `dirname: missing operand` | `SIF` is not the LeRobot image, so there is no `lerobot-train` in it |
+| our log: `ModuleNotFoundError: No module named 'baselines'` | `franka_src` is incomplete; `sync.sh code` again |
+| our log: `ModuleNotFoundError: No module named 'lerobot_robot_bimanual_franka'` | `franka_src` predates the EE-state step (2026-10-14); `sync.sh code` again |
+| SAIL log: `This config is key-locked - cannot add key` | the baselines image predates the recipe; rebuild, push and pull it |
+| SAIL log: `was not trained on the shared diffusion recipe` | a resume from an old-recipe checkpoint; `-- --retrain` |
+| sweep log: `trained on an earlier diffusion recipe; training it again` | expected for this task the first time |
+| our log: `wandb: ERROR api_key not configured` | `WANDB_API_KEY` was not exported before submitting |
+
 ## Evaluating on Tillicum
 
 The sweeps run on Tillicum too, so they stop holding the workstation's GPU.
@@ -276,11 +443,21 @@ docker push atsai06/franka-sim-eval:$TAG && docker push atsai06/franka-sim-eval:
 rsync -a --mkpath baselines/tillicum/ atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/atsai06/tillicum/
 ```
 
-On a Tillicum compute node, with the same `APPTAINER_*` exports as the training pull:
+Pull it on a Tillicum compute node, not the login node. The pull unpacks 52 GB
+and squashes it into one `.sif`, so ask for 2 hours rather than the training
+pull's 30 minutes:
 
 ```bash
+ssh atsai06@tillicum.hyak.uw.edu
+salloc --qos=normal --gpus=1 --cpus-per-task=8 --mem=64G --time=02:00:00
+# the prompt changes to the node's name (g0xx) once the allocation starts
+export APPTAINER_CACHEDIR=/gpfs/scrubbed/$USER/apptainer_cache APPTAINER_TMPDIR=/gpfs/scrubbed/$USER/tmp
+mkdir -p /gpfs/scrubbed/$USER/containers $APPTAINER_CACHEDIR $APPTAINER_TMPDIR
 apptainer pull --force /gpfs/scrubbed/$USER/containers/franka-sim-eval.sif docker://atsai06/franka-sim-eval:latest
+exit                                     # gives the node back; you are on the login node again
 ```
+
+Everything after this runs on the login node.
 
 The prep HDF5s and the policies must already be on the cluster. They are if the
 suite trained there. pi05 downloads its checkpoint (12 GB) into the cluster's
@@ -335,7 +512,7 @@ How it works:
   unchanged `evaluate --tasks <i> --backend <b> --sweep-id <id>`. The same home
   mount as training puts the cluster data at `/home/franka`, so the run
   directories and manifests copy back unchanged. Each unit gets its own policy
-  port, and the job skips node g011, whose EGL stalls at startup
+  port, and the job skips nodes g001, g003, g005 and g011, whose EGL stalls at startup
   ([EGL_STARTUP_STALL.md](../multi-fast/docs/EGL_STARTUP_STALL.md)).
 - **Resubmitting is safe.** `evaluate --resume` skips a unit whose sweep already
   has a completed run. An unfinished run is moved to `outputs_unfinished/` and
@@ -353,6 +530,7 @@ How it works:
 | `not trained, left out: task_3:sail` | no `.trained.json` for that policy on the cluster |
 | `port N is already held by pid P` | another job on the node holds that port; resubmit and the unit runs again |
 | `ModuleNotFoundError` in a unit log | the image predates the code change; rebuild, push and pull |
+| `OSError: [Errno 28] No space left on device` from `numba/core/caching.py` | an older `eval_libero.slurm` that ran the image with `--writable-tmpfs`, a 64 MB overlay. rsync `baselines/tillicum/` up again |
 
 ## Speed
 
@@ -446,7 +624,7 @@ Every sheet is 16:9 (3200 x 1800 px). Panels that list tasks sit side by side an
 share one column of task names. On the comparison sheet each method has one
 colour in every bar chart (pi05 green, SAIL amber, B-Spline indigo), and several
 sweeps of one method are shades of that colour, lightest first in speed-up order
-([`column_colors`](../scripts/rollout_report.py#L720)):
+([`column_colors`](../scripts/rollout_report.py#L959)):
 
 ```bash
 python scripts/rollout_report.py --sweep sail_100_20 bsp_1x bsp_2x bsp_4x bsp_8x
@@ -490,10 +668,10 @@ Where it shows up:
 - The sweep sheet: a seventh tile (mean \|F\|, with p95 and max), each episode's
   p95 as a dot per task (the third per-task panel in the top row), a histogram of
   each episode's peak, and every episode's \|F\| profile overlaid on a log axis
-  ([`force_overlay`](../scripts/rollout_report.py#L438)). Colour is the task, in
+  ([`force_overlay`](../scripts/rollout_report.py#L509)). Colour is the task, in
   sheet order. Shade is the episode, first lightest. Tasks 9-16 reuse the eight
   colours dashed, and any beyond that are grey
-  ([`task_styles`](../scripts/rollout_report.py#L425)). A key beside the overlay
+  ([`task_styles`](../scripts/rollout_report.py#L480)). A key beside the overlay
   lists each task's p95 and peak.
 - The comparison sheet: a per-task p95 grid and mean/p95/max bars per sweep.
 - `collect_rollout_report.sh`'s `index.json`: `ee_force_n` per run.
@@ -1008,7 +1186,7 @@ Per-task spreads at 20 episodes are about ±10 points. Read the pooled rows.
 | the env reproduces the recording | replay recorded actions, diff observations | 3e-14 on `robot0_eef_pos` |
 | the plant is stock | read `dof_armature` etc. off the live env | values above |
 | SAIL's gains follow its targets at its speed better than stock | `check_libero_sim_rollout.py --targets reached`, 12 tasks x 10 demos ([SAIL's controller](#sails-controller)) | 56.7% at SAIL's gains, 22.5% stock |
-| both hardware loops still work | `check_baseline_rollout_offline.py` | 86/86 |
+| both hardware loops still work | `check_baseline_rollout_offline.py` | 118/118 |
 | the line numbers here | `python scripts/check_doc_refs.py` | 0 problems |
 
 Run `check_libero_sim_rollout.py` after touching `sim_env.py` or `Stepper`. Needs
@@ -1069,7 +1247,10 @@ mujoco, no policy, no GPU, ~1 min for five demos.
 | [libero_bridge/evaluate.py](libero_bridge/evaluate.py) | per-task rollout sweep, sweep ids |
 | [tillicum/submit_libero_train.sh](tillicum/submit_libero_train.sh) | the training sweep on Tillicum, one Slurm array element per task and backend |
 | [tillicum/train_libero.slurm](tillicum/train_libero.slurm) | one array element: stage, mount, train |
-| [tillicum/progress.sh](tillicum/progress.sh) | each unit's epoch, rate and time left, read from its training log |
+| [tillicum/progress.sh](tillicum/progress.sh) | each unit's epoch, rate and time left, read from its training log; `diffusion <repo>` for our policy |
+| [tillicum/submit_diffusion_train.sh](tillicum/submit_diffusion_train.sh) | the diffusion base policy of a real recording on Tillicum, one GPU |
+| [tillicum/train_diffusion.slurm](tillicum/train_diffusion.slurm) | that job: `lerobot_train_recipe.py` from `franka_src`, or its resume from `checkpoints/last` |
+| [tillicum/sync.sh](tillicum/sync.sh) | the workstation's side: code, converted tasks and recordings up, policies and logs back |
 | [tillicum/Dockerfile](tillicum/Dockerfile) | the image, both envs pinned to this machine's |
 | [tillicum/submit_libero_eval.sh](tillicum/submit_libero_eval.sh) | the evaluation sweep on Tillicum, several units per GPU |
 | [tillicum/eval_libero.slurm](tillicum/eval_libero.slurm) | one array element: its units, each its own `evaluate` |

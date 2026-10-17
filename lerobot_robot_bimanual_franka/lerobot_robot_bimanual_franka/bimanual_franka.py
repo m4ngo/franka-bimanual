@@ -495,10 +495,7 @@ class BimanualFranka(Robot):
         if not targets_q:
             return True
 
-        for arm in targets_q:
-            self.grippers[arm].move(
-                gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM, blocking=False
-            )
+        grip_mm = {arm: gripper_norm * self.grippers[arm].GRIPPER_TRUE_MAX_MM for arm in targets_q}
 
         names = list(targets_q)
         rate_hz = float(home_fps if home_fps is not None else fc.home_fps())
@@ -510,6 +507,11 @@ class BimanualFranka(Robot):
         while True:
             tick_start = time.perf_counter()
             kin = self.robot_manager.current_kinematic_state_batch(names)
+            # Every tick, not once: a driver may drop a command that comes too soon
+            # after the last (FrankaGripper's 0.5 s debounce), and a reset that
+            # began right after a grasp would then leave the fingers shut.
+            for arm in names:
+                self.grippers[arm].move(grip_mm[arm], blocking=False)
 
             # Not screened: a home configuration is a saved, known-safe q, and the
             # worktable floor only bounds an EE goal pose.
@@ -522,7 +524,8 @@ class BimanualFranka(Robot):
             # Exit at rest, not merely in position: returning mid-motion leaves the
             # arm coasting into whatever the caller does next.
             max_qdot = max(float(np.max(np.abs(kin[arm][1]))) for arm in names)
-            converged = max_err < tol_rad and max_qdot < homing.SETTLE_QDOT
+            converged = (max_err < tol_rad and max_qdot < homing.SETTLE_QDOT
+                         and all(self._gripper_at(arm, grip_mm[arm]) for arm in names))
 
             if converged or tick_start >= deadline:
                 self._cached_kin_state = None
@@ -543,6 +546,12 @@ class BimanualFranka(Robot):
             elapsed = time.perf_counter() - tick_start
             if elapsed < period_s:
                 time.sleep(period_s - elapsed)
+
+    def _gripper_at(self, arm: str, target_mm: float) -> bool:
+        """The gripper reads within 10% of its range of `target_mm`; unknown counts as there."""
+        gripper = self.grippers[arm]
+        pos = gripper.position
+        return pos is None or abs(pos - target_mm) <= 0.1 * gripper.GRIPPER_TRUE_MAX_MM
 
     # ------------------------------------------------------- tuning and readouts
 

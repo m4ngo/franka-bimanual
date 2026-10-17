@@ -17,6 +17,11 @@ checkpoints/latest.ckpt is what bspline_rollout.sh --ckpt takes.
 --resume <run_dir> continues one of those from its checkpoints/latest.ckpt
 (model, EMA, optimizer, epoch and step) to the epoch count it was started with;
 bspline_train.py explains what upstream's own resume gets wrong.
+
+The workspace config is the reference for the recipe all three diffusion
+policies share (baselines/diffusion_recipe.py); every value of it is still
+passed as an override, so the recipe module, not the config's defaults, is what
+a run is trained on.
 """
 
 from __future__ import annotations
@@ -37,6 +42,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 import h5py  # noqa: E402
 
+from baselines import diffusion_recipe as recipe  # noqa: E402
 from baselines.interpreters import python_for  # noqa: E402
 from baselines.train_common import crop_size, policies_dir, stream  # noqa: E402
 
@@ -152,12 +158,11 @@ dataset:
 
 def epochs_for_steps(steps: int, python: list[str], hydra_dir: Path, overrides: list[str],
                      env: dict) -> int:
-    """Epochs that give at least `steps` gradient steps, with the last one saved.
+    """Epochs that give at least `steps` gradient steps: ceil(steps / steps_per_epoch).
 
     The epoch length is measured by building the dataset (dataset_len.py) under
-    the same config the trainer gets; the result is rounded up to k*checkpoint_every+1
-    because the workspace only writes latest.ckpt on epochs divisible by
-    checkpoint_every, so any other count ends on an unsaved epoch.
+    the same config the trainer gets. The last epoch is saved whatever the count,
+    because bspline_train.py writes latest.ckpt once more when training ends.
     """
     probe_overrides = [o for o in overrides if not o.startswith("hydra.run.dir=")]
     probe_overrides.append(f"hydra.run.dir={hydra_dir / 'probe'}")
@@ -172,14 +177,9 @@ def epochs_for_steps(steps: int, python: list[str], hydra_dir: Path, overrides: 
     probe = json.loads(line)
     samples, batch = int(probe["samples"]), int(probe["batch_size"])
     per_epoch = -(-samples // batch)                      # DataLoader keeps the last partial batch
-    checkpoint_every = int(probe["checkpoint_every"])
-    needed = -(-int(steps) // per_epoch)
-    k = -(-(needed - 1) // checkpoint_every)
-    epochs = k * checkpoint_every + 1
-    logger.info("--steps %d: %d samples / batch %d = %d steps per epoch -> %d epochs "
-                "(%d steps; %d needed, rounded to k*%d+1 so the last epoch checkpoints)",
-                steps, samples, batch, per_epoch, epochs, epochs * per_epoch, needed,
-                checkpoint_every)
+    epochs = -(-int(steps) // per_epoch)
+    logger.info("--steps %d: %d samples / batch %d = %d steps per epoch -> %d epochs (%d steps)",
+                steps, samples, batch, per_epoch, epochs, epochs * per_epoch)
     return epochs
 
 
@@ -197,12 +197,13 @@ def main() -> int:
     p.add_argument("--steps", type=int, default=None,
                    help="gradient-step budget in place of --epochs, the count lerobot-train's "
                         "--steps means: the dataset is built once to measure an epoch "
-                        "(dataset_len.py) and epochs = ceil(steps / steps_per_epoch), rounded "
-                        "up to the next k*checkpoint_every + 1 so the last epoch is saved")
+                        "(dataset_len.py) and epochs = ceil(steps / steps_per_epoch)")
     p.add_argument("--checkpoint-every", type=int, default=None, help="default: the config's (100)")
-    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=recipe.BATCH_SIZE,
+                   help="default: the shared diffusion recipe's")
     p.add_argument("--num-workers", type=int, default=None, help="dataloader workers")
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--seed", type=int, default=recipe.SEED,
+                   help="default: the shared diffusion recipe's")
     p.add_argument("--device", default=None, help="e.g. cuda:0")
     p.add_argument("--wandb", action="store_true", help="log online; default offline")
     p.add_argument("--wandb-project", default=None, help="default: the workspace config's")
@@ -255,6 +256,7 @@ def main() -> int:
                              "training.resume=false"]),
         f"logging.mode={'online' if args.wandb else 'offline'}",
         f"policy.crop_shape=[{crop_size(h, w)[0]},{crop_size(h, w)[1]}]",
+        *recipe.bspline_overrides(),
     ]
     for flag, key in (("epochs", "training.num_epochs"),
                       ("checkpoint_every", "training.checkpoint_every"),
@@ -292,8 +294,11 @@ def main() -> int:
            "--config-name", WORKSPACE_CONFIG, *overrides]
     logger.info("%s %s", "resuming" if resume else "run directory", run_dir)
     t0 = time.time()
-    rc, _ = stream(cmd, PROJECT, env=env)
+    rc, finished = stream(cmd, PROJECT, env=env, watch="nothing to do")
     ckpt = run_dir / "checkpoints" / "latest.ckpt"
+    if rc == 0 and finished and ckpt.is_file():
+        logger.info("%s already holds the whole run:\n  %s", run_dir, ckpt)
+        return 0
     if rc != 0 or not ckpt.is_file() or ckpt.stat().st_mtime < t0:
         logger.error("training failed (exit %d); no new %s", rc, ckpt)
         return rc or 1

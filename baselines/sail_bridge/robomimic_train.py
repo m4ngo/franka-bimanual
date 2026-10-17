@@ -15,7 +15,9 @@ This launcher patches the obs fetch to `observation_horizon` frames and hands
 off to the stock training entry point. The batch the model receives is
 identical -- --check proves it by comparing samples from a patched and an
 unpatched dataset -- so a checkpoint trained this way is exactly what upstream
-would have produced. The submodule itself is untouched.
+would have produced. It also installs recipe_patch, which makes robomimic honour
+the shared diffusion recipe's config keys (baselines/diffusion_recipe.py). The
+submodule itself is untouched.
 """
 
 from __future__ import annotations
@@ -24,11 +26,18 @@ import argparse
 import json
 import os
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 import numpy as np
 
-import robomimic.utils.dataset as dataset_module
-from robomimic.config import config_factory
+from baselines.sail_bridge import recipe_patch
+
+recipe_patch.install()
+
+import robomimic.utils.dataset as dataset_module  # noqa: E402
+from robomimic.config import config_factory  # noqa: E402
 
 _ORIGINAL = dataset_module.SequenceDataset.get_obs_sequence_from_demo
 
@@ -139,6 +148,12 @@ def main() -> int:
     config = load_config(args.config)
     if args.check:
         return check(config)
+    if config.train.get("load_ckpt", None) is not None:
+        # The resumed model is rebuilt from the checkpoint's config; its LR
+        # schedule must be this run's, positioned at this run's start step.
+        lr = config.algo.optim_params.policy.learning_rate
+        recipe_patch.install(lr_override={k: lr[k] for k in (
+            "step_scheduler", "num_warmup_steps", "num_training_steps", "start_step")})
     configure_wandb(config)
     if not args.no_obs_window:
         window = _obs_window(config.algo.horizon.observation_horizon, config.train.frame_stack)

@@ -56,8 +56,9 @@ logger = logging.getLogger(__name__)
 # (translation m, rotation rad, gripper) per mode: the delta ones are the values
 # this script has always used; ee_pose's are "unchanged" up to float noise.
 DEFAULT_THRESHOLDS = {
-    "delta": (0.0005, 0.01, 0.01),
-    "ee_pose": (1e-4, 1e-3, 1e-3),
+    "delta": (0.001, 0.001, 0.001),
+    "ee_pose": (1e-4, 1e-4, 1e-4),
+    "gripper": (0.01)
 }
 
 

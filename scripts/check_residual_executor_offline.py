@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""run_residual.py's executor for an EE_POS base, off the arm.
+"""run_residual.py's executor for an EE_POS or CHUNK_RELATIVE base, off the arm.
 
     python scripts/check_residual_executor_offline.py
 
@@ -9,6 +9,7 @@ residual summed there with FAST's rule, each target dispatched as the one-step
 delta from the measured pose. This pins that equivalence -- the helpers are
 compared against reach_residual's own functions, not a restatement of them --
 and runs _run_episode against a fake arm that lands on every goal it is sent.
+A CHUNK_RELATIVE base planning the same targets must drive the arm identically.
 Exits PASS/FAIL.
 """
 
@@ -134,6 +135,15 @@ def check_classifier() -> None:
                       str(d / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"))
             got = Stub(d).action_space()
             check(f"{name} stats -> {want}", got == want, got)
+        d = Path(tmp) / "chunkrel"
+        d.mkdir()
+        # Relative offsets reach past the 0.15 m reach bound; only the width tells them apart.
+        save_file({"action.min": np.array([-0.09, -0.12, -0.15] + [0] * 6, dtype=np.float32),
+                   "action.max": np.array([0.15, 0.14, 0.17] + [0] * 6, dtype=np.float32)},
+                  str(d / "policy_postprocessor_step_0_unnormalizer_processor.safetensors"))
+        stub = Stub(d)
+        check("9-wide stats -> CHUNK_RELATIVE", stub.action_space() == "CHUNK_RELATIVE"
+              and stub.chunk_relative, stub.action_space())
 
 
 class FakeArm:
@@ -200,6 +210,16 @@ class LineBase(ObservationHistory):
         return np.array([[*(start + [0.02 * (k + 1), 0, 0]), *q, 0.5, 0.0, 0.0] for k in range(10)])
 
 
+class RelLineBase(LineBase):
+    """LineBase's targets, emitted relative to the pose it observed last (m, rotvec)."""
+
+    chunk_relative = True
+
+    def infer(self, window: list[dict]) -> np.ndarray:
+        self.windows.append([o["_step"] for o in window])
+        return np.array([[0.02 * (k + 1), 0, 0, 0, 0, 0, 0.5, 0.0, 0.0] for k in range(10)])
+
+
 class ConstResidual:
     """0.4 units (2 cm) of +y on every step, gains kp 0.3 / kd -0.1."""
     center_on_eef = False
@@ -244,8 +264,8 @@ def check_loop() -> None:
     run_residual.tty = types.SimpleNamespace(setraw=lambda f: None)
     run_residual._stdin_key_pressed = lambda: False
 
-    def run(residual, wrench=None, drift=(0.0, 0.0, 0.0), infer_lead=1):
-        arm, base, recorder = FakeArm(drift), LineBase(), EpisodeRecorder()
+    def run(residual, wrench=None, drift=(0.0, 0.0, 0.0), infer_lead=1, base_cls=LineBase):
+        arm, base, recorder = FakeArm(drift), base_cls(), EpisodeRecorder()
         run_residual._run_episode(arm, base, residual, dataset=None, episode_time_s=0.5, fps=50.0,
                                   recorder=recorder, infer_lead=infer_lead, wrench=wrench)
         return arm, base, recorder
@@ -290,6 +310,26 @@ def check_loop() -> None:
     check("residual gains drive the arm",
           all(abs(a["kp"] - 0.3) < 1e-6 and abs(a["kd"] + 0.1) < 1e-6 for a in arm.sent))
     check("x still advances 2 cm per step", np.allclose([a["r_x"] for a in arm.sent], 0.02, atol=1e-9))
+
+    print("_run_episode with a CHUNK_RELATIVE base")
+    for label, kwargs in (("base only", {}), ("drifting arm", {"drift": (0.0, 0.0, 0.004)}),
+                          ("prefetched", {"infer_lead": 2})):
+        a_abs, _, r_abs = run(None, **kwargs)
+        a_rel, _, r_rel = run(None, base_cls=RelLineBase, **kwargs)
+        check(f"{label}: the same goals as the EE_POS base planning the same targets",
+              len(a_abs.sent) == len(a_rel.sent)
+              and all(np.allclose(list(x.values()), list(y.values()), atol=1e-6)
+                      for x, y in zip(a_abs.sent, a_rel.sent))
+              and np.allclose(r_abs.base_desired_pos, r_rel.base_desired_pos, atol=1e-6))
+    res_abs, res_rel = ConstResidual(), ConstResidual()
+    a_abs, _, _ = run(res_abs)
+    a_rel, _, _ = run(res_rel, base_cls=RelLineBase)
+    check("the residual sees the same normalised chunk from either base",
+          len(res_abs.chunks) == len(res_rel.chunks)
+          and all(np.allclose(x, y, atol=1e-5) for x, y in zip(res_abs.chunks, res_rel.chunks)))
+    check("with the residual: the same goals",
+          all(np.allclose(list(x.values()), list(y.values()), atol=1e-6)
+              for x, y in zip(a_abs.sent, a_rel.sent)))
 
 
 def main() -> int:

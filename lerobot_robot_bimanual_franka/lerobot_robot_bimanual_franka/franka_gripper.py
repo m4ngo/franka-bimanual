@@ -85,6 +85,8 @@ def close_gripper(controller):
         self._lock = threading.Lock()
         self._pending: tuple | None = None
         self._running = False
+        # The last command the hand completed without raising, so a repeat is skipped.
+        self._last_done = None
 
     @staticmethod
     def _clamp_mm(position_mm: float) -> float:
@@ -118,6 +120,7 @@ def close_gripper(controller):
         result = bool(self._rpc_home(self._controller))
         self._position_mm = self.GRIPPER_TRUE_MAX_MM
         self._position_ts = None
+        self._last_done = self._rpc_open
         return result
 
     def home_async(self) -> threading.Thread:
@@ -142,6 +145,12 @@ def close_gripper(controller):
         `_is_open`, which move() has already committed: the open issued while a
         grasp was still running vanished, `_is_open` said open, and the elif
         never fired again -- the gripper stayed shut until reconnect.
+
+        Coalescing can also leave a grasp queued behind the grasp it repeats (a
+        flickering target: close, open, close inside one motion). `_drain` skips
+        it: the hand stalls ~5.3 s on a grasp issued while it already holds an
+        object, raises "Command failed!", and the open queued behind it waits out
+        the stall.
         """
         with self._lock:
             self._pending = (rpc, args, from_mm)
@@ -158,21 +167,25 @@ def close_gripper(controller):
                     self._running = False
                     return
             rpc, args, from_mm = job
+            if rpc is self._last_done:
+                continue
             if from_mm is not None:
                 # Stamp when the motion starts, not when it was queued: position
                 # is dead-reckoned from here and a queued command can sit behind
                 # a blocking grasp for most of a second.
                 self._position_mm = from_mm
                 self._position_ts = time.monotonic()
-            self._call(rpc, *args)
+            self._last_done = rpc if self._call(rpc, *args) else None
 
     @staticmethod
-    def _call(rpc, *args) -> None:
+    def _call(rpc, *args) -> bool:
         try:
             rpc(*args)
+            return True
         except Exception as e:
-            # A failed grasp (nothing between the fingers) raises; not fatal.
+            # Not fatal; the hand's state is unknown, so the next command is not skipped.
             logger.warning("gripper command failed: %s", e)
+            return False
 
     def ack_fast_stop(self) -> bool:
         return True

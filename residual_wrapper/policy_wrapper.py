@@ -7,6 +7,9 @@ Base policy output  : (T, 10) [x, y, z, qx, qy, qz, qw, gripper, kp, kd]
                       physical units the lerobot postprocessor returns: metres and a
                       unit quaternion (xyzw). run_residual.py refuses a checkpoint
                       trained on per-step deltas (BasePolicy.action_space).
+                    or (T, 9) [dx, dy, dz, rx, ry, rz, gripper, kp, kd] (CHUNK_RELATIVE,
+                      scripts/training/lerobot_train_chunkrel.py): each pose relative to
+                      the pose at the latest observation, in metres and a rotvec (rad).
 
 Residual input chunk: (_RESIDUAL_HORIZON, 9) [dx, dy, dz, rx, ry, rz, gripper, kp, kd]
                       Each base pose relative to the pose the base planned from:
@@ -19,6 +22,7 @@ Residual output     : (_CHUNK_EXEC, 9) [damping, stiffness, dx, dy, dz, rx, ry, 
 """
 
 import contextlib
+import functools
 import logging
 import sys
 from collections import deque
@@ -39,6 +43,9 @@ logger = logging.getLogger(__name__)
 
 _MULTI_FAST_PATH = Path(__file__).resolve().parent.parent / "multi-fast"
 _AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "none": None}
+# Where each sim proprio key sits in the 17-wide vector the runners build.
+_PROPRIO_LAYOUT = {"robot0_eef_pos": (0, 3), "robot0_eef_quat": (3, 7), "robot0_gripper_qpos": (7, 9),
+                   "controller_state": (9, 11), "robot0_eef_vel": (11, 17)}
 
 
 def _format_obs_for_policy(obs: dict) -> dict:
@@ -60,6 +67,7 @@ class ObservationHistory:
     """
 
     n_obs_steps = 1
+    chunk_relative = False  # infer() emits poses relative to the latest observation's
     _frames: "deque | tuple" = ()
 
     def reset(self) -> None:
@@ -109,12 +117,21 @@ class BasePolicy(ObservationHistory):
         super().reset()
         self.policy.reset()
 
+    @functools.cached_property
+    def chunk_relative(self) -> bool:
+        return self.action_space() == "CHUNK_RELATIVE"
+
     def action_space(self) -> str:
         """`EE_POS`, `EE_DELTA` or `CHUNK_RELATIVE`, read off the checkpoint's own unnormaliser
         stats: lerobot_source.action_space's rule, applied to the extremes of the action range."""
         from safetensors.numpy import load_file
 
-        files = sorted(self.path.glob("policy_postprocessor_step_*_unnormalizer_processor.safetensors"))
+        pattern = "policy_postprocessor_step_*_unnormalizer_processor.safetensors"
+        root = self.path
+        if not root.is_dir():  # a Hub repo id: the files sit in the HF cache
+            from huggingface_hub import snapshot_download
+            root = Path(snapshot_download(str(self.path), allow_patterns=[pattern]))
+        files = sorted(root.glob(pattern))
         if not files:
             raise FileNotFoundError(f"no unnormaliser stats under {self.path}; cannot tell whether "
                                     "this checkpoint emits poses or deltas")
@@ -228,6 +245,14 @@ class ResidualPolicy:
         if data_kwargs.get("use_rgb", False):
             raise ValueError("Checkpoint trained with use_rgb=True; the real cloud is xyz-only. "
                              "Retrain without RGB or use a different checkpoint.")
+        keys = data_kwargs.get("proprio_keys") or list(_PROPRIO_LAYOUT)
+        missing = [k for k in keys if k not in _PROPRIO_LAYOUT]
+        if missing:
+            raise ValueError(f"checkpoint proprio_keys {missing} have no real-robot source")
+        self._proprio_idx = np.concatenate([np.arange(*_PROPRIO_LAYOUT[k]) for k in keys])
+        if len(self._proprio_idx) != model_kwargs["proprio_dim"]:
+            raise ValueError(f"proprio_keys {keys} give {len(self._proprio_idx)} values, model expects "
+                             f"{model_kwargs['proprio_dim']} (history_len={data_kwargs.get('history_len')})")
         self.center_on_eef = bool(data_kwargs.get("center_on_eef", False))
         self.num_points = int(data_kwargs.get("num_points", 2048))
         crop = data_kwargs.get("crop_half_extent")
@@ -263,13 +288,16 @@ class ResidualPolicy:
         obs: "action_chunk" (horizon, 9) from env_wrapper.residual_input, whose kp/kd
         columns the model does not take; "proprio" (17,) [pose(7), finger qpos(2),
         damping, kp, twist(6)]; "point_cloud" (N, 3) in the proprio pose's frame.
+        The model sees only its checkpoint's proprio_keys; the cloud is centred on
+        proprio[:3] either way.
         """
         proprio = obs["proprio"]
         pcd = self._prepare_pcd(obs["point_cloud"].astype(np.float32), proprio[:3])
         self.last_network_pcd = pcd
         base_action = obs["action_chunk"][:, :7].flatten().astype(np.float32)
         with torch.inference_mode():
-            out = self.model(self._tensor(pcd), self._tensor(proprio), self._tensor(base_action))
+            out = self.model(self._tensor(pcd), self._tensor(proprio[self._proprio_idx]),
+                             self._tensor(base_action))
 
         result = out.squeeze(0).cpu().numpy().reshape(_CHUNK_EXEC, 9)
         result[:, :2] = np.clip(result[:, :2], -self.gains_mag, self.gains_mag)

@@ -168,9 +168,35 @@ every sample in a batch is conditioned or not together.
 Set `train.data` to the processed HDF5. Output goes to
 `train.output_dir` (`../bc_trained_models/SAIL/` by default, i.e. outside the
 repo). `sail_bridge/train.py` generates the config from this template, changing
-only what our data changes: the camera keys under `observation.modalities.obs.rgb`,
+what our data changes: the camera keys under `observation.modalities.obs.rgb`,
 `CropRandomizer`'s crop (76/84 of the file's image size, which reproduces the
-template's 76 at 84), the dataset and output paths, and the epoch budget.
+template's 76 at 84), the dataset and output paths, and the epoch budget. It
+also changes what the recipe the three diffusion policies share changes
+(`baselines/diffusion_recipe.py`, B-Spline's values):
+
+| Setting | Template | Recipe |
+|---|---|---|
+| UNet step embedding | 256 (hardcoded; `algo.unet.*` is ignored) | 128 |
+| Optimizer | Adam, betas 0.9/0.999, no weight decay | AdamW, betas 0.95/0.999, weight decay 1e-6 |
+| Learning rate | 1e-4 constant | 1e-4, 500-step warmup, cosine to 0, stepped per gradient step |
+| EMA decay | `(1 + n) / (10 + n)` (diffusers ignores `power` without `use_ema_warmup`) | `1 - (1 + n)^-0.75`, capped at 0.9999 |
+| Batch size, seed | 128, 1 | 64, 42 |
+
+Upstream builds `ConditionalUnet1D(input_dim, global_cond_dim)` and
+`EMAModel(power=...)` with nothing else, and creates its optimizer and
+per-epoch scheduler with no betas, eps or step schedule. So
+`sail_bridge/recipe_patch.py` registers the extra config keys, with upstream's
+behaviour as each default, and makes `_create_networks`, the optimizer and the
+scheduler read them. `robomimic_train.py` and `policy_server.py` install it. An
+older checkpoint loads exactly as before. `ema.update_after_step` is 1 because
+diffusers counts the step before computing the decay and B-Spline after; with
+the 1 the two decay sequences are identical.
+
+The fork trains epochs `0..num_epochs` inclusive (`scripts/train.py:235`), one
+more than robomimic, so `num_epochs` N is `(N + 1) * epoch_every_n_steps`
+gradient steps. `--steps` accounts for it: 200000 at 500 per epoch is
+`num_epochs` 399, and the last checkpoint is `model_epoch_399.pth`. The earlier
+`model_epoch_400.pth` runs trained 200,500 steps.
 
 Two things `train.py` does that a wrapper has to know: it **catches every
 exception and exits 0** (the wrapper watches for "run failed with error"), and
@@ -276,7 +302,22 @@ nothing here builds the simulator, so it is not applied. It adds:
   check and calls `env.getSimTimeInfo()` for its clock, neither of which exists
   outside the patched simulator. **Running SAIL on our arm means writing the
   rollout loop ourselves**; the trained policy and the precision labels transfer,
-  the executor does not.
+  the executor does not. The simulator's loop also assumes inference takes no
+  time and every row is held by a stiff simulated OSC; ported line for line it
+  shook the arm. The paper describes its hardware executor instead (Sec. 4.4
+  "Action scheduling"; App. D.1, a 100 Hz spline-interpolated schedule tracked
+  in pose and velocity; App. J, Table J.5, kp 300 / kv 34.6), and that is what
+  runs on the arm: [ROLLOUT.md](ROLLOUT.md), "How each method runs".
+- **The precision labels mostly say "slow" on `filter-10-6-bowl-plate`.** AWE
+  needed 68 waypoints per demonstration there against 19 on `9-16-libero-90-9`
+  (more rotation and vertical travel), so DBSCAN's 2.5 cm `eps` clusters 92% of
+  steps as precise, 97% slowed after the rollout's 6-row window: 5x ran the
+  episode 2% faster than 1x. The paper's other labelling, gripper events, is
+  `python -m baselines.sail_bridge.gripper_labels <sail.hdf5>`: precise from 8
+  steps before a gripper command change to 4 after it, and while the fingers
+  move -- 27% labelled, 34% slowed, so 2x/3x/5x take 0.67/0.56/0.47 of the 1x
+  time. It writes the label keys passes 2-3 would, so `train.py` skips both;
+  `--relabel` puts the AWE labels back. Either way the policy is retrained.
 - **Inference wants what the simulator env handed it.** `RolloutPolicy` does
   no observation processing of its own: robomimic's env wrapper delivered images
   already CHW float in [0, 1], and with `train.frame_stack: 2` a

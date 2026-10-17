@@ -57,10 +57,22 @@ Repeat each with `--speed 2` and `--speed 3` for the 1x/2x/3x comparison; what
 `sail_rollout.sh` passes SAIL's own `base_cfg_weight_1.json` guide config, as
 upstream's README evaluates; `--guide-config ""` runs unguided.
 
-Run them with the GPU otherwise idle. SAIL's inference measured 36 ms per
-request on an idle GPU and 140-150 ms while a LIBERO sweep shared it, and at 2x
-and 3x the arm holds its goal for whatever inference takes beyond `inf_delay`
-rows (100 ms and 67 ms).
+**The arm homes to where the demonstrations started.** Without `--home-pose-name`,
+the rollout reads the training recording's first frames and homes to the saved
+pose (`home_poses/*.json`) nearest that start; a home further than
+`baselines.exec.home_tolerance_{m,rad}` (2 cm / 0.1 rad) from it is refused, by
+name, unless `--allow-home-mismatch`. The manifest records the match under
+`environment.home_match`. This exists because it went wrong:
+`filter-10-6-bowl-plate` was recorded from `home_pose_raised_19cm`, the
+2026-10-08 rollouts homed to the default `home_pose` 19 cm lower, and both
+policies started outside their training distribution -- SAIL's first goal was
+15 cm from the arm, B-Spline's 0.9 rad, and the plans after them disagreed with
+each other.
+
+Run them with the GPU otherwise idle. SAIL's inference measured 30 ms per
+request unguided and 53 ms guided (two denoiser passes) on an idle GPU, and
+140-150 ms while a LIBERO sweep shared it. A slow inference costs SAIL a held
+goal only once the current plan has run out (`plan_exhausted_s` in the notes).
 
 None of them takes an output path. Each works out which dataset its policy was
 trained on and files itself under that task automatically -- see **Where a run
@@ -100,8 +112,18 @@ and asks for the whole action sequence (item 11 below). Neither submodule is
 edited.
 
 During an episode: **right arrow** ends it as a success, **left arrow** as a
-failure, a timeout counts as a failure, and Ctrl-C aborts the run. That verdict
-is the measurement — there is no automatic success detector on this rig.
+failure, **up arrow** throws the attempt away and runs the same episode again
+(no episode row, frames, video, force trace or chunks are kept), a timeout counts
+as a failure, and Ctrl-C aborts the run. That verdict is the measurement — there
+is no automatic success detector on this rig.
+
+Between episodes the arm homes while the finished episode is written to the
+dataset, rather than after it, and the gripper is always opened: `home()`
+re-sends the open command every tick and does not report converged until the
+gripper reads open, because the Franka Hand driver drops a command sent within
+0.5 s of the last one (a reset right after a grasp). Also, and `homing.max_qdot_rad_s` /
+`homing.tau_fraction` (`config/control.yaml`) were raised to 0.8 / 0.8 for
+about 1.6x faster homing; back them off if homing starts tripping reflexes.
 
 ## Where a run goes
 
@@ -189,10 +211,10 @@ it to the state bundle, and the workstation unpacks it
 ([`_unpack`](../lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_process.py#L53)) and exposes it per arm as
 [`BimanualFranka.last_ee_wrench`](../lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/bimanual_franka.py#L602).
 
-**When it is sampled.** Once per goal sent, right after `send_action`, whose
-state read is the one that goal was anchored on: the
-`Dispatcher.send` for SAIL and B-Spline
-([rollout_common.py:350](rollout_common.py#L350)), and `_run_episode` for
+**When it is sampled.** Once per goal sent, right after `send_action`, from the
+latest state read: for SAIL and B-Spline that is the observation thread's, which
+their goals are sent on as their anchor, so the value repeats between camera
+frames ([`Dispatcher.send`](rollout_common.py#L458)), and `_run_episode` for
 `run_residual.py` ([run_residual.py:674](../residual_wrapper/run_residual.py#L674))
 and `run_residual_openpi.py`. The reach scripts (`real_reach_rollout.py` and
 `run_residual.py` with a FAST `.zip`) read it in `RealReach.step`
@@ -287,34 +309,92 @@ sweep runner carry an id; one launched by hand gets none unless you pass
 
 ## How each method runs
 
-Both loops are ports of upstream's own rollout code, run against the arm instead
-of upstream's simulator or YAM server:
+B-Spline's loop is a port of upstream's own rollout code. SAIL's repo ships only
+a simulator executor; the arm runs the hardware executor its paper describes.
 
 | | SAIL | B-Spline |
 |---|---|---|
-| upstream code | `run_trained_agent_receding_horizon.py:rollout_diffusion_policy` | `rollout_local_policy.py:rollout_episode` + `policy_local_bspline.py:PolicyLocalBSpline` |
-| port | [sail_bridge/rollout.py](sail_bridge/rollout.py) | [bspline_bridge/rollout.py](bspline_bridge/rollout.py), [spline_plan.py](bspline_bridge/spline_plan.py) |
-| `--speed s` | `fast_control_freq` = s x 20 Hz; precision steps at `slow_fps` (20 Hz, 1x) | `speed_up_times` = s |
-| goals | one per plan row, each held 1/rate (`env.step(a, control_freq)`) | the spline sampled at wall-clock `t`, `control_freq` (200) times a second |
-| OSC | `baselines.sail.osc_kp_scale` (2) x the stock kp, stock damping | stock: kp 150, damping ratio 1, as multi-fast runs |
+| upstream | repo: `run_trained_agent_receding_horizon.py:rollout_diffusion_policy` (simulator); paper arXiv 2506.11948 Sec. 4.4 and App. D.1 (hardware, unreleased) | `rollout_local_policy.py:rollout_episode` + `policy_local_bspline.py:PolicyLocalBSpline` |
+| port | [sail_bridge/rollout.py](sail_bridge/rollout.py), [schedule.py](sail_bridge/schedule.py) | [bspline_bridge/rollout.py](bspline_bridge/rollout.py), [spline_plan.py](bspline_bridge/spline_plan.py) |
+| `--speed s` | fast rows due at s x 20 Hz; precision rows at `slow_fps` (20 Hz, 1x) | `speed_up_times` = s |
+| goals | a spline fitted over the plan, streamed at `goal_hz` (100), each goal led along its velocity by kd/kp | the spline sampled at wall-clock `t`, `control_freq` (200) times a second |
+| OSC | `baselines.sail.osc_kp_scale` (2) x the stock kp = 300, the paper's hardware kp; damping ratio `osc_damping_ratio` 0.5 (the paper's is 1.0) | stock at every speed, each goal led along the plan, standing in for upstream's servo speed-up |
 
-**SAIL.** Each cycle observes, starts inference, executes `inf_delay` (4) rows
-of the previous plan, then `execute_n_actions` (8) rows of the new one from row
-4 -- upstream's indexing exactly. Upstream's simulator stops while the policy
-thinks; here inference runs during those 4 rows, and if it is still running
-after them the arm holds its last goal until it returns (`inference_waits` and
-`inference_wait_s` in the episode notes). The precision window and EAG
-(guidance on the next 4 rows of the current plan, dropped when the arm is more
-than `pos_teb` / `ori_teb` from the first of them) are upstream's.
+**SAIL.** The repo's executor drives a simulator, which pauses while the policy
+thinks: latency is modelled as `inf_delay` rows of the previous plan, and every
+row is a goal robosuite's stiff OSC holds for one control period. Run line for
+line on the arm (this port did until 2026-10-08) that is a staircase of goals
+with a zero velocity target. The arm brakes toward every row and lurches to the
+next, trails the plan by kd/kp (1.4 cm at 1x, 2.8 cm at 2x), and the trailing
+switches EAG off -- 4 of 21 inferences guided on the 2026-10-08 run -- so
+successive plans disagree. That was the shaking and the bouncing. The executor
+now is the paper's ([`ScheduledPlan`](sail_bridge/schedule.py#L50)):
+
+- a plan's row k is due at its observation's time plus the intervals before it,
+  1/fast_hz or 1/slow_hz as the precision window says;
+- the plan in hand keeps running while the next is inferred, and the next takes
+  over when it lands, at the row due then; the old plan's later rows are
+  dropped ([`install`](sail_bridge/rollout.py#L173));
+- the next request goes out `execute_n_actions` (8) rows after a plan took over,
+  by row H - `inf_delay` (12) at the latest, and earlier when the measured
+  inference time would run the plan dry ([`request`](sail_bridge/rollout.py#L156));
+- EAG conditions the next inference on the current plan's rows from the
+  observation's time on, and drops guidance when the arm, at that observation,
+  is more than `pos_teb` / `ori_teb` from where the plan wanted it -- upstream's
+  thresholds and error definitions;
+- a cubic least-squares spline, one knot every `spline_knot_rows` (4) rows, is
+  fitted over the plan and streamed at `goal_hz`. Each goal is led along the
+  spline's velocity by the OSC's own kd/kp (0.058 s at kp 300, damping 0.5), which turns its
+  kp*e_p - kd*v into the paper's kp*e_p + kd*e_v without touching the law. A
+  fit rather than an interpolation because the rows are reached poses, and the
+  demonstrations' reached poses carry the recording's frame-to-frame jitter.
+
+With the trained `filter-10-6-bowl-plate` checkpoint and a training episode
+replayed into it in real time (no arm), 14 of 15 inferences were guided, the
+goal jumped 0.2 cm at the median plan switch and 0.6 cm at the worst (0.9 cm
+and 4.9 deg unguided), and the planned pose stayed within 0.2 cm (median) of the
+demonstration.
 
 **B-Spline.** Every 1/200 s the loop requests a new spline if the current one
 ends within `predict_before_end` (0.1 s), time-aligns a new spline onto the old
 one, and sends the plan sampled at `t = elapsed * speed_up_times *
-origin_time_scale`. Nothing is sent before the first plan exists. Upstream also
-speeds its own servo up with the plan (`set_ik_dt_scale(speed_up_times)`); the
-arm runs the stock OSC instead, so at speed it trails the plan further than it
-trailed the demonstrations, and a replan that starts at the observed pose shows
-up as `time_align_error_max` / `time_align_over_threshold` in the notes.
+origin_time_scale`. Nothing is sent before the first plan exists, and nothing
+bounds how far a goal may lead the arm. Upstream speeds its servo up with the
+plan for B-Spline rollouts (`set_ik_dt_scale(speed_up_times)`), so the arm
+trails a sped-up plan by the distance it trailed it at 1x, and leaves its motor
+stiffness alone. Here the OSC stays stock at every speed -- the controller the
+demonstrations were recorded under -- and each goal is led along the plan by
+(kd/kp)(1 - 1/speed): 82 ms at 2x, 109 ms at 3x
+([`bspline_lead`](rollout_common.py#L401)). That holds the 1x lag on a steady
+plan; unlike upstream's faster servo, the arm still recovers from a jump in the
+plan at the 1x rate. `baselines.bspline.goal_lead` false sends the plan as
+sampled.
+
+One deviation, `baselines.bspline.defer_stitch` (on): upstream enters a new
+plan the moment it lands. When that is before the plan's first knot, its
+alignment has no window to search and the plan starts at that knot, so the
+goal jumps ahead by the gap; YAM's IK servo (orientation gain 1/s) glides over
+it, the OSC does not. Deferred, the old plan runs until that knot is due and
+the stitch is then searched as upstream searches it
+([`_install`](bspline_bridge/spline_plan.py#L353)). Offline on this task at 75 ms
+latency and 1x, the stitch jump's p90 went from 1.3 cm / 1.6 deg to
+0.3 cm / 0.6 deg. `stitches_deferred` in the notes counts them; false is
+upstream exactly.
+
+A second, `baselines.bspline.grasp_hold_s` (0.15 s): upstream never waits for a
+grasp, and at speed the arm carried on while the fingers were still closing.
+When the plan's gripper command crosses `grasp_threshold` (0.5) toward shut, the
+arm holds the pose it is at for `grasp_hold_s` (0.5 s) with the gripper commanded
+shut, whether or not the fingers have finished -- pause, grasp, unpause. The plan's clock stands still meanwhile
+([`HoldClock`](bspline_bridge/spline_plan.py#L72)), so the plan resumes where it
+stopped. The gripper stays commanded shut until the plan opens it: resumed
+mid-transition, the plan's own value (about 0.5) would reopen the fingers to
+half open around what they just grasped. `grasp_holds` and `grasp_hold_s` in
+the notes count and time them; `grasp_hold_s` 0 disables.
+Releasing never pauses: once a grasp has held, another can only trigger after
+the command has opened past `grasp_rearm` (0.9) again, so a release whose
+command dips back under 0.5 -- at a replan, or a spline overshoot -- is not
+taken for a grasp.
 
 Three things are this side's, not upstream's, and each is forced by the arm:
 
@@ -322,14 +402,23 @@ Three things are this side's, not upstream's, and each is forced by the arm:
    read blocks until the next frame and `get_observation` waits for both
    cameras -- 15-20 reads/s measured, 72 ms per read with the CPU loaded -- so
    the control loop never reads the robot itself; it takes the newest snapshot.
-2. **The policy's two frames are two distinct snapshots about one demonstration
-   step (50 ms) apart** (`ObservationPump.window`), the spacing both policies
-   trained on. Upstream picks them by control tick, which at these read rates
-   would often hand the policy the same frame twice.
+2. **The policy's two frames are two distinct snapshots** (`ObservationPump.window`):
+   for B-Spline one demonstration step (50 ms) apart, as upstream's `obs_stride`;
+   for SAIL one fast step apart, as upstream's frame stack is one env step,
+   which past 1x is shorter than a camera period, so it is the previous frame.
+   Upstream picks them by control tick, which at these read rates would often
+   hand the policy the same frame twice.
 3. **The dataset is written after the episode**, from frames buffered at 20 Hz.
    The video encoder holds the Python GIL for about a second when an episode's
    first frame arrives; written live, that froze the goal stream at the start
    of every episode (the 200-500 ms first `send_gap` in every earlier run).
+4. **A goal costs one RPyC call, not two.** `send_action` re-reads the arm to
+   anchor its goal, which an absolute EE_POS goal only uses for diagnostics; the
+   observation thread makes that read instead and goals go out on it. Together
+   with the GIL hand-off cut from CPython's 5 ms to
+   `baselines.exec.gil_switch_interval_s`, this is aimed at the goal rate: the
+   2026-10-08 B-Spline runs managed 76-100 Hz of their 200, with 25-50 ms gaps.
+   Not yet measured on the arm -- the once-a-second `goals ... Hz` line says.
 
 The SAIL server clamps the normalised guidance reference to [-1, 1]: a model
 output clamped to +-1 comes back as 1.0000002 after unnormalising and
@@ -374,13 +463,15 @@ covered by a check in scripts/check_baseline_rollout_offline.py.
    gripper position. The server derives this and refuses to claim a label the
    action width cannot hold.
 6. **`EE_POS` has no delta envelope, and that is faithful to osc.py.** A sped-up
-   plan leads the arm on purpose. `baselines.exec.max_lead_m` therefore **aborts
-   the episode**; it is not a clamp, because clamping would be a third limit
-   layer and would eat exactly the lead the method needs. If it fires, lower
-   `--speed` — do not raise the bound to get past it.
-7. **The policy's observations are one demonstration step apart, not one control
-   tick.** Upstream's `obs_stride` (control rate / data rate) does this by tick
-   count; here `ObservationPump.window` picks distinct snapshots ~50 ms apart.
+   plan leads the arm on purpose, and neither upstream bounds the lead, so
+   nothing here does either: `max_lead_m` / `max_lead_rad` in the episode row
+   are recorded, never acted on. They used to abort the episode at 0.15 m /
+   0.5 rad, which cut B-Spline off on its first goal whenever the arm started
+   away from the demonstrations (see the home check under **Running it**).
+7. **The policy's two observations are distinct snapshots, spaced as upstream
+   spaces them.** B-Spline's `obs_stride` (control rate / data rate) puts them one
+   demonstration step apart; SAIL's frame stack puts them one env step apart.
+   Here `ObservationPump.window` picks the distinct snapshot nearest that spacing.
 8. **Camera frames are resized to what the checkpoint declares.** SAIL's HDF5
    carries full-resolution frames while its config expects 84x84, and nothing
    else in the stack would notice the mismatch. Both servers report their shapes
@@ -433,21 +524,27 @@ what makes the lead monitor and the tracking-error check testable at all. The
 servers are real ZMQ peers answering with synthetic chunks and splines, so the
 client, the pickling and the handshake are the real ones.
 
-It covers the ported helpers against upstream's own source; SAIL's exact
-upstream row order with instant and with slow inference, each goal held for its
-own step's rate, the precision strip, guidance being the previous plan's next
-4 rows, and both methods' gain channels; B-Spline's goal rate, its distinct
-observation window and no goal before the first plan; the spline's wall-clock
-timing at three `(speed_up, origin_time_scale)` combinations; the
-abort-not-clamp behaviour; and the recorded dataset's schema, rate and the
-chunk indexing the episode pages draw from.
+It covers the ported helpers against upstream's own source; SAIL's schedule
+(rows due at their own step's interval, the fitted spline and its base-frame
+velocity, take-over at the row due on arrival, a plan per `execute_n_actions`
+rows, a slow inference that does not run the plan dry, guidance being the
+previous plan's rows from the observation on) and that a velocity-led goal is
+the PD law with a velocity term; the home check against a recording's first
+frames; both methods' gain channels, B-Spline's sped up with the plan; B-Spline's
+goal rate, its distinct observation window, no goal before the first plan, a
+stalled arm that does not end the episode, and the deferred stitch; the spline's
+wall-clock timing at three `(speed_up, origin_time_scale)` combinations; goals
+sent on the observation's state read; and the recorded dataset's schema, rate
+and the chunk indexing the episode pages draw from.
 
 Its `[servers]` section also drives the real servers' request handling under a
 stubbed robomimic: frame stacking, image processing, key filtering,
 `return_action_sequence`, and the checkpoint-config reads.
 
 What it cannot tell you: whether the arm tracks, and whether a real checkpoint's
-actions are sane — `check_policy_server.py` covers the second.
+actions are sane — `check_policy_server.py` covers the second. Run it after
+touching `rollout_common.py`, either bridge's `rollout.py`, `schedule.py` or
+`spline_plan.py`.
 
 ## First run on hardware
 
@@ -456,8 +553,8 @@ Operator on the e-stop. Preflight per `RIGHT_ARM_RIG_HANDOFF.md` (want
 then walk up:
 
 ```bash
-SAIL=~/franka_data/policies/HuskyMango/9-16-libero-90-9/sail/20261001185958/models/model_epoch_400.pth
-BSP=~/franka_data/policies/HuskyMango/9-16-libero-90-9/bspline/20261001_185323/checkpoints/latest.ckpt
+SAIL=~/franka_data/policies/HuskyMango/filter-10-6-bowl-plate/sail/20261008012044/models/model_epoch_400.pth
+BSP=~/franka_data/policies/HuskyMango/filter-10-6-bowl-plate/bspline/20261008_011303/checkpoints/latest.ckpt
 
 # 1. handshake and homing only, no motion
 ./scripts/sail_rollout.sh --start-server --ckpt "$SAIL" --rig=single_arm_right --dry-run --num-episodes 1
@@ -469,9 +566,16 @@ BSP=~/franka_data/policies/HuskyMango/9-16-libero-90-9/bspline/20261001_185323/c
 # 3. then --speed 2, then --speed 3
 ```
 
-Watch the once-a-second `goals ... Hz  send-gap avg/max` line: SAIL's rate
-should sit between 20 Hz and 20 x `--speed`, and B-Spline's at 200 Hz with a
-send-gap max of a few ms. A send-gap max near 50+ ms on B-Spline is the arm
-sitting on one goal. On the NUC, watch `control_command_success_rate` and
-reflexes in `~/pylibfranka_server.log`. Nothing here changes `torque:`, so no
+Check the `homing to <pose>` line before the first episode: it should name the
+pose the demonstrations started from (`home_pose_raised_19cm` for
+`filter-10-6-bowl-plate`), within a few millimetres.
+
+Watch the once-a-second `goals ... Hz  send-gap avg/max` line: SAIL's should sit
+at `goal_hz` (100 Hz) and B-Spline's at 200 Hz, both with a send-gap max of a few
+ms. A send-gap max near 50+ ms is the arm sitting on one goal. In the episode
+notes, SAIL's `switch_jump_cm_*` and `tracking_error_cm_*` say how well plans
+agree and how closely the arm follows them, and `guided_inferences` against
+`inferences` how often EAG was on. B-Spline runs the stock kp at every speed.
+On the NUC, watch `control_command_success_rate` and reflexes in
+`~/pylibfranka_server.log`. Nothing here changes `torque:`, so no
 `deploy_nuc_server.sh` is needed.

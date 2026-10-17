@@ -89,7 +89,17 @@ command in `.venv-bspline` with a task config generated from the file
 `cache_suffix` keyed by the file's size and mtime) placed in the run directory
 and reached through hydra's `--config-dir`, plus `hydra.run.dir` pointed at
 `~/franka_data/policies/<dataset>/bspline/<timestamp>/`. Nothing is written into
-the submodule.
+the submodule. This workspace config is the reference for the recipe SAIL and
+our LeRobot policy share (`baselines/diffusion_recipe.py`). The bridge still
+passes every recipe value as an override, so the recipe module is what a run is
+trained on, and it sets `policy.num_inference_steps=10` so the saved config
+matches what the policy server runs (upstream's config says 16).
+
+The workspace saves `latest.ckpt` only on epochs divisible by
+`checkpoint_every`. `bspline_bridge/bspline_train.py` saves it once more when
+training ends, so `--steps` is `ceil(steps / steps_per_epoch)` epochs, at most
+one epoch over. Before this fix it rounded up to `k * checkpoint_every + 1`
+epochs, which was 201,684 steps for a 200,000 budget on filter-10-6-bowl-plate.
 
 `train.py` is a 41-line shim: it puts the project directory and
 `diffusion_policy/` on `sys.path`, registers the `eval:` OmegaConf resolver, and

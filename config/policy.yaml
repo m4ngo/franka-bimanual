@@ -42,27 +42,42 @@ baselines:
     slow_fps: 20
     # Real rollouts' dataset frame rate. null -> control_fps(), the demonstrations' rate.
     record_fps: null
-    # Goal-vs-measured divergence that ABORTS the episode. Not a clamp: EE_POS
-    # has no delta envelope, and a sped-up plan leads the arm on purpose.
-    max_lead_m: 0.15
-    max_lead_rad: 0.5
+    # How far the home may put the EE from where the training demonstrations
+    # started before a real rollout refuses it (rollout_common.resolve_home).
+    home_tolerance_m: 0.02
+    home_tolerance_rad: 0.1
+    # The rollout process's GIL hand-off. At CPython's 5 ms default a busy camera
+    # or inference thread can hold the goal loop past a whole 200 Hz period.
+    gil_switch_interval_s: 5.0e-4
 
   sail:
     # Upstream's kwargs literal (run_trained_agent_receding_horizon.py).
+    # Rows of a plan executed, from the row it took over at, before the next
+    # observation and inference.
     execute_n_actions: 8
-    # Rows of the PREVIOUS plan executed while the new one is inferred; the new
-    # plan is entered at this row. On the arm, inference runs during these rows
-    # and the arm holds its goal if it is still running after them.
+    # Upstream's simulated inference delay, in rows. On the arm the delay is real
+    # and measured; this is the latest row a request may wait for (H - inf_delay).
     inf_delay: 4
     slowdown_window_size: 6
     # EAG tracking-error bounds: guidance is dropped for an inference when the
-    # arm is further than this from the next goal of the current plan.
+    # arm, at the observation, is further than this from where the plan wanted it.
     pos_teb: 0.02             # m, inf-norm
     ori_teb: 0.05             # rad
-    # OSC stiffness on the arm, as a multiple of torque.osc.default_kp, at the
-    # default damping ratio. Upstream evaluates under a stiffer controller than it
-    # records with (osc_pose_SAIL.json); here twice the stock kp.
+    # Rate the splined plan is streamed to the arm at; the paper's hardware
+    # executor interpolates and schedules each chunk at 100 Hz (App. D.1).
+    goal_hz: 100
+    # The spline fitted over each plan (sail_bridge/schedule.py): one interior knot
+    # every this many rows. The rows are reached poses, which carry the
+    # recording's frame-to-frame jitter; 1 would interpolate it into the velocity
+    # target. The paper fits a spline and does not say how smooth.
+    spline_knot_rows: 4
+    # OSC stiffness on the arm, as a multiple of torque.osc.default_kp: kp 300,
+    # the paper's hardware stiffness (App. J, Table J.5), twice the stiffness the
+    # demonstrations were collected under.
     osc_kp_scale: 2.0
+    # Damping ratio on the arm. The paper's hardware kv 34.6 is ratio 1.0; 0.5 is
+    # the sim rollout's (sim_osc below), chosen here as well.
+    osc_damping_ratio: 0.5
     # The sim rollout's OSC gains (baselines/libero_bridge/rollout.py), merged
     # over robosuite's osc_pose.json; null keeps the stock value. LIBERO's 5 cm
     # per-step limit is never changed. SAIL is also evaluated at kp
@@ -89,9 +104,31 @@ baselines:
     # its length. 0.2 is upstream's code default; 0.5 is the paper appendix's
     # half segment. Shared with the sim rollout.
     time_align_larger_t: 0.5
-    # Sim rollout only: lead each sampled goal by (kd/kp)*(1 - 1/speed_up_times) s.
-    # The real rollout sends the plan as sampled.
+    # Lead each sampled goal by (kd/kp)*(1 - 1/speed_up_times) s along the plan, so
+    # a sped-up plan is trailed by the distance it was at 1x -- what upstream's
+    # set_ik_dt_scale(speed_up_times) servo speed-up does -- at stock stiffness:
+    # 82 ms at 2x, 109 ms at 3x. Both the real and the sim rollout; false sends
+    # the plan as sampled.
     goal_lead: true
+    # Real rollout. Upstream enters a new plan the moment it lands; when that is
+    # before the plan's first knot, its alignment has no window to search and the
+    # plan starts at that knot, so the goal jumps ahead by the gap. YAM's IK servo
+    # (orientation gain 1/s) glides over it; the OSC does not. true keeps the old
+    # plan until that knot is due, then aligns as upstream does. Offline on
+    # filter-10-6-bowl-plate at 75 ms latency, 1x: stitch jump p90 1.3 cm / 1.6 deg
+    # -> 0.3 cm / 0.6 deg. false is upstream exactly.
+    defer_stitch: true
+    # Real rollout, not upstream's: when the plan's gripper command closes (crosses
+    # grasp_threshold downward; the demonstrations command 1 open, 0 shut) the arm
+    # holds the pose it is at for grasp_hold_s with the gripper commanded shut,
+    # whether or not the fingers have finished, the plan's clock stopped; then
+    # resumes the plan where it left it. 0 disables.
+    grasp_hold_s: 0.4
+    grasp_threshold: 0.5
+    # Releasing never pauses: after a grasp, a new one can only trigger once the
+    # command has opened past this again, so a release that dips back under
+    # grasp_threshold (a replan, spline overshoot) is not taken for a grasp.
+    grasp_rearm: 0.9
     gripper_slowdown_enabled: false
     gripper_slowdown_threshold: 0.08
     gripper_slowdown_steps: 7

@@ -245,7 +245,8 @@ def build_action(chunk_step: np.ndarray, kp: float, kd: float) -> dict:
 # in that normalised space, the sum is turned back into absolute targets, and
 # each target is executed as the one-step delta from the pose measured at that
 # step. Position and rotation are both target-typed here (a pose recording
-# carries both), unlike reach's position-only curve.
+# carries both), unlike reach's position-only curve. A CHUNK_RELATIVE base
+# already emits the chunk relative to that pose; normalise_relative only rescales it.
 
 def chunk_to_relative(chunk: np.ndarray, anchor_pos: np.ndarray,
                       anchor_quat_xyzw: np.ndarray) -> np.ndarray:
@@ -262,6 +263,15 @@ def chunk_to_relative(chunk: np.ndarray, anchor_pos: np.ndarray,
     out[:, 0:3] = (chunk[:, 0:3] - np.asarray(anchor_pos, dtype=np.float64)) / _POS_SCALE
     out[:, 3:6] = (Rotation.from_quat(chunk[:, 3:7]) * anchor_rot.inv()).as_rotvec() / _ROT_SCALE
     out[:, 6:9] = chunk[:, 7:10]
+    return out
+
+
+def normalise_relative(chunk: np.ndarray) -> np.ndarray:
+    """(T, 9) chunk-relative [dpos m, rotvec rad, grip, kp, kd] from a CHUNK_RELATIVE base ->
+    chunk_to_relative's normalised units."""
+    out = np.array(chunk, dtype=np.float32, copy=True)
+    out[:, 0:3] /= _POS_SCALE
+    out[:, 3:6] /= _ROT_SCALE
     return out
 
 

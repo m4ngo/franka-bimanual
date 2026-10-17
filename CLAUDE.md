@@ -236,7 +236,7 @@ editable_mode=compat` (`franka_config` first) plus the non-PyPI deps (FRAMOS-bui
   — `home()`'s per-joint speed budget and the ramp that respects it. The budget is
   a closed-form result about the joint-impedance gains
   (`tau_fraction · tau_limit / (kd · (1 + lead_margin))`), and it is **read**, not
-  re-derived, by the test that asserts it. Joint 5 binds at 0.30 rad/s.
+  re-derived, by the test that asserts it. Joint 5 binds at 0.48 rad/s.
 - [torque_config.py](lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/torque_config.py)
   — resolves `control.yaml`'s `torque:` block on either side of the RPyC link.
   See "Getting config onto the NUC" above.
@@ -436,6 +436,7 @@ groups every real/sim record, replay and compare entry point by purpose.
 | `replay_dataset.py --mode delta\|ee_pose` | Re-record a whole dataset on the arm; `ee_pose` relabels EE_DELTA actions to the absolute OSC goals they produce (an EE_POS source is screened and replayed as is), `delta` replays deltas as recorded (optionally magnitude-bounded) and refuses an EE_POS source | EE |
 | `filter_noop_actions.py --source-repo-id <ds> --target-repo-id <id>` | Copy a recording without its no-op frames; `delta` drops a frame whose delta is below threshold, `ee_pose` one whose target pose did not change from the previous frame (mode classified by reach, `--dry-run` reports counts without decoding video) | — |
 | `train.sh <repo_id> <policy_repo> <bs> <steps> <policy_type> <resume> <config>` | Train a policy with wandb logging, upload to HF | — |
+| `training/lerobot_train_recipe.py <lerobot-train flags>` | lerobot-train for the diffusion base policy on the recipe SAIL and B-Spline share (`baselines/diffusion_recipe.py`): the recipe's flags ahead of the caller's, the crop from the image size, B-Spline's EMA, whose weights are what `pretrained_model/` holds, and the baselines' robot state: `observation.state` becomes EE pose + gripper through a saved preprocessor step (`ee_state.JointStateToEEPose`), so rollouts convert the same way. `training/train_diffusion*.sh`, `train_pipeline.py` and the tillicum job all run it | — |
 | `rollout_policy.sh <repo_id> <n_eps> <policy_repo> <out_dir>` | Roll out a policy and log trajectories | EE |
 | `home_pose.py` | Save / drive named home configurations (`home_poses/*.json`) | joint |
 | `openpi_client_franka.py` | Single-arm OpenPI inference client; DROID-style joint-velocity observations to a remote websocket policy | joint |
@@ -457,14 +458,17 @@ groups every real/sim record, replay and compare entry point by purpose.
 | `../sysid/merge_episodes.py <out> <files...>` | Join episode files into one fit dataset, with renames and the `_train` / `_validate` split | — |
 | `setup_baseline_envs.sh` | Build `.venv-sail` / `.venv-bspline`, the baselines' own interpreters | — |
 | `prepare_baseline_datasets.py` | One EE_POS recording → sysid / SAIL / B-Spline HDF5s | — |
-| `train_pipeline.py start <pipelines/*.yaml>` | Convert a recording and train all three policies (diffusion base, B-Spline, SAIL) from one yaml, detached, into one run directory; each stage reuses, or resumes from the checkpoint of, an earlier run's same training unless `--retrain <stage>`; `status` (shows a failed stage's error line) / `summary` / `stop` / `retry <stage>` (resumes from the stage's last checkpoint; an OOM beside the other trainings is retried on its own automatically) | — |
+| `train_pipeline.py start <pipelines/*.yaml>` | Convert a recording and train all three policies (diffusion base, B-Spline, SAIL) on one shared recipe (`baselines/diffusion_recipe.py`) from one yaml, detached, into one run directory; each stage reuses, or resumes from the checkpoint of, an earlier run's same training unless `--retrain <stage>`; `status` (shows a failed stage's error line) / `summary` / `stop` / `retry <stage>` (resumes from the stage's last checkpoint; an OOM beside the other trainings is retried on its own automatically) | — |
 | `../baselines/{sail,bspline}_bridge/train.py` | Train a baseline on its HDF5 in its own venv (`python -m baselines.sail_bridge.train`) | — |
-| `sail_rollout.sh` | Roll a trained SAIL policy out with upstream's receding-horizon loop at `--speed N`; starts its policy server in `.venv-sail` | EE_POS |
+| `../baselines/tillicum/send_datasets.sh <user> <task_* folder>` | Send one task to Tillicum's scrubbed space: `sail.hdf5`, `bspline.hdf5`, the filtered recording stamped in them, and the diffusion job's code, on one password + Duo. `TRAIN_AND_EVAL.md` is the whole record → train → evaluate loop | — |
+| `../baselines/tillicum/fetch_policies.sh <user> <repo_id>` | Bring the trained ZAP base, SAIL and B-Spline policies and their logs back; prints the newest checkpoint of each | — |
+| `sail_rollout.sh` | Roll a trained SAIL policy out at `--speed N` with the paper's hardware executor (rows due in time, a fitted spline tracked in pose and velocity, EAG); starts its policy server in `.venv-sail`. Both rollouts home to where the training demonstrations started | EE_POS |
 | `bspline_rollout.sh` | Roll a trained B-Spline policy out with upstream's spline loop at `--speed N`; starts its server in `.venv-bspline` | EE_POS |
 | `check_policy_server.py <sail\|bspline>` | Handshake + one synthetic inference against a running policy server; the preflight for a new checkpoint | — |
 | `check_baseline_rollout_offline.py` | Both baseline loops against a fake arm and fake policy servers, plus the servers' request handling under a stubbed robomimic | — |
 | `check_residual_executor_offline.py` | `run_residual.py`'s EE_POS-base executor against `reach_residual.py`'s own functions and a fake arm: chunk-relative targets, FAST's composition, one-step deltas, the delta-checkpoint refusal | — |
 | `rollout_summary.py <task>` | Compare every method's rollouts recorded under one task | — |
+| `package_real_eval.py <repo_id>` | The real comparison as one folder and zip: the newest 20-episode run of SAIL 5x, B-Spline 1x/2x/4x, base dp and base dp + ZAP (any checkpoints), their charts, stats, per-episode 3D pages and labelled clips | — |
 | `check_spacemouse.py` | Print raw SpaceMouse channels and the base-frame delta they become | — |
 | `measure_joint_friction.py` | Per-joint Coulomb/viscous friction; sets `torque.friction.coulomb_nm` | joint |
 | `local_module_check.sh` | Editable-install + uninstall recipe for all six packages | — |

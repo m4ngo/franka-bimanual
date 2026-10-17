@@ -54,9 +54,7 @@ cameras:
     depth: true
     calibration:
       source: frames/camera/cam_2_matrices.txt
-      # +0.10 m in x vs that printout: it was produced with the old
-      # WORLD_ORIGIN_OFFSET baked in, and these are board-centre relative.
-      rms_reprojection_px: 0.1285
+      rms_reprojection_px: 0.4503
       intrinsic_matrix:
         - [953.00372061, 0.00000000, 644.18322926]
         - [0.00000000, 979.57007661, 358.01723376]
@@ -64,10 +62,10 @@ cameras:
       distortion_coeffs: [2.18422004e-02, 7.00473072e-01, 1.69082283e-03, -5.82597153e-04, -2.69227978e+00]
       # camera -> calibration frame
       r_cam_in_calib:
-        - [-0.35982169, 0.75057596, -0.55422385]
-        - [0.93160186, 0.32177194, -0.16905853]
-        - [0.05144241, -0.57714690, -0.81501849]
-      t_cam_in_calib: [0.53740284, 0.50428987, 0.83421789]
+        - [0.38055814, 0.76983260, -0.51238001]
+        - [0.92343072, -0.28668516, 0.25512216]
+        - [0.04950961, -0.57023626, -0.81998745]
+      t_cam_in_calib: [0.69250482, -0.08487003, 0.84986305]
 
 
   cam_3:

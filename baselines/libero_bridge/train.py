@@ -34,6 +34,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
+from baselines import diffusion_recipe  # noqa: E402
 from baselines.libero_bridge import sim_env  # noqa: E402
 from baselines.run_record import read_source_repo_id  # noqa: E402
 from baselines.train_common import policies_dir  # noqa: E402
@@ -86,6 +87,17 @@ def finished_steps(hdf5: Path, backend: str) -> int | None:
         return None
 
 
+def trained_on_other_recipe(hdf5: Path, backend: str) -> bool:
+    """A finished training whose marker predates, or differs from, the shared diffusion recipe."""
+    marker = marker_for(hdf5, backend)
+    if marker is None or not marker.is_file():
+        return False
+    try:
+        return json.loads(marker.read_text()).get("recipe") != diffusion_recipe.fingerprint()
+    except Exception:
+        return True
+
+
 def mark_finished(hdf5: Path, backend: str, steps: int | None, ckpt: Path | None) -> None:
     marker = marker_for(hdf5, backend)
     if marker is None:
@@ -94,6 +106,7 @@ def mark_finished(hdf5: Path, backend: str, steps: int | None, ckpt: Path | None
     marker.write_text(json.dumps({
         "steps": steps, "backend": backend, "dataset": str(hdf5),
         "checkpoint": str(ckpt) if ckpt else None,
+        "recipe": diffusion_recipe.fingerprint(),
         "finished_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }, indent=2))
 
@@ -198,7 +211,11 @@ def main() -> int:
             logger.warning("[%d/%d] %s: no %s, skipping", i, len(jobs), label, hdf5.name)
             failed.append(f"{label} (no dataset)")
             continue
-        done = None if args.retrain else finished_steps(hdf5, backend)
+        stale = trained_on_other_recipe(hdf5, backend)
+        if stale and not args.retrain:
+            logger.info("[%d/%d] %s: trained on an earlier diffusion recipe; training it again",
+                        i, len(jobs), label)
+        done = None if args.retrain or stale else finished_steps(hdf5, backend)
         if done is not None and (args.steps is None or done >= args.steps):
             logger.info("[%d/%d] %s: already trained to %s steps (%s)", i, len(jobs),
                         label, done, checkpoint_for(hdf5, backend))
@@ -208,7 +225,7 @@ def main() -> int:
         cmd = [sys.executable, "-m", f"baselines.{backend}_bridge.train", str(hdf5)]
         if args.steps is not None:
             cmd += ["--steps", str(args.steps)]
-        resumable = args.resume and not args.retrain and done is None
+        resumable = args.resume and not args.retrain and not stale and done is None
         partial = checkpoint_for(hdf5, backend) if resumable else None
         if partial is not None:
             cmd += ["--resume", str(_RESUME_FROM[backend](partial))]

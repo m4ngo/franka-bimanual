@@ -1,0 +1,275 @@
+{
+  "schema_version": 1,
+  "run": {
+    "run_id": "20261009_131949-multifast",
+    "method": "multifast",
+    "sweep": null,
+    "status": "completed",
+    "reason": null,
+    "started_at": "2026-10-09T13:19:49-0700",
+    "updated_at": "2026-10-09T13:24:19-0700",
+    "duration_s": 269.766
+  },
+  "train_dataset": {
+    "repo_id": "HuskyMango/filter-10-6-bowl-plate",
+    "resolved_from": "checkpoint",
+    "flag": null,
+    "checkpoint_says": "HuskyMango/filter-10-6-bowl-plate",
+    "agrees": null,
+    "training_hdf5": null,
+    "local": {
+      "path": "/home/franka/.cache/huggingface/lerobot/HuskyMango/filter-10-6-bowl-plate",
+      "exists": true,
+      "episodes": 30,
+      "frames": 5370,
+      "fps": 20,
+      "robot_type": "single_arm_right",
+      "codebase_version": "v3.0"
+    }
+  },
+  "environment": {
+    "git": {
+      "commit": "22cfa8b9608cf97509dea69be7712e850cb8b115",
+      "branch": "main",
+      "dirty": true,
+      "dirty_files": [
+        "10-5-bowl-plate_vs_KITCHEN_SCENE1_put_the_black_bowl_on_the_plate/",
+        "20261005_185555-multifast/",
+        "20261005_185907-multifast/",
+        "20261005_190342-multifast/",
+        "20261005_190654-multifast/",
+        "20261007_130159-multifast/",
+        "20261008_201705-multifast/",
+        "20261009_113631-multifast/",
+        "20261009_115019-multifast/",
+        "20261009_131103-multifast/",
+        "20261009_131653-multifast/",
+        "CLAUDE.md",
+        "ENTRYPOINTS.md",
+        "None/Offline/replay/",
+        "baselines/LIBERO_SIM.md",
+        "baselines/ROLLOUT.md",
+        "baselines/SAIL.md",
+        "baselines/bspline_bridge/rollout.py",
+        "baselines/bspline_bridge/spline_plan.py",
+        "baselines/policy_math.py",
+        "baselines/rollout_common.py",
+        "baselines/sail_bridge/gripper_labels.py",
+        "baselines/sail_bridge/rollout.py",
+        "baselines/sail_bridge/schedule.py",
+        "baselines/tillicum/eval_libero.slurm",
+        "baselines/tillicum/submit_diffusion_train.sh",
+        "baselines/tillicum/train_diffusion.slurm",
+        "config/README.md",
+        "config/calibration.yaml",
+        "config/cameras.yaml",
+        "config/policy.yaml",
+        "config/world.yaml",
+        "frames/camera/cam_2_matrices.txt",
+        "frames/camera/camera_calibration.py",
+        "home_poses/home_pose_raised_19cm.json",
+        "lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_gripper.py",
+        "multi-fast",
+        "nohup.out",
+        "residual_wrapper/env_wrapper.py",
+        "residual_wrapper/policy_wrapper.py",
+        "residual_wrapper/run_residual.py",
+        "residual_wrapper/stitch_videos.py",
+        "scripts/check_baseline_rollout_offline.py",
+        "scripts/check_residual_executor_offline.py",
+        "scripts/rollout_report.py",
+        "scripts/training/train_diffusion.sh",
+        "scripts/training/train_diffusion_chunkrel.sh",
+        "tests/test_grippers.py"
+      ]
+    },
+    "machine": {
+      "host": "deepblue.cs.washington.edu",
+      "user": "franka",
+      "python": "3.12.13",
+      "executable": "/home/franka/franka_ws/.venv/bin/python",
+      "cwd": "/home/franka/franka_ws",
+      "argv": [
+        "residual_wrapper/run_residual.py",
+        "--base-policy",
+        "HuskyMango/diffusion-filter-10-6-bowl-plate",
+        "--residual-policy",
+        "/home/franka/checkpoints/d0b91645/checkpoint/best.pt",
+        "--num-episodes",
+        "10",
+        "--home-pose-name",
+        "home_pose_raised_19cm"
+      ]
+    },
+    "rig_profile": "single_arm_right",
+    "key_prefix": "r",
+    "physical_arm": "right",
+    "arm": {
+      "robot_ip": "192.168.201.10",
+      "server_ip": "192.168.3.10",
+      "rpyc_port": 18812,
+      "gripper_rpyc_port": 18822,
+      "gripper_kind": "franka_hand",
+      "gripper_ip": "192.168.201.10",
+      "nuc": "mario@192.168.3.10",
+      "ee_sphere": {
+        "center_tool_m": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "radius_m": 0.1
+      }
+    },
+    "cameras": {
+      "cam_3": [
+        224,
+        224
+      ],
+      "cam_2": [
+        224,
+        224
+      ]
+    },
+    "robot_type": "single_arm_franka",
+    "control_fps": 20,
+    "home_pose": "home_pose_raised_19cm",
+    "home_q_override": null,
+    "torque": {
+      "default_kp": 150.0,
+      "default_damping_ratio": 1.0,
+      "gain_exp_base": 10.0,
+      "uncouple_pos_ori": true,
+      "cross_coupling_compensation": false,
+      "rotor_inertia_kg_m2": [
+        1.25,
+        0.625,
+        0.417,
+        0.313,
+        0.125,
+        0.104,
+        0.0893
+      ],
+      "delta_pos_max_m": 0.05,
+      "delta_rot_max_rad": 0.5
+    },
+    "tuning": {
+      "ee_translation_fudge": 1.0,
+      "ee_rotation_fudge": 1.0,
+      "friction_kc": 0.05,
+      "kp_ori_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kp_pos_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kd_ori_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kd_pos_scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "safety": {
+      "worktable_height_m": 1.03,
+      "brake_distance_min_m": 0.01
+    },
+    "dry_run": false
+  },
+  "policy": {
+    "base_policy": {
+      "path": "HuskyMango/diffusion-filter-10-6-bowl-plate",
+      "exists": false
+    },
+    "residual_policy": {
+      "path": "/home/franka/checkpoints/d0b91645/checkpoint/best.pt",
+      "exists": true,
+      "sha256": "a88762c7938deed907789b61300c0d9a24490c401d217f70f83d603add5b88ce",
+      "size_bytes": 16861367,
+      "modified_at": "2026-10-08T19:06:16-0700"
+    },
+    "residual_enabled": true,
+    "replay_dataset": null,
+    "device": "cuda",
+    "base_action_space": "EE_POS",
+    "control_mode": "EE_DELTA",
+    "control_mode_source": "fixed",
+    "control_mode_reason": "the base policy emits EE_POS or chunk-relative targets; each is executed as the one-step delta from the pose measured at that step, as the reach executor runs its base"
+  },
+  "parameters": {
+    "exec_fps": 20.0,
+    "obs_fps": 20.0,
+    "num_episodes": 10,
+    "episode_time_s": 60.0,
+    "task": "multifast rollout",
+    "infer_lead": 1,
+    "proprio_frame": "world",
+    "sim_proprio_convention": true,
+    "base_amp": "fp16",
+    "base_compile": "default",
+    "residual": {
+      "chunk_exec": 5,
+      "horizon": 10,
+      "pos_scale_m": 0.05,
+      "rot_scale_rad": 0.5,
+      "gains_mag": 0.5,
+      "residual_mag": 0.2,
+      "residual_trans_mag": 0.2,
+      "residual_rot_mag": 0.2,
+      "res_pos_gain": 1.0,
+      "res_rot_gain": 1.0
+    }
+  },
+  "outputs": {
+    "run_dir": "/home/franka/franka_data/outputs/HuskyMango/filter-10-6-bowl-plate/20261009_131949-multifast",
+    "manifest": "/home/franka/franka_data/outputs/HuskyMango/filter-10-6-bowl-plate/20261009_131949-multifast/manifest.json",
+    "episodes": "/home/franka/franka_data/outputs/HuskyMango/filter-10-6-bowl-plate/20261009_131949-multifast/episodes.jsonl",
+    "force_profiles": "/home/franka/franka_data/outputs/HuskyMango/filter-10-6-bowl-plate/20261009_131949-multifast/force_profiles.npz",
+    "dataset": {
+      "recorded": true,
+      "repo_id": "filter-10-6-bowl-plate-20261009_131949-multifast",
+      "path": "/home/franka/franka_data/outputs/HuskyMango/filter-10-6-bowl-plate/20261009_131949-multifast/dataset",
+      "exists": true,
+      "episodes": 10,
+      "frames": 3646,
+      "fps": 20,
+      "robot_type": "single_arm_franka",
+      "codebase_version": "v3.0"
+    }
+  },
+  "summary": {
+    "episodes": 10,
+    "successes": 0,
+    "success_rate": 0.0,
+    "verdicts": {
+      "failure": 9,
+      "timeout": 1
+    },
+    "mean_time_to_success_s": null,
+    "median_time_to_success_s": null,
+    "min_time_to_success_s": null,
+    "max_time_to_success_s": null,
+    "total_episode_time_s": 184.29682394093834,
+    "total_steps": 3646,
+    "total_inferences": 733,
+    "total_slow_steps": 0,
+    "total_guided_inferences": 0,
+    "aborted_episodes": 0,
+    "ee_force_n": {
+      "mean": 4.6736,
+      "median": 3.7255,
+      "p95": 11.1011,
+      "max": 24.7071,
+      "peak": 32.2975,
+      "episodes": 10
+    }
+  }
+}

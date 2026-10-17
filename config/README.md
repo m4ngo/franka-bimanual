@@ -19,7 +19,7 @@ read from here instead.
 | `rig.yaml` | Robot profiles — which arms and cameras each robot config exposes, under which key prefixes, and which leader device drives it |
 | `teleop.yaml` | GELLO and SpaceMouse device ports, scales, sign flips, calibration positions |
 | `policy.yaml` | Residual/policy normalization contract shared by sysid, residual_wrapper and trained checkpoints |
-| `calibration.yaml` | ChArUco board spec and IO layout for `frames/camera/camera_calibration.py` |
+| `calibration.yaml` | ChArUco board specs (one for the intrinsics images, one for the extrinsics images) and IO layout for `frames/camera/camera_calibration.py` |
 
 ## Reading it
 

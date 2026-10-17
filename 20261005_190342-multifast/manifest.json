@@ -1,0 +1,254 @@
+{
+  "schema_version": 1,
+  "run": {
+    "run_id": "20261005_190342-multifast",
+    "method": "multifast",
+    "sweep": null,
+    "status": "completed",
+    "reason": null,
+    "started_at": "2026-10-05T19:03:42-0700",
+    "updated_at": "2026-10-05T19:06:05-0700",
+    "duration_s": 142.446
+  },
+  "train_dataset": {
+    "repo_id": "HuskyMango/filter-9-19-libero-90-9",
+    "resolved_from": "checkpoint",
+    "flag": null,
+    "checkpoint_says": "HuskyMango/filter-9-19-libero-90-9",
+    "agrees": null,
+    "training_hdf5": null,
+    "local": {
+      "path": "/home/franka/.cache/huggingface/lerobot/HuskyMango/filter-9-19-libero-90-9",
+      "exists": true,
+      "episodes": 30,
+      "frames": 3775,
+      "fps": 20,
+      "robot_type": "single_arm_right",
+      "codebase_version": "v3.0"
+    }
+  },
+  "environment": {
+    "git": {
+      "commit": "22cfa8b9608cf97509dea69be7712e850cb8b115",
+      "branch": "main",
+      "dirty": true,
+      "dirty_files": [
+        "multi-fast",
+        "residual_wrapper/env_wrapper.py",
+        "residual_wrapper/policy_wrapper.py",
+        "residual_wrapper/run_residual.py",
+        "scripts/check_residual_executor_offline.py"
+      ]
+    },
+    "machine": {
+      "host": "deepblue.cs.washington.edu",
+      "user": "franka",
+      "python": "3.12.13",
+      "executable": "/home/franka/franka_ws/.venv/bin/python",
+      "cwd": "/home/franka/franka_ws",
+      "argv": [
+        "residual_wrapper/run_residual.py",
+        "--base-policy",
+        "/home/franka/franka_data/policy/train/diffusion_HuskyMango/filter-9-19-libero-90-9_HuskyMango/diffusion-filter-9-19-libero-90-9/checkpoints/last/pretrained_model",
+        "--no-residual",
+        "--rig",
+        "single_arm_right",
+        "--num-episodes",
+        "10",
+        "--episode-time-s",
+        "30",
+        "--save-videos"
+      ]
+    },
+    "rig_profile": "single_arm_right",
+    "key_prefix": "r",
+    "physical_arm": "right",
+    "arm": {
+      "robot_ip": "192.168.201.10",
+      "server_ip": "192.168.3.10",
+      "rpyc_port": 18812,
+      "gripper_rpyc_port": 18822,
+      "gripper_kind": "franka_hand",
+      "gripper_ip": "192.168.201.10",
+      "nuc": "mario@192.168.3.10",
+      "ee_sphere": {
+        "center_tool_m": [
+          0.0,
+          0.0,
+          -0.1
+        ],
+        "radius_m": 0.1
+      }
+    },
+    "cameras": {
+      "cam_3": [
+        224,
+        224
+      ],
+      "cam_2": [
+        224,
+        224
+      ]
+    },
+    "robot_type": "single_arm_right",
+    "control_fps": 20,
+    "home_pose": "home_pose",
+    "home_q_override": null,
+    "torque": {
+      "default_kp": 150.0,
+      "default_damping_ratio": 1.0,
+      "gain_exp_base": 10.0,
+      "uncouple_pos_ori": true,
+      "cross_coupling_compensation": false,
+      "rotor_inertia_kg_m2": [
+        1.25,
+        0.625,
+        0.417,
+        0.313,
+        0.125,
+        0.104,
+        0.0893
+      ],
+      "delta_pos_max_m": 0.05,
+      "delta_rot_max_rad": 0.5
+    },
+    "tuning": {
+      "ee_translation_fudge": 1.0,
+      "ee_rotation_fudge": 1.0,
+      "friction_kc": 0.05,
+      "kp_ori_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kp_pos_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kd_ori_scale": [
+        1.0,
+        1.0,
+        1.0
+      ],
+      "kd_pos_scale": [
+        1.0,
+        1.0,
+        1.0
+      ]
+    },
+    "safety": {
+      "worktable_height_m": 1.0,
+      "brake_distance_min_m": 0.01,
+      "max_lead_m": 0.15,
+      "max_lead_rad": 0.5
+    },
+    "dry_run": false
+  },
+  "policy": {
+    "base_policy": {
+      "path": "/home/franka/franka_data/policy/train/diffusion_HuskyMango/filter-9-19-libero-90-9_HuskyMango/diffusion-filter-9-19-libero-90-9/checkpoints/200000/pretrained_model",
+      "exists": true,
+      "sha256": null,
+      "size_bytes": null,
+      "modified_at": "2026-09-17T18:27:19-0700"
+    },
+    "residual_policy": null,
+    "residual_enabled": false,
+    "replay_dataset": null,
+    "device": "cuda",
+    "base_action_space": "EE_POS",
+    "control_mode": "EE_DELTA",
+    "control_mode_source": "fixed",
+    "control_mode_reason": "the base policy emits EE_POS or chunk-relative targets; each is executed as the one-step delta from the pose measured at that step, as the reach executor runs its base"
+  },
+  "parameters": {
+    "exec_fps": 20.0,
+    "obs_fps": 20.0,
+    "num_episodes": 10,
+    "episode_time_s": 30.0,
+    "task": "multifast rollout",
+    "infer_lead": 1,
+    "proprio_frame": "world",
+    "sim_proprio_convention": true,
+    "base_amp": "fp16",
+    "base_compile": "default",
+    "residual": {
+      "chunk_exec": 5,
+      "horizon": 10,
+      "pos_scale_m": 0.05,
+      "rot_scale_rad": 0.5,
+      "gains_mag": 0.5,
+      "residual_mag": 0.2,
+      "residual_trans_mag": 0.2,
+      "residual_rot_mag": 0.2,
+      "res_pos_gain": 1.0,
+      "res_rot_gain": 1.0
+    }
+  },
+  "outputs": {
+    "run_dir": "/home/franka/franka_data/outputs/HuskyMango/filter-9-19-libero-90-9/20261005_190342-multifast",
+    "manifest": "/home/franka/franka_data/outputs/HuskyMango/filter-9-19-libero-90-9/20261005_190342-multifast/manifest.json",
+    "episodes": "/home/franka/franka_data/outputs/HuskyMango/filter-9-19-libero-90-9/20261005_190342-multifast/episodes.jsonl",
+    "force_profiles": "/home/franka/franka_data/outputs/HuskyMango/filter-9-19-libero-90-9/20261005_190342-multifast/force_profiles.npz",
+    "dataset": {
+      "recorded": true,
+      "repo_id": "filter-9-19-libero-90-9-20261005_190342-multifast",
+      "path": "/home/franka/franka_data/outputs/HuskyMango/filter-9-19-libero-90-9/20261005_190342-multifast/dataset",
+      "exists": true,
+      "episodes": 10,
+      "frames": 1649,
+      "fps": 20,
+      "robot_type": "single_arm_right",
+      "codebase_version": "v3.0"
+    },
+    "videos": [
+      "episode_000_cam_2.mp4",
+      "episode_000_cam_3.mp4",
+      "episode_001_cam_2.mp4",
+      "episode_001_cam_3.mp4",
+      "episode_002_cam_2.mp4",
+      "episode_002_cam_3.mp4",
+      "episode_003_cam_2.mp4",
+      "episode_003_cam_3.mp4",
+      "episode_004_cam_2.mp4",
+      "episode_004_cam_3.mp4",
+      "episode_005_cam_2.mp4",
+      "episode_005_cam_3.mp4",
+      "episode_006_cam_2.mp4",
+      "episode_006_cam_3.mp4",
+      "episode_007_cam_2.mp4",
+      "episode_007_cam_3.mp4",
+      "episode_008_cam_2.mp4",
+      "episode_008_cam_3.mp4",
+      "episode_009_cam_2.mp4",
+      "episode_009_cam_3.mp4"
+    ]
+  },
+  "summary": {
+    "episodes": 10,
+    "successes": 10,
+    "success_rate": 1.0,
+    "verdicts": {
+      "success": 10
+    },
+    "mean_time_to_success_s": 8.459906093400786,
+    "median_time_to_success_s": 8.010920164000709,
+    "min_time_to_success_s": 7.08274984601303,
+    "max_time_to_success_s": 12.262872746010544,
+    "total_episode_time_s": 84.59906093400787,
+    "total_steps": 1649,
+    "total_inferences": 335,
+    "total_slow_steps": 0,
+    "total_guided_inferences": 0,
+    "aborted_episodes": 0,
+    "ee_force_n": {
+      "mean": 4.7133,
+      "median": 3.7168,
+      "p95": 11.5585,
+      "max": 27.8063,
+      "peak": 38.8479,
+      "episodes": 10
+    }
+  }
+}

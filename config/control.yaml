@@ -364,8 +364,8 @@ torque:
 homing:
   gripper_norm: 1.0
   # Must leave room for the SLOWEST joint's speed budget (homing.speed_budget()),
-  # not for the nominal max_qdot_rad_s. Joint 5 is the binding one at 0.30 rad/s --
-  # its 30 Nm clamp against kd 20 -- so a 1 rad move genuinely takes 3.3 s and at
+  # not for the nominal max_qdot_rad_s. Joint 5 is the binding one at 0.48 rad/s --
+  # its 30 Nm clamp against kd 20 -- so a 1 rad move takes 2.1 s; at 0.30 rad/s and
   # 5.0 home() reported "failed to converge" on a move that was still arriving.
   max_time_s: 6.0
   tol_rad: 0.05
@@ -377,12 +377,14 @@ homing:
   # Note this cannot fix cartesian_reflex trips on its own -- Coulomb friction is
   # speed-INDEPENDENT, so the friction share of libfranka's inferred external wrench
   # is the same at 0.5 rad/s as at 1.0. Lowering it only removes the inertial share.
-  max_qdot_rad_s: 0.5
+  max_qdot_rad_s: 0.8
   settle_qdot_rad_s: 0.05
   lead_margin: 1.5
   # Fraction of each joint's clamp that kp*lead + kd*qdot may spend together; both
   # scale with speed, so this caps speed per joint. A saturated joint never converges.
-  tau_fraction: 0.5
+  # 0.5 until 2026-10-09; raised with max_qdot_rad_s 0.5 -> 0.8 to home ~1.6x faster
+  # between eval episodes. Back both off if homing starts tripping reflexes.
+  tau_fraction: 0.8
 
 observation:
   image_width: 224
@@ -423,5 +425,5 @@ noise:
   # axis per step. EE_DELTA adds it to the delta before clip_delta; EE_POS adds
   # it to the composed goal, after the residual and before the worktable screen.
   # The recorded action is the leader's; only the goal the arm pursues carries it.
-  pos_scale_m: 0.01
-  rot_scale_rad: 0.03
+  pos_scale_m: 0.015
+  rot_scale_rad: 0.025

@@ -15,16 +15,26 @@ The control loop is upstream's `rollout_episode`
 every 1/control_freq s a new spline is requested if the current one ends within
 `predict_before_end` s, a new spline is time-aligned onto the old one, and the
 plan is sampled at wall-clock `t = elapsed * speed_up_times * origin_time_scale`.
-No goal is sent before the first plan exists.
+No goal is sent before the first plan exists, and nothing bounds how far a goal
+may lead the arm: upstream has no such bound, and a sped-up plan leads on purpose.
 
 The policy's observations are the newest snapshot and the one nearest a
 demonstration step before it (ObservationPump.window), which is what upstream's
 `obs_stride` selects from its per-tick history.
 
-The arm runs the stock OSC, as multi-fast does. Upstream also speeds its own
-servo up with the plan (`set_ik_dt_scale(speed_up_times)`); that has no
-counterpart here, so at speed the arm trails a B-Spline plan by more than it
-trailed the demonstrations.
+Upstream speeds its servo up with the plan (`set_ik_dt_scale(speed_up_times)`),
+so the arm trails a sped-up plan by the distance it trailed it at 1x. Here the
+OSC stays the stock controller the demonstrations were recorded under, at every
+speed, and each goal is led along the plan by (kd/kp)(1 - 1/speed) s instead
+(rollout_common.bspline_lead), which holds that 1x lag.
+
+Not upstream's: when the plan's gripper command closes (crosses
+baselines.bspline.grasp_threshold downward) the arm holds the pose it is at for
+baselines.bspline.grasp_hold_s with the gripper commanded closed, whether or not
+the fingers have finished, while the plan's clock stands still, so the plan
+resumes where it stopped: pause, grasp, unpause. The gripper stays
+commanded closed until the plan opens it again: resumed mid-transition, the
+plan's own value would reopen the fingers around what they just grasped.
 
 Control mode is EE_POS: `bspline_bridge/dataset.py` trains on the absolute
 commanded pose. The sampled action is 10-dim -- xyz + rot6d + gripper -- because
@@ -49,9 +59,10 @@ import franka_config as fc  # noqa: E402
 
 from baselines import rollout_common as rc  # noqa: E402
 from baselines import run_record as rr  # noqa: E402
+from baselines.policy_math import lead_goal  # noqa: E402
 from baselines.rollout_viz import render_after_run  # noqa: E402
 from baselines.bspline_bridge.spline_plan import (  # noqa: E402
-    GRIPPER_INDEX, POSE_DIM, SplinePlanner, decode_action as decode,
+    GRIPPER_INDEX, POSE_DIM, HoldClock, SplinePlanner, decode_action as decode,
 )
 from baselines.zmq_client import PolicyClient  # noqa: E402
 from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
@@ -59,17 +70,23 @@ from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
 logger = logging.getLogger("baselines.bspline")
 
 POLICY = "bspline"
+# The normalised gripper command for shut; the demonstrations command exactly this.
+_CLOSED = 0.0
 
 
 def make_episode_fn(client: PolicyClient, planner_kwargs: dict, control_freq: float,
-                    shapes: dict):
+                    shapes: dict, gains: dict, lead: np.ndarray):
     period = 1.0 / float(control_freq)
     spacing = 1.0 / rc.data_fps()
-    gains = rc.stock_gains()
+    leading = bool(np.any(lead > 0.0))
+    hold_s = float(fc.policy("baselines.bspline.grasp_hold_s"))
+    threshold = float(fc.policy("baselines.bspline.grasp_threshold"))
+    rearm = float(fc.policy("baselines.bspline.grasp_rearm"))
 
     def episode_fn(controller, dispatcher, pump, ep, stopper) -> None:
         client.reset()
-        planner = SplinePlanner(client, **planner_kwargs)
+        clock = HoldClock()
+        planner = SplinePlanner(client, clock=clock.now, **planner_kwargs)
         n_obs = planner.n_obs_steps
         plans_seen = 0
         goal: tuple[np.ndarray, np.ndarray] | None = None
@@ -77,6 +94,13 @@ def make_episode_fn(client: PolicyClient, planner_kwargs: dict, control_freq: fl
         window: list[dict] = []
         cache: dict[int, dict] = {}
         exhausted = 0
+        last_grip: float | None = None
+        closed = False            # a grasp held the gripper shut; the plan has not reopened it
+        armed = False             # the command has been fully open since the last grasp
+        hold_goal: dict | None = None
+        hold_start: float | None = None   # when the current grasp hold began
+        holds = 0
+        held_s: list[float] = []
         try:
             start_time = time.perf_counter()
             for step_idx in itertools.count():
@@ -99,11 +123,19 @@ def make_episode_fn(client: PolicyClient, planner_kwargs: dict, control_freq: fl
                     if len(cache) == n_obs:
                         window = [cache[sn.seq] for sn in snaps]
                     if goal is not None:
-                        pos_err, rot_err = rc.check_lead(goal[0], goal[1], snap.m)
+                        pos_err, rot_err = rc.lead(goal[0], goal[1], snap.m)
                         ep.max_lead_m = max(ep.max_lead_m, pos_err)
                         ep.max_lead_rad = max(ep.max_lead_rad, rot_err)
 
-                sample = planner.step(window, obs_time=snap.t)
+                now = time.perf_counter()
+                if hold_start is not None:
+                    if now - hold_start < hold_s:
+                        dispatcher.send(hold_goal, anchor=snap.kin)
+                        continue
+                    clock.release(now)
+                    held_s.append(now - hold_start)
+                    hold_start = None
+                sample = planner.step(window, obs_time=clock.effective(snap.t))
                 if planner.plans != plans_seen:
                     plans_seen = planner.plans
                     dispatcher.chunk([np.concatenate(decode(r)[:2])
@@ -112,7 +144,34 @@ def make_episode_fn(client: PolicyClient, planner_kwargs: dict, control_freq: fl
                     exhausted += int(plans_seen > 0)
                     continue
                 pos, quat, grip = decode(sample)
-                dispatcher.send(rc.ee_pos_action(pos, quat, grip, gains))
+                if hold_s > 0.0:
+                    # Only a close from fully open is a grasp: a release whose command
+                    # wobbles back under the threshold (a replan, spline overshoot)
+                    # must never pause the arm.
+                    grasping = (armed and last_grip is not None
+                                and last_grip > threshold >= grip)
+                    last_grip = grip
+                    if closed and grip > threshold:
+                        closed = False            # the plan opens the gripper itself
+                    if grip >= rearm:
+                        armed = True
+                    if grasping:
+                        armed = False
+                        # Hold where the arm is, not where the plan's goal is: it leads the arm.
+                        closed = True
+                        holds += 1
+                        clock.hold(now)
+                        hold_start = now
+                        goal = rc.fresh_pose(controller)
+                        hold_goal = rc.ee_pos_action(*goal, _CLOSED, gains)
+                        dispatcher.send(hold_goal, anchor=snap.kin)
+                        continue
+                    if closed:
+                        grip = _CLOSED
+                if leading:
+                    pos, quat = lead_goal(pos, quat, *decode(planner.peek(period))[:2],
+                                          period, lead)
+                dispatcher.send(rc.ee_pos_action(pos, quat, grip, gains), anchor=snap.kin)
                 goal = (pos, quat)
         finally:
             planner.wait_for_pending_inference()
@@ -125,6 +184,9 @@ def make_episode_fn(client: PolicyClient, planner_kwargs: dict, control_freq: fl
             # Ticks with no plan to sample after the first one landed: the arm held its goal.
             ep.notes["plan_exhausted_ticks"] = exhausted
             ep.notes["spline_request_failures"] = planner.failures
+            ep.notes["stitches_deferred"] = planner.deferred
+            ep.notes["grasp_holds"] = holds
+            ep.notes["grasp_hold_s"] = [round(s, 3) for s in held_s]
 
     return episode_fn
 
@@ -151,6 +213,7 @@ def planner_settings(meta: dict, args, control_freq: float) -> dict:
         gripper_slowdown_steps=int(fc.policy("baselines.bspline.gripper_slowdown_steps")),
         gripper_index=GRIPPER_INDEX,
         compare_dim=POSE_DIM,
+        defer_stitch=bool(fc.policy("baselines.bspline.defer_stitch")),
     )
 
 
@@ -177,6 +240,9 @@ def main() -> int:
     args = p.parse_args()
 
     logging.basicConfig(level=logging.INFO, force=True)
+    if args.speed <= 0:
+        p.error(f"--speed must be positive, got {args.speed}")
+    rc.configure_process()
     port = args.port or int(fc.policy("baselines.zmq.bspline_port"))
     client = PolicyClient(port, int(fc.policy("baselines.zmq.recv_timeout_ms")), args.host)
     meta = client.meta()
@@ -186,14 +252,11 @@ def main() -> int:
 
     control_freq = float(args.control_freq or fc.policy("baselines.bspline.control_freq"))
     planner_kwargs = planner_settings(meta, args, control_freq)
-    logger.info("speed %.2fx: goals at %.0f Hz, origin_time_scale %.1f, "
-                "predict_before_end %.2f s, stock OSC",
-                planner_kwargs["speed_up_times"], control_freq,
-                planner_kwargs["origin_time_scale"], planner_kwargs["predict_before_end"])
 
     try:
         train_dataset = rr.resolve_train_dataset(
             args.train_dataset, meta.get("train_dataset"), meta.get("training_hdf5"))
+        home_match = rc.resolve_home(args, train_dataset)
     except ValueError as exc:
         p.error(str(exc))
     run_dir, record = rc.open_run(args, POLICY, train_dataset)
@@ -204,16 +267,25 @@ def main() -> int:
                control_mode=ControlMode.EE_POS.value,
                control_mode_source="fixed",
                control_mode_reason="bspline_bridge/dataset.py trains on absolute poses")
-    record.set("parameters", **rc.bspline_parameters(args, meta, planner_kwargs, control_freq))
 
     controller = rc.build_robot(args.rig, ControlMode.EE_POS)
+    gains = rc.stock_gains()
+    lead = rc.bspline_lead(args.speed, controller)
+    record.set("parameters", **rc.bspline_parameters(args, meta, planner_kwargs, control_freq,
+                                                     lead))
+    logger.info("speed %.2fx: goals at %.0f Hz, origin_time_scale %.1f, "
+                "predict_before_end %.2f s, stock OSC, goal lead %.4f s",
+                planner_kwargs["speed_up_times"], control_freq,
+                planner_kwargs["origin_time_scale"], planner_kwargs["predict_before_end"],
+                float(lead[0]))
     controller.connect()
     status, reason = "completed", None
     try:
-        record.set("environment", **rc.environment(args, controller))
+        record.set("environment", **rc.environment(args, controller), home_match=home_match)
         shapes = rc.check_camera_coverage(meta, controller, args.allow_missing_cameras)
         rc.run_episodes(args, controller, run_dir, record,
-                        make_episode_fn(client, planner_kwargs, control_freq, shapes),
+                        make_episode_fn(client, planner_kwargs, control_freq, shapes,
+                                        gains, lead),
                         nominal_hz=control_freq)
     except KeyboardInterrupt:
         status, reason = "interrupted", "KeyboardInterrupt at the robot"

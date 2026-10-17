@@ -1,0 +1,113 @@
+{
+  "schema_version": 1,
+  "run": {
+    "run_id": "20261008_211605-bspline",
+    "method": "bspline",
+    "sweep": null,
+    "status": "running",
+    "reason": null,
+    "started_at": "2026-10-08T21:16:05-0700",
+    "updated_at": "2026-10-08T21:16:12-0700",
+    "duration_s": 6.577
+  },
+  "train_dataset": {
+    "repo_id": "Offline/replay",
+    "resolved_from": "flag",
+    "flag": "Offline/replay",
+    "checkpoint_says": null,
+    "agrees": null
+  },
+  "environment": {
+    "git": {
+      "commit": "22cfa8b9608cf97509dea69be7712e850cb8b115",
+      "branch": "main",
+      "dirty": true,
+      "dirty_files": [
+        "10-5-bowl-plate_vs_KITCHEN_SCENE1_put_the_black_bowl_on_the_plate/",
+        "20261005_185555-multifast/",
+        "20261005_185907-multifast/",
+        "20261005_190342-multifast/",
+        "20261005_190654-multifast/",
+        "20261007_130159-multifast/",
+        "20261008_201705-multifast/",
+        "ENTRYPOINTS.md",
+        "None/Offline/replay/",
+        "baselines/LIBERO_SIM.md",
+        "baselines/bspline_bridge/rollout.py",
+        "baselines/bspline_bridge/spline_plan.py",
+        "baselines/policy_math.py",
+        "baselines/rollout_common.py",
+        "baselines/sail_bridge/rollout.py",
+        "baselines/sail_bridge/schedule.py",
+        "baselines/tillicum/eval_libero.slurm",
+        "baselines/tillicum/submit_diffusion_train.sh",
+        "baselines/tillicum/train_diffusion.slurm",
+        "config/policy.yaml",
+        "config/world.yaml",
+        "home_poses/home_pose_raised_19cm.json",
+        "lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/franka_gripper.py",
+        "multi-fast",
+        "nohup.out",
+        "residual_wrapper/env_wrapper.py",
+        "residual_wrapper/policy_wrapper.py",
+        "residual_wrapper/run_residual.py",
+        "residual_wrapper/stitch_videos.py",
+        "scripts/check_baseline_rollout_offline.py",
+        "scripts/check_residual_executor_offline.py",
+        "scripts/rollout_report.py",
+        "scripts/training/train_diffusion.sh",
+        "scripts/training/train_diffusion_chunkrel.sh",
+        "tests/test_grippers.py"
+      ]
+    },
+    "machine": {
+      "host": "deepblue.cs.washington.edu",
+      "user": "franka",
+      "python": "3.12.13",
+      "executable": "/home/franka/franka_ws/.venv/bin/python",
+      "cwd": "/home/franka/franka_ws",
+      "argv": [
+        "/tmp/claude-1000/-home-franka-franka-ws/28640755-7fe0-48c0-b0a6-326a00d2a1bb/scratchpad/replay_bsp2.py"
+      ]
+    }
+  },
+  "outputs": {
+    "run_dir": "None/Offline/replay/20261008_211605-bspline",
+    "manifest": "None/Offline/replay/20261008_211605-bspline/manifest.json",
+    "episodes": "None/Offline/replay/20261008_211605-bspline/episodes.jsonl",
+    "force_profiles": "None/Offline/replay/20261008_211605-bspline/force_profiles.npz",
+    "dataset": {
+      "recorded": false,
+      "repo_id": null,
+      "path": null,
+      "fps": 20
+    },
+    "videos_dir": null
+  },
+  "summary": {
+    "episodes": 1,
+    "successes": 0,
+    "success_rate": 0.0,
+    "verdicts": {
+      "timeout": 1
+    },
+    "mean_time_to_success_s": null,
+    "median_time_to_success_s": null,
+    "min_time_to_success_s": null,
+    "max_time_to_success_s": null,
+    "total_episode_time_s": 6.500853696023114,
+    "total_steps": 1289,
+    "total_inferences": 6,
+    "total_slow_steps": 0,
+    "total_guided_inferences": 0,
+    "aborted_episodes": 0,
+    "ee_force_n": {
+      "mean": 0.0,
+      "median": 0.0,
+      "p95": 0.0,
+      "max": 0.0,
+      "peak": 0.0,
+      "episodes": 1
+    }
+  }
+}

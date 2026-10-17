@@ -86,13 +86,24 @@ def propagate_pose(pos, quat_xyzw, deltas) -> tuple[np.ndarray, np.ndarray]:
     return p, r.as_quat()
 
 
+def apply_lead(pos, quat_xyzw, vel, ang_vel, lead) -> tuple[np.ndarray, np.ndarray]:
+    """The goal moved `lead` seconds (per axis, (6,)) along a base-frame velocity.
+
+    Against a PD law kp*(goal - x) - kd*v, a goal led by kd/kp seconds gives
+    kp*e_p + kd*(v_goal - v): velocity tracking without touching the law.
+    """
+    lead = np.asarray(lead, dtype=np.float64)
+    r = Rotation.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
+    p = np.asarray(pos, dtype=np.float64) + lead[:3] * np.asarray(vel, dtype=np.float64)
+    return p, (Rotation.from_rotvec(lead[3:] * np.asarray(ang_vel, dtype=np.float64)) * r).as_quat()
+
+
 def lead_goal(pos, quat_xyzw, next_pos, next_quat_xyzw, dt: float, lead) -> tuple[np.ndarray, np.ndarray]:
     """The goal moved `lead` seconds (per axis, (6,)) further along its own velocity.
 
     The velocity is the step from this goal to the one `dt` seconds later.
     """
-    lead = np.asarray(lead, dtype=np.float64)
     r = Rotation.from_quat(np.asarray(quat_xyzw, dtype=np.float64))
     vel = (np.asarray(next_pos, dtype=np.float64) - np.asarray(pos, dtype=np.float64)) / dt
     ang_vel = (Rotation.from_quat(np.asarray(next_quat_xyzw, dtype=np.float64)) * r.inv()).as_rotvec() / dt
-    return np.asarray(pos, dtype=np.float64) + lead[:3] * vel, (Rotation.from_rotvec(lead[3:] * ang_vel) * r).as_quat()
+    return apply_lead(pos, quat_xyzw, vel, ang_vel, lead)

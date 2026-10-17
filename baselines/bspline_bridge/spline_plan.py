@@ -69,6 +69,34 @@ def safer_knots(knots) -> np.ndarray:
     return knots
 
 
+class HoldClock:
+    """perf_counter with holds cut out: a planner on it sees no time pass while the arm holds.
+
+    `effective` maps any perf_counter stamp (an observation's, say) onto the same
+    clock, so obs_time and the plan stay on one time base across a hold.
+    """
+
+    def __init__(self) -> None:
+        self._holds: list[tuple[float, float]] = []   # (start, end); end inf while open
+
+    def hold(self, start: float) -> None:
+        """Stop the clock from `start` until `release`."""
+        self._holds.append((float(start), float("inf")))
+
+    def release(self, end: float) -> None:
+        start, _ = self._holds[-1]
+        self._holds[-1] = (start, max(float(end), start))
+
+    def holding(self, t: float) -> bool:
+        return bool(self._holds) and self._holds[-1][0] <= t < self._holds[-1][1]
+
+    def effective(self, t: float) -> float:
+        return t - sum(max(0.0, min(t, end) - start) for start, end in list(self._holds))
+
+    def now(self) -> float:
+        return self.effective(time.perf_counter())
+
+
 class SplinePlanner:
     def __init__(
         self,
@@ -90,6 +118,7 @@ class SplinePlanner:
         gripper_slowdown_steps: int = 7,
         gripper_index: int = 9,
         compare_dim: int = 9,
+        defer_stitch: bool = False,
         clock=None,
         synchronous: bool = False,
     ) -> None:
@@ -112,6 +141,9 @@ class SplinePlanner:
         self.gripper_slowdown_threshold = float(gripper_slowdown_threshold)
         self.gripper_slowdown_steps = int(gripper_slowdown_steps)
         self.gripper_index = int(gripper_index)
+        # Not upstream's: hold a new plan until its first knot is due instead of
+        # jumping to it. See _install.
+        self.defer_stitch = bool(defer_stitch)
         # The plan is sampled at `clock()`, so a simulator passes its own step
         # counter and `t` advances with SIM time instead of the wall clock.
         # Wall-clock diagnostics below stay on perf_counter.
@@ -130,7 +162,10 @@ class SplinePlanner:
         self.last_t_normalized: float | None = None
         self.plan_start_t = 0.0  # where the installed plan was entered (the stitch point)
         self._sampled = None    # (predictor, t, max_t) of the last poll_action sample
-        self.getting_spline = False
+        self.getting_spline = False   # a plan was requested and is not installed yet
+        self._in_flight = False       # the server is working on that request
+        self._deferred = None         # (bspline, req, min_t) waiting for its first knot
+        self.deferred = 0
         self.plans = 0
         self.failures = 0
         self.align_errors: list[float] = []
@@ -154,6 +189,7 @@ class SplinePlanner:
             self.last_obs_time_to_predict = None
             self.last_t_normalized = None
             self.getting_spline = False
+            self._deferred = None
             self._accumulated_t = 0.0
             self._last_step_time = None
             self._last_gripper = None
@@ -183,7 +219,7 @@ class SplinePlanner:
         deadline = time.perf_counter() + float(timeout)
         while time.perf_counter() < deadline:
             with self.lock:
-                if not self.getting_spline:
+                if not self._in_flight:
                     return True
             time.sleep(0.01)
         return False
@@ -213,6 +249,7 @@ class SplinePlanner:
     def poll_action(self) -> np.ndarray | None:
         """Sample the current plan without feeding an observation."""
         with self.lock:
+            self._install_deferred_if_due()
             if self.predictor is None or self.last_obs_time_to_predict is None:
                 return None
             now = self._clock()
@@ -266,6 +303,7 @@ class SplinePlanner:
             if not needs:
                 return
             self.getting_spline = True
+            self._in_flight = True
             epoch = self._epoch
         req = {
             "obs": [dict(o) for o in sequence],
@@ -280,6 +318,7 @@ class SplinePlanner:
         except queue.Full:
             with self.lock:
                 self.getting_spline = False
+                self._in_flight = False
 
     def _predict_process(self) -> None:
         while not self._stop:
@@ -307,43 +346,83 @@ class SplinePlanner:
             with self.lock:
                 self.failures += 1
                 self.getting_spline = False
+        finally:
+            with self.lock:
+                self._in_flight = False
 
     def _install(self, bspline: np.ndarray, req: dict) -> None:
         with self.lock:
             if req["epoch"] != self._epoch:
                 self.getting_spline = False
                 return
-            # last_t_normalized is only set once poll_action has sampled. A
-            # second plan can land before that (a slow loop, a large
-            # predict_before_end), and there is nothing to align to yet.
-            if (self.predictor is None or self.disable_time_align
-                    or self.last_t_normalized is None):
-                self._flush(bspline)
-                self.last_obs_time_to_predict = self._clock()
-                t_new, error = 0.0, 0.0
-            else:
-                old = np.asarray(
-                    self.predictor(np.array([self.last_t_normalized])), dtype=np.float64
-                ).squeeze()
-                self._flush(bspline)
-                t_new, error = self._align(old, req["obs_time"])
-                if self.restart_on_time_align_error and error > self.time_align_error_threshold:
-                    logger.warning("time-align error %.6f too large; restarting at t=0", error)
-                    t_new = 0.0
-                self.last_obs_time_to_predict = (
-                    self._clock()
-                    - t_new / self.speed_up_times / self.origin_time_scale
-                )
-                if error > self.time_align_error_threshold:
-                    logger.warning("time-align error %.6f over threshold %.6f",
-                                   error, self.time_align_error_threshold)
-                self.align_errors.append(float(error))
-            if self.gripper_slowdown_enabled:
-                self._accumulated_t = float(t_new)
-                self._last_step_time = self._clock()
-            self.plan_start_t = float(t_new)
-            self.plans += 1
-            self.getting_spline = False
+            if (self.defer_stitch and self.predictor is not None and not self.disable_time_align
+                    and self.last_t_normalized is not None):
+                # Upstream enters a new plan at once. When inference took less
+                # time than the plan's first knot lies ahead, _align has no
+                # window to search and the plan starts at that knot: the goal
+                # jumps forward by the gap. Deferred, the old plan runs until the
+                # knot is due and the stitch is searched.
+                min_t = float(safer_knots(bspline[..., 0])[self.degree])
+                if self._knots_since(req["obs_time"]) < min_t:
+                    self._deferred = (bspline, req, min_t)
+                    self.deferred += 1
+                    return
+            self._install_locked(bspline, req)
+
+    def _knots_since(self, obs_time: float) -> float:
+        return (self._clock() - obs_time) * self.speed_up_times * self.origin_time_scale
+
+    def _install_deferred_if_due(self) -> None:
+        """With the lock held: install a deferred plan once its first knot is due,
+        or at once if the plan it would replace has run out."""
+        if self._deferred is None:
+            return
+        bspline, req, min_t = self._deferred
+        spent = (self.last_obs_time_to_predict is not None
+                 and self._knots_since(self.last_obs_time_to_predict) > self.max_t)
+        # Strictly past it: at exactly min_t the alignment window is empty again.
+        if self._knots_since(req["obs_time"]) > min_t or spent:
+            self._deferred = None
+            try:
+                self._install_locked(bspline, req)
+            except Exception:
+                # As _serve treats a failed install: the old plan runs on.
+                logger.exception("installing a deferred spline failed")
+                self.failures += 1
+                self.getting_spline = False
+
+    def _install_locked(self, bspline: np.ndarray, req: dict) -> None:
+        # last_t_normalized is only set once poll_action has sampled. A
+        # second plan can land before that (a slow loop, a large
+        # predict_before_end), and there is nothing to align to yet.
+        if (self.predictor is None or self.disable_time_align
+                or self.last_t_normalized is None):
+            self._flush(bspline)
+            self.last_obs_time_to_predict = self._clock()
+            t_new, error = 0.0, 0.0
+        else:
+            old = np.asarray(
+                self.predictor(np.array([self.last_t_normalized])), dtype=np.float64
+            ).squeeze()
+            self._flush(bspline)
+            t_new, error = self._align(old, req["obs_time"])
+            if self.restart_on_time_align_error and error > self.time_align_error_threshold:
+                logger.warning("time-align error %.6f too large; restarting at t=0", error)
+                t_new = 0.0
+            self.last_obs_time_to_predict = (
+                self._clock()
+                - t_new / self.speed_up_times / self.origin_time_scale
+            )
+            if error > self.time_align_error_threshold:
+                logger.warning("time-align error %.6f over threshold %.6f",
+                               error, self.time_align_error_threshold)
+            self.align_errors.append(float(error))
+        if self.gripper_slowdown_enabled:
+            self._accumulated_t = float(t_new)
+            self._last_step_time = self._clock()
+        self.plan_start_t = float(t_new)
+        self.plans += 1
+        self.getting_spline = False
 
     def _flush(self, bspline_raw: np.ndarray) -> None:
         """Ported. Column 0 is the knot vector, the rest are control points; the

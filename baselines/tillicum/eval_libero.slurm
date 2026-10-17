@@ -12,8 +12,9 @@
 #SBATCH --mem=200G
 #SBATCH --time=06:00:00
 #SBATCH --requeue
-# EGL rendering stalls at startup on g011 (multi-fast/docs/EGL_STARTUP_STALL.md).
-#SBATCH --exclude=g011
+# EGL rendering stalls at startup on g011, and on g001/g003/g005 in 11 of 12
+# libero_goal eval jobs (multi-fast/docs/EGL_STARTUP_STALL.md).
+#SBATCH --exclude=g001,g003,g005,g011
 
 set -euo pipefail
 : "${SIF:?}" "${CLUSTER_HOME:?}" "${WORKSTATION_HOME:?}"
@@ -35,8 +36,12 @@ mkdir -p "$JOB_TMP"
 trap 'rm -rf "$JOB_TMP"' EXIT
 
 THREADS=$(( ${SLURM_CPUS_PER_TASK:-8} / PER_GPU ))
-ENVS=(--env NVIDIA_DRIVER_CAPABILITIES=all --env "OMP_NUM_THREADS=$(( THREADS > 0 ? THREADS : 1 ))")
-[ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ENVS+=(--env "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES")
+# numba caches beside its source unless told otherwise, and the image is read-only.
+ENVS=(--env NVIDIA_DRIVER_CAPABILITIES=all --env "OMP_NUM_THREADS=$(( THREADS > 0 ? THREADS : 1 ))"
+      --env NUMBA_CACHE_DIR=/tmp/numba)
+# CUDA_VISIBLE_DEVICES stays outside, as in multi-fast's eval: the cgroup already
+# limits the job to its GPU, and robosuite reads the variable as an EGL device index.
+echo "host CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 
 PIDS=()
 NAMES=()
@@ -51,7 +56,7 @@ for ((slot = 0; slot < PER_GPU; slot++)); do
     PORT=$((20000 + (SLURM_JOB_ID * 8 + slot) % 12000))
     mkdir -p "$HOST_PREP/rollout_logs_$SWEEP"
     echo "[$slot] $TASK $BACKEND $SWEEP port $PORT ${EVAL_ARGS[*]} -- ${ROLLOUT_ARGS[*]}"
-    apptainer exec --nv --containall --writable-tmpfs \
+    apptainer exec --nv --containall \
         --home "$CLUSTER_HOME:$WORKSTATION_HOME" \
         --bind "$JOB_TMP:/tmp" \
         "${ENVS[@]}" \

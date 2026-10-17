@@ -14,8 +14,15 @@ pass 1, and this runs passes 2-4 in the SAIL venv:
 
 Passes 2 and 3 edit the HDF5 in place and are skipped when their keys already
 exist (--relabel forces them). The generated config differs from the template
-only where our data does: camera keys, the crop size derived from the file's
-image size, the dataset path, the output directory, and the epoch budget.
+where our data does (camera keys, the crop size derived from the file's image
+size, the dataset path, the output directory, the epoch budget) and where the
+recipe the three diffusion policies share does (baselines/diffusion_recipe.py:
+step embedding 128, AdamW, a per-step cosine schedule, the EMA warmup form,
+batch 64). recipe_patch.py makes robomimic honour those keys.
+
+SAIL's fork trains epochs 0..num_epochs inclusive (scripts/train.py:235), one
+more than robomimic's 1..num_epochs, so N epochs is (N + 1) * epoch_every_n_steps
+gradient steps; --steps accounts for it.
 
 Checkpoints land in <output-dir>/<name>/<timestamp>/models/model_epoch_N.pth
 (the timestamp is robomimic's own), which is what sail_rollout.sh --ckpt takes.
@@ -40,6 +47,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 import h5py  # noqa: E402
 
+from baselines import diffusion_recipe as recipe  # noqa: E402
 from baselines.interpreters import python_for  # noqa: E402
 from baselines.train_common import crop_size, policies_dir, stream  # noqa: E402
 
@@ -125,12 +133,16 @@ def build_config(info: Info, args, output_dir: Path) -> dict:
     # off that grid would otherwise end on an unsaved epoch.
     save = cfg["experiment"]["save"]
     save["epochs"] = sorted(set(save["epochs"]) | {int(args.epochs)})
+    start_step = 0
     if args.resume is not None:
         # robomimic rebuilds the model and EMA from the checkpoint and carries the
-        # epoch count on; the optimizer starts fresh (the checkpoint holds none)
-        # at the same constant learning rate.
+        # epoch count on; the optimizer starts fresh (the checkpoint holds none),
+        # and the LR schedule resumes at the step the checkpoint ended on.
         tr["load_ckpt"] = str(args.resume.resolve())
         tr["epoch_start"] = checkpoint_epoch(args.resume) + 1
+        start_step = tr["epoch_start"] * int(args.epoch_every_n_steps)
+    recipe.apply_to_sail(cfg, num_training_steps=total_steps(args.epochs, args.epoch_every_n_steps),
+                         start_step=start_step)
     tr["batch_size"] = int(args.batch_size)
     tr["seed"] = int(args.seed)
     tr["num_data_workers"] = int(args.data_workers)
@@ -144,6 +156,11 @@ def build_config(info: Info, args, output_dir: Path) -> dict:
     else:
         cfg["observation"]["encoder"]["rgb"]["obs_randomizer_class"] = None
     return cfg
+
+
+def total_steps(epochs: int, epoch_every_n_steps: int) -> int:
+    """Gradient steps in a run of `epochs`: the fork trains epochs 0..epochs."""
+    return (int(epochs) + 1) * int(epoch_every_n_steps)
 
 
 _CKPT_EPOCH = re.compile(r"model_epoch_(\d+)\.pth$")
@@ -179,16 +196,19 @@ def main() -> int:
     p.add_argument("--epochs", type=int, default=None, help="default: the template's")
     p.add_argument("--steps", type=int, default=None,
                    help="gradient-step budget in place of --epochs: epochs = "
-                        "ceil(steps / epoch_every_n_steps), the same count lerobot-train's "
-                        "--steps means, so the three policies can be trained equally long")
+                        "ceil(steps / epoch_every_n_steps) - 1 (the fork trains epochs 0..N), "
+                        "the same count lerobot-train's --steps means, so the three policies "
+                        "can be trained equally long")
     p.add_argument("--epoch-every-n-steps", type=int, default=None,
                    help="gradient steps per epoch; default: the template's")
     p.add_argument("--save-every", "--checkpoint-every", dest="save_every", type=int, default=None,
                    help="checkpoint every N epochs; default: the template's. The last epoch is "
                         "always saved. --checkpoint-every is B-Spline's name for it, so one "
                         "--extra can carry it to both")
-    p.add_argument("--batch-size", type=int, default=None)
-    p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=recipe.BATCH_SIZE,
+                   help="default: the shared diffusion recipe's")
+    p.add_argument("--seed", type=int, default=recipe.SEED,
+                   help="default: the shared diffusion recipe's")
     p.add_argument("--data-workers", type=int, default=None)
     p.add_argument("--no-tb", action="store_true", help="no tensorboard logging")
     p.add_argument("--wandb", action="store_true", help="log online to wandb; default off")
@@ -215,12 +235,17 @@ def main() -> int:
 
     if args.steps is not None and args.epochs is not None:
         p.error("--steps and --epochs are two ways to say the same thing; pass one")
+    if args.resume is not None:
+        run_config = args.resume.resolve().parent.parent / "config.json"
+        stale = (recipe.sail_mismatches(json.loads(run_config.read_text()))
+                 if run_config.is_file() else ["no config.json beside it"])
+        if stale:
+            p.error(f"{args.resume} was not trained on the shared diffusion recipe "
+                    f"({', '.join(stale[:4])}); train it again rather than resuming it")
     template = json.loads(TEMPLATE.read_text())
     for attr, key in (("epochs", ("train", "num_epochs")),
                       ("epoch_every_n_steps", ("experiment", "epoch_every_n_steps")),
                       ("save_every", ("experiment", "save", "every_n_epochs")),
-                      ("batch_size", ("train", "batch_size")),
-                      ("seed", ("train", "seed")),
                       ("data_workers", ("train", "num_data_workers"))):
         if getattr(args, attr) is None:
             node = template
@@ -229,10 +254,12 @@ def main() -> int:
             setattr(args, attr, node)
 
     if args.steps is not None:
-        # robomimic counts epochs; an epoch is epoch_every_n_steps gradient steps.
-        args.epochs = -(-int(args.steps) // int(args.epoch_every_n_steps))
-        logger.info("--steps %d -> %d epochs of %d steps (%d steps)", args.steps, args.epochs,
-                    args.epoch_every_n_steps, args.epochs * int(args.epoch_every_n_steps))
+        # robomimic counts epochs; an epoch is epoch_every_n_steps gradient steps,
+        # and epochs 0..N run.
+        args.epochs = -(-int(args.steps) // int(args.epoch_every_n_steps)) - 1
+        logger.info("--steps %d -> %d epochs of %d steps (%d steps; epochs 0..%d)", args.steps,
+                    args.epochs, args.epoch_every_n_steps,
+                    total_steps(args.epochs, args.epoch_every_n_steps), args.epochs)
 
     info = inspect_hdf5(args.hdf5)
     output_dir = policies_dir(info.source_repo_id, args.output_dir)
@@ -249,11 +276,14 @@ def main() -> int:
         p.error(f"action key {base_key!r} is not in the file; it has {sorted(info.action_widths)}")
 
     steps: list[tuple[str, list[str]]] = []
-    if wants_label and (args.relabel or not info.has_waypoints):
+    # Waypoints are only the label pass's input: labels already present (e.g. from
+    # gripper_labels.py) need neither.
+    needs_labels = wants_label and (args.relabel or args.action_key not in info.precision_keys)
+    if needs_labels and (args.relabel or not info.has_waypoints):
         steps.append(("AWE waypoints", [*python, str(AWE_SCRIPT), "--dataset", str(args.hdf5.resolve()),
                                         "--err_threshold", str(args.err_threshold),
                                         "--num_workers", str(args.num_workers)]))
-    if wants_label and (args.relabel or args.action_key not in info.precision_keys):
+    if needs_labels:
         steps.append(("precision labels", [*python, str(LABEL_SCRIPT), "--dataset",
                                            str(args.hdf5.resolve()), "--action_key", base_key]))
     for label, cmd in steps:
@@ -295,8 +325,9 @@ def main() -> int:
                          args.resume, checkpoint_epoch(args.resume), args.epochs)
             return 1
         logger.info("resuming at epoch %d of %d from %s", checkpoint_epoch(args.resume) + 1, args.epochs, args.resume)
-    logger.info("=== training (%d epochs x %d steps, batch %d) ===",
-                args.epochs, args.epoch_every_n_steps, args.batch_size)
+    logger.info("=== training (epochs 0..%d x %d steps = %d steps, batch %d) ===",
+                args.epochs, args.epoch_every_n_steps,
+                total_steps(args.epochs, args.epoch_every_n_steps), args.batch_size)
     # robomimic_train.py reads these instead of robomimic's gitignored macros_private.py.
     env = dict(os.environ)
     if args.wandb_entity:

@@ -1,0 +1,9 @@
+
+HuskyMango/filter-10-6-bowl-plate
+  run                        method      eps   ok   rate  median s   mean s |F| N avg/p95/max  status       notes
+  20261009_164232-bspline    bspline      20   17    85%      9.30     9.30          3.1/7/20  completed    200Hz dirty-tree
+  20261009_171034-bspline    bspline      20   17    85%      6.05     6.07         3.6/10/24  completed    200Hz 2.0x dirty-tree
+  20261009_171738-bspline    bspline      20    9    45%      4.70     4.75         5.2/14/28  completed    200Hz 4.0x dirty-tree
+  20261009_173143-sail       sail         20   19    95%      8.26     8.96         4.0/12/37  completed    100Hz 5.0x precision eag dirty-tree
+  20261009_180700-multifast  multifast    20   20   100%     10.12    10.04          4.2/8/15  completed    20Hz base-only dirty-tree
+  20261009_181330-multifast  multifast    20   19    95%      6.90     7.40         6.6/15/28  interrupted  20Hz dirty-tree
