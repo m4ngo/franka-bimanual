@@ -31,7 +31,6 @@ class GelloLeaderFields:
     gripper_travel_counts: int = field(default_factory=lambda: _gello("gripper_travel_counts"))
     smoothing: float = field(default_factory=lambda: _gello("smoothing"))
     use_async: bool = field(default_factory=lambda: _gello("use_async"))
-    use_noise: bool = field(default_factory=lambda: _gello("use_noise"))
 
     @classmethod
     def for_side(cls, side: str, **overrides) -> "GelloLeaderFields":

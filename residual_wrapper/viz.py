@@ -2,7 +2,8 @@
 
 Call ``EpisodeRecorder.record()`` at each control step and
 ``EpisodeRecorder.record_chunk()`` each time inference runs a new action chunk,
-then ``save_episode_html(recorder, path)`` after the loop to write a
+then ``save_episode_html(recorder, path, **rig_frames(robot.config.rig_profile))``
+after the loop to write a
 self-contained animated HTML containing:
 
     - 3D arm skeleton animated over the episode (FK chain)
@@ -28,8 +29,9 @@ total forecast     : same, but residual position corrections are included for th
 
 All geometry rendered by this module — skeleton, EE poses, and chunk
 forecasts — is expressed in WORLD frame. FK produces robot-frame geometry,
-which is transformed into world frame via the robot's base pose in world, read
-from config/world.yaml (robot_base_in_world): the robot base (skeleton joint 0)
+which is transformed into world frame via the robot's base pose in world, which
+the caller passes in (``rig_frames`` reads it, and the depth camera's pose, from
+the rig profile the robot was built with): the robot base (skeleton joint 0)
 is placed at that translation, oriented per that quaternion. Point clouds
 recorded by EpisodeRecorder are assumed to already be in world frame and are
 used as-is.
@@ -43,6 +45,7 @@ import os
 import franka_config as fc
 import numpy as np
 import plotly.graph_objects as go
+from plotly.colors import sample_colorscale
 from plotly.subplots import make_subplots
 from scipy.spatial.transform import Rotation
 
@@ -50,14 +53,6 @@ from lerobot_robot_bimanual_franka.franka_fk import franka_fk_chain
 from lerobot_robot_bimanual_franka.gain_schedule import remap_constants
 from lerobot_robot_bimanual_franka.osc_torque_controller import resolve_gains
 
-_PROFILE = "single_arm_franka"
-_ARM = fc.profile(_PROFILE).arms[fc.profile(_PROFILE).depth_center_arm]
-
-# Robot base pose expressed in world frame (translation + wxyz quaternion),
-# from config/world.yaml. Skeleton joint 0 (the robot origin) is placed here.
-_BASE_IN_WORLD = fc.robot_base_in_world(_ARM)
-_DEFAULT_ROBOT_IN_WORLD_T = tuple(float(v) for v in _BASE_IN_WORLD.translation)
-_DEFAULT_ROBOT_IN_WORLD_Q_WXYZ = _BASE_IN_WORLD.quat_wxyz
 _AXIS_COLORS = (
     "rgba(220, 40, 40, 0.92)",
     "rgba(40, 170, 80, 0.92)",
@@ -70,12 +65,30 @@ _BASE_AXIS_COLORS = (
     "rgba(95, 180, 70, 0.82)",
     "rgba(55, 120, 220, 0.82)",
 )
-# Depth-camera pose in world frame, from config/cameras.yaml (camera -> world).
-_DEPTH_CAM_KEY = fc.profile(_PROFILE).depth_cameras[0]
-_DEPTH_CAM_IN_WORLD = fc.camera(_DEPTH_CAM_KEY).calibration.cam_in_world
-_DEFAULT_CAM_IN_WORLD_R = tuple(tuple(float(v) for v in row) for row in _DEPTH_CAM_IN_WORLD.rotation)
-_DEFAULT_CAM_IN_WORLD_T = tuple(float(v) for v in _DEPTH_CAM_IN_WORLD.translation)
 _STATIC_AXIS_LENGTH = 0.12
+
+
+def rig_frames(rig_profile: str) -> dict:
+    """The save_*_html frame kwargs for one rig profile: its arm's base pose and
+    its first depth camera's pose (omitted when it has none, which hides it).
+
+    Pass the profile the robot was BUILT with, `robot.config.rig_profile`, so the
+    page draws the camera the cloud was actually read from.
+    """
+    profile = fc.profile(rig_profile)
+    base = fc.robot_base_in_world(profile.arms[profile.depth_center_arm])
+    frames = dict(
+        robot_base_in_world_translation=tuple(float(v) for v in base.translation),
+        robot_base_in_world_quat_wxyz=base.quat_wxyz,
+    )
+    calibration = fc.camera(profile.depth_cameras[0]).calibration if profile.depth_cameras else None
+    if calibration is not None:
+        cam = calibration.cam_in_world
+        frames.update(
+            cam_in_world_rotation=tuple(tuple(float(v) for v in row) for row in cam.rotation),
+            cam_in_world_translation=tuple(float(v) for v in cam.translation),
+        )
+    return frames
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +120,7 @@ class EpisodeRecorder:
         self.point_clouds: list[np.ndarray | None] = []  # (N, 3) world-space, or None
         # Per-inference chunk forecast events, sorted by ascending step index.
         self.chunk_events: list[dict] = []
+        self.floor_rise: list[float] = []
         # Per-inference network-input clouds (post crop/downsample/re-centering).
         self.policy_pcd_events: list[dict] = []
         # --viz-latency-debug: per chunk, inference timing and robot-frame positions.
@@ -125,6 +139,7 @@ class EpisodeRecorder:
         kd: float,
         gripper: float,
         res_gripper: float,
+        floor_rise: float = 0.0,
         point_cloud: np.ndarray | None = None,
         res_rotvec: np.ndarray | None = None,
     ) -> None:
@@ -150,6 +165,7 @@ class EpisodeRecorder:
         self.kd.append(float(kd))
         self.gripper.append(float(gripper))
         self.res_gripper.append(float(res_gripper))
+        self.floor_rise.append(float(floor_rise))
         self.point_clouds.append(
             np.asarray(point_cloud, dtype=np.float32).copy() if point_cloud is not None else None
         )
@@ -554,6 +570,59 @@ def _latency_traces(events: list[dict], R_r2w, t_r2w) -> list[go.Scatter3d]:
     return traces
 
 
+def _waypoint_lift_mm(recorder: EpisodeRecorder, j: int, n: int) -> np.ndarray:
+    """(n,) worktable-floor lift (mm) at each waypoint of chunk event j; 0 where none.
+
+    Waypoint k >= 1 is the target sent on step `step + k - 1`, up to the step the
+    next chunk takes over. Waypoint 0 is the anchor, never sent.
+    """
+    lift = np.zeros(n, dtype=np.float32)
+    rise = getattr(recorder, "floor_rise", [])
+    if len(rise) != len(recorder):
+        return lift  # recorded before floor_rise existed
+    events = recorder.chunk_events
+    start = events[j]["step"]
+    stop = events[j + 1]["step"] if j + 1 < len(events) else len(recorder)
+    k = max(0, min(n - 1, stop - start))
+    lift[1:k + 1] = np.asarray(rise[start:start + k], dtype=np.float32) * 1e3
+    return lift
+
+
+def _lift_style(marker: dict, lift_mm: np.ndarray | None) -> dict:
+    """Scatter3d marker/text kwargs drawing floor-lifted waypoints bright red.
+
+    Always sets text: an animation frame that omits it keeps the previous frame's.
+    """
+    hit = None if lift_mm is None else np.asarray(lift_mm) > 1e-3
+    if hit is None or not hit.any():
+        return dict(marker=marker, text="")
+    if "colorscale" in marker:
+        colors = sample_colorscale(
+            marker["colorscale"],
+            np.clip(np.asarray(marker["color"], dtype=np.float64) / max(marker["cmax"], 1), 0.0, 1.0))
+    else:
+        colors = [marker["color"]] * len(hit)
+    size = marker["size"]
+    return dict(
+        marker=dict(size=[size + 4 if h else size for h in hit],
+                    color=[_FLOOR_LIFT_COLOR if h else c for h, c in zip(hit, colors)]),
+        text=[f"floor lifted {v:.1f} mm" if h else "" for h, v in zip(hit, lift_mm)],
+    )
+
+
+def _floor_lift_legend(chunk_events: list[dict]) -> list[go.Scatter3d]:
+    """Legend-only key for the red waypoints; empty when the floor lifted nothing."""
+    lifts = [ev["lift_mm"] for ev in chunk_events if (ev["lift_mm"] > 1e-3).any()]
+    if not lifts:
+        return []
+    n = sum(int((v > 1e-3).sum()) for v in lifts)
+    peak = max(float(v.max()) for v in lifts)
+    return [go.Scatter3d(x=[None], y=[None], z=[None], mode="markers",
+                         marker=dict(size=8, color=_FLOOR_LIFT_COLOR),
+                         name=f"floor-lifted waypoint ({n} steps, max {peak:.1f} mm)")]
+
+
+
 def save_latency_html(events: list[dict], path: str, title: str = "inference latency") -> None:
     """Per-chunk timing and how far the arm moved while the chunk was inferred."""
     if not events:
@@ -619,8 +688,8 @@ def _metric_trace(
 
 
 def _build_robot_to_world(
-    translation: tuple[float, float, float],
-    quat_wxyz: tuple[float, float, float, float],
+    translation: tuple[float, float, float] | None,
+    quat_wxyz: tuple[float, float, float, float] | None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return (R, t) for p_world = R @ p_robot + t.
 
@@ -632,6 +701,8 @@ def _build_robot_to_world(
         quat_wxyz:    Unit quaternion (w, x, y, z) — robot base orientation in
                       world frame.
     """
+    if translation is None or quat_wxyz is None:
+        raise ValueError("robot base pose required; pass **rig_frames(robot.config.rig_profile)")
     w, x, y, z = quat_wxyz
     R = Rotation.from_quat([x, y, z, w]).as_matrix()  # scipy expects xyzw
     t = np.array(translation, dtype=np.float64)
@@ -708,8 +779,11 @@ _EXEC_STEPS = 5
 # Waypoint marker colorscales, matching multi-fast pcd_viz: base yellow→red,
 # total (student) cyan→blue. Step-k on both traces shares the same color rank so
 # base/total divergence is readable waypoint-by-waypoint.
-_BASE_FCAST_COLORSCALE = [[0.0, "yellow"], [1.0, "red"]]
-_TOTAL_FCAST_COLORSCALE = [[0.0, "cyan"], [1.0, "blue"]]
+# rgb, not names: sample_colorscale cannot interpolate named colors.
+_BASE_FCAST_COLORSCALE = [[0.0, "rgb(255, 255, 0)"], [1.0, "rgb(255, 0, 0)"]]
+_TOTAL_FCAST_COLORSCALE = [[0.0, "rgb(0, 255, 255)"], [1.0, "rgb(0, 0, 255)"]]
+# Forecast waypoints whose sent goal the worktable floor lifted.
+_FLOOR_LIFT_COLOR = "rgb(255, 0, 60)"
 
 
 def _forecast_traces(
@@ -719,19 +793,22 @@ def _forecast_traces(
     name: str,
     cmax: int,
     show_legend: bool = False,
+    lift_mm: np.ndarray | None = None,
 ) -> tuple[go.Scatter3d, go.Scatter3d]:
     """Build (executed, lookahead) Scatter3d pair for one chunk forecast.
 
     The first _EXEC_STEPS waypoints (plus the current-EE anchor at index 0) are
     drawn solid; the remaining horizon is drawn dashed, sharing its first point
     with the executed segment so the polylines connect. Waypoint markers are
-    colored by within-chunk timestep on a fixed [0, cmax] scale.
+    colored by within-chunk timestep on a fixed [0, cmax] scale, except those
+    with a nonzero lift_mm (per waypoint), which are drawn bright red.
     """
     fcast = np.asarray(fcast, dtype=np.float32)
     n = len(fcast)
     exec_end = min(n, _EXEC_STEPS + 1)
     executed = fcast[:exec_end]
     ts_exec = np.arange(exec_end)
+    lift = None if lift_mm is None else np.asarray(lift_mm)[:n]
     if n > exec_end:
         lookahead = fcast[exec_end - 1:]
         ts_look = np.arange(exec_end - 1, n)
@@ -742,7 +819,8 @@ def _forecast_traces(
         x=executed[:, 0], y=executed[:, 1], z=executed[:, 2],
         mode="lines+markers",
         line=dict(color=line_color, width=5),
-        marker=dict(size=6, color=ts_exec, colorscale=colorscale, cmin=0, cmax=cmax),
+        **_lift_style(dict(size=6, color=ts_exec, colorscale=colorscale, cmin=0, cmax=cmax),
+                      None if lift is None else lift[:exec_end]),
         name=name,
         showlegend=show_legend,
     )
@@ -750,7 +828,8 @@ def _forecast_traces(
         x=lookahead[:, 0], y=lookahead[:, 1], z=lookahead[:, 2],
         mode="lines+markers",
         line=dict(color=line_color, width=3, dash="dash"),
-        marker=dict(size=4, color=ts_look, colorscale=colorscale, cmin=0, cmax=cmax),
+        **_lift_style(dict(size=4, color=ts_look, colorscale=colorscale, cmin=0, cmax=cmax),
+                      None if lift is None or n <= exec_end else lift[exec_end - 1:]),
         name=f"{name} (lookahead)",
         showlegend=False,
     )
@@ -778,11 +857,11 @@ def save_episode_html(
     title: str = "Residual episode",
     frame_stride: int = 1,
     fps: float = 20.0,
-    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
-    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] | None = None,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] | None = None,
     pcd_max_pts: int = 3000,
-    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
-    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = None,
+    cam_in_world_translation: tuple[float, float, float] | None = None,
     reference_trail: np.ndarray | None = None,
     reference_name: str = "reference EE",
 ) -> None:
@@ -824,16 +903,13 @@ def save_episode_html(
                                    Use 2–4 to reduce file size for long episodes.
         fps:                       Playback speed in frames per second (default 20).
         robot_base_in_world_translation: (tx, ty, tz) metres — robot base position in
-                                   world frame. Defaults to BimanualFrankaConfig
-                                   values.
+                                   world frame. Required; see rig_frames.
         robot_base_in_world_quat_wxyz:  (w, x, y, z) unit quaternion — robot base
-                                   orientation in world frame. Defaults to
-                                   BimanualFrankaConfig values.
+                                   orientation in world frame. Required.
         pcd_max_pts:               Max points to render per frame (uniformly
                                    subsampled).  Reduces HTML size for dense clouds.
         cam_in_world_rotation:     3x3 camera->world rotation; None hides the
-                                   camera frame. Defaults to the cam_2_scene
-                                   calibration in config_single_arm_franka.
+                                   camera frame.
         cam_in_world_translation:  (tx, ty, tz) metres — camera position in world
                                    frame; None hides the camera frame.
         reference_trail:           Optional (N, 3) WORLD-frame EE trail from another
@@ -911,8 +987,9 @@ def save_episode_html(
                 _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
                 if ev.get("total_traj_pose") is not None else None
             ),
+            "lift_mm": _waypoint_lift_mm(recorder, j, len(ev["base_traj"])),
         }
-        for ev in recorder.chunk_events
+        for j, ev in enumerate(recorder.chunk_events)
     ]  # sorted ascending by step (order preserved from recorder)
 
     # --- global 3D bbox (prevents camera rescaling between animation frames) -
@@ -987,7 +1064,8 @@ def save_episode_html(
     # multi-fast pcd_viz, where only the base trajectory gets a lookahead).
     _init_total_exec, _init_total_look = _forecast_traces(
         _init_total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
-        "total chunk forecast", fcast_cmax, show_legend=True)
+        "total chunk forecast", fcast_cmax, show_legend=True,
+        lift_mm=_init_ev["lift_mm"] if _init_ev else None)
     fig.add_trace(_init_total_exec, row=1, col=1)
     # Trace 3: base chunk forecast, executed segment (base-policy only)
     _init_base_exec, _init_base_look = _forecast_traces(
@@ -1080,7 +1158,7 @@ def save_episode_html(
         # exists past _EXEC_STEPS, so its "lookahead" trace stays empty.
         total_exec_tr, total_look_tr = _forecast_traces(
             total_fcast[:_EXEC_STEPS + 1], _TOTAL_FCAST_COLORSCALE, "royalblue",
-            "total chunk forecast", fcast_cmax)
+            "total chunk forecast", fcast_cmax, lift_mm=ev["lift_mm"] if ev else None)
         base_exec_tr, base_look_tr = _forecast_traces(
             base_fcast, _BASE_FCAST_COLORSCALE, "gray",
             "base chunk forecast", fcast_cmax)
@@ -1227,6 +1305,9 @@ def save_episode_html(
     for trace in _latency_traces(recorder.latency_events, R_r2w, t_r2w):
         fig.add_trace(trace, row=1, col=1)
 
+    for trace in _floor_lift_legend(chunk_events):
+        fig.add_trace(trace, row=1, col=1)
+
     fig.write_html(path, include_plotlyjs="cdn")
 
 
@@ -1236,11 +1317,11 @@ def save_rollout_html(
     title: str = "Base policy rollout",
     frame_stride: int = 1,
     fps: float = 20.0,
-    robot_base_in_world_translation: tuple[float, float, float] = _DEFAULT_ROBOT_IN_WORLD_T,
-    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] = _DEFAULT_ROBOT_IN_WORLD_Q_WXYZ,
+    robot_base_in_world_translation: tuple[float, float, float] | None = None,
+    robot_base_in_world_quat_wxyz: tuple[float, float, float, float] | None = None,
     pcd_max_pts: int = 3000,
-    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = _DEFAULT_CAM_IN_WORLD_R,
-    cam_in_world_translation: tuple[float, float, float] | None = _DEFAULT_CAM_IN_WORLD_T,
+    cam_in_world_rotation: tuple[tuple[float, float, float], ...] | None = None,
+    cam_in_world_translation: tuple[float, float, float] | None = None,
     forecast_name: str = "base chunk forecast",
     reference_trail: np.ndarray | None = None,
     reference_name: str = "reference EE",
@@ -1342,8 +1423,9 @@ def save_rollout_html(
                 _apply_robot_to_world_pose(ev["total_traj_pose"], R_r2w, t_r2w)
                 if ev.get("total_traj_pose") is not None else None
             ),
+            "lift_mm": _waypoint_lift_mm(recorder, j, len(ev["base_traj"])),
         }
-        for ev in recorder.chunk_events
+        for j, ev in enumerate(recorder.chunk_events)
     ]  # sorted ascending by step (order preserved from recorder)
 
     pcd_for_bbox = [p[:, :3] for p in pcd_world if len(p) > 0] if has_pcd else []
@@ -1401,7 +1483,9 @@ def save_rollout_html(
     )
     # Trace 2: base chunk forecast (full projected trajectory from most recent inference)
     fig.add_trace(
-        _trail_trace(_init_base_fcast, color="royalblue", name=forecast_name),
+        # A base-only run executes the base chunk, so its sent goals are these waypoints.
+        _trail_trace(_init_base_fcast, color="royalblue", name=forecast_name).update(
+            **_lift_style(dict(size=3, color="royalblue"), _init_ev["lift_mm"] if _init_ev else None)),
         row=1, col=1,
     )
     # Trace 3-5: live EE orientation triad.
@@ -1461,7 +1545,7 @@ def save_rollout_html(
                 x=base_fcast[:, 0], y=base_fcast[:, 1], z=base_fcast[:, 2],
                 mode="lines+markers",
                 line=dict(color="royalblue", width=5),
-                marker=dict(size=3, color="royalblue"),
+                **_lift_style(dict(size=3, color="royalblue"), ev["lift_mm"] if ev else None),
             ),
         ]
         frame_data.extend(_pose_axes_traces(current_pose, "current ee", _FORECAST_AXIS_LENGTH, colors=_CURRENT_AXIS_COLORS, width=5, opacity=0.95))
@@ -1576,6 +1660,9 @@ def save_rollout_html(
                                    dash="dash", width=3, marker_size=2), row=1, col=1)
 
     for trace in _latency_traces(recorder.latency_events, R_r2w, t_r2w):
+        fig.add_trace(trace, row=1, col=1)
+
+    for trace in _floor_lift_legend(chunk_events):
         fig.add_trace(trace, row=1, col=1)
 
     fig.write_html(path, include_plotlyjs="cdn")

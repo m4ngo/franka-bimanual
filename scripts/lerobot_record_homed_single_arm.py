@@ -49,8 +49,10 @@ from lerobot.utils.utils import init_logging, log_say
 
 # Importing the plugin packages triggers their @register_subclass decorators.
 from lerobot_robot_bimanual_franka import (
-    ControlMode, SingleArmFranka, SingleArmFrankaConfig, SingleArmRightConfig,
+    ControlMode, SingleArmFranka, SingleArmFrankaConfig, single_arm_profiles,
 )
+from lerobot_robot_bimanual_franka.action_noise import configured_scales
+from lerobot_robot_bimanual_franka.config_single_arm_franka import ARM_KEY
 
 # The mode -> (control mode, leader units) table, shared with the teleop driver so
 # a recording cannot pair a leader with a control mode it does not speak.
@@ -122,12 +124,9 @@ class _StdinKeyboardThread:
 # SpaceMice enumerate as identical HID devices, so picking the wrong one
 # connects successfully and then does nothing.
 _DEFAULT_RIG = fc.default_single_arm_profile()
-_ARM_KEY = fc.profile(_DEFAULT_RIG).depth_center_arm
-# Rig profile -> config class; which PHYSICAL arm each drives is in config/rig.yaml.
-_RIGS = {
-    "single_arm_franka": SingleArmFrankaConfig,
-    "single_arm_right": SingleArmRightConfig,
-}
+_ARM_KEY = ARM_KEY
+# Every --rig choice; which PHYSICAL arm each drives is in config/rig.yaml.
+_RIGS = single_arm_profiles()
 
 
 def _str2bool(v: str) -> bool:
@@ -136,10 +135,11 @@ def _str2bool(v: str) -> bool:
 
 def _build_robot(control_mode: ControlMode, depth: bool = True, noise: bool = False,
                  rig: str = _DEFAULT_RIG) -> SingleArmFranka:
-    cfg = _RIGS[rig](
+    cfg = SingleArmFrankaConfig(
+        rig_profile=rig,
         control_mode=control_mode,
         depth=depth,
-        use_noise=noise,
+        **(configured_scales() if noise else {}),
     )
     return make_robot_from_config(cfg)
 
@@ -151,11 +151,7 @@ def _build_teleop(mode: str, teleop_id: str, device: str | None = None, rig: str
             f"rig profile {rig!r} has no teleop_device; set one in config/rig.yaml "
             "or pass --teleop-device."
         )
-    # use_noise on the GELLO leaders is recording-only jitter (Gello.NOISE_SCALE on
-    # each joint), deliberately not applied during plain teleop.
-    return make_teleoperator_from_config(
-        build_leader(mode, device, teleop_id, use_noise=mode.startswith("gello"))
-    )
+    return make_teleoperator_from_config(build_leader(mode, device, teleop_id))
 
 
 def _build_dataset(args, robot, teleop_proc, robot_obs_proc) -> LeRobotDataset:
@@ -272,9 +268,11 @@ def main() -> None:
         default=None,
         help="Homing control rate (Hz). Default: control.rates.home_fps in config/control.yaml.",
     )
-    p.add_argument("--noise", type=_str2bool, default=False,
-                   help="Follower-side action noise at control.yaml's noise.* scales "
-                        "(EE_DELTA and EE_POS)")
+    p.add_argument("--noise", type=_str2bool, default=None,
+                   help="Goal noise at control.yaml's noise.* scales, added by the robot "
+                        "just before dispatch; the recorded action stays clean (all "
+                        "control modes). Default: on for teleop recording, off for "
+                        "--policy runs.")
 
     args = p.parse_args()
     init_logging()
@@ -290,7 +288,8 @@ def main() -> None:
         control_mode = ControlMode(fc.profile(args.rig).control_mode)
     else:
         control_mode = MODES[args.teleop_mode][0]
-    robot = _build_robot(control_mode=control_mode, depth=args.depth, noise=args.noise,
+    noise = args.noise if args.noise is not None else args.policy is None
+    robot = _build_robot(control_mode=control_mode, depth=args.depth, noise=noise,
                          rig=args.rig)
     teleop = (None if args.policy else
               _build_teleop(args.teleop_mode, args.teleop_id, args.teleop_device, rig=args.rig))

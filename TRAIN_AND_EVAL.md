@@ -1,6 +1,7 @@
 # Record, train, and evaluate: SAIL, B-Spline, and ZAP
 
-Guide to running task evaluation loop.
+Guide to running task evaluation loop. The same loop in sim (LIBERO) is
+[NEW_DIFFUSION_POLICY_ARCH.md](NEW_DIFFUSION_POLICY_ARCH.md).
 
 ```
 record dataset → filter dataset + convert to baselines → send dataset to 

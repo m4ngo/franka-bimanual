@@ -51,6 +51,7 @@ from lerobot.utils.utils import init_logging, log_say
 # so make_robot_from_config / make_teleoperator_from_config can resolve
 # bimanual_franka / bimanual_gello{,_ee} by name.
 from lerobot_robot_bimanual_franka import BimanualFranka, BimanualFrankaConfig, ControlMode
+from lerobot_robot_bimanual_franka.action_noise import configured_scales
 from lerobot_teleoperator_gello import (
     BimanualGelloConfig,
     BimanualGelloEEConfig,
@@ -67,8 +68,9 @@ def _str2bool(v: str) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "y", "t")
 
 
-def _build_robot(control_mode: ControlMode) -> BimanualFranka:
-    cfg = BimanualFrankaConfig(control_mode=control_mode)
+def _build_robot(control_mode: ControlMode, noise: bool = False) -> BimanualFranka:
+    cfg = BimanualFrankaConfig(control_mode=control_mode,
+                               **(configured_scales() if noise else {}))
     return make_robot_from_config(cfg)
 
 
@@ -76,14 +78,14 @@ def _build_teleop(mode: str, teleop_id: str):
     if mode == "gello":
         cfg = BimanualGelloConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields.for_side("left", use_noise=True),
-            right_arm_config=GelloLeaderFields.for_side("right", use_noise=True),
+            left_arm_config=GelloLeaderFields.for_side("left"),
+            right_arm_config=GelloLeaderFields.for_side("right"),
         )
     elif mode == "gello_ee":
         cfg = BimanualGelloEEConfig(
             id=teleop_id,
-            left_arm_config=GelloLeaderFields.for_side("left", use_noise=True),
-            right_arm_config=GelloLeaderFields.for_side("right", use_noise=True),
+            left_arm_config=GelloLeaderFields.for_side("left"),
+            right_arm_config=GelloLeaderFields.for_side("right"),
         )
     else:
         raise ValueError(f"Unsupported --teleop-mode: {mode!r}. Use 'gello' or 'gello_ee'.")
@@ -158,6 +160,9 @@ def main() -> None:
     p.add_argument("--resume", type=_str2bool, default=False)
     p.add_argument("--push-to-hub", type=_str2bool, default=True)
     p.add_argument("--play-sounds", type=_str2bool, default=False)
+    p.add_argument("--noise", type=_str2bool, default=False,
+                   help="Goal noise at control.yaml's noise.* scales, added by the robot "
+                        "just before dispatch; the recorded action stays clean")
 
     p.add_argument("--home-pose-name", default=fc.default_home_pose_name(),
                    help=f"Name of a saved pose in {POSES_DIR} (overrides --home-q-* and --home-gripper)")
@@ -182,7 +187,7 @@ def main() -> None:
         args._policy_cfg = PreTrainedConfig.from_pretrained(args.policy)
         args._policy_cfg.pretrained_path = args.policy
 
-    robot = _build_robot(control_mode=ControlMode(args.control_mode))
+    robot = _build_robot(control_mode=ControlMode(args.control_mode), noise=args.noise)
     teleop = None if args.policy else _build_teleop(args.teleop_mode, args.teleop_id)
 
     teleop_proc, robot_action_proc, robot_obs_proc = make_default_processors()

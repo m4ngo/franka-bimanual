@@ -79,9 +79,10 @@ class BimanualFrankaConfig(RobotConfig):
     kd_pos_scale: tuple[float, float, float] = field(
         default_factory=lambda: tuple(fc.control("tuning.kd_pos_scale"))
     )
-    use_noise: bool = False
-    noise_pos_scale: float = field(default_factory=lambda: fc.control("noise.pos_scale_m"))
-    noise_rot_scale: float = field(default_factory=lambda: fc.control("noise.rot_scale_rad"))
+    # Gaussian goal noise, std dev per axis per step; 0.0 is off. See action_noise.
+    noise_pos_scale: float = 0.0
+    noise_rot_scale: float = 0.0
+    noise_joint_scale: float = 0.0
     cameras: dict[str, CameraConfig] = field(
         default_factory=lambda: profile_cameras(PROFILE)
     )

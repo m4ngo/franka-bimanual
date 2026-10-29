@@ -32,8 +32,8 @@ here:
                 EE_POS goal -- no delta envelope and no latched orientation, both
                 of which live on the EE_DELTA branch (see
                 `ee_goals.OSCGoalBuilder.absolute`) -- unless the recording ran
-                with use_noise set, in which case the goal carried
-                `OSCGoalBuilder.perturb`'s jitter that the recorded action does not.
+                with goal noise on, in which case the goal carried
+                `action_noise.ActionNoise`'s jitter that the recorded action does not.
 
 Row alignment is already the fit's: LeRobot writes obs_t and then calls
 send_action, so state precedes its action and sim step t scores against row t+1.

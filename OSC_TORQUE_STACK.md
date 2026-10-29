@@ -72,7 +72,6 @@ This is the path used by the delta-action policies. The action already contains 
 - extracts the position delta from the action,
 - converts the delta quaternion to an axis-angle rotation vector,
 - adds any cached residual offset from `cache_delta()`,
-- optionally adds noise if the config requests it,
 - clips to the policy envelope with `clip_delta()`,
 - applies any configured translation/rotation fudge, and
 - updates the persistent orientation goal only when the rotation delta is nonzero.
@@ -83,7 +82,11 @@ That last point is load-bearing: pure translation commands must keep the current
 
 This mode interprets the action as an absolute pose. `BimanualFranka._osc_goal_absolute()` converts the pose directly into an OSC goal, optionally ignoring the action and parking on the current pose when `ignore_action=True`.
 
-The same cached residual delta offsets from `cache_delta()` are applied here too, and `OSCGoalBuilder.perturb()` then adds the configured action noise (`control.yaml` `noise:`) when `use_noise` is set -- the same draw the delta path adds to its delta, applied here to the composed goal. The action the recording stores is the leader's; only the goal the arm pursues carries the noise.
+The same cached residual delta offsets from `cache_delta()` are applied here too.
+
+#### Action noise
+
+`action_noise.ActionNoise` adds Gaussian noise to the goal in every mode, just before it is dispatched: to the composed OSC goal (after `clip_delta`, the fudges and the residual, before the worktable screen) and to the `JOINT_POS` joint goal. The latched `goal_ori` is never perturbed. The scales are the robot config's `noise_pos_scale`, `noise_rot_scale` and `noise_joint_scale`, all 0.0 (off) by default; `control.yaml`'s `noise:` block holds the values a run turns on (`lerobot_record_homed_single_arm.py` for teleop recording, `--noise` elsewhere). The action the recording stores is the leader's, without noise. Leaders never add noise of their own.
 
 #### `JOINT_POS`
 

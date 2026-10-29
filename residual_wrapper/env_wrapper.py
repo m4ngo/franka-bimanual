@@ -8,20 +8,16 @@ import franka_config as fc
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-from lerobot_robot_bimanual_franka import (
-    SingleArmFranka, SingleArmFrankaConfig, SingleArmRight, SingleArmRightConfig,
-)
+from lerobot_robot_bimanual_franka import SingleArmFranka, SingleArmFrankaConfig, single_arm_profiles
+from lerobot_robot_bimanual_franka.config_single_arm_franka import ARM_KEY
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk
 from lerobot_robot_bimanual_franka.franka_jacobian import zero_jacobian
 
-_PROFILE = "single_arm_franka"
-_ARM_KEY = fc.profile(_PROFILE).depth_center_arm
+_PROFILE = fc.default_single_arm_profile()
+_ARM_KEY = ARM_KEY
 
-# Rig profile -> robot class. Which physical arm each drives is in config/rig.yaml.
-_RIGS = {
-    "single_arm_franka": (SingleArmFranka, SingleArmFrankaConfig),
-    "single_arm_right": (SingleArmRight, SingleArmRightConfig),
-}
+# Every --rig choice. Which physical arm each drives is in config/rig.yaml.
+_RIGS = single_arm_profiles()
 
 _RES_POS_GAIN = fc.policy("residual.res_pos_gain")
 _RES_ROT_GAIN = fc.policy("residual.res_rot_gain")
@@ -365,12 +361,10 @@ def start_controller(with_cameras: bool = True, rig: str = _PROFILE) -> SingleAr
 
     All hardware addressing comes from the `rig` profile in config/rig.yaml.
     """
-    if fc.profile(rig).depth_center_arm != _ARM_KEY:
-        raise ValueError(f"rig {rig!r} does not expose the {_ARM_KEY!r} key prefix")
-    robot_cls, config_cls = _RIGS[rig]
-    config = config_cls(
+    config = SingleArmFrankaConfig(
+        rig_profile=rig,
         **({} if with_cameras else {"cameras": {}, "depth_cam": {}, "depth": False}),
     )
-    robot = robot_cls(config)
+    robot = SingleArmFranka(config)
     robot.connect()
     return robot

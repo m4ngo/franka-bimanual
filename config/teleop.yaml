@@ -11,7 +11,6 @@ gello:
   gripper_travel_counts: 575
   smoothing: 0.99          # EMA alpha; 1.0 = no smoothing
   use_async: true
-  use_noise: false
   devices:
     left: {port: /dev/ttyUSB1}
     right: {port: /dev/ttyUSB0}

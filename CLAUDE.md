@@ -342,6 +342,11 @@ known image) rather than raising.
 cameras. `single_arm_franka` exposes the **left** FR3 under the `r_` key prefix
 (deliberate: it keeps previously recorded `r_*` datasets readable), so the key
 prefix is not the physical arm — always resolve through the profile.
+`SingleArmFrankaConfig` reads its arm, cameras and control mode from its
+`rig_profile` field at construction, so `--rig` (or `--robot.rig_profile`) is the
+one switch; every single-arm entry point passes it through. Code that runs after
+the robot exists reads `robot.config.rig_profile`, never a module constant — that
+is how the episode HTML once drew `cam_2` over a cloud read from `cam_7`.
 
 ## Teleop stack
 

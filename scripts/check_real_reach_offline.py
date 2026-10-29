@@ -57,7 +57,6 @@ class FakeArm:
 		self._goals = OSCGoalBuilder(
 			translation_fudge=float(fc.control("tuning.ee_translation_fudge")),
 			rotation_fudge=float(fc.control("tuning.ee_rotation_fudge")),
-			use_noise=False, noise_pos_scale=0.0, noise_rot_scale=0.0,
 		)
 		self.safety = ActionSafetyScreen({key: fc.robot_base_in_world(arm)},
 										 {key: fc.ee_sphere(arm)})

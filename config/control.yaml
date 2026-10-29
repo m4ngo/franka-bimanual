@@ -421,9 +421,10 @@ gripper:
     close_join_timeout_s: 1.0
 
 noise:
-  # Gaussian action noise the follower adds when use_noise is set, std dev per
-  # axis per step. EE_DELTA adds it to the delta before clip_delta; EE_POS adds
-  # it to the composed goal, after the residual and before the worktable screen.
-  # The recorded action is the leader's; only the goal the arm pursues carries it.
-  pos_scale_m: 0.015
-  rot_scale_rad: 0.025
+  # Gaussian goal noise, std dev per axis per step, for runs that turn it on
+  # (lerobot_record_homed_single_arm.py by default, --noise elsewhere). The robot
+  # configs default every scale to 0.0. Added to the composed goal just before
+  # dispatch, before the worktable screen; the recorded action stays clean.
+  pos_scale_m: 0.015      # EE_DELTA / EE_POS goal position
+  rot_scale_rad: 0.025    # EE_DELTA / EE_POS goal orientation
+  joint_scale_rad: 0.02   # JOINT_POS goal, per joint

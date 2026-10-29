@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Convert a regenerated LIBERO demo file into SAIL and B-Spline training HDF5s.
+"""Convert a regenerated LIBERO demo file into the SAIL and B-Spline training
+HDF5s and our diffusion base's LeRobot dataset.
 
-    python -m baselines.libero_bridge.dataset ~/libero_data/libero_10/libero_10_relabeled \
-        --out-dir ~/franka_data/baseline_prep/libero_10
+    python -m baselines.libero_bridge.dataset ~/libero_data_sysid/libero_90 \
+        --out-dir ~/franka_data/baseline_prep/libero_90_sysid_2026_09_16
 
-Each task is filed by its index in the suite, not its name: task 2 of libero_10
-lands in `<out-dir>/task_2/` and is stamped `libero_10/task_2`, which is where
-its policies and rollouts go too. The suite is the nearest directory in the
-source's path named after one, or --suite.
+All three come from the same demos, episodes and frames; only what each policy
+reads and predicts differs. Each task is filed by its index in the suite, not
+its name: task 2 of libero_10 lands in `<out-dir>/task_2/` and is stamped
+`libero_10/task_2`, which is where its policies and rollouts go too. A file
+regenerate_on_plant.py re-recorded is stamped `<suite>_<plant>/task_2` instead,
+so it is never filed beside the stock-plant demos. The suite is the nearest
+directory in the source's path named after one, or --suite.
 
 The sim half of scripts/prepare_baseline_datasets.py. It reads what
 `multi-fast/scripts/libero/regenerate_libero_dataset.py` writes, not raw LIBERO:
@@ -48,9 +52,12 @@ logger = logging.getLogger("baselines.libero")
 # definition here that the rollout re-derives is how the two drift. That module
 # is numpy + cv2 at import time, so it costs nothing here.
 from baselines.libero_bridge.sim_env import (  # noqa: E402
-    CAMERAS, DEFAULT_IMAGE_SIZE, GRIPPER, policy_frame, resolve_task, suites, task_names,
-    task_tag,
+    CAMERAS, DEFAULT_IMAGE_SIZE, DP_STATE_KEYS, GRIPPER, policy_frame, resolve_task, suites,
+    task_names, task_tag,
 )
+
+# What convert_task writes per task, in order.
+KINDS = ("sail", "bspline", "lerobot")
 
 
 def suite_of(source: Path) -> str:
@@ -142,6 +149,27 @@ def bspline_episode(demo) -> dict[str, np.ndarray]:
     }
 
 
+# Our diffusion base's feature names; the action is the real base's EE_POS less kp/kd.
+LEROBOT_STATE = ("eef_x", "eef_y", "eef_z", "eef_qx", "eef_qy", "eef_qz", "eef_qw",
+                 "gripper_qpos_0", "gripper_qpos_1")
+LEROBOT_ACTION = ("x", "y", "z", "qx", "qy", "qz", "qw", "gripper")
+
+
+def lerobot_episode(demo) -> dict[str, np.ndarray]:
+    reached_pos, _, reached_quat, commanded_pos, commanded_rotvec = poses(demo)
+    gripper_act = demo["actions"][()][:, GRIPPER].astype(np.float64)
+    # On the state's hemisphere: from_rotvec keeps the relabeler's sign (see poses()).
+    commanded_quat = Rotation.from_rotvec(commanded_rotvec).as_quat()
+    state = {"robot0_eef_pos": reached_pos, "robot0_eef_quat": reached_quat,
+             "robot0_gripper_qpos": demo["obs/gripper_states"][()]}
+    return {
+        "observation.state": np.concatenate(
+            [state[k] for k, _ in DP_STATE_KEYS], axis=1).astype("float32"),
+        "action": np.concatenate(
+            [commanded_pos, commanded_quat, gripper_act[:, None]], axis=1).astype("float32"),
+    }
+
+
 def demos(source: Path, build, *, episodes, min_steps, include_images, image_size, flip):
     with h5py.File(source, "r") as f:
         data = f["data"]
@@ -164,6 +192,102 @@ def demos(source: Path, build, *, episodes, min_steps, include_images, image_siz
             yield ep_index, arrays
 
 
+def default_repo_id(source: Path, suite: str, index: int) -> str:
+    """`<suite>/task_<i>`, or `<suite>_<plant>/task_<i>` for a re-recorded file."""
+    stamp = comparison_env(source)
+    prefix = suite if stamp is None else f"{suite}_{json.loads(stamp)['plant']}"
+    return f"{prefix}/{task_tag(index)}"
+
+
+def comparison_env(source: Path) -> str | None:
+    """The environment regenerate_on_plant.py recorded the demos in, as its JSON
+    stamp; None for a stock-plant regenerate_libero_dataset.py file."""
+    with h5py.File(source, "r") as f:
+        stamp = f["data"].attrs.get("comparison_env")
+    return None if stamp is None else str(stamp)
+
+
+def convert_lerobot(source, root: Path | None, *, suite: str, episodes=None, min_steps=20,
+                    include_images=True, image_size=DEFAULT_IMAGE_SIZE, flip_images=True,
+                    source_repo_id=None) -> int:
+    """The diffusion base's LeRobot dataset, from the same demos and frames as
+    sail.hdf5 and bspline.hdf5.
+
+    Images are stored as `image` (lossless PNG), not video, so the base trains on
+    the pixels the baselines do. `source.json` at the root records what
+    LeRobot's own metadata cannot: the source file, the environment stamp and
+    which source demo each episode is.
+    """
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+    from lerobot.utils.constants import HF_LEROBOT_HOME
+    from libero.libero import benchmark
+
+    source = Path(source).expanduser()
+    index = resolve_task(suite, source.stem)
+    repo_id = source_repo_id or default_repo_id(source, suite, index)
+    root = Path(root).expanduser() if root is not None else HF_LEROBOT_HOME / repo_id
+    if root.exists():
+        raise SystemExit(f"{root} exists; delete it to convert over it")
+    language = benchmark.get_benchmark_dict()[suite]().get_task(index).language
+
+    features = {
+        "observation.state": {"dtype": "float32", "shape": (len(LEROBOT_STATE),),
+                              "names": list(LEROBOT_STATE)},
+        "action": {"dtype": "float32", "shape": (len(LEROBOT_ACTION),),
+                   "names": list(LEROBOT_ACTION)},
+    }
+    tmp = root.with_name(root.name + ".tmp")
+    if tmp.exists():
+        import shutil
+        shutil.rmtree(tmp)
+    dataset = None
+    episode_map = []
+    try:
+        for ep_index, arrays in demos(source, lerobot_episode, episodes=episodes,
+                                      min_steps=min_steps, include_images=include_images,
+                                      image_size=image_size, flip=flip_images):
+            images_ = {f"observation.images.{dst}": arrays.pop(f"obs/{dst}")
+                       for _, dst in CAMERAS if f"obs/{dst}" in arrays}
+            if dataset is None:
+                for key, frames in images_.items():
+                    features[key] = {"dtype": "image", "shape": tuple(frames.shape[1:]),
+                                     "names": ["height", "width", "channel"]}
+                dataset = LeRobotDataset.create(repo_id, fps=20, features=features, root=tmp,
+                                                robot_type="libero_panda", use_videos=False)
+            for t in range(len(arrays["action"])):
+                frame = {k: v[t] for k, v in arrays.items()}
+                frame.update({k: v[t] for k, v in images_.items()})
+                frame["task"] = language
+                dataset.add_frame(frame)
+            dataset.save_episode()
+            episode_map.append(ep_index)
+        if dataset is None:
+            logger.error("no episodes converted")
+            return 1
+        dataset.finalize()
+    except BaseException:
+        import shutil
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
+    with h5py.File(source, "r") as f:
+        first = next(iter(f["data"].values()))
+        # What the frames were rendered at before policy_frame downsampled them.
+        rendered = int(first[f"obs/{CAMERAS[0][0]}"].shape[1])
+    (tmp / "source.json").write_text(json.dumps({
+        "converter": "baselines/libero_bridge/dataset.py:lerobot",
+        "source_dataset": str(source),
+        "source_repo_id": repo_id,
+        "libero_suite": suite, "libero_task_index": index,
+        "libero_task": task_names(suite)[index],
+        "comparison_env": json.loads(comparison_env(source) or "null"),
+        "render_resolution": rendered,
+        "source_episodes": episode_map,
+    }, indent=1))
+    tmp.rename(root)
+    logger.info("wrote %d episodes to %s", len(episode_map), root)
+    return 0
+
+
 def convert(source, out: Path, kind: str, *, suite: str, episodes=None, min_steps=20,
             include_images=True, image_size=DEFAULT_IMAGE_SIZE, flip_images=True,
             source_repo_id=None) -> int:
@@ -173,7 +297,7 @@ def convert(source, out: Path, kind: str, *, suite: str, episodes=None, min_step
     name = task_names(suite)[index]
     # Checkpoints and rollouts are filed under this id: `<root>/libero_10/task_2/`,
     # one suite per directory (baselines/run_record.py:_safe_segment).
-    repo_id = source_repo_id or f"{suite}/{task_tag(index)}"
+    repo_id = source_repo_id or default_repo_id(source, suite, index)
     # An index repeats across suites, so a task_<i>/ already stamped with another
     # id is a wrong --out-dir, not a file to replace.
     was = read_source_repo_id(out)
@@ -181,6 +305,9 @@ def convert(source, out: Path, kind: str, *, suite: str, episodes=None, min_step
         raise SystemExit(f"{out} holds {was}, not {repo_id}. Wrong --out-dir? "
                          f"Delete it to convert over it.")
     root_attrs = {"libero_task": name, "libero_suite": suite, "libero_task_index": index}
+    env_stamp = comparison_env(source)
+    if env_stamp is not None:
+        root_attrs["comparison_env"] = env_stamp
     if kind == "sail":
         # robomimic's train.py loads env_args before it checks whether rollouts
         # are on. Type 6 is EnvType.REAL_TYPE, so is_robosuite_env() stays False
@@ -199,8 +326,10 @@ def convert(source, out: Path, kind: str, *, suite: str, episodes=None, min_step
     )
 
 
-def convert_task(source: Path, out_dir: Path, *, suite: str, skip=(), **kwargs) -> int:
-    """Both files for one task into `out_dir`.
+def convert_task(source: Path, out_dir: Path, *, suite: str, skip=(), lerobot_root=None,
+                 **kwargs) -> int:
+    """All three training sets for one task: sail.hdf5 and bspline.hdf5 into
+    `out_dir`, the LeRobot dataset at `lerobot_root` (default the HF cache).
 
     The directory's name matters a little: bspline_bridge/train.py takes the
     hydra task name, and so the wandb tag, from the parent directory of the HDF5.
@@ -208,12 +337,16 @@ def convert_task(source: Path, out_dir: Path, *, suite: str, skip=(), **kwargs) 
     index = resolve_task(suite, source.stem)
     out_dir.mkdir(parents=True, exist_ok=True)
     failed = []
-    for kind in ("sail", "bspline"):
+    for kind in KINDS:
         if kind in skip:
             continue
         logger.info("=== %s: %s/%s, %s ===", kind, suite, task_tag(index),
                     task_names(suite)[index])
-        if convert(source, out_dir / f"{kind}.hdf5", kind, suite=suite, **kwargs) != 0:
+        if kind == "lerobot":
+            rc = convert_lerobot(source, lerobot_root, suite=suite, **kwargs)
+        else:
+            rc = convert(source, out_dir / f"{kind}.hdf5", kind, suite=suite, **kwargs)
+        if rc != 0:
             failed.append(kind)
     if failed:
         logger.error("%s: failed %s", source.name, ", ".join(failed))
@@ -245,8 +378,13 @@ def main() -> int:
                         "against something else that did not flip")
     p.add_argument("--source-repo-id", default=None,
                    help="what the file is stamped with, and so where checkpoints and "
-                        "rollouts are filed. Default <suite>/task_<i>")
-    p.add_argument("--skip", nargs="*", choices=["sail", "bspline"], default=[])
+                        "rollouts are filed. Default <suite>/task_<i>, or <suite>_<plant>/task_<i> "
+                        "for a regenerate_on_plant.py file")
+    p.add_argument("--skip", nargs="*", choices=list(KINDS), default=[])
+    p.add_argument("--lerobot-root", type=Path, default=None,
+                   help="where the LeRobot dataset goes, or for a suite directory where its "
+                        "task_<i>/ datasets go; default $HF_LEROBOT_HOME/<source-repo-id>, "
+                        "where lerobot-train and baselines/tillicum/sync.sh look for it")
     args = p.parse_args()
 
     # force: importing franka_config installs a root handler, which makes a
@@ -277,7 +415,10 @@ def main() -> int:
         for task in sorted(tasks, key=index.get):
             tag = task_tag(index[task])
             try:
-                rc = convert_task(task, args.out_dir / tag, suite=suite, skip=args.skip, **kwargs)
+                rc = convert_task(task, args.out_dir / tag, suite=suite, skip=args.skip,
+                                  lerobot_root=(None if args.lerobot_root is None
+                                                else args.lerobot_root / tag),
+                                  **kwargs)
             except OSError as exc:
                 # An interrupted regeneration run leaves a truncated file. Say so
                 # and keep going; the other tasks are still usable.
@@ -292,7 +433,8 @@ def main() -> int:
             return 1
         return 0
 
-    return convert_task(args.source, args.out_dir, suite=suite, skip=args.skip, **kwargs)
+    return convert_task(args.source, args.out_dir, suite=suite, skip=args.skip,
+                        lerobot_root=args.lerobot_root, **kwargs)
 
 
 if __name__ == "__main__":

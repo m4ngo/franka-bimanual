@@ -18,7 +18,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 import env_wrapper
-from viz import EpisodeRecorder, save_episode_html, save_rollout_html, save_policy_pcd_npz
+from viz import EpisodeRecorder, rig_frames, save_episode_html, save_rollout_html, save_policy_pcd_npz
 from viz import _propagate_pose_traj
 from env_wrapper import (
     ee_pose_to_world,
@@ -619,14 +619,16 @@ def _save_viz(
     title: str,
     frame_stride: int,
     fps: float,
+    rig_profile: str,
 ) -> None:
     """Dispatch to save_rollout_html (base only) or save_episode_html (residual)."""
+    frames = rig_frames(rig_profile)
     if residual is None:
         save_rollout_html(recorder, path, title=f"base policy — {title}",
-                          frame_stride=frame_stride, fps=fps)
+                          frame_stride=frame_stride, fps=fps, **frames)
     else:
         save_episode_html(recorder, path, title=f"residual — {title}",
-                          frame_stride=frame_stride, fps=fps)
+                          frame_stride=frame_stride, fps=fps, **frames)
     if recorder.policy_pcd_events:
         pcd_path = (path[:-len(".html")] if path.endswith(".html") else path) + "_policy_pcd.npz"
         centered = residual is not None and residual.center_on_eef
@@ -860,7 +862,8 @@ def main() -> None:
                 if recorder is not None and len(recorder) > 0:
                     viz_path = os.path.join(args.viz_dir, "episode.html")
                     print(f"saving visualization to {viz_path}...")
-                    _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps)
+                    _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps,
+                              controller.config.rig_profile)
                 controller.disconnect()
             return
 
@@ -907,7 +910,8 @@ def main() -> None:
                             args.viz_dir, f"episode_{ep_idx:03d}.html"
                         )
                         print(f"saving visualization to {viz_path}...")
-                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps)
+                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps,
+                                  controller.config.rig_profile)
                 dataset.save_episode()
                 print(f"episode {dataset.num_episodes - 1} saved")
 

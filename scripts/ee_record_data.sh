@@ -18,10 +18,10 @@ lerobot-record \
     --resume="$5" \
     --robot.type=bimanual_franka \
     --robot.control_mode=EE_POS \
+    --robot.noise_pos_scale="$(cfg control.noise.pos_scale_m)" \
+    --robot.noise_rot_scale="$(cfg control.noise.rot_scale_rad)" \
     --teleop.type=bimanual_gello_ee \
     --teleop.id=gello_ee_teleop \
-    --teleop.left_arm_config.use_noise=true \
-    --teleop.right_arm_config.use_noise=true \
     --dataset.repo_id="$1" \
     --dataset.num_episodes="$2" \
     --dataset.single_task="$3" \

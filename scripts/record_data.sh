@@ -22,10 +22,9 @@ lerobot-record \
     --resume="$5" \
     --robot.type=bimanual_franka \
     --robot.control_mode=JOINT_POS \
+    --robot.noise_joint_scale="$(cfg control.noise.joint_scale_rad)" \
     --teleop.type=bimanual_gello \
     --teleop.id=gello_teleop \
-    --teleop.left_arm_config.use_noise=true \
-    --teleop.right_arm_config.use_noise=true \
     --dataset.repo_id="$1" \
     --dataset.num_episodes="$2" \
     --dataset.single_task="$3" \

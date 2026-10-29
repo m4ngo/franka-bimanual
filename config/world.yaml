@@ -22,7 +22,7 @@ calib_origin_in_world:
   #
   # x = -0.10: the world origin sits 0.10 m along +X from the board centre.
   # z =  0.908: the board (on the table) is 0.908 m above the floor.
-  translation_m: [-0.10, 0.0, 0.908]
+  translation_m: [0.00, 0.0, 0.908]
   quat_wxyz: [1.0, 0.0, 0.0, 0.0]
 
 robot_base_in_world:

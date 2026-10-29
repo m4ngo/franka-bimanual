@@ -32,6 +32,7 @@ baselines:
   zmq:
     sail_port: 5556
     bspline_port: 5555        # upstream policy_server_bspline.py's own default
+    dp_port: 5557             # baselines/dp_bridge/policy_server.py, our sim diffusion base
     recv_timeout_ms: 15000
 
   exec:
@@ -123,7 +124,7 @@ baselines:
     # holds the pose it is at for grasp_hold_s with the gripper commanded shut,
     # whether or not the fingers have finished, the plan's clock stopped; then
     # resumes the plan where it left it. 0 disables.
-    grasp_hold_s: 0.4
+    grasp_hold_s: 0.0
     grasp_threshold: 0.5
     # Releasing never pauses: after a grasp, a new one can only trigger once the
     # command has opened past this again, so a release that dips back under

@@ -64,7 +64,7 @@ def render_run(run_dir) -> list[Path]:
     import franka_config as fc
     import pandas as pd
     from lerobot_robot_bimanual_franka.franka_fk import franka_fk_chain
-    from viz import EpisodeRecorder, save_rollout_html
+    from viz import EpisodeRecorder, rig_frames, save_rollout_html
 
     run_dir = Path(run_dir)
     files = sorted((run_dir / "dataset" / "data").glob("*/*.parquet"))
@@ -79,6 +79,9 @@ def render_run(run_dir) -> list[Path]:
     col = {n: i for i, n in enumerate(names)}
     ee_pos = manifest["policy"]["control_mode"] == "EE_POS"
     base = fc.robot_base_in_world(env["physical_arm"])
+    frames = rig_frames(env["rig_profile"]) if env.get("rig_profile") in fc.profile_names() else {}
+    frames.update(robot_base_in_world_translation=tuple(float(v) for v in base.translation),
+                  robot_base_in_world_quat_wxyz=base.quat_wxyz)
     stride = max(1, round(info["fps"] / fc.control_fps()))
     episodes = {}
     if (run_dir / "episodes.jsonl").is_file():
@@ -119,9 +122,7 @@ def render_run(run_dir) -> list[Path]:
         save_rollout_html(
             rec, str(path),
             title=f"{manifest['run']['method']} {run_dir.name}: episode {idx} ({e.get('verdict', '?')})",
-            frame_stride=stride, fps=info["fps"] / stride,
-            robot_base_in_world_translation=tuple(float(v) for v in base.translation),
-            robot_base_in_world_quat_wxyz=base.quat_wxyz,
+            frame_stride=stride, fps=info["fps"] / stride, **frames,
             forecast_name=label,
             reference_trail=base.apply(goal[:, :3]) if ee_pos else None,
             reference_name="dispatched goals",

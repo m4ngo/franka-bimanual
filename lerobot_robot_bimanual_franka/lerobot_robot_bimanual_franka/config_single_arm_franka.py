@@ -1,9 +1,11 @@
 """Single-arm FR3 follower config.
 
-The exposed key prefix is `r_`, but which PHYSICAL arm that maps to is
-declared by the `single_arm_franka` profile in config/rig.yaml (currently the
-LEFT FR3 on luigi). Keeping the key prefix decoupled from the arm identity is
-what lets previously recorded `r_*` datasets stay readable.
+The exposed key prefix is always `r_`; which PHYSICAL arm and cameras it maps
+to is the `rig_profile` field, a profile in config/rig.yaml. Every field left
+at None is filled from that profile in `__post_init__`, so
+`--robot.rig_profile` alone moves the arm and cameras together, and an explicit
+field override still wins. Keeping the key prefix decoupled from the arm
+identity is what lets previously recorded `r_*` datasets stay readable.
 """
 
 from dataclasses import dataclass, field
@@ -15,25 +17,24 @@ from lerobot.robots import RobotConfig
 from .bimanual_franka_config import ControlMode
 from .rig_config import profile_arm_fields, profile_cameras, profile_depth_cameras
 
-PROFILE = "single_arm_right"
+# The only key prefix this config's fields are named for.
+ARM_KEY = "r"
 
-_VALID_ARMS: tuple[str, ...] = tuple(fc.profile(PROFILE).arms)
 
-
-def _arm_field(key: str, suffix: str):
-    return field(default_factory=lambda: profile_arm_fields(PROFILE)[f"{key}_{suffix}"])
+def single_arm_profiles() -> tuple[str, ...]:
+    """Rig profiles this config can drive: one arm, exposed under ARM_KEY."""
+    return tuple(n for n in fc.profile_names() if fc.profile(n).keys == (ARM_KEY,))
 
 
 @RobotConfig.register_subclass("single_arm_franka")
 @dataclass
 class SingleArmFrankaConfig(RobotConfig):
-    control_mode: ControlMode = field(
-        default_factory=lambda: ControlMode(fc.profile(PROFILE).control_mode)
-    )
-    r_server_ip: str = _arm_field("r", "server_ip")
-    r_robot_ip: str = _arm_field("r", "robot_ip")
-    r_gripper_ip: str = _arm_field("r", "gripper_ip")
-    r_port: int = _arm_field("r", "port")
+    rig_profile: str = field(default_factory=fc.default_single_arm_profile)
+    control_mode: ControlMode | None = None
+    r_server_ip: str | None = None
+    r_robot_ip: str | None = None
+    r_gripper_ip: str | None = None
+    r_port: int | None = None
     # Gripper RPyC port -- a DIFFERENT process from the torque server. pylibfranka's
     # Gripper bindings do not release the GIL across blocking calls, so a gripper
     # command issued in the torque server's process stalls the 1 kHz RT thread
@@ -41,10 +42,10 @@ class SingleArmFrankaConfig(RobotConfig):
     # communication_constraints_violation. Set an arm's gripper_rpyc_port equal to
     # its rpyc_port in arms.yaml to go back to sharing one process.
     #
-    # Resolved through the profile, NOT hardcoded: this rig exposes the LEFT arm
-    # under `r_`, whose gripper server is on 18823, not the right arm's 18822.
-    r_gripper_port: int = _arm_field("r", "gripper_port")
-    active_arms: tuple[str, ...] = _VALID_ARMS
+    # Resolved through the profile, NOT hardcoded: it differs per arm (18822
+    # right, 18823 left) and the `r_` prefix does not say which arm this is.
+    r_gripper_port: int | None = None
+    active_arms: tuple[str, ...] | None = None
     # Every knob below is a per-rig hardware trim and lives in ONE place,
     # config/control.yaml's `tuning:` block. A literal default here would win
     # over the yaml and make it decoration -- see config/README.md.
@@ -84,29 +85,45 @@ class SingleArmFrankaConfig(RobotConfig):
     kd_pos_scale: tuple[float, float, float] = field(
         default_factory=lambda: tuple(fc.control("tuning.kd_pos_scale"))
     )
-    use_noise: bool = False
-    noise_pos_scale: float = field(default_factory=lambda: fc.control("noise.pos_scale_m"))
-    noise_rot_scale: float = field(default_factory=lambda: fc.control("noise.rot_scale_rad"))
-    depth: bool = field(default_factory=lambda: fc.profile(PROFILE).depth)
-    depth_cam: dict[str, CameraConfig] = field(
-        default_factory=lambda: profile_depth_cameras(PROFILE)
-    )
+    # Gaussian goal noise, std dev per axis per step; 0.0 is off. See action_noise.
+    noise_pos_scale: float = 0.0
+    noise_rot_scale: float = 0.0
+    noise_joint_scale: float = 0.0
+    depth: bool | None = None
+    depth_cam: dict[str, CameraConfig] | None = None
     depth_crop_radius_m: float = field(
         default_factory=lambda: fc.control("observation.depth_crop_radius_m")
     )
-    cameras: dict[str, CameraConfig] = field(
-        default_factory=lambda: profile_cameras(PROFILE)
-    )
-    depth_center_arm: str = field(
-        default_factory=lambda: fc.profile(PROFILE).depth_center_arm
-    )
-    rig_profile: str = PROFILE
+    cameras: dict[str, CameraConfig] | None = None
+    depth_center_arm: str | None = None
 
     def __post_init__(self):
+        profile = fc.profile(self.rig_profile)
+        if profile.keys != (ARM_KEY,):
+            raise ValueError(
+                f"rig {self.rig_profile!r} exposes keys {profile.keys}; this config drives "
+                f"one arm under {ARM_KEY!r}. Single-arm rigs: {single_arm_profiles()}."
+            )
+        for name, value in profile_arm_fields(self.rig_profile).items():
+            if getattr(self, name) is None:
+                setattr(self, name, value)
+        if self.control_mode is None:
+            self.control_mode = ControlMode(profile.control_mode)
+        if self.depth is None:
+            self.depth = profile.depth
+        if self.depth_cam is None:
+            self.depth_cam = profile_depth_cameras(self.rig_profile)
+        if self.cameras is None:
+            self.cameras = profile_cameras(self.rig_profile)
+        if self.depth_center_arm is None:
+            self.depth_center_arm = profile.depth_center_arm
+
         if hasattr(super(), "__post_init__"):
             super().__post_init__()
 
-        valid = tuple(fc.profile(self.rig_profile).arms)
+        valid = profile.keys
+        if self.active_arms is None:
+            self.active_arms = valid
         if not self.active_arms:
             raise ValueError(f"active_arms must contain {valid}.")
 

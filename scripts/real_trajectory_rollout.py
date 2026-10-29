@@ -61,7 +61,7 @@ sys.path.insert(0, str(_ROOT))
 
 import franka_config as fc  # noqa: E402
 from lerobot.datasets.lerobot_dataset import LeRobotDataset  # noqa: E402
-from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig, SingleArmRightConfig  # noqa: E402
+from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig, single_arm_profiles  # noqa: E402
 from lerobot_robot_bimanual_franka import gain_schedule as gs  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.reach_record import (  # noqa: E402
@@ -171,8 +171,8 @@ def main() -> int:
 					   help="every episode of the dataset, into one episodes.hdf5")
 	ap.add_argument("--root", default=None, help="local dataset root (default: the HF cache)")
 	ap.add_argument("--source", choices=("dataset", "arm"), default="dataset")
-	ap.add_argument("--arm", default="left", choices=("left", "right"),
-					help="physical arm; the key prefix stays r_ either way")
+	ap.add_argument("--rig", choices=sorted(single_arm_profiles()), default=fc.default_single_arm_profile(),
+					help="rig profile; which physical arm it drives is in config/rig.yaml")
 	ap.add_argument("--out", default=str(Path.home() / "franka_data" / "real_traj"))
 	ap.add_argument("--dry-run", action="store_true", help="--source arm: home and convert only")
 	ap.add_argument("--gain-amp", type=float, default=0.0,
@@ -189,8 +189,8 @@ def main() -> int:
 
 	ds = open_dataset(args.repo_id, args.root)
 	episodes = list(range(int(ds.meta.total_episodes))) if args.all else [args.episode]
-	cls = SingleArmFrankaConfig if args.arm == "left" else SingleArmRightConfig
-	cfg = cls(control_mode=ControlMode.EE_POS)
+	cfg = SingleArmFrankaConfig(rig_profile=args.rig, control_mode=ControlMode.EE_POS)
+	arm = cfg.arm_name("r")
 	schedule = None
 	if args.gain_amp != 0.0:
 		schedule = gs.describe(args.gain_amp, args.gain_amp, args.gain_freq, args.gain_ramp_s,
@@ -224,12 +224,12 @@ def main() -> int:
 	run_dir = (Path(args.out) / args.repo_id.replace("/", "__")
 			   / f"{which}_{args.source}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 	run_dir.mkdir(parents=True, exist_ok=True)
-	meta = run_metadata(args.arm, seed=-1)
+	meta = run_metadata(arm, seed=-1)
 	meta.update({"repo_id": args.repo_id, "episodes": episodes, "source": args.source,
 				 "gain_schedule": schedule})
 	producer = "scripts/real_trajectory_rollout.py"
 
-	rec = EpisodeRecorder(args.arm, source=args.source, policy_action_format=POLICY_ACTION_LEROBOT)
+	rec = EpisodeRecorder(arm, source=args.source, policy_action_format=POLICY_ACTION_LEROBOT)
 	results = []
 	stopped = None
 	if args.source == "dataset":

@@ -7,10 +7,10 @@ version: 2
 # Intrinsics and extrinsics images may show different physical boards, so each
 # image set is detected against its own spec.
 intrinsics_board:
-  squares_x: 12              # total squares (black+white), horizontal
-  squares_y: 9               # total squares (black+white), vertical
-  square_length_m: 0.0645    # checkerboard square edge
-  marker_length_m: 0.047     # marker's black-bordered footprint
+  squares_x: 11              # total squares (black+white), horizontal
+  squares_y: 11              # total squares (black+white), vertical
+  square_length_m: 0.050     # checkerboard square edge
+  marker_length_m: 0.0385    # marker's black-bordered footprint
   aruco_dict: null           # e.g. DICT_4X4_100; null -> autodetect
 
 extrinsics_board:
@@ -53,12 +53,12 @@ world_axes:
   # table; re-check them whenever either changes. [-Y, X, Z] is for the 11x11
   # board as placed for the 2026-10-09 cam_2 photos (+x toward the tape on the
   # board edge nearest cam_2). The 12x9 board used [X, Y, Z].
-  board_to_world: [-Y, X, Z]
+  board_to_world: [-X, -Y, Z]
 
 fit:
   reproj_error_threshold_px: 0.5
   min_charuco_corners: 6
-  show_debug_images: true
+  show_debug_images: false
 
 paths:
   # Relative to the repo root; {cam} is substituted with the camera id.

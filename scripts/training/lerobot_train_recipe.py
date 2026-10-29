@@ -23,6 +23,8 @@ baselines/diffusion_recipe.py holds the recipe. This adds four things:
     preprocessor step saved with the checkpoint, so rollouts apply it too, and
     the state's normaliser stats are recomputed over the converted states. A
     resumed checkpoint keeps whichever state it was trained on.
+    `--ee-state=as-recorded` skips the conversion, for a dataset whose state is
+    already that pose (the LIBERO sim's, baselines/libero_bridge/dataset.py).
 
 lerobot_train_chunkrel.py applies the same through install() and with_recipe_args().
 """
@@ -99,7 +101,18 @@ def with_recipe_args(argv: list[str]) -> list[str]:
     return [argv[0], *ours, *args]
 
 
-def install() -> None:
+EE_STATE_MODES = ("from-joints", "as-recorded")
+
+
+def pop_ee_state(argv: list[str]) -> tuple[list[str], str]:
+    """argv without `--ee-state=<mode>`, which lerobot-train would refuse, and the mode."""
+    modes = [a.split("=", 1)[1] for a in argv if a.startswith("--ee-state=")]
+    if len(modes) > 1 or (modes and modes[0] not in EE_STATE_MODES):
+        raise SystemExit(f"--ee-state takes one of {EE_STATE_MODES}; got {modes}")
+    return [a for a in argv if not a.startswith("--ee-state=")], (modes or ["from-joints"])[0]
+
+
+def install(ee_state: str = "from-joints") -> None:
     make_policy = lerobot_train.make_policy
     update_policy = lerobot_train.update_policy
     save_checkpoint = lerobot_train.save_checkpoint
@@ -152,8 +165,9 @@ def install() -> None:
         return step, optimizer, scheduler
 
     def make_processors_with_ee_state(policy_cfg, pretrained_path=None, **kwargs):
-        # A fresh run converts; a resumed one keeps what its checkpoint was trained on.
-        ee = pretrained_path is None or uses_ee_state(pretrained_path)
+        # A resumed run keeps what its checkpoint was trained on.
+        ee = (uses_ee_state(pretrained_path) if pretrained_path is not None
+              else ee_state == "from-joints")
         ds_meta = _STATE["ds_meta"]
         if ee:
             df, _ = load_frames(Path(ds_meta.root))
@@ -176,6 +190,7 @@ def install() -> None:
 
 
 if __name__ == "__main__":
-    sys.argv = with_recipe_args(sys.argv)
-    install()
+    argv, ee_state = pop_ee_state(sys.argv)
+    sys.argv = with_recipe_args(argv)
+    install(ee_state)
     lerobot_train.main()

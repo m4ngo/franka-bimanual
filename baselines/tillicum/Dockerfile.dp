@@ -1,0 +1,17 @@
+# Our sim diffusion base's policy server on Tillicum (baselines/dp_bridge/policy_server.py,
+# started by dp_server.sh): the LeRobot image the base trains in, plus pyzmq, which
+# lerobot pulls in only for its robot extras. The code is bound in from FRANKA_SRC
+# (sync.sh code), as train_diffusion.slurm does, so it needs no rebuild when it changes.
+#
+#   docker build -f baselines/tillicum/Dockerfile.dp -t atsai06/lerobot-dp-server:v0.5.1 baselines/tillicum
+#
+# then on a Tillicum compute node:
+#
+#   apptainer pull /gpfs/scrubbed/$USER/containers/lerobot-dp-server.sif docker://atsai06/lerobot-dp-server:v0.5.1
+ARG LEROBOT_IMAGE=atsai06/lerobot-act-train:v0.5.1
+FROM ${LEROBOT_IMAGE}
+# Into the interpreter lerobot-train runs on, which is what dp_server.sh executes.
+RUN PY="$(dirname "$(command -v lerobot-train)")/python" \
+    && ("$PY" -m pip --version >/dev/null 2>&1 || "$PY" -m ensurepip) \
+    && "$PY" -m pip install --no-cache-dir "pyzmq==27.1.0" \
+    && "$PY" -c "import zmq"

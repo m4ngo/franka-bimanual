@@ -29,7 +29,7 @@ sys.path.insert(0, str(_ROOT / "multi-fast"))
 import franka_config as fc  # noqa: E402
 from lerobot.robots.utils import make_robot_from_config  # noqa: E402
 from lerobot_robot_bimanual_franka import (  # noqa: E402
-	ControlMode, SingleArmFrankaConfig, SingleArmRightConfig,
+	ControlMode, SingleArmFrankaConfig, single_arm_profiles,
 )
 from lerobot_robot_bimanual_franka.reach_record import ReachEpisodeRecorder  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach import RealReach  # noqa: E402
@@ -141,8 +141,8 @@ def main() -> int:
 	ap.add_argument("--dry-run", action="store_true",
 					help="connect and sample, but never send an action")
 	ap.add_argument("--out", default=str(Path.home() / "franka_data" / "real_reach"))
-	ap.add_argument("--arm", default="left", choices=("left", "right"),
-					help="physical arm to drive; the key prefix stays r_ either way")
+	ap.add_argument("--rig", choices=sorted(single_arm_profiles()), default=fc.default_single_arm_profile(),
+					help="rig profile; which physical arm it drives is in config/rig.yaml")
 	ap.add_argument("--no-viz", action="store_true",
 					help="write episodes.hdf5 only, no episode HTML")
 	ap.add_argument("--viz-stride", type=int, default=1,
@@ -153,16 +153,14 @@ def main() -> int:
 	if float(cfg["orientation"]["delta_max_deg"]) > 0.0:
 		print("NOTE: orientation is enabled; phase 2 was scoped position-only.")
 
-	arm = args.arm
+	arm = fc.profile(args.rig).arms["r"]
 	if not fc.robot_base_in_world_verified(arm):
 		print(f"WARNING: robot_base_in_world({arm!r}) is unverified in config/world.yaml.\n"
 			  f"         The worktable floor derives from it. Verify before running near the table.")
 
-	# Both profiles expose their arm under the r_ prefix; single_arm_franka is
-	# the left FR3, single_arm_right the physical right one.
-	cls = SingleArmFrankaConfig if arm == "left" else SingleArmRightConfig
-	print(f"arm {arm} via {cls.__name__}")
-	robot = make_robot_from_config(cls(control_mode=ControlMode.EE_DELTA))
+	print(f"rig {args.rig} -> arm {arm}")
+	robot = make_robot_from_config(SingleArmFrankaConfig(rig_profile=args.rig,
+														 control_mode=ControlMode.EE_DELTA))
 	robot.connect()
 	try:
 		env = RealReach(robot, arm=arm, arm_key="r", seed=args.seed)

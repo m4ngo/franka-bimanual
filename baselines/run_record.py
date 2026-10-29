@@ -42,10 +42,11 @@ DEFAULT_ROOT = Path.home() / "franka_data" / "outputs"
 
 # Directory-name suffix per method. `multifast` rather than `multi-fast` so the
 # run id stays one token either side of the timestamp separator.
-# pi05 is multi-fast's BASE policy on its own; multifast is that base plus a
-# trained FAST residual. Kept apart so a base-only run cannot be read as the
-# whole method (baselines/libero_bridge/pi05.py).
-METHODS = ("sail", "bspline", "multifast", "pi05")
+# pi05 and dp are base policies on their own -- multi-fast's pi0.5 and our
+# diffusion base -- and multifast is a base plus a trained residual (ZAP). Kept
+# apart so a base-only run cannot be read as the whole method
+# (baselines/libero_bridge/pi05.py, dp_bridge/policy_server.py).
+METHODS = ("sail", "bspline", "multifast", "pi05", "dp")
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 

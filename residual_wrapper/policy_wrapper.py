@@ -21,7 +21,6 @@ Residual output     : (_CHUNK_EXEC, 9) [damping, stiffness, dx, dy, dz, rx, ry, 
                       stiffness (multi-fast convention).
 """
 
-import contextlib
 import functools
 import logging
 import sys
@@ -31,18 +30,18 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from env_wrapper import _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG, _STATE_OBS_KEYS
-from lerobot.configs.policies import PreTrainedConfig
-from lerobot.datasets import LeRobotDataset
-from lerobot.policies.factory import get_policy_class, make_pre_post_processors
-from lerobot.policies.utils import populate_queues, prepare_observation_for_inference
-from lerobot.utils.constants import OBS_IMAGES
-from lerobot_robot_bimanual_franka.lerobot_source import action_space as _action_space
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from baselines.lerobot_inference import ChunkPolicy  # noqa: E402
+from env_wrapper import _CHUNK_EXEC, _GAINS_MAG, _RESIDUAL_MAG, _STATE_OBS_KEYS  # noqa: E402
+from lerobot.datasets import LeRobotDataset  # noqa: E402
+from lerobot_robot_bimanual_franka.lerobot_source import action_space as _action_space  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
-_MULTI_FAST_PATH = Path(__file__).resolve().parent.parent / "multi-fast"
-_AMP_DTYPES = {"fp16": torch.float16, "bf16": torch.bfloat16, "none": None}
+_MULTI_FAST_PATH = _REPO_ROOT / "multi-fast"
 # Where each sim proprio key sits in the 17-wide vector the runners build.
 _PROPRIO_LAYOUT = {"robot0_eef_pos": (0, 3), "robot0_eef_quat": (3, 7), "robot0_gripper_qpos": (7, 9),
                    "controller_state": (9, 11), "robot0_eef_vel": (11, 17)}
@@ -85,37 +84,24 @@ class ObservationHistory:
 
 
 class BasePolicy(ObservationHistory):
-    """A pretrained lerobot ACT / diffusion policy.
+    """A pretrained lerobot ACT / diffusion policy, on the arm's observations.
 
-    It sets the control loop's step budget, and its cost is GPU compute -- the
-    diffusion UNet's sequential denoising calls -- so `amp` and `compile_mode`
-    are the levers: fp16 plus a compiled UNet runs it in 21.8 ms against 33.0 ms.
+    It sets the control loop's step budget; `amp` and `compile_mode` are the
+    levers on its cost (baselines/lerobot_inference.ChunkPolicy, which the sim's
+    policy server shares, so a base plans identically on the arm and in sim).
     """
 
     def __init__(self, path: str, device: str = "cuda",
                  amp: str | None = None, compile_mode: str | None = None) -> None:
-        amp_key = str(amp or "none").lower()
-        if amp_key not in _AMP_DTYPES:
-            raise ValueError(f"amp must be one of {sorted(_AMP_DTYPES)}, got {amp!r}")
-        self._amp_dtype = _AMP_DTYPES[amp_key]
-        self.device = torch.device(device)
-        self.path = Path(path)
-
-        cfg = PreTrainedConfig.from_pretrained(path)
-        cfg.pretrained_path = path
-        cfg.device = device
-        self.policy = get_policy_class(cfg.type).from_pretrained(path, config=cfg)
-        self.policy.eval()
-        self.preprocessor, self.postprocessor = make_pre_post_processors(cfg, pretrained_path=path)
-        self.n_obs_steps = int(getattr(cfg, "n_obs_steps", 1) or 1)
-        self.policy.reset()
-        self._queued = getattr(self.policy, "_queues", None) is not None  # diffusion's obs queue
-        if compile_mode and compile_mode.lower() != "none":
-            self._compile_unet(compile_mode)
+        self.core = ChunkPolicy(path, device=device, amp=amp, compile_mode=compile_mode)
+        self.path = self.core.path
+        self.device = self.core.device
+        self.n_obs_steps = self.core.n_obs_steps
+        self.policy = self.core.policy
 
     def reset(self) -> None:
         super().reset()
-        self.policy.reset()
+        self.core.reset()
 
     @functools.cached_property
     def chunk_relative(self) -> bool:
@@ -151,52 +137,8 @@ class BasePolicy(ObservationHistory):
         return _action_space(rows)
 
     def infer(self, window: list[dict]) -> np.ndarray:
-        """(T, 10) planned from `window` (ObservationHistory.window, oldest first).
-
-        A queued policy (diffusion) has the window replayed into a fresh queue, so
-        predict_action_chunk stacks what select_action would have queued step by step.
-        """
-        frames = [self._preprocess(obs) for obs in window]
-        with torch.inference_mode(), self._autocast():
-            if self._queued:
-                self._replay(frames)
-            chunk = self.policy.predict_action_chunk(frames[-1])  # (1, T, action_dim)
-        # fp32 before the postprocessor: its unnormalisation stats are fp32.
-        chunk = chunk.float().squeeze(0)
-        return np.stack([self.postprocessor(chunk[i:i + 1]).squeeze(0).cpu().numpy()
-                         for i in range(chunk.shape[0])])
-
-    def _preprocess(self, obs: dict) -> dict:
-        batch = self.preprocessor(prepare_observation_for_inference(_format_obs_for_policy(obs), self.device))
-        return {k: v for k, v in batch.items() if k.startswith("observation.")}
-
-    def _replay(self, frames: list[dict]) -> None:
-        """Refill the policy's observation queue from frames, as select_action fills it."""
-        image_keys = self.policy.config.image_features
-        self.policy.reset()
-        for f in frames:
-            if image_keys:
-                f[OBS_IMAGES] = torch.stack([f[k] for k in image_keys], dim=-4)
-            self.policy._queues = populate_queues(self.policy._queues, f)
-
-    def _autocast(self):
-        if self._amp_dtype is None:
-            return contextlib.nullcontext()
-        return torch.autocast(self.device.type, dtype=self._amp_dtype)
-
-    def _compile_unet(self, mode: str) -> None:
-        """Compile the denoising UNet, the only module worth compiling; eager on any failure."""
-        unet = getattr(getattr(self.policy, "diffusion", None), "unet", None)
-        if unet is None:
-            logger.warning("compile_mode=%s ignored: %s has no diffusion.unet",
-                           mode, type(self.policy).__name__)
-            return
-        try:
-            self.policy.diffusion.unet = torch.compile(unet, mode=mode)
-            logger.info("compiled diffusion UNet (mode=%s); first inference pays the "
-                        "compile cost, so warm up before the episode", mode)
-        except Exception:
-            logger.exception("torch.compile failed; running eager")
+        """(T, 10) planned from `window` (ObservationHistory.window, oldest first)."""
+        return self.core.infer_frames([_format_obs_for_policy(obs) for obs in window])
 
 
 class Trajectory(ObservationHistory):

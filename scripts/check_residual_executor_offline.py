@@ -264,10 +264,12 @@ def check_loop() -> None:
     run_residual.tty = types.SimpleNamespace(setraw=lambda f: None)
     run_residual._stdin_key_pressed = lambda: False
 
-    def run(residual, wrench=None, drift=(0.0, 0.0, 0.0), infer_lead=1, base_cls=LineBase):
+    def run(residual, wrench=None, drift=(0.0, 0.0, 0.0), infer_lead=1, base_cls=LineBase,
+            reanchor=False):
         arm, base, recorder = FakeArm(drift), base_cls(), EpisodeRecorder()
         run_residual._run_episode(arm, base, residual, dataset=None, episode_time_s=0.5, fps=50.0,
-                                  recorder=recorder, infer_lead=infer_lead, wrench=wrench)
+                                  recorder=recorder, infer_lead=infer_lead, wrench=wrench,
+                                  reanchor=reanchor)
         return arm, base, recorder
 
     wrench = WrenchTrace("r")
@@ -299,6 +301,19 @@ def check_loop() -> None:
     err = np.abs(np.array(arm.goals) - np.array(recorder.total_desired_pos)).max()
     check("an arm moving between observation and send still gets exactly the planned target",
           err < 1e-6, f"max goal error {err * 1e3:.2f} mm")
+
+    arm, _, _ = run(None, drift=(0.0, 0.0, 0.004), reanchor=True)
+    z = np.array([a["r_z"] for a in arm.sent])
+    first = np.arange(len(z)) % ew._CHUNK_EXEC == 0
+    check("reanchor: a chunk's first goal keeps its full offset from the pose at send; the rest stay absolute",
+          np.allclose(z[first], 0, atol=1e-9) and np.allclose(z[~first], -0.004, atol=1e-9)
+          and np.allclose([a["r_x"] for a in arm.sent], 0.02, atol=1e-9), str(np.round(z * 1e3, 2)))
+    a_off, _, _ = run(ConstResidual())
+    a_on, _, _ = run(ConstResidual(), reanchor=True)
+    check("reanchor: an arm that has not moved gets the same goals",
+          len(a_off.sent) == len(a_on.sent)
+          and all(np.allclose(list(x.values()), list(y.values()), atol=1e-9)
+                  for x, y in zip(a_off.sent, a_on.sent)))
 
     residual = ConstResidual()
     arm, base, _ = run(residual)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Roll a trained SAIL or B-Spline policy out on LIBERO, in simulation.
+"""Roll a trained SAIL, B-Spline or diffusion-base (dp) policy out on LIBERO, in simulation.
 
     ./scripts/libero_rollout.sh --backend sail --start-server --ckpt <CKPT.pth> --task 9
 
@@ -16,7 +16,7 @@ counter. Holding the simulated latency fixed -- SAIL's `inf_delay`, which is
 upstream's own model precisely because upstream evaluates in sim -- is what
 makes a success rate reproducible rather than a measurement of this GPU.
 
-Both backends drive the env through absolute pose targets, the space their
+All three drive the env through absolute pose targets, the space their
 converted datasets are in. `sim_env.SimTask.action` inverts each target into the
 normalised OSC delta LIBERO takes, through multi-fast's own inverse of the
 relabeler that wrote the training targets, so the executor and the converter
@@ -64,11 +64,11 @@ from baselines.zmq_client import PolicyClient  # noqa: E402
 
 logger = logging.getLogger("baselines.libero.rollout")
 
-BACKENDS = ("sail", "bspline", "pi05")
-# The two that live behind a ZMQ policy server in their own venv. pi05 is
+BACKENDS = ("sail", "bspline", "dp", "pi05")
+# The ones that live behind a ZMQ policy server in their own venv. pi05 is
 # multi-fast's base policy and loads in THIS process -- openpi is already in
 # multi-fast/.venv, which is the interpreter this loop runs in.
-SERVED = ("sail", "bspline")
+SERVED = ("sail", "bspline", "dp")
 
 
 @dataclass
@@ -159,17 +159,18 @@ class Stepper:
                 self.raw["agentview_image"][::-1]).astype(np.uint8))
             self._next_frame += self.video_stride / self.control_freq
 
-    def send(self, pos, rotvec, gripper: float, hz: float) -> None:
+    def send(self, pos, rotvec, gripper: float, hz: float | None = None) -> None:
         """Command one absolute pose target for 1/hz simulated seconds.
 
         One env step whose control period is 1/hz, which is how SAIL's own sim
-        (its patched robosuite) plays action rows faster than they were recorded.
-        The delta is recomputed against the pose measured that step, the same
-        semantics as EE_POS on the arm.
+        (its patched robosuite) plays action rows faster than they were recorded;
+        None is the env's own step, as multi-fast's executor takes it. The delta
+        is recomputed against the pose measured that step, the same semantics as
+        EE_POS on the arm.
         """
         if self.finished:
             return
-        self._advance(self.task.action(pos, rotvec, gripper), 1.0 / hz)
+        self._advance(self.task.action(pos, rotvec, gripper), None if hz is None else 1.0 / hz)
 
     def send_raw(self, action) -> None:
         """One env step with a LIBERO action as given.
@@ -199,16 +200,16 @@ class Stepper:
 
 
 def sim_osc(backend: str, args) -> dict:
-    """The backend's execution controller, as `sim_env.osc_config` arguments.
+    """The backend's execution controller, as `comparison_env.osc_config` arguments.
 
-    Empty is the stock controller the demonstrations were recorded under. pi05
-    always runs that: its normalised deltas were learned under it.
+    Empty is the plant's own controller, the one the demonstrations were
+    re-recorded under. pi05 and dp always run that: pi05's deltas were learned
+    under it, and dp's gains are the residual's to change, not the executor's.
     """
     flags = {"kp": args.osc_kp, "damping_ratio": args.osc_damping_ratio}
-    if backend not in SERVED:
+    if backend in ("pi05", "dp"):
         if any(v is not None for v in flags.values()):
-            raise SystemExit("pi05's deltas were learned under the stock controller, "
-                             "so it runs that; drop the --osc-* flags")
+            raise SystemExit(f"{backend} runs the plant's own controller; drop the --osc-* flags")
         return {}
     out = dict(fc.policy(f"baselines.{backend}.sim_osc") or {})
     out.update({k: v for k, v in flags.items() if v is not None})
@@ -386,6 +387,28 @@ def bspline_episode(stepper: Stepper, client: PolicyClient, planner_kwargs: dict
 
 
 # ---------------------------------------------------------------------------
+# dp (our diffusion base, alone)
+# ---------------------------------------------------------------------------
+
+def dp_episode(stepper: Stepper, client: PolicyClient, chunk_exec: int, ep: SimEpisode) -> None:
+    """Replan every `chunk_exec` env steps from the last n_obs_steps frames and
+    execute that many rows, each as one env step's absolute target -- what
+    run_residual.py --no-residual does on the arm, and what multi-fast's
+    executor does under ZAP with the residual zeroed.
+    """
+    client.reset()
+    while not stepper.finished:
+        rep = client.request({"obs": list(stepper.history)})
+        if "error" in rep:
+            raise RuntimeError(f"policy server: {rep['error']}")
+        ep.inferences += 1
+        for row in np.asarray(rep["chunk"], dtype=np.float64)[:chunk_exec]:
+            if stepper.finished:
+                break
+            stepper.send(row[:3], Rotation.from_quat(row[3:7]).as_rotvec(), float(row[7]))
+
+
+# ---------------------------------------------------------------------------
 # pi0.5 (multi-fast's base policy)
 # ---------------------------------------------------------------------------
 
@@ -501,7 +524,11 @@ def main() -> int:
         i = sim_env.resolve_task(args.suite, args.task)
         name = sim_env.task_names(args.suite)[i]
         said = str(meta.get("train_dataset") or "")
-        if said and said not in (f"{args.suite}/{sim_env.task_tag(i)}", f"{args.suite}/{name}"):
+        expected = {f"{args.suite}/{sim_env.task_tag(i)}", f"{args.suite}/{name}",
+                    f"{args.suite}_{sim_env.comparison_plant()}/{sim_env.task_tag(i)}"}
+        if args.train_dataset:
+            expected.add(args.train_dataset)
+        if said and said not in expected:
             p.error(f"the server on port {port} serves a policy trained on {said!r}, "
                     f"but this rollout is {args.suite} task {i} ({name}). Check --suite "
                     f"and --task against --ckpt; if they agree, another run's server is "
@@ -537,21 +564,27 @@ def main() -> int:
                         root=args.output_root or rr.DEFAULT_ROOT)
     record = rr.RunRecord(run_dir, args.backend, train_dataset, sweep=args.sweep_id)
     served = args.backend in SERVED
+    trained_in = meta.get("comparison_env") or sim_env.recorded_in(meta.get("training_hdf5"))
+    if trained_in is not None and trained_in != task.identity:
+        p.error(f"the policy's demos were recorded in {trained_in}, but this rollout runs in "
+                f"{task.identity}")
     record.set("policy",
                checkpoint=rr.file_provenance(args.ckpt),
                server=({"host": args.host, "port": port, **{k: v for k, v in meta.items()}}
                        if served else {k: v for k, v in meta.items()}),
                control_mode="absolute_pose_target" if served else "osc_delta",
                control_mode_reason=(
-                   "both converted datasets train on absolute poses; sim_env.action "
+                   "every converted dataset trains on absolute poses; sim_env.action "
                    "inverts them into LIBERO's OSC delta" if served else
                    "pi0.5 emits LIBERO's own normalised OSC deltas, stepped as given"))
     record.set("environment",
                simulator="libero/robosuite",
-               plant="stock",
-               plant_reason="no plant or gripper overrides; "
-                            "regenerate_libero_dataset.py recorded the demos under this model",
-               controller=("stock" if not osc else "sim_osc"),
+               plant=task.identity["plant"],
+               comparison_env=task.identity,
+               plant_reason="multi-fast utils/envs/comparison_env.py, the environment "
+                            "regenerate_on_plant.py re-recorded the demos in and ZAP is "
+                            "evaluated in",
+               controller=("plant" if not osc else "sim_osc"),
                controller_overrides=osc,
                osc=report,
                suite=args.suite, task=task.name, task_index=task.task_index,
@@ -559,7 +592,7 @@ def main() -> int:
                render_resolution=resolution,
                policy_image_shapes={k: list(v) for k, v in shapes.items() if k.endswith("_image")},
                control_freq=float(task.env.env.control_freq),
-               max_steps=budget, settle_steps=sim_env.SETTLE_STEPS,
+               max_steps=budget, settle_steps=task.identity["settle_steps"],
                init_states=task.n_init_states)
 
     fast_fps = float(args.fast_fps or fc.policy("baselines.exec.fast_fps"))
@@ -569,6 +602,7 @@ def main() -> int:
     params = {"sail": settings,
               "bspline": {**planner_kwargs, "fast_fps": fast_fps,
                           "goal_lead": bool(fc.policy("baselines.bspline.goal_lead"))},
+              "dp": {"chunk_exec": int(fc.policy("residual.chunk_exec"))},
               "pi05": {"chunk_size": chunk_size}}
     record.set("parameters", **params[args.backend])
 
@@ -596,6 +630,8 @@ def main() -> int:
                 sail_episode(stepper, client, settings, ep)
             elif args.backend == "bspline":
                 bspline_episode(stepper, client, planner_kwargs, fast_fps, ep)
+            elif args.backend == "dp":
+                dp_episode(stepper, client, params["dp"]["chunk_exec"], ep)
             else:
                 pi05_episode(stepper, policy, chunk_size, ep)
             ep.steps = stepper.steps

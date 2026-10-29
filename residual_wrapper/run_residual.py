@@ -32,7 +32,7 @@ import time
 import tty
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
@@ -66,8 +66,8 @@ from env_wrapper import default_home_q as _default_home_q
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.video_utils import VideoEncodingManager
 from policy_wrapper import BasePolicy, ResidualPolicy, Trajectory
-from viz import (EpisodeRecorder, save_episode_html, save_latency_html, save_policy_pcd_npz,
-                 save_rollout_html)
+from viz import (EpisodeRecorder, rig_frames, save_episode_html, save_latency_html,
+                 save_policy_pcd_npz, save_rollout_html)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -241,6 +241,13 @@ class Chunk:
     network_pcd: np.ndarray | None
     latency: dict
 
+    def reanchored(self, kin: dict) -> "Chunk":
+        """The same offsets from the pose in kin, which the arm reached while this chunk was inferred."""
+        pos, quat = _pose(kin)
+        return replace(self, anchor_pos=pos,
+                       base_poses=relative_to_poses(self.base_rel, pos, quat),
+                       total_poses=relative_to_poses(self.total_rel, pos, quat))
+
 
 class ChunkPlanner:
     """Base (+ residual) inference over a Snapshot, on the loop thread or the prefetch worker."""
@@ -401,7 +408,7 @@ def _record_chunk(recorder: EpisodeRecorder, chunk: Chunk) -> None:
 
 
 def _record_step(recorder: EpisodeRecorder, snap: Snapshot, cursor: ChunkCursor,
-                 action: dict) -> None:
+                 action: dict, controller) -> None:
     chunk, i = cursor.chunk, cursor.i
     res = chunk.res_chunk[i] if i < len(chunk.res_chunk) else None
     recorder.record(
@@ -414,6 +421,7 @@ def _record_step(recorder: EpisodeRecorder, snap: Snapshot, cursor: ChunkCursor,
         kd=action["kd"],
         gripper=action[f"{_ARM_KEY}_gripper"],
         res_gripper=float(res[8]) if res is not None else 0.0,
+        floor_rise=(getattr(controller, "_last_floor_rise", None) or {}).get(_ARM_KEY, 0.0),
         point_cloud=snap.cloud,
         res_rotvec=((cursor.rel[i, 3:6] - chunk.base_rel[i, 3:6]) * _ROT_SCALE).astype(np.float32),
     )
@@ -608,12 +616,15 @@ def _run_episode(
     ep: Episode | None = None,
     wrench: WrenchTrace | None = None,
     latency_debug: bool = False,
+    reanchor: bool = False,
 ) -> None:
     """One episode: a chunk every _CHUNK_EXEC steps, one EE_DELTA goal per step.
 
     infer_lead > 1 starts a chunk's inference that many steps before its first
     action, on a worker, overlapping the chunk still executing; 1 infers on the
     step that executes it. episode_time_s None runs until the operator stops it.
+    reanchor offsets each new chunk from the pose read just before its first goal,
+    not the observed one; a replay keeps its recorded targets.
     """
     planner = ChunkPlanner(controller, base_policy, residual, proprio_frame,
                            sim_proprio_convention, dump_dir, latency_debug)
@@ -658,6 +669,8 @@ def _run_episode(
                         t_wait = time.perf_counter()
                         chunk, pending = pending.result(), None
                         stats.wait.append((time.perf_counter() - t_wait) * 1e3)
+                    if reanchor and not replaying:
+                        chunk = chunk.reanchored(controller.read_kinematic_state())
                     chunks += 1
                     cursor = ChunkCursor(chunk, replaying)
                     if latency_debug:
@@ -684,7 +697,7 @@ def _run_episode(
                     pending = pool.submit(planner.plan, base_policy.window(), snap, gains, chunks)
 
                 if recorder is not None:
-                    _record_step(recorder, snap, cursor, action)
+                    _record_step(recorder, snap, cursor, action, controller=controller)
                 if dataset is not None:
                     dataset.add_frame(_dataset_frame(snap.obs, action, task, controller.cameras))
 
@@ -751,14 +764,15 @@ def _build_dataset(args, controller) -> LeRobotDataset:
 
 
 def _save_viz(recorder: EpisodeRecorder, path: str, residual: ResidualPolicy | None,
-              title: str, frame_stride: int, fps: float) -> None:
+              title: str, frame_stride: int, fps: float, rig_profile: str) -> None:
     """save_rollout_html (base only) or save_episode_html (residual), plus the extras."""
+    frames = rig_frames(rig_profile)
     if residual is None:
         save_rollout_html(recorder, path, title=f"base policy — {title}",
-                          frame_stride=frame_stride, fps=fps)
+                          frame_stride=frame_stride, fps=fps, **frames)
     else:
         save_episode_html(recorder, path, title=f"residual — {title}",
-                          frame_stride=frame_stride, fps=fps)
+                          frame_stride=frame_stride, fps=fps, **frames)
     stem = path.removesuffix(".html")
     if recorder.latency_events:
         save_latency_html(recorder.latency_events, stem + "_latency.html",
@@ -819,6 +833,7 @@ def _parameter_record(args) -> dict:
         "episode_time_s": args.episode_time_s,
         "task": args.task,
         "infer_lead": args.infer_lead,
+        "reanchor": args.reanchor,
         "proprio_frame": args.proprio_frame,
         "sim_proprio_convention": not args.raw_proprio,
         "base_amp": args.base_amp,
@@ -861,8 +876,7 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-policy", required=False, help="Path to base policy checkpoint")
     parser.add_argument("--rig", choices=sorted(env_wrapper._RIGS), default=env_wrapper._PROFILE,
-                        help="rig profile for a LeRobot base; which physical arm it drives "
-                             "is in config/rig.yaml (the reach path uses --arm)")
+                        help="rig profile; which physical arm it drives is in config/rig.yaml")
     parser.add_argument(
         "--residual-policy",
         default=str(Path(__file__).resolve().parent.parent / "best.pt"),
@@ -909,6 +923,11 @@ def _parse_args() -> argparse.Namespace:
                              "many steps old. 1 = no prefetch: the chunk is inferred on the "
                              "step that executes it, which fits the 20 Hz budget once the "
                              "base policy is sped up (see --base-amp / --base-compile)")
+    parser.add_argument("--reanchor", action="store_true",
+                        help="Offset each chunk from the pose read just before its first goal "
+                             "instead of the pose it was observed at, so the arm's motion "
+                             "during inference (~35 ms) does not eat into the chunk's lead. "
+                             "Ignored when replaying a dataset")
     parser.add_argument("--base-amp", choices=("fp16", "bf16", "none"), default="fp16",
                         help="Autocast dtype for the base policy. Its cost is GPU compute, "
                              "not launch overhead, so precision is the lever that shrinks it: "
@@ -960,8 +979,6 @@ def _parse_args() -> argparse.Namespace:
     reach = parser.add_argument_group("reach residual (FAST .zip checkpoint only; also "
                                       "reads --num-episodes, --device, --viz-stride)")
     reach.add_argument("--seed", type=int, default=0, help="curve sampling seed")
-    reach.add_argument("--arm", default="left", choices=("left", "right"),
-                       help="physical arm to drive; the key prefix stays r_ either way")
     reach.add_argument("--policy", default="residual", choices=("residual", "base", "both"),
                        help="per episode: the residual on its base, the base alone, or both "
                             "in succession on the same curve")
@@ -1091,6 +1108,7 @@ def _episode(args, run: Run, ep_idx: int, homed: bool) -> None:
             ep=ep,
             wrench=wrench,
             latency_debug=args.viz_latency_debug,
+            reanchor=args.reanchor,
         )
     finally:
         _file_episode(args, run, ep, recorder, wrench, time.perf_counter() - t0)
@@ -1116,7 +1134,7 @@ def _file_episode(args, run: Run, ep: Episode, recorder: EpisodeRecorder | None,
         viz_path = os.path.join(args.viz_dir, f"episode_{ep.episode:03d}.html")
         print(f"saving visualization to {viz_path}...")
         _save_viz(recorder, viz_path, run.residual, f"episode {ep.episode} — {args.task}",
-                  args.viz_stride, args.fps)
+                  args.viz_stride, args.fps, run.controller.config.rig_profile)
         ep.notes["viz"] = os.path.basename(viz_path)
     run.record.add_episode(ep)
 
@@ -1180,7 +1198,7 @@ def main() -> None:
     if Path(args.residual_policy).suffix == ".zip":
         # A different base, loop and record entirely; nothing below applies.
         import reach_residual
-        reach_residual.run(args.residual_policy, args.num_episodes, args.seed, args.arm,
+        reach_residual.run(args.residual_policy, args.num_episodes, args.seed, args.rig,
                            args.policy, args.device, args.out, args.viz_stride, args.no_viz)
         return
     logging.basicConfig(level=logging.INFO, force=True)

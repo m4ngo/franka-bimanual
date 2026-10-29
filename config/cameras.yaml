@@ -25,13 +25,13 @@ defaults:
     align_to: color
     color_format: rgb8
     depth_format: z16
-    streaming_fps: 30
+    streaming_fps: 60
     # Density filter on the projected cloud: a point survives only if the 3x3x3
     # block of `blob_filter_radius_m` voxels around it holds more than
     # `blob_filter_min_neighbors` others. Off by default — it changes what the
     # policy sees, so enabling it is a per-run decision.
     blob_filter: false
-    blob_filter_min_neighbors: 100
+    blob_filter_min_neighbors: 128
     blob_filter_radius_m: 0.02
   arv:
     pixel_format: Mono8
@@ -65,7 +65,7 @@ cameras:
         - [0.38055814, 0.76983260, -0.51238001]
         - [0.92343072, -0.28668516, 0.25512216]
         - [0.04950961, -0.57023626, -0.81998745]
-      t_cam_in_calib: [0.69250482, -0.08487003, 0.84986305]
+      t_cam_in_calib: [0.72250482, -0.08487003, 0.87186305]
 
 
   cam_3:
@@ -112,3 +112,25 @@ cameras:
         - [0.33176631, 0.85065211, -0.40782608]
         - [0.41393851, -0.51973991, -0.74734553]
       t_cam_in_calib: [0.57975414, 0.45897286, 0.90583442]
+
+  cam_7:
+    type: framos
+    name: workspace_framos_de1
+    ip: 192.168.0.117
+    serial_number: 6CD146030DE1
+    role: scene
+    mount: world
+    depth: true
+    calibration:
+      source: frames/camera/cam_7_matrices.txt
+      rms_reprojection_px: 0.2038
+      intrinsic_matrix:
+        - [900.40296036, 0.00000000, 631.03552031]
+        - [0.00000000, 897.13511410, 385.48854899]
+        - [0.00000000, 0.00000000, 1.00000000]
+      distortion_coeffs: [1.14569071e-01, -2.16307968e-02, 3.30356444e-03, 2.27551653e-03, -6.94874086e-01]
+      r_cam_in_calib:
+        - [0.36870935, 0.74947155, -0.54985982]
+        - [0.92045669, -0.21186082, 0.32844250]
+        - [0.12966456, -0.62722197, -0.76797116]
+      t_cam_in_calib: [0.51429295, -0.21502712, 0.59044797]

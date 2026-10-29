@@ -5,8 +5,10 @@
 # the workstation:
 #
 #   bash baselines/tillicum/send_datasets.sh <tillicum_user> ~/franka_data/baseline_prep/real/task_<dataset>
+#   bash baselines/tillicum/send_datasets.sh <tillicum_user> ~/franka_data/baseline_prep/libero_90_sysid_2026_09_16/task_9
 #
-# The folder is what scripts/prepare_baseline_datasets.py wrote. The recording
+# The folder is what scripts/prepare_baseline_datasets.py (real) or
+# baselines/libero_bridge/dataset.py (LIBERO sim) wrote. The recording
 # sent with it is the one the converters stamped into both HDF5s. Everything
 # lands under /gpfs/scrubbed/<tillicum_user>; sending again resumes and skips
 # what is already there.
@@ -15,7 +17,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-usage() { sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
+usage() { sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 
 [ $# -eq 2 ] || usage
 export TILLICUM_USER=$1
@@ -56,15 +58,26 @@ if [ "$LABELS" = none ]; then
     echo "  python -m baselines.sail_bridge.gripper_labels $DIR/sail.hdf5" >&2
 fi
 
+# A real recording's task folder sits in baseline_prep/real/; a LIBERO one in baseline_prep/<suite>_<plant>/.
+suite=$(basename "$(dirname "$DIR")")
 bash "$HERE/sync.sh" code
-bash "$HERE/sync.sh" real "$DIR"
+if [ "$suite" = real ]; then
+    bash "$HERE/sync.sh" real "$DIR"
+else
+    bash "$HERE/sync.sh" sim "$DIR"
+fi
 bash "$HERE/sync.sh" lerobot "$REPO_ID"
 
 name=$(basename "$DIR")
+if [ "$suite" = real ]; then
+    tasks=${name#task_} steps=200000 ee=""
+else
+    tasks=${name#task_} steps=100000 ee="--ee-state=as-recorded "
+fi
 echo
 echo "Sent to ${TILLICUM_DEST:-$TILLICUM_USER@tillicum.hyak.uw.edu:/gpfs/scrubbed/$TILLICUM_USER}. Train it on the Tillicum login node:"
 echo "  export WANDB_API_KEY=<your wandb key>"
-echo "  bash /gpfs/scrubbed/\$USER/tillicum/submit_libero_train.sh real --tasks ${name#task_} --steps 200000 --apply \\"
+echo "  bash /gpfs/scrubbed/\$USER/tillicum/submit_libero_train.sh $suite --tasks $tasks --steps $steps --apply \\"
 echo "      -- --extra --wandb --wandb-project franka-recipe"
-echo "  bash /gpfs/scrubbed/\$USER/tillicum/submit_diffusion_train.sh $REPO_ID --steps 200000 --name recipe-200k --apply \\"
-echo "      -- --wandb.project=franka-recipe"
+echo "  bash /gpfs/scrubbed/\$USER/tillicum/submit_diffusion_train.sh $REPO_ID --steps $steps --name recipe-$((steps / 1000))k --apply \\"
+echo "      -- ${ee}--wandb.project=franka-recipe"

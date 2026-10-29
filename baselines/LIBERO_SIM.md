@@ -1,14 +1,22 @@
-# SAIL and B-Spline on LIBERO
+# SAIL, B-Spline and ZAP on LIBERO
 
-The sim half of the three-way comparison we run on the FR3. Same env, same init
-states, same clock for all three:
+The sim half of the comparison we run on the FR3. Same env, same init states,
+same clock for every method:
 
 - **SAIL**, **B-Spline** -- trained here from LIBERO demos.
-- **pi05** -- multi-fast's base policy, pretrained. Not multi-fast: no FAST
-  residual exists for these tasks, so it files under its own name.
+- **dp** -- our diffusion base, trained on the same demos by the same recipe
+  (`baselines/diffusion_recipe.py`), alone and under the ZAP residual
+  ([The matched comparison](#the-matched-comparison)).
+- **pi05** -- multi-fast's base policy, pretrained.
 
-`baselines/README.md` is the hardware side; `baselines/ROLLOUT.md` covers run
-directories.
+Every rollout runs in one environment, the fitted `sysid_2026_09_16` plant
+([The environment](#the-environment)). `baselines/README.md` is the hardware
+side; `baselines/ROLLOUT.md` covers run directories.
+
+**To train and evaluate all four on libero_10, libero_goal and libero_spatial,
+follow [NEW_DIFFUSION_POLICY_ARCH.md](../NEW_DIFFUSION_POLICY_ARCH.md).** It is
+the copy-paste runbook, from re-recording the demos to the report's charts. This
+file explains how each step works.
 
 ## Setup, once
 
@@ -20,7 +28,227 @@ source ~/franka_ws/.venv/bin/activate
 Idempotent. `multi-fast/.venv` must already exist -- it is the only interpreter
 with robosuite, libero and openpi.
 
+## The matched comparison
+
+SAIL, B-Spline, base dp and base dp + ZAP on one dataset, one recipe and one
+plant, as on the arm: only what each policy reads and predicts differs. Piloted
+on libero_90 task 9 (bowl on plate, the sim twin of the real task).
+
+### 1. Re-record the demos on the comparison plant (workstation)
+
+```bash
+cd ~/franka_ws/multi-fast
+MUJOCO_GL=egl PYOPENGL_PLATFORM=egl .venv/bin/python scripts/libero/regenerate_on_plant.py \
+    ~/libero_data/libero_90/KITCHEN_SCENE1_put_the_black_bowl_on_the_plate_demo.hdf5 \
+    --out-dir ~/libero_data_sysid/libero_90
+```
+
+Prints one line per demo and `kept 40 of 45 on sysid_2026_09_16`. Each step
+commands the stock run's recorded OSC goal through `target_slot_to_delta`
+against the pose measured on the fitted plant
+([`replay`](../multi-fast/scripts/libero/regenerate_on_plant.py#L66)), so the
+arm follows the demonstrated path while friction slows it: on task 9 it trails
+the stock path by 6 cm (median of the per-demo maximum) in the fast approach and
+catches up to under 1 cm in the slow phases, and about 20 steps per demo hit
+LIBERO's 5 cm step limit, so their stored goal is the clipped one the controller
+ran. Holding the last goal 40 more steps keeps the same 40: the 5 failures are
+not lag at the end. Fields come from
+[`DemoRecorder`](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L102),
+which `regenerate_libero_dataset.py` records with too. `--stock` replays on the
+stock plant instead; on its own source it reproduces the goals to 2e-6 rad and
+the reached path to 1.4e-5 m, which is the check that the replay is right.
+
+### 2. Three training sets from that one file
+
+```bash
+cd ~/franka_ws && source .venv/bin/activate
+python -m baselines.libero_bridge.dataset \
+    ~/libero_data_sysid/libero_90/KITCHEN_SCENE1_put_the_black_bowl_on_the_plate_demo.hdf5 \
+    --out-dir ~/franka_data/baseline_prep/libero_90_sysid_2026_09_16/task_9
+```
+
+29 s. Writes `sail.hdf5` and `bspline.hdf5` there and the dp's LeRobot dataset at
+`~/.cache/huggingface/lerobot/libero_90_sysid_2026_09_16/task_9`
+([`convert_lerobot`](libero_bridge/dataset.py#L210)), all from the same demos
+and 84x84 frames. The id is `<suite>_<plant>/task_<i>`
+([`default_repo_id`](libero_bridge/dataset.py#L195)), so nothing re-recorded is
+filed beside the stock-plant `libero_90/...` runs. The dp reads B-Spline's exact
+input (`robot0_eef_pos`, `robot0_eef_quat`, `robot0_gripper_qpos`, 9 wide) and
+predicts B-Spline's commanded pose as `[x, y, z, qx, qy, qz, qw, gripper]`, the
+real base's `EE_POS` without kp/kd ([`lerobot_episode`](libero_bridge/dataset.py#L158)).
+Images are the `image` dtype (lossless PNG), not video, so the dp trains on the
+baselines' pixels: on task 9 all three files agree bit for bit on images and
+state, and the dp's quaternion matches B-Spline's rotation vector to 5e-8 rad.
+
+### 3. Train all three on Tillicum, one 100k-step budget
+
+From the workstation (password + Duo once; the connection is reused 30 min):
+
+```bash
+cd ~/franka_ws
+bash baselines/tillicum/sync.sh code
+bash baselines/tillicum/sync.sh lerobot libero_90_sysid_2026_09_16/task_9
+rsync -a --mkpath --partial --info=progress2 --include='task_*/' --include='*.hdf5' --exclude='*' \
+    ~/franka_data/baseline_prep/libero_90_sysid_2026_09_16/ \
+    atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/atsai06/franka_home/franka_data/baseline_prep/libero_90_sysid_2026_09_16/
+```
+
+On the Tillicum login node:
+
+```bash
+bash /gpfs/scrubbed/$USER/tillicum/submit_libero_train.sh libero_90_sysid_2026_09_16 --tasks 9 --steps 100000 --apply
+bash /gpfs/scrubbed/$USER/tillicum/submit_diffusion_train.sh libero_90_sysid_2026_09_16/task_9 \
+    --steps 100000 --name recipe-100k --apply -- --ee-state=as-recorded
+```
+
+`--ee-state=as-recorded` tells `lerobot_train_recipe.py` the state is already the
+end-effector pose ([`pop_ee_state`](../scripts/training/lerobot_train_recipe.py#L107));
+without it the run stops at `expected [7 joints, gripper] states, got width 9`.
+Everything else -- widths, AdamW, EMA, batch 64, the 76 crop of 84 -- is the
+recipe's, logged as `crop (76, 76) of (84, 84) images`. A local 1000-step run
+went at 12 steps/s on the 5090. Then back on the workstation:
+
+```bash
+bash baselines/tillicum/sync.sh fetch libero_90_sysid_2026_09_16/task_9
+```
+
+### 4. The dp policy server
+
+The dp checkpoint is lerobot 0.5.1's and `multi-fast/.venv` pins lerobot 0.1.0
+for openpi, so the base runs in the workspace venv behind ZMQ
+([`DPPolicyServer`](dp_bridge/policy_server.py#L67)) and both rollout harnesses
+ask it for chunks. It plans with [`ChunkPolicy`](lerobot_inference.py#L32), the
+code `run_residual.py`'s `BasePolicy` plans with on the arm, and it is stateless:
+each request carries its own two consecutive control-step frames. 33 ms per
+window on the 5090. For the steps below, in its own terminal:
+
+```bash
+cd ~/franka_ws
+.venv/bin/python baselines/dp_bridge/policy_server.py --port 5557 --ckpt-path \
+    ~/franka_data/policies/libero_90_sysid_2026_09_16/task_9/diffusion/recipe-100k/checkpoints/last/pretrained_model
+```
+
+### 5. ZAP on the dp base (multi-fast)
+
+The `_dp` task suffix swaps pi0.5 for this base
+([`dp_base_overrides`](../multi-fast/scripts/task_config.sh#L86)): target mode,
+chunk-relative, the 256-rendered 84x84 frames and the comparison gripper. The
+`lerobot_dp` base ([`LeRobotDPBaseWrapper`](../multi-fast/utils/base_policy_utils.py#L1036))
+turns the server's absolute poses into the chunk-relative OSC units the residual
+composes in, as `env_wrapper.chunk_to_relative` does on the arm, and refuses a
+server, frame size or environment that is not the one the base was trained for
+([`_load_lerobot_dp_policy`](../multi-fast/utils/base_policy_utils.py#L1118)). The
+previous frame travels in the observation as `<key>_prev`
+([`_with_prev`](../multi-fast/utils/envs/wrappers.py#L511)): FAST draws the base
+twice per state, so a history kept by the base would queue one frame twice. The
+replay buffer leaves those keys out
+([FAST's buffer](../multi-fast/stable-baselines3/stable_baselines3/fast/fast.py#L375)).
+
+Base stats and references, on the workstation, with the server up:
+
+```bash
+cd ~/franka_ws/multi-fast
+export DP_BASE_CKPT=~/franka_data/policies/libero_90_sysid_2026_09_16/task_9/diffusion/recipe-100k/checkpoints/last/pretrained_model
+UV_NO_SYNC=1 ARM_FILTER=dp_recipe TASKS=libero_90_9 EXTRA_OVERRIDES="plant=sysid_2026_09_16" \
+    OUT_DIR=logs/action_space_sweep/dp_recipe_l90_9_p0916 bash scripts/libero/eval_action_space_sweep.sh "" 50 10
+.venv/bin/python scripts/libero/sweep_to_base_stats.py logs/action_space_sweep/dp_recipe_l90_9_p0916
+UV_NO_SYNC=1 bash scripts/utils/precompute_references.sh libero_90_dp libero.task_id=9 plant=sysid_2026_09_16
+```
+
+The stats land at `cfg/base_stats/libero/dp_recipe/sysid_2026_09_16/libero_90/task_9.yaml`.
+Base success there decides whether a teacher is worth training: libero_goal 0/3/6
+were dropped for pi0.5 at 0.08 to 0.60.
+
+The teacher, collection and student use `77bb0d2a`'s settings (the pi0.5 task-9
+teacher, from its `.hydra/overrides.yaml` on Tillicum) with only the task name
+changed to `libero_90_9_dp`. The teacher sees the comparison gripper too: this
+base learned its grasp timing at gripper speed 0.05, and on the stock 0.01 it
+would close five times too slowly. In a Slurm job,
+[`start_dp_server`](../multi-fast/scripts/task_config.sh#L116) starts the server
+for each run when the job exports `DP_SERVER_SH` (this repo's
+`baselines/tillicum/dp_server.sh`) and `DP_BASE_CKPT` as the server sees it
+(`/home/franka/franka_data/policies/...`); its image is `Dockerfile.dp`.
+
+### 6. Evaluate all four in the one environment (workstation)
+
+SAIL and B-Spline, 50 episodes = the suite's 50 start states:
+
+```bash
+cd ~/franka_ws && source .venv/bin/activate
+python -m baselines.libero_bridge.evaluate ~/franka_data/baseline_prep/libero_90_sysid_2026_09_16 \
+    --tasks 9 --backend sail bspline --num-episodes 50
+```
+
+The base alone through the same loop, as a cross-check on the harness below:
+
+```bash
+./scripts/libero_rollout.sh --backend dp --start-server --suite libero_90 --task 9 --num-episodes 50 --ckpt \
+    ~/franka_data/policies/libero_90_sysid_2026_09_16/task_9/diffusion/recipe-100k/checkpoints/last/pretrained_model
+```
+
+Base dp + ZAP, and the base alone in the same process, with the server up:
+
+```bash
+cd ~/franka_ws/multi-fast
+export DP_BASE_CKPT=~/franka_data/policies/libero_90_sysid_2026_09_16/task_9/diffusion/recipe-100k/checkpoints/last/pretrained_model
+for base in False True; do
+  UV_NO_SYNC=1 bash scripts/distill/eval.sh libero_90_dp libero.task_id=9 plant=sysid_2026_09_16 \
+      libero.comparison_env=true n_eval=50 env.n_envs=10 eval_base=$base \
+      student.log_dir=$HOME/checkpoints student.id=<the new student> student.checkpoint=best
+done
+cd ~/franka_ws
+python -m baselines.libero_bridge.import_eval_distill \
+    ~/checkpoints/<the new student>/libero_90_9/comparison.json --sweep-id zap
+python -m baselines.libero_bridge.import_eval_distill \
+    ~/checkpoints/<the new student>/libero_90_9/comparison_base.json --sweep-id dp
+python scripts/rollout_summary.py libero_90_sysid_2026_09_16/task_9
+```
+
+`libero.comparison_env=true` puts eval_distill in the environment the other three
+run in ([`_comparison_setup`](../multi-fast/eval_distill.py#L875)): worker *i*
+starts at states *i*, *i* + n_envs, ..., each scored once
+([quota](../multi-fast/eval_distill.py#L608)) -- without it the first `n_eval`
+episodes to finish count, which favours quick successes -- and the settle
+commands the gripper open, as the demos were regenerated, instead of holding it
+at 0 ([the settle action](../multi-fast/utils/envs/wrappers.py#L362)).
+[`import_eval_distill`](libero_bridge/import_eval_distill.py) files both runs as
+`multifast` and `dp`, under LIBERO's own task name so the report lines them up
+with the other methods' rows, and with each episode's wrist force when the
+`comparison.json` has it (eval_distill writes it since 2026-10-29).
+`--sweep-id` tags them for `rollout_report.py` ([Read results](#read-results)),
+which draws nothing without one. `rollout_summary.py` tags each run with its
+environment and prints `NOT COMPARABLE` when a table mixes two.
+
+Checked on task 9 before any training, with a 1000-step dp:
+
+| check | result |
+|---|---|
+| the 40 re-recorded labels through `SimTask` + `Stepper` | 40/40 succeed; reached path 1e-7 m from the recording (worst demo 0.4 mm) |
+| the same labels through `lerobot_dp`'s conversion and ZAP's executor, zero residual | 6/6 succeed; 2.3 mm worst, the one-substep lag of the observed pose behind the latched anchor |
+| multi-fast's observation vs `SimTask.observe`, same start state, one env per process | bit-identical, images and `<key>_prev` included, with or without point-cloud rendering |
+| the server's input path vs LeRobot's training loader, same noise | bit-identical chunks |
+| `debug_run.sh libero_90_9_dp` | trains and evaluates against the server |
+
+Two envs in one process do not render identically -- 9% of pixels differed by up
+to 195 levels on identical sim states -- so compare harnesses across processes.
+
+| symptom | cause |
+|---|---|
+| `lerobot_dp base: the base's demos were recorded in a different environment` | `plant=` missing, or the gripper is not `cfg/distill/eval.yaml`'s |
+| `lerobot_dp base: the server holds ..., not base_policy.checkpoint=...` | a stale server, or `DP_BASE_CKPT` names another run |
+| `no reply from the dp policy server` | it is not running, or not on `DP_SERVER_PORT` (5557) |
+| `libero_90_dp names no task id to find its dp checkpoint by` | the distill launchers need `DP_BASE_CKPT` |
+| `libero.comparison_env=True, but this eval runs {...}` | `settle_steps` or a gripper override differs from the comparison's |
+| `n_eval=... must be a multiple of env.n_envs` | so that every start state is scored exactly once |
+| `No base stats at cfg/base_stats/libero/dp_recipe/...` | step 5's sweep has not been run for this plant |
+| `traj_deviation_lambda > 0 requires ... references` | step 5's `precompute_references.sh` |
+| `the policy's demos were recorded in ..., but this rollout runs in ...` | a policy trained on another plant's demos |
+
 ## Run everything
+
+The commands below are the stock-demo pipeline. Rollouts now run in the
+comparison environment, so a new run takes its source from
+`~/libero_data_sysid/<suite>` ([above](#the-matched-comparison)).
 
 ```bash
 # 1. LIBERO demos -> sail.hdf5 + bspline.hdf5 per task  (pi05 needs none of this)
@@ -44,7 +272,7 @@ On one 5090: conversion ~15 s/task. Training dominates -- SAIL 107-252 min/task
 ## Tasks are numbered
 
 A task is named by its index in its suite, in LIBERO's own order
-([`task_names`](libero_bridge/sim_env.py#L98)): task 2 of libero_10 is
+([`task_names`](libero_bridge/sim_env.py#L118)): task 2 of libero_10 is
 `task_2`. That names its prep directory (`baseline_prep/libero_10/task_2/`), the
 id stamped on its files (`libero_10/task_2`), and so where its policies and
 rollouts go. Every task flag takes the index, the tag or the full LIBERO name:
@@ -58,12 +286,12 @@ prep directory's files rather than a default.
 
 libero_90 was converted before this, so its directories, policies and rollouts
 keep the full task names. Indices find them too
-([`task_dirs`](libero_bridge/train.py#L126)); `teacher_tasks.txt` is indices.
+([`task_dirs`](libero_bridge/train.py#L139)); `teacher_tasks.txt` is indices.
 
 ## One task
 
 `evaluate` is a loop over `scripts/libero_rollout.sh`. Call that directly for a
-single run; [`checkpoint_for`](libero_bridge/train.py#L59) finds the checkpoint.
+single run; [`checkpoint_for`](libero_bridge/train.py#L60) finds the checkpoint.
 
 ```bash
 PREP=~/franka_data/baseline_prep/libero_90
@@ -91,6 +319,118 @@ beside the baselines (`evaluate` does this itself). On disk the checkpoints are
 Unconsumed flags pass through to `baselines.libero_bridge.rollout`. For its
 `--help`, run it under `multi-fast/.venv/bin/python` -- nothing else can import
 it.
+
+## A ZAP student from multi-fast
+
+The checkpoints under `~/checkpoints/<id>/` are multi-fast distillation
+students: a point-cloud residual on top of pi0.5. `40cdf603` is the residual
+the real ZAP rollouts load. They do not go through `libero_rollout.sh`;
+multi-fast's own [`eval_distill.py`](../multi-fast/eval_distill.py) rolls them
+out, and runs the pi0.5 base in the same process.
+
+### Quickstart: 40cdf603 on libero_90 task 9
+
+Task 9 of libero_90 is `KITCHEN_SCENE1_put_the_black_bowl_on_the_plate`, the
+sim version of the real bowl-plate task, and one of the tasks this student was
+trained on.
+
+Once, copy the base policy down from Tillicum (password + Duo). The student
+was trained on top of the chunk-relative pi0.5 arm, and that checkpoint is not
+on the workstation:
+
+```bash
+rsync -a --mkpath --info=progress2 \
+    atsai06@tillicum.hyak.uw.edu:/gpfs/scrubbed/ecai0608/openpi_checkpoints/pi05_libero90_chunkrel/pi05_libero90_chunkrel_264702_seed1/29999/ \
+    ~/openpi_checkpoints/pi05_libero90_chunkrel/pi05_libero90_chunkrel_264702_seed1/29999/
+```
+
+Then, for every run:
+
+```bash
+nvidia-smi --query-gpu=memory.used,memory.total --format=csv   # pi0.5 needs the card mostly free
+cd ~/franka_ws/multi-fast
+UV_NO_SYNC=1 bash scripts/distill/eval.sh libero_90_target libero.task_id=9 \
+    plant=sysid_2026_09_16 \
+    student.log_dir=$HOME/checkpoints student.id=40cdf603 student.checkpoint=best \
+    n_eval=20 env.n_envs=4 save_video=True
+```
+
+The success rate prints at the end:
+
+```
+[libero_90_9] n_rollouts: 20
+  Subgoal success rate / avg success time: <rate> / <time>
+```
+
+The time is averaged over the successful episodes only, in chunks: one chunk is
+5 env steps, 0.25 s of sim time. With no successes it reads 80, the 400-step
+episode limit.
+
+Videos land beside the checkpoint, under `~/checkpoints/40cdf603/libero_90_9/`
+([`video_dir`](../multi-fast/eval_distill.py#L1164)):
+
+| file | what |
+|---|---|
+| `videos/rollout_<env>_<success\|fail>.mp4` | the first episode of each env, so `env.n_envs` videos. Agent view, 256x256, 2x real time |
+| `videos/rollout_<env>_<success\|fail>_metrics.mp4` | the first success and the first failure, with the commanded delta, damping, stiffness and EE force plotted under the video |
+| `pcd_videos/rollout_<env>_<success\|fail>_pcd.html` | the same two episodes as the student saw them: its point cloud each step, with the base plan, the student's plan and the path the EE actually took. Open in a browser. About 60 MB for a 400-step episode; `pcd_viz.frame_stride=N` keeps every Nth step |
+
+A second run overwrites these. Pass `artifact_tag=<name>` to write
+`videos_<name>/` instead and keep both.
+
+### What each argument does
+
+| argument | why |
+|---|---|
+| `libero_90_target` | the libero_90 config plus the chunk-relative pi0.5 base ([`task_to_base_overrides`](../multi-fast/scripts/task_config.sh#L129)). The plain `libero_90` uses the delta base, and the student refuses it ([check](../multi-fast/eval_distill.py#L1079)) |
+| `libero.task_id=9` | the task's index in the suite |
+| `plant=sysid_2026_09_16` | the plant the student's data was collected on. Without it the eval runs on `default` and refuses ([check](../multi-fast/eval_distill.py#L1087)) |
+| `student.log_dir`, `student.id` | the eval loads `<log_dir>/<id>/checkpoint/<checkpoint>.pt` ([`student_run_dir`](../multi-fast/eval_distill.py#L966)). `log_dir` defaults to `multi-fast/logs/distill`, which is empty here |
+| `student.checkpoint` | `best` (lowest validation loss), `latest`, or a snapshot such as `epoch_0500` |
+| `n_eval`, `env.n_envs` | episodes in total, and how many run in parallel. Keep `n_eval` a multiple of `env.n_envs`; extra episodes are discarded |
+| `save_video=True` | the videos and HTML above. Off by default |
+| `UV_NO_SYNC=1` | `eval.sh` calls `uv run`, which first re-syncs the venv and fails building `egl-probe` on this machine. The venv is already complete, so skip the sync |
+
+Optional:
+
+| argument | what |
+|---|---|
+| `eval_base=True` | the pi0.5 base alone, same env and init states, for the with/without-residual comparison. Writes `videos_base/` |
+| `pcd_viz.counterfactual_base=True` | a second HTML, `..._pcd_cf.html`, adding what the base chunk alone would have reached from each state. Costs extra physics per chunk |
+| `zero_residual=True` | keep the student's gains, drop its pose residual |
+
+### Other checkpoints and tasks
+
+Read a student's stamp before choosing the task name and plant:
+
+```bash
+~/franka_ws/multi-fast/.venv/bin/python -c "
+import sys, torch
+d = torch.load(sys.argv[1], map_location='cpu', weights_only=False)['data_kwargs']
+print(d['teacher']); print(*d['paths'], sep='\n')" ~/checkpoints/40cdf603/checkpoint/best.pt
+```
+
+`chunk_relative: True` means a `_target` task name, and `plant` is what to pass
+as `plant=`. `paths` lists the training tasks; for 40cdf603 they are libero_90
+task 9, libero_goal 1, 2, 4, 5, 7, 8, 9, and reach. Any other task is held out.
+That is a fair test, but say so when reporting it.
+
+For libero_goal, the task name is `libero_goal_target` and the base is
+`pi05_libero4_chunkrel`. It is also only on Tillicum, beside the libero90 one.
+
+These numbers do not pool with the SAIL / B-Spline / pi05 table above. That
+table runs stock robosuite. This runs the sysid plant, variable impedance,
+multi-fast's gripper settings and 10 settle steps after each reset
+([eval.yaml](../multi-fast/cfg/distill/eval.yaml)).
+
+| symptom | cause |
+|---|---|
+| `No checkpoint for pi05_libero90_chunkrel under $HOME/openpi_checkpoints/...` | the rsync step |
+| `Student run dir ./logs/distill/40cdf603 does not exist` | `student.log_dir` missing |
+| `The student was trained on base_policy.chunk_relative=True data, but this eval composed False` | the plain task name; add `_target` |
+| `The student's data was collected on plant ['sysid_2026_09_16'], but this eval runs on 'default'` | `plant=` missing |
+| `Failed to build egl-probe` | `UV_NO_SYNC=1` missing |
+| `RESOURCE_EXHAUSTED: Out of memory` right after `Loading pi0.5` | something else holds the GPU. On 2026-10-22 two openpi policy servers held 23.7 of 32.6 GB and pi0.5 could not load |
 
 ## Training on Tillicum
 
@@ -212,7 +552,7 @@ How it works:
   ([cleanup](tillicum/train_libero.slurm#L41)). B-Spline trains from an
   in-memory copy it builds itself.
 - **`--resume`** continues a unit that has checkpoints but no `.trained.json`
-  ([`_RESUME_FROM`](libero_bridge/train.py#L48)). SAIL starts a new run dir from
+  ([`_RESUME_FROM`](libero_bridge/train.py#L49)). SAIL starts a new run dir from
   the newest `model_epoch_N.pth`, with a fresh optimizer. B-Spline continues its
   own run dir, optimizer included, to the epoch count it started with. A
   preempted job requeues (`--requeue`) and loses at most one checkpoint
@@ -386,7 +726,7 @@ How it works:
   script refuses to queue without it
   ([`FRANKA_SRC`](tillicum/submit_diffusion_train.sh#L52)).
 - **The crop.** The wrapper sets `crop_shape` from the recording's image size
-  ([`make_policy_with_ema`](../scripts/training/lerobot_train_recipe.py#L110)).
+  ([`make_policy_with_ema`](../scripts/training/lerobot_train_recipe.py#L123)).
   LeRobot crops randomly while the policy is in training mode and centrally
   otherwise, as SAIL's `CropRandomizer` and B-Spline's `eval_fixed_crop` do. On a
   smoke checkpoint the same image gave different features twice in training mode
@@ -520,7 +860,7 @@ How it works:
   ([`sweep_runs`](libero_bridge/evaluate.py#L49)). A preempted job requeues the
   same way.
 - **Units started in the same second do not clash.** The second run takes the
-  next second's directory ([`RunDir`](run_record.py#L239)).
+  next second's directory ([`RunDir`](run_record.py#L240)).
 - Manifests record the image tag as `environment.git.image`, because the image
   has no `.git`.
 
@@ -602,7 +942,7 @@ backend ran more than one suite
 ([`render_sweep`](../scripts/rollout_summary.py#L89)). `--sweep latest` takes the
 newest. Every run recorded since 2026-10-01 shows the OSC it ran in its notes,
 e.g. `[kp 300, damping 0.5, step limit 5 cm]`
-([`osc_text`](run_record.py#L489)); the step limit is the largest position step
+([`osc_text`](run_record.py#L490)); the step limit is the largest position step
 one env step may command. Only rollouts started through `evaluate` carry an id unless you pass
 `--sweep-id` yourself. `--json` emits manifests instead of the table.
 
@@ -622,9 +962,12 @@ and one that ran both suites gives `<sweep>.libero_10.png` and
 `comparison.png` (`comparison.<suite>.png` when there are several suites).
 Every sheet is 16:9 (3200 x 1800 px). Panels that list tasks sit side by side and
 share one column of task names. On the comparison sheet each method has one
-colour in every bar chart (pi05 green, SAIL amber, B-Spline indigo), and several
-sweeps of one method are shades of that colour, lightest first in speed-up order
-([`column_colors`](../scripts/rollout_report.py#L959)):
+colour in every bar chart (pi05 green, SAIL amber, B-Spline indigo, base dp pink,
+base dp + ZAP dark green), and several sweeps of one method are shades of that
+colour, lightest first in speed-up order
+([`column_colors`](../scripts/rollout_report.py#L993)). The sheets call the
+imported `dp` and `multifast` runs "base dp" and "base dp + ZAP", and the header
+names the plant the runs recorded:
 
 ```bash
 python scripts/rollout_report.py --sweep sail_100_20 bsp_1x bsp_2x bsp_4x bsp_8x
@@ -643,15 +986,15 @@ is gitignored -- regenerate it rather than committing it.
 Every sim rollout since 2026-10-01 records the force and torque at the gripper's
 wrist sensor after each env step. It is the same reading multi-fast's
 `eval_fast.py` takes
-([libero.py:379](../multi-fast/utils/envs/libero.py#L379)), read by
-[`SimTask.wrench`](libero_bridge/sim_env.py#L227) and recorded by
-[`Stepper._advance`](libero_bridge/rollout.py#L193). It lands in three places:
+([libero.py:406](../multi-fast/utils/envs/libero.py#L406)), read by
+[`SimTask.wrench`](libero_bridge/sim_env.py#L253) and recorded by
+[`Stepper._advance`](libero_bridge/rollout.py#L185). It lands in three places:
 
 | where | what |
 |---|---|
 | `force_profiles.npz` in the run directory | `ee_force_003` and `ee_torque_003` are episode 3's (steps, 3) vectors in N and Nm; `control_freq` converts steps to seconds. 3-10 KB per episode, rewritten after each one |
 | `episodes.jsonl`, `ee_force_n` | that episode's mean, median, p95 and max of \|F\| ([`force_stats`](force_log.py#L22)) |
-| `manifest.json`, `summary.ee_force_n` | the run: each of those averaged over episodes, which is what `eval_fast.py` prints ([eval_fast.py:504](../multi-fast/eval_fast.py#L504)), plus `peak`, the largest single reading ([`force_summary`](run_record.py#L389)) |
+| `manifest.json`, `summary.ee_force_n` | the run: each of those averaged over episodes, which is what `eval_fast.py` prints ([eval_fast.py:539](../multi-fast/eval_fast.py#L539)), plus `peak`, the largest single reading ([`force_summary`](run_record.py#L399)) |
 
 The numbers compare directly with eval_fast's. It masks every step after
 success; here the episode already ends at success, so nothing needs masking. At
@@ -668,18 +1011,22 @@ Where it shows up:
 - The sweep sheet: a seventh tile (mean \|F\|, with p95 and max), each episode's
   p95 as a dot per task (the third per-task panel in the top row), a histogram of
   each episode's peak, and every episode's \|F\| profile overlaid on a log axis
-  ([`force_overlay`](../scripts/rollout_report.py#L509)). Colour is the task, in
+  ([`force_overlay`](../scripts/rollout_report.py#L520)). Colour is the task, in
   sheet order. Shade is the episode, first lightest. Tasks 9-16 reuse the eight
   colours dashed, and any beyond that are grey
-  ([`task_styles`](../scripts/rollout_report.py#L480)). A key beside the overlay
+  ([`task_styles`](../scripts/rollout_report.py#L504)). A key beside the overlay
   lists each task's p95 and peak.
 - The comparison sheet: a per-task p95 grid and mean/p95/max bars per sweep.
 - `collect_rollout_report.sh`'s `index.json`: `ee_force_n` per run.
 
 The real rollouts record the same statistics in the same files, from the arm's
-own force estimate ([ROLLOUT.md](ROLLOUT.md#end-effector-force)).
+own force estimate ([ROLLOUT.md](ROLLOUT.md#end-effector-force)). So do base dp
+and base dp + ZAP: eval_distill reads the same sensor after each env step, writes
+each episode's readings into `comparison.json`, and `import_eval_distill` turns
+them into `force_profiles.npz`.
 
-Runs recorded before 2026-10-01 have no profiles. Their tile reads "not
+Runs recorded before 2026-10-01 have no profiles, nor do eval_distill runs from
+before 2026-10-29. Their tile reads "not
 recorded", the column shows `-`, and the extra rows are left out.
 
 To pull one episode's profile out of the newest run:
@@ -697,35 +1044,34 @@ print(npz.parent.name, f.shape, f"peak {np.linalg.norm(f, axis=1).max():.1f} N")
 EOF
 ```
 
-## The plant is stock
+## The environment
 
-No plant or gripper overrides. B-Spline and pi05 also run the stock controller;
-SAIL runs its own ([next section](#sails-controller)). Check this first if a
-number looks wrong.
+Every rollout -- SAIL, B-Spline, dp here, base dp + ZAP in eval_distill -- runs in
+multi-fast's [comparison_env.py](../multi-fast/utils/envs/comparison_env.py): the
+`sysid_2026_09_16` plant (the CMA-ES fit of MuJoCo to the FR3), ZAP's gripper
+settings from `cfg/distill/eval.yaml` (speed 0.05, 40 N), the suite's own start
+states and 10 settle steps with the gripper commanded open. The demos are
+re-recorded in it first ([The matched comparison](#the-matched-comparison)), so
+no policy is evaluated on a plant other than the one its demos came from.
+[`SimTask`](libero_bridge/sim_env.py#L162) builds it and
+[`comparison_env.reset`](../multi-fast/utils/envs/comparison_env.py#L62) re-applies
+the plant after every reset: LIBERO resets with `hard_reset=True`, which rebuilds
+the model from XML. [`identity`](../multi-fast/utils/envs/comparison_env.py#L42) is
+stamped on every re-recorded file, dataset and run manifest.
 
-multi-fast's [plant_overrides.py](../multi-fast/utils/envs/plant_overrides.py)
-fits MuJoCo to the real FR3, which has no place here: the demos were recorded
-under the shipped Panda model, so a fitted plant measures the gap between plants
-rather than between policies.
-[regenerate_libero_dataset.py:122](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L122)
-recorded them with a bare `OffScreenRenderEnv`, and
-[sim_env.py:184](libero_bridge/sim_env.py#L184) builds the rollout env the same
-way instead of through `make_libero_env`, which would re-apply the overrides on
-every reset.
-
-Read off the live env: `dof_armature` `5/(i+1)` per joint, `dof_frictionloss`
-0.1, `dof_damping` 0.1 (0.01 wrist), joint torque limits 80 Nm (12 Nm on the
-last two). The stock controller: kp 150, damping ratio 1.0, `uncouple_pos_ori`
-true, `output_max` 0.05 m / 0.5 rad, `control_freq` 20 Hz.
+B-Spline and dp run the plant's controller: kp 150, damping ratio 1.0,
+`uncouple_pos_ori` true, `output_max` 0.05 m / 0.5 rad, `control_freq` 20 Hz;
+SAIL runs its own ([next section](#sails-controller)). Runs made before
+2026-10-23 used the stock plant and gripper and are not comparable with these.
 
 ## SAIL's controller
 
 SAIL rolls out under its own OSC gains,
-[`baselines.sail.sim_osc`](../config/policy.yaml#L71): kp 300 (stock 150) and
-damping ratio 0.5 (stock 1.0). Everything else is stock, including LIBERO's 5 cm
+[`baselines.sail.sim_osc`](../config/policy.yaml#L87): kp 300 (stock 150) and
+damping ratio 0.5 (the plant's 1.0). Everything else is the plant's, including LIBERO's 5 cm
 limit on how far one env step may move the position target, which every method
 runs under. B-Spline and pi05 keep the stock gains
-([`baselines.bspline.sim_osc`](../config/policy.yaml#L101) is null). Each run's
+([`baselines.bspline.sim_osc`](../config/policy.yaml#L139) is null). Each run's
 manifest records what the controller actually ran as `environment.osc`, and
 `rollout_summary.py` and the report sheets print it as
 `kp 300, damping 0.5, step limit 5 cm`.
@@ -894,20 +1240,20 @@ separate process and only a socket crosses between them. That is why the sim wor
 needed no new policy code: both servers are the unchanged hardware ones
 ([sail](sail_bridge/policy_server.py), [bspline](bspline_bridge/policy_server.py)),
 which do not care whether an observation came from an arm or from mujoco.
-[`python_for`](interpreters.py#L32) picks the interpreter: `$SAIL_PYTHON` /
+[`python_for`](interpreters.py#L34) picks the interpreter: `$SAIL_PYTHON` /
 `$BSPLINE_PYTHON`, else the venv, else `conda run`.
 
 **[libero_rollout.sh](../scripts/libero_rollout.sh)**, in order: splits arguments
 (`--guide-config` and `--port` to the server, rest to the rollout,
-[:32](../scripts/libero_rollout.sh#L32)); refuses if the port is already held,
+[:33](../scripts/libero_rollout.sh#L33)); refuses if the port is already held,
 because a leftover server would answer the handshake as if it were ours
-([:97](../scripts/libero_rollout.sh#L97)); starts the server in its own
-interpreter ([:107](../scripts/libero_rollout.sh#L107)); waits on the handshake
+([:98](../scripts/libero_rollout.sh#L98)); starts the server in its own
+interpreter ([:108](../scripts/libero_rollout.sh#L108)); waits on the handshake
 rather than sleeping, since checkpoint load time varies
-([:113](../scripts/libero_rollout.sh#L113)); runs the rollout under
-`multi-fast/.venv` ([:121](../scripts/libero_rollout.sh#L121)); on exit kills the
+([:114](../scripts/libero_rollout.sh#L114)); runs the rollout under
+`multi-fast/.venv` ([:122](../scripts/libero_rollout.sh#L122)); on exit kills the
 server's process group and waits for the port to free
-([`cleanup`](../scripts/libero_rollout.sh#L72)). The group, not the pid, because
+([`cleanup`](../scripts/libero_rollout.sh#L73)). The group, not the pid, because
 `conda run` spawns python as a child. It never `exec`s the rollout, which would
 drop the trap and orphan the server.
 
@@ -929,15 +1275,15 @@ for every later send. Every use is behind a lock
 ([`PolicyClient`](zmq_client.py#L43)) because a REQ socket is not thread-safe and
 B-Spline's planner requests from a worker thread. Both servers reply
 `{"error": ...}` instead of dying
-([`SAILPolicyServer.run`](sail_bridge/policy_server.py#L276)).
+([`SAILPolicyServer.run`](sail_bridge/policy_server.py#L280)).
 
 **B-Spline's server needed wrapping.** Upstream's `policy_server_bspline.py` is a
 submodule file we do not edit, and it replies `{}` to anything but `reset` and
 `obs` -- including the handshake. So
 [bspline_bridge/policy_server.py](bspline_bridge/policy_server.py) loads it by
-path ([`_load_upstream`](bspline_bridge/policy_server.py#L43)) and subclasses its
+path ([`_load_upstream`](bspline_bridge/policy_server.py#L45)) and subclasses its
 server to add the `meta` branch
-([`Server`](bspline_bridge/policy_server.py#L166)), built from the checkpoint's
+([`Server`](bspline_bridge/policy_server.py#L180)), built from the checkpoint's
 config. Start upstream's directly and the handshake returns `{}`.
 
 **Shared helpers.** `rollout.py` runs under `multi-fast/.venv`, which has no
@@ -953,14 +1299,14 @@ Not raw LIBERO, but what
 [regenerate_libero_dataset.py](../multi-fast/scripts/libero/regenerate_libero_dataset.py)
 writes -- every demo replayed, with three changes:
 
-1. No-ops dropped ([:176](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L176))
-   and failed replays discarded ([:237](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L237)),
+1. No-ops dropped ([:260](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L260))
+   and failed replays discarded ([:282](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L282)),
    so the baselines see exactly the frames multi-fast sees.
 2. The OSC controller's absolute goal recorded as `goal_pos` / `goal_ori`
-   ([:223](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L223)). This
+   ([:151](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L151)). This
    is why conversion is a re-key, not a replay -- no simulator needed.
 3. Ten settle steps before recording
-   ([:144](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L144)); the
+   ([:248](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L248)); the
    rollout repeats them (`sim_env.SETTLE_STEPS`).
 
 **Reached vs commanded.** `obs/ee_*` is where the arm was, `goal_*` where it was
@@ -968,14 +1314,14 @@ told to go. SAIL trains on reached poses (upstream's design), B-Spline on
 commanded. They are in different frames -- `goal_pos` and `obs/ee_pos` are the
 grip site, `obs/ee_ori` is the wrist body -- so the regeneration script converts
 with a per-demo tool transform
-([:156](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L156)) and
+([:92](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L92)) and
 sign-canonicalises against the pre-action quaternion
-([:224](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L224)). The
+([:152](../multi-fast/scripts/libero/regenerate_libero_dataset.py#L152)). The
 rollout undoes exactly that.
 
 [dataset.py](libero_bridge/dataset.py) writes the two files
-([`sail_episode`](libero_bridge/dataset.py#L113),
-[`bspline_episode`](libero_bridge/dataset.py#L132)):
+([`sail_episode`](libero_bridge/dataset.py#L120),
+[`bspline_episode`](libero_bridge/dataset.py#L139)):
 
 | key | SAIL | B-Spline | from |
 |---|---|---|---|
@@ -995,7 +1341,7 @@ own ±1 channel, unconverted. Frames are 84x84 (both upstreams' benchmark size),
 [`sim_env.policy_frame`](libero_bridge/sim_env.py#L56) -- which the converter
 imports rather than copying, so training and rollout frames cannot drift.
 Rotation vectors are copied, not re-derived
-([`poses`](libero_bridge/dataset.py#L78)): scipy's `as_rotvec` folds the angle
+([`poses`](libero_bridge/dataset.py#L85)): scipy's `as_rotvec` folds the angle
 into `[0, π]` and the gripper-down pose sits at π, so passing these through scipy
 is what would introduce a discontinuity. Demos are renumbered from 0, since
 LIBERO's indices have gaps and B-Spline's loader indexes `demo_{i}` by position.
@@ -1009,11 +1355,11 @@ sim and hardware policies are trained by identical code.
 - `--steps` goes to both, so they train equally long.
 - Checkpoints land in `~/franka_data/policies/<suite>/task_<i>/<backend>/`, from
   the id the converter stamped on the HDF5
-  ([`backend_dir`](libero_bridge/train.py#L52)).
+  ([`backend_dir`](libero_bridge/train.py#L53)).
 - SAIL first runs its AWE waypoint and precision-labelling passes, ~5 min/task.
   They edit the HDF5 in place and skip if the keys exist.
 - Completion is a marker, not a checkpoint
-  ([`marker_for`](libero_bridge/train.py#L68)) -- both trainers checkpoint
+  ([`marker_for`](libero_bridge/train.py#L69)) -- both trainers checkpoint
   periodically, so "a checkpoint exists" would roll out a half-trained policy.
   `.trained.json` records the budget reached; `--allow-unfinished` overrides.
 - `--resume` continues an unfinished training from its newest checkpoint
@@ -1035,19 +1381,19 @@ goal_ori = R(scale_action(a[3:6])) @ measured_ori    # ±0.5 rad
 ```
 
 so hitting a target means solving for `a` against the pose measured at that step.
-[`SimTask.action`](libero_bridge/sim_env.py#L280) calls multi-fast's
-[`target_slot_to_delta`](../multi-fast/utils/base_policy_utils.py#L553) rather than
+[`SimTask.action`](libero_bridge/sim_env.py#L291) calls multi-fast's
+[`target_slot_to_delta`](../multi-fast/utils/base_policy_utils.py#L555) rather than
 reimplementing the inverse -- it is the exact inverse of the relabeler that wrote
 the training targets, so executor and converter cannot drift. It also undoes the
 site-to-body transform with
-[`estimate_site_to_body`](../multi-fast/utils/base_policy_utils.py#L598),
+[`estimate_site_to_body`](../multi-fast/utils/base_policy_utils.py#L600),
 re-estimated per episode in
-[`SimTask.start`](libero_bridge/sim_env.py#L203). Skip that transform and nothing
+[`SimTask.start`](libero_bridge/sim_env.py#L219). Skip that transform and nothing
 errors; it just commands a goal rotated ~90°. The delta is recomputed every env
 step against that step's measured pose
 ([`Stepper.send`](libero_bridge/rollout.py#L162)), matching `EE_POS` on the arm,
 and out-of-range targets saturate like `scale_action` does. pi05 skips all of it
-([`Stepper.send_raw`](libero_bridge/rollout.py#L183)).
+([`Stepper.send_raw`](libero_bridge/rollout.py#L175)).
 
 **Clock.** The clock is the env's step counter; otherwise a plan's phase depends
 on GPU speed and success rates do not reproduce. SAIL executes a fixed `inf_delay`
@@ -1058,8 +1404,8 @@ that file. Episode time is simulated seconds, written to `wall_time_s` so
 `rollout_summary.py` reads it unchanged, with real time beside it as
 `clock_time_s`.
 
-**SAIL** ([`sail_episode`](libero_bridge/rollout.py#L245),
-[`sail_settings`](libero_bridge/rollout.py#L228)) implements upstream's three eval
+**SAIL** ([`sail_episode`](libero_bridge/rollout.py#L246),
+[`sail_settings`](libero_bridge/rollout.py#L223)) implements upstream's three eval
 mechanisms:
 
 - *Receding horizon* -- enter a new chunk at the row matching what went out since
@@ -1073,7 +1419,7 @@ mechanisms:
 A SAIL row is a trajectory sample at the recording rate, so at `fast_fps` 100 Hz
 the trajectory plays 5x faster than recorded -- the same ratio the arm runs, and
 the point of the method. Each row is one env step lasting `1/hz`
-([`SimTask.step(action, dt)`](libero_bridge/sim_env.py#L226)), which is all
+([`SimTask.step(action, dt)`](libero_bridge/sim_env.py#L237)), which is all
 SAIL's robosuite patch does: it changes the control period, not the physics. The
 step's observables are read fresh, since robosuite otherwise refreshes them at
 the env's own 20 Hz. Before this, a row lasted a fifth of a 20 Hz step and only
@@ -1085,8 +1431,8 @@ steps pass robosuite's 1000-step horizon inside libero_10's budget; the episode
 budget is the Stepper's, in simulated seconds. The arm only keeps up under
 SAIL's own controller ([SAIL's controller](#sails-controller)).
 
-**B-Spline** ([`bspline_episode`](libero_bridge/rollout.py#L352),
-[`bspline_planner_kwargs`](libero_bridge/rollout.py#L315)) is shorter because the
+**B-Spline** ([`bspline_episode`](libero_bridge/rollout.py#L353),
+[`bspline_planner_kwargs`](libero_bridge/rollout.py#L316)) is shorter because the
 server returns spline parameters, not actions, so the loop samples the plan
 itself. `origin_time_scale` is the env's control rate: knots count demo frames, so
 `t` advances one knot per env step. Time alignment is off in sim -- upstream
@@ -1118,7 +1464,7 @@ differences from the baselines:
   in-process. `rollout.SERVED` ([:71](libero_bridge/rollout.py#L71)) is the list
   that needs one.
 - **No action-space inverse** -- it emits LIBERO's own seven normalised deltas.
-- **No receding horizon** -- [`pi05_episode`](libero_bridge/rollout.py#L397)
+- **No receding horizon** -- [`pi05_episode`](libero_bridge/rollout.py#L415)
   replans every `chunk_size` (5) steps, matching `scripts/libero/eval_pi05.py`.
 
 `load` sets `XLA_PYTHON_CLIENT_PREALLOCATE=false` before the first JAX import,
@@ -1127,7 +1473,7 @@ or JAX takes 90% of the card. The checkpoint is
 task instruction comes from the LIBERO benchmark API via multi-fast's loader.
 
 **One episode:** reset, `set_init_state` with init state *i* from the suite's own
-50 ([`SimTask.start`](libero_bridge/sim_env.py#L203) -- LIBERO's standard eval
+50 ([`SimTask.start`](libero_bridge/sim_env.py#L219) -- LIBERO's standard eval
 states, the ones `eval_pi05.py` uses); ten settle steps; estimate the tool
 transform; then loop observe / infer / convert / step
 ([`Stepper`](libero_bridge/rollout.py#L99)) until the env's own `done` -- LIBERO
@@ -1245,6 +1591,7 @@ mujoco, no policy, no GPU, ~1 min for five demos.
 | [libero_bridge/pi05.py](libero_bridge/pi05.py) | multi-fast's base policy as a backend |
 | [libero_bridge/train.py](libero_bridge/train.py) | per-task training sweep |
 | [libero_bridge/evaluate.py](libero_bridge/evaluate.py) | per-task rollout sweep, sweep ids |
+| [libero_bridge/import_eval_distill.py](libero_bridge/import_eval_distill.py) | files multi-fast's base dp and base dp + ZAP evals as run directories |
 | [tillicum/submit_libero_train.sh](tillicum/submit_libero_train.sh) | the training sweep on Tillicum, one Slurm array element per task and backend |
 | [tillicum/train_libero.slurm](tillicum/train_libero.slurm) | one array element: stage, mount, train |
 | [tillicum/progress.sh](tillicum/progress.sh) | each unit's epoch, rate and time left, read from its training log; `diffusion <repo>` for our policy |

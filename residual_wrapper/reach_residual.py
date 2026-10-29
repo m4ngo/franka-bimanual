@@ -33,9 +33,7 @@ for _p in ("scripts", "multi-fast", "multi-fast/stable-baselines3", "."):
 
 import franka_config as fc  # noqa: E402
 from lerobot.robots.utils import make_robot_from_config  # noqa: E402
-from lerobot_robot_bimanual_franka import (  # noqa: E402
-    ControlMode, SingleArmFrankaConfig, SingleArmRightConfig,
-)
+from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig  # noqa: E402
 from lerobot_robot_bimanual_franka.reach_record import ReachEpisodeRecorder  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach import RealReach  # noqa: E402
 from lerobot_robot_bimanual_franka.real_reach_geometry import (  # noqa: E402
@@ -202,9 +200,10 @@ def save_html(viz_rec: EpisodeRecorder, path: Path, arm: str, base_only: bool, t
     print(f"viz -> {path}")
 
 
-def run(checkpoint: str, episodes: int, seed: int, arm: str, policy: str,
+def run(checkpoint: str, episodes: int, seed: int, rig: str, policy: str,
         device: str, out: str, viz_stride: int, no_viz: bool) -> None:
     variants = VARIANTS[policy]
+    arm = fc.profile(rig).arms["r"]
     # Before the arm: a bad checkpoint should fail here, not after homing.
     model = load_residual(checkpoint, device)
     cfg = model.cfg
@@ -217,9 +216,9 @@ def run(checkpoint: str, episodes: int, seed: int, arm: str, policy: str,
               f"         The worktable floor derives from it. Verify before running near the table.")
     # Kinematics only: no reason to wait on six GigE connects for a task that
     # never reads a camera.
-    cls = SingleArmFrankaConfig if arm == "left" else SingleArmRightConfig
-    robot = make_robot_from_config(cls(control_mode=ControlMode.EE_DELTA,
-                                      cameras={}, depth_cam={}, depth=False))
+    print(f"rig {rig} -> arm {arm}")
+    robot = make_robot_from_config(SingleArmFrankaConfig(
+        rig_profile=rig, control_mode=ControlMode.EE_DELTA, cameras={}, depth_cam={}, depth=False))
     robot.connect()
     try:
         env = RealReach(robot, arm=arm, arm_key="r")

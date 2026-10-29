@@ -26,6 +26,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 BACKENDS = {
     "sail": ("SAIL_PYTHON", _REPO_ROOT / ".venv-sail", "SAIL"),
     "bspline": ("BSPLINE_PYTHON", _REPO_ROOT / ".venv-bspline", "robodiff"),
+    # Our diffusion base: the workspace venv's lerobot, which multi-fast/.venv lacks.
+    "dp": ("DP_PYTHON", _REPO_ROOT / ".venv", None),
 }
 
 
@@ -40,7 +42,7 @@ def python_for(backend: str) -> list[str]:
     candidate = venv / "bin" / "python"
     if candidate.is_file():
         return [str(candidate)]
-    if shutil.which("conda"):
+    if conda_env and shutil.which("conda"):
         return ["conda", "run", "--no-capture-output", "-n", conda_env, "python"]
     raise SystemExit(
         f"no interpreter for the {backend} baseline: {candidate} does not exist, "

@@ -88,6 +88,8 @@ alternate rig without editing tracked files.
   policies were trained in; changing it there without changing the sim breaks
   parity rather than fixing the rig.
 - **The default single-arm rig is `rig.yaml`'s `default_single_arm_profile`.**
+  It is only the default: `SingleArmFrankaConfig` resolves everything from its
+  `rig_profile` field, which every single-arm entry point sets from `--rig`.
   `scripts/single_arm_teleop.sh` reads it for its banner and passes it on as
   `--rig`, and both single-arm drivers use it as their argparse default, so the
   rig a script names is always the rig that connects. It used to be restated in

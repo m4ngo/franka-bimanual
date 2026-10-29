@@ -42,18 +42,12 @@ class OSCGoalBuilder:
         self,
         translation_fudge: float,
         rotation_fudge: float,
-        use_noise: bool,
-        noise_pos_scale: float,
-        noise_rot_scale: float,
     ) -> None:
         # Sim-to-real delta scaling. Applied to the axis-angle rotation delta, NOT
         # to the quaternion: scaling all four components uniformly is undone by
         # normalisation. 1.0 on both is exactly what the policy emitted.
         self._trans_fudge = float(translation_fudge)
         self._rot_fudge = float(rotation_fudge)
-        self._use_noise = bool(use_noise)
-        self._noise_pos_scale = float(noise_pos_scale)
-        self._noise_rot_scale = float(noise_rot_scale)
         # osc.py's goal_ori: an ABSOLUTE orientation carried across steps. See
         # from_delta for why it is not recomputed every step.
         self._goal_ori: dict[str, Rotation] = {}
@@ -87,15 +81,7 @@ class OSCGoalBuilder:
         dpos = np.asarray(delta_pos, dtype=np.float64)
         drot = np.asarray(delta_rotvec_, dtype=np.float64)
 
-        # The COMMANDED rotation, before noise. The zero-test above is exact and
-        # Gaussian noise never is, so with use_noise set every step looked like a
-        # rotation command and goal_ori was re-anchored each time. Noise still
-        # perturbs the goal; it just no longer decides whether there is one.
         rotation_commanded = bool(np.any(drot))
-        if self._use_noise:
-            noise_pos, noise_rot = self._sample_noise()
-            dpos = dpos + noise_pos
-            drot = drot + noise_rot
 
         # Clip to the envelope a policy could have emitted, THEN apply the hardware
         # fudge. The other order lets clip_delta eat the fudge -- at tf=3 a 0.05 m
@@ -109,33 +95,11 @@ class OSCGoalBuilder:
             self._goal_ori[arm] = Rotation.from_rotvec(drot) * Rotation.from_quat(ee_quat_xyzw)
         return np.asarray(ee_pos, dtype=np.float64) + dpos, self._goal_ori[arm].as_quat()
 
-    def _sample_noise(self) -> tuple[np.ndarray, np.ndarray]:
-        """One draw of the configured action noise: a position offset and a
-        rotation vector. The single definition both goal paths perturb with."""
-        pos = np.random.normal(0.0, self._noise_pos_scale, 3)
-        rot = Rotation.from_euler("xyz", np.random.normal(0.0, self._noise_rot_scale, 3)).as_rotvec()
-        return pos, rot
-
-    def perturb(self, goal: Goal) -> Goal:
-        """EE_POS's share of ``use_noise``: jitter an ABSOLUTE goal by the same
-        draw ``from_delta`` adds to a delta.
-
-        Applied to the composed goal rather than the action, so the recorded
-        action stays what the leader emitted and only the pose the controller
-        pursues carries the noise. No envelope on this path, so the scales in
-        control.yaml bound it directly."""
-        if not self._use_noise:
-            return goal
-        pos, quat = goal
-        noise_pos, noise_rot = self._sample_noise()
-        return pos + noise_pos, (Rotation.from_rotvec(noise_rot) * Rotation.from_quat(quat)).as_quat()
-
     @staticmethod
     def absolute(goal_pos: np.ndarray, goal_quat_xyzw: np.ndarray) -> Goal:
         """EE_POS: the action already carries an absolute pose, so it becomes the
         OSC goal directly -- no envelope, because a pose is not a step, and no
-        latched orientation, because the caller supplies one every step. Noise,
-        when configured, is ``perturb``'s job on the composed goal."""
+        latched orientation, because the caller supplies one every step."""
         quat = np.asarray(goal_quat_xyzw, dtype=np.float64)
         return (
             np.asarray(goal_pos, dtype=np.float64),
@@ -151,7 +115,7 @@ class OSCGoalBuilder:
     ) -> tuple[np.ndarray, np.ndarray]:
         """The arithmetic inverse of ``from_delta``'s pose composition.
 
-        Ignores clip_delta, the fudges and noise -- none are invertible -- so
+        Ignores clip_delta and the fudges -- neither is invertible -- so
         this is the delta a bare policy step would have needed, not a replay of
         what from_delta applies.
         """

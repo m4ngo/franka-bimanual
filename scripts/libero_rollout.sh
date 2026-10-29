@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 
-# Roll a trained SAIL or B-Spline policy out on LIBERO, in simulation.
+# Roll a trained SAIL, B-Spline or diffusion-base (dp) policy out on LIBERO, in
+# simulation, in utils/envs/comparison_env.py's environment.
 #
 # Three interpreters, none of which can be merged: the policy runs in
-# .venv-sail / .venv-bspline (baselines/interpreters.py), the LIBERO env in
+# .venv-sail / .venv-bspline / .venv (baselines/interpreters.py), the LIBERO env in
 # multi-fast/.venv -- the only one with robosuite and libero -- and this
 # script's `cfg` helper in the workspace venv. With --start-server this script
 # launches the policy server; otherwise start it yourself and pass --port.
@@ -49,8 +50,8 @@ done
 case "$BACKEND" in
     # pi05 is multi-fast's base policy; it loads inside the rollout process
     # (openpi is already in multi-fast/.venv), so it has no server and no port.
-    sail|bspline|pi05) ;;
-    *) echo "--backend must be sail, bspline or pi05 (got '${BACKEND}')" >&2; exit 1 ;;
+    sail|bspline|dp|pi05) ;;
+    *) echo "--backend must be sail, bspline, dp or pi05 (got '${BACKEND}')" >&2; exit 1 ;;
 esac
 if [[ "$BACKEND" != pi05 && -z "$PORT" ]]; then
     PORT="$(cfg "policy.baselines.zmq.${BACKEND}_port")"
@@ -114,7 +115,7 @@ if [[ "$START_SERVER" == 1 ]]; then
     python "$(dirname "$0")/_wait_policy_server.py" "$BACKEND" "$PORT"
 fi
 
-echo "${BACKEND} rollout on LIBERO (stock robosuite plant)"
+echo "${BACKEND} rollout on LIBERO (comparison environment)"
 cd "$REPO_ROOT"
 STATUS=0
 PORT_ARG=()

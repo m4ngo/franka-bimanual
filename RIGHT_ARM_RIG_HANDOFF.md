@@ -109,7 +109,10 @@ different process from the torque server and must resolve through the profile.
 
 ## Design choices and why
 
-- **Subclassed rather than refactored.** `SingleArmRightConfig` extends
+- **Subclassed rather than refactored.** *(Superseded 2026-10-23:
+  `SingleArmFrankaConfig` now fills its profile fields from `rig_profile` in
+  `__post_init__`, and `SingleArmRightConfig` only pins `rig_profile`.)*
+  `SingleArmRightConfig` extends
   `SingleArmFrankaConfig` and overrides only the profile-derived fields.
   A factory that parameterises the base class would be less duplicative, but
   `SingleArmFrankaConfig` is what `tests/test_osc_stack.py`'s `make_robot` builds

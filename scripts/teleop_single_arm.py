@@ -38,8 +38,9 @@ from lerobot.teleoperators import make_teleoperator_from_config  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 from lerobot_robot_bimanual_franka import (  # noqa: E402
-    ControlMode, SingleArmFrankaConfig, SingleArmRightConfig,
+    ControlMode, SingleArmFrankaConfig, single_arm_profiles,
 )
+from lerobot_robot_bimanual_franka.config_single_arm_franka import ARM_KEY  # noqa: E402
 from lerobot_teleoperator_gello import GelloConfig, GelloEEConfig  # noqa: E402
 from lerobot_teleoperator_spacemouse import SpaceMouseConfig  # noqa: E402
 
@@ -47,16 +48,12 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_RIG = fc.default_single_arm_profile()
 # The exposed key prefix, which is NOT the physical arm -- see config/rig.yaml.
-# Every rig in _RIGS must expose it; main() rejects one that does not.
-_ARM_KEY = next(iter(fc.profile(_DEFAULT_RIG).arms))
+_ARM_KEY = ARM_KEY
 
-# Rig profile -> config class. Which PHYSICAL arm each drives is in config/rig.yaml,
-# never here. Both expose the same `r_` key prefix, which is what lets the leader
-# wiring below be shared; main() rejects a rig that does not.
-_RIGS = {
-    "single_arm_franka": SingleArmFrankaConfig,
-    "single_arm_right": SingleArmRightConfig,
-}
+# Every --rig choice: the profiles exposing one arm under _ARM_KEY, which is what
+# lets the leader wiring below be shared. Which PHYSICAL arm each drives is in
+# config/rig.yaml, never here.
+_RIGS = single_arm_profiles()
 
 def _spacemouse(device: str, teleop_id: str, use_delta: bool, **_) -> SpaceMouseConfig:
     return SpaceMouseConfig(
@@ -67,12 +64,11 @@ def _spacemouse(device: str, teleop_id: str, use_delta: bool, **_) -> SpaceMouse
     )
 
 
-def _gello(cls, device: str, teleop_id: str, use_noise: bool = False):
+def _gello(cls, device: str, teleop_id: str):
     return cls(
         id=teleop_id,
         side=_ARM_KEY,
         port=fc.teleop(f"gello.devices.{device}.port"),
-        use_noise=use_noise,
     )
 
 
@@ -94,10 +90,10 @@ MODES = {
 }
 
 
-def build_leader(mode: str, device: str, teleop_id: str, use_noise: bool = False):
+def build_leader(mode: str, device: str, teleop_id: str):
     """Leader config for one mode. Shared with the recording scripts so the
     mode -> (control mode, units) pairing has exactly one definition."""
-    return MODES[mode][1](device=device, teleop_id=teleop_id, use_noise=use_noise)
+    return MODES[mode][1](device=device, teleop_id=teleop_id)
 
 
 def _measured_ee(robot):
@@ -159,10 +155,6 @@ def main() -> int:
 
     init_logging()
     rig = args.rig
-    arm_key = next(iter(fc.profile(rig).arms))
-    if arm_key != _ARM_KEY:
-        parser.error(f"rig {rig!r} exposes key {arm_key!r}, not {_ARM_KEY!r}; the leader "
-                     "prefix and gripper wiring assume the latter.")
     device = args.teleop_device or getattr(fc.profile(rig), "teleop_device", None)
     if device is None:
         parser.error(
@@ -175,7 +167,7 @@ def main() -> int:
     logger.info("%s: %s-hand leader driving %s in %s",
                 args.mode, device, rig, control_mode.value)
 
-    robot = make_robot_from_config(_RIGS[rig](control_mode=control_mode))
+    robot = make_robot_from_config(SingleArmFrankaConfig(rig_profile=rig, control_mode=control_mode))
     teleop = make_teleoperator_from_config(
         build_leader(args.mode, device, f"{args.mode}_{_ARM_KEY}_teleop")
     )

@@ -215,7 +215,7 @@ it to the state bundle, and the workstation unpacks it
 latest state read: for SAIL and B-Spline that is the observation thread's, which
 their goals are sent on as their anchor, so the value repeats between camera
 frames ([`Dispatcher.send`](rollout_common.py#L458)), and `_run_episode` for
-`run_residual.py` ([run_residual.py:674](../residual_wrapper/run_residual.py#L674))
+`run_residual.py` ([run_residual.py:693](../residual_wrapper/run_residual.py#L693))
 and `run_residual_openpi.py`. The reach scripts (`real_reach_rollout.py` and
 `run_residual.py` with a FAST `.zip`) read it in `RealReach.step`
 ([real_reach.py:211](../lerobot_robot_bimanual_franka/lerobot_robot_bimanual_franka/real_reach.py#L211)), with the end-of-period pose, and

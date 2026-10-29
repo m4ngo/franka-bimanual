@@ -187,9 +187,6 @@ def _shadow(cfg):
     goals = s.OSCGoalBuilder(
         translation_fudge=cfg.ee_translation_fudge,
         rotation_fudge=cfg.ee_rotation_fudge,
-        use_noise=cfg.use_noise,
-        noise_pos_scale=cfg.noise_pos_scale,
-        noise_rot_scale=cfg.noise_rot_scale,
     )
     safety = s.ActionSafetyScreen(
         {_ARM_KEY: cfg.base_in_world(_ARM_KEY)},

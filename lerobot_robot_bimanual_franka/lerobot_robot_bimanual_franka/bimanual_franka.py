@@ -27,6 +27,7 @@ from lerobot_camera_arv import ArvCamera, ArvCameraConfig
 from lerobot_camera_framos import FramosCamera, FramosCameraConfig
 
 from . import homing
+from .action_noise import ActionNoise
 from .bimanual_franka_config import BimanualFrankaConfig, ControlMode
 from .ee_goals import OSCGoalBuilder, delta_rotvec
 from .franka_gripper import FrankaGripper
@@ -116,16 +117,16 @@ class BimanualFranka(Robot):
         # composed on. Read-only: nothing in the control path consumes them, so
         # they add no limit layer -- they exist so a rollout can record what the
         # arm was commanded instead of an estimate of it.
+        self._last_floor_rise = {}
         self._last_osc_goal: dict[str, tuple[np.ndarray, np.ndarray]] = {}
         self._last_osc_anchor: dict[str, tuple[np.ndarray, np.ndarray]] = {}
 
         self._goals = OSCGoalBuilder(
             translation_fudge=config.ee_translation_fudge,
             rotation_fudge=config.ee_rotation_fudge,
-            use_noise=config.use_noise,
-            noise_pos_scale=config.noise_pos_scale,
-            noise_rot_scale=config.noise_rot_scale,
         )
+        self._noise = ActionNoise(config.noise_pos_scale, config.noise_rot_scale,
+                                  config.noise_joint_scale)
         # Per-rig gain trims, kept as plain attributes because sysid/tune.py sweeps
         # them by setattr on the robot and the parity harness reads them back off it.
         self._kp_ori_scale = np.asarray(config.kp_ori_scale, dtype=np.float64)
@@ -401,8 +402,9 @@ class BimanualFranka(Robot):
         kd_scale = DAMPING_EXP_SCALE ** float(np.clip(action["kd"], -1.0, 1.0))
         goals = {
             arm: (
-                np.fromiter((action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)),
-                            dtype=np.float64, count=NUM_JOINTS),
+                self._noise.joints(
+                    np.fromiter((action[f"{arm}_joint_{i}"] for i in range(1, NUM_JOINTS + 1)),
+                                dtype=np.float64, count=NUM_JOINTS)),
                 kp_scale,
                 kd_scale,
             )
@@ -417,10 +419,13 @@ class BimanualFranka(Robot):
             action["kp"], action["kd"], self._kp_ori_scale, self._kd_ori_scale,
             kp_pos_scale=self._kp_pos_scale, kd_pos_scale=self._kd_pos_scale,
         )
-        goals = {arm: self._osc_goal(arm, action, kin[arm], ignore_action) for arm in self.active_arms}
-        goals = self.safety.shape_goal(goals)
-        # After clip, fudge, the latched goal_ori and the worktable screen: the pose
-        # the arm was told to hold, which is what a sim replay has to reproduce.
+        raw = {arm: self._noise.pose(self._osc_goal(arm, action, kin[arm], ignore_action))
+               for arm in self.active_arms}
+        goals = self.safety.shape_goal(raw)
+        self._last_floor_rise = {a : float(np.linalg.norm(goals[a][0] - raw[a][0])) for a in goals}
+        # After clip, fudge, the latched goal_ori, noise and the worktable screen:
+        # the pose the arm was told to hold, which is what a sim replay has to
+        # reproduce.
         # Copied -- move_osc_goal_batch ships these over RPyC.
         self._last_osc_goal = {a: (np.array(p, dtype=np.float64), np.array(q, dtype=np.float64))
                                for a, (p, q) in goals.items()}
@@ -448,10 +453,7 @@ class BimanualFranka(Robot):
         else:
             target = self._action_vec(action, arm, EE_AXIS_KEYS)
             goal = self._goals.absolute(target[:3], target[3:])
-        goal = self._goals.offset(goal, self.delta_pos, self.delta_rot)
-        # Last, so it lands on the goal the arm is told to hold -- the residual
-        # included -- as from_delta's noise does on the delta path.
-        return self._goals.perturb(goal)
+        return self._goals.offset(goal, self.delta_pos, self.delta_rot)
 
     @staticmethod
     def _action_vec(action: RobotAction, arm: str, keys: tuple[str, ...]) -> np.ndarray:

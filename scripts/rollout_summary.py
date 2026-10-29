@@ -135,6 +135,13 @@ def load_episodes(doc: dict) -> list[dict]:
     return [json.loads(ln) for ln in path.read_text().splitlines() if ln.strip()]
 
 
+def comparison_env(doc: dict) -> str | None:
+    """The run's multi-fast comparison_env stamp, as one comparable string; None
+    for a run from before the stamp (or from the arm)."""
+    env = (doc.get("environment") or {}).get("comparison_env")
+    return None if env is None else json.dumps(env, sort_keys=True)
+
+
 def render(task: str, runs: list[Path]) -> None:
     # A LIBERO task is filed by index (libero_10/task_2), which names nothing.
     language = ((load(runs[0]) or {}).get("environment") or {}).get("language")
@@ -144,6 +151,7 @@ def render(task: str, runs: list[Path]) -> None:
             f"{'median s':>9} {'mean s':>8} {FORCE_HEAD:>17}  {'status':<12} notes")
     print(head)
     print("  " + "-" * (len(head) - 2))
+    envs: dict[str, str] = {}
     for run in runs:
         doc = load(run)
         if doc is None:
@@ -167,6 +175,8 @@ def render(task: str, runs: list[Path]) -> None:
             notes.append(f"{s['aborted_episodes']} aborted")
         if doc.get("environment", {}).get("git", {}).get("dirty"):
             notes.append("dirty-tree")
+        if (env := comparison_env(doc)) is not None:
+            notes.append(f"env {envs.setdefault(env, chr(ord('A') + len(envs)))}")
         print(f"  {r.get('run_id', run.name):<26} {r.get('method', '?'):<10} "
               f"{_fmt(s.get('episodes')):>4} {_fmt(s.get('successes')):>4} "
               f"{_fmt(s.get('success_rate'), '.0%'):>6} "
@@ -174,6 +184,10 @@ def render(task: str, runs: list[Path]) -> None:
               f"{_fmt(s.get('mean_time_to_success_s'), '.2f'):>8} "
               f"{_force(s.get('ee_force_n')):>17}  "
               f"{r.get('status', '?'):<12} {' '.join(notes)}")
+    if len(envs) > 1:
+        print("  NOT COMPARABLE: these runs ran in different environments:")
+        for env, tag in envs.items():
+            print(f"    env {tag}: {env}")
 
 
 def main() -> int:

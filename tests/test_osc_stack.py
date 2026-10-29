@@ -257,18 +257,18 @@ _SIM_PARITY_KNOBS = {
     "kd_pos_scale": (1.0, 1.0, 1.0),
     "ee_translation_fudge": 1.0,
     "ee_rotation_fudge": 1.0,
-    "use_noise": False,
+    "noise_pos_scale": 0.0,
+    "noise_rot_scale": 0.0,
+    "noise_joint_scale": 0.0,
 }
 
 # Reach the control loop through make_session, not the robot config.
 _SESSION_KNOBS = {"friction_kc", "friction_kc_joint_pos", "friction_kc_joint_neg"}
 
-# Transport, framing and perception: cannot reach the torque path. noise_*_scale
-# is control-path but gated by use_noise, which is pinned above.
+# Transport, framing and perception: cannot reach the torque path.
 _INERT_FIELDS = {
     "active_arms", "calibration_dir", "cameras", "control_mode", "depth",
     "depth_cam", "depth_center_arm", "depth_crop_radius_m", "id",
-    "noise_pos_scale", "noise_rot_scale",
     "r_gripper_ip", "r_gripper_port", "r_port", "r_robot_ip", "r_server_ip",
     # rig_profile selects arms/cameras/base poses. It reaches the torque path
     # only through the safety screen, which the parity harness bypasses.
@@ -1019,7 +1019,7 @@ def test_every_hardware_knob_is_pinned():
     robot = make_robot(make_case(np.random.default_rng(0)))
     assert robot._trans_fudge == 1.0 and robot._rot_fudge == 1.0
     assert np.allclose(robot._kp_ori_scale, 1.0) and np.allclose(robot._kp_pos_scale, 1.0)
-    assert robot.config.use_noise is False
+    assert robot._noise.pos_scale == robot._noise.rot_scale == robot._noise.joint_scale == 0.0
 
 
 def test_ee_delta_goal_survives_a_round_trip_through_an_ee_pos_action():
@@ -1048,7 +1048,7 @@ def test_ee_delta_goal_survives_a_round_trip_through_an_ee_pos_action():
         f"franka_fk and fk_chain disagree ({worst_fk_p:.1e} m, {worst_fk_o:.1e}); the "
         "relabel would anchor on a different pose than the control loop")
 
-    builder = OSCGoalBuilder(1.0, 1.0, False, 0.0, 0.0)
+    builder = OSCGoalBuilder(1.0, 1.0)
     worst = 0.0
     for step in range(300):
         q = rng.uniform(-2.0, 2.0, 7)
@@ -1898,29 +1898,49 @@ def test_kp_clip_carries_kd_with_it():
 
 
 def test_action_noise_does_not_defeat_the_orientation_hold():
-    """The "did the caller ask for a rotation" test is an exact compare against
-    zero, so Gaussian noise made every step look like a rotation command and
-    nothing held the EE's orientation while it translated."""
+    """Noise lands on the dispatched goal, never on the latched goal_ori: the
+    "was a rotation commanded" test is an exact compare against zero, so noise
+    reaching it would re-anchor the hold every step and nothing would hold the
+    EE's orientation while it translated."""
     case = make_case(np.random.default_rng(13))
-    robot = make_robot(case, use_noise=True, noise_pos_scale=1e-3,
-                       noise_rot_scale=1e-3)
+    robot = make_robot(case, noise_pos_scale=1e-3, noise_rot_scale=1e-3)
     # Establish the held orientation, then translate only.
     robot.send_action(ee_delta_action([0.0, 0.0, 0.0], [0.0, 0.0, 0.3]))
-    held = robot.robot_manager.osc_goals[-1]["r"][1]
+    held = robot._osc_goal_ori["r"].as_quat()
     for _ in range(4):
         robot.send_action(ee_delta_action([0.4, 0.0, 0.0], [0.0, 0.0, 0.0]))
-    after = robot.robot_manager.osc_goals[-1]["r"][1]
-    # Same rotation up to quaternion double cover.
-    err = Rotation.from_quat(after) * Rotation.from_quat(held).inv()
+    err = robot._osc_goal_ori["r"] * Rotation.from_quat(held).inv()
     assert err.magnitude() < 1e-12, (
-        f"goal orientation moved {err.magnitude():.3e} rad across pure-translation "
-        "steps with use_noise set; the hold is being re-anchored every step")
+        f"latched goal_ori moved {err.magnitude():.3e} rad across pure-translation "
+        "steps with noise on; the hold is being re-anchored every step")
+    sent = Rotation.from_quat(robot.robot_manager.osc_goals[-1]["r"][1])
+    assert 0.0 < (sent * Rotation.from_quat(held).inv()).magnitude() < 1e-2, (
+        "dispatched orientation should be the held one plus one noise draw")
+
+
+def _noise_stats(robot, action, measure, n=2000):
+    """Send `action` n times; `measure(robot)` -> this step's deviation from the
+    clean goal. Also checks send_action hands the action back unmodified, since
+    that is what a recording stores."""
+    np.random.seed(21)
+    dev = []
+    for _ in range(n):
+        returned = robot.send_action(dict(action))
+        assert all(returned[k] == action[k] for k in action), "send_action altered the action"
+        dev.append(measure(robot))
+    return np.asarray(dev)
+
+
+def _assert_gaussian(dev, sigma):
+    n = len(dev)
+    assert np.allclose(dev.std(axis=0), sigma, rtol=0.1), dev.std(axis=0)
+    assert np.abs(dev.mean(axis=0)).max() < 4 * sigma / np.sqrt(n)
 
 
 def test_ee_pos_noise_jitters_the_goal_at_the_configured_scales():
-    """use_noise reaches EE_POS too: the COMPOSED goal is perturbed at the
-    control.yaml scales while the action -- what a recording stores -- is left as
-    the leader emitted it. Off, an absolute pose passes through exactly."""
+    """EE_POS: the COMPOSED goal is perturbed at the configured scales while the
+    action -- what a recording stores -- is left as the leader emitted it. Off,
+    an absolute pose passes through exactly."""
     rng = np.random.default_rng(21)
     case = make_case(rng)
     target_p = case["ee_pos"] + rng.uniform(-0.05, 0.05, 3)
@@ -1936,23 +1956,49 @@ def test_ee_pos_noise_jitters_the_goal_at_the_configured_scales():
     assert np.allclose(gp, target_p) and 1.0 - abs(float(gq @ tq)) < 1e-12
 
     pos_sigma, rot_sigma = 2e-3, 5e-3
-    noisy = make_robot(case, mode=ControlMode.EE_POS, use_noise=True,
+    noisy = make_robot(case, mode=ControlMode.EE_POS,
                        noise_pos_scale=pos_sigma, noise_rot_scale=rot_sigma)
-    np.random.seed(21)
-    n = 2000
-    dpos, drot = np.empty((n, 3)), np.empty((n, 3))
-    for i in range(n):
-        returned = noisy.send_action(dict(action))
-        assert all(returned[k] == action[k] for k in action), "send_action altered the action"
-        gp, gq = noisy.robot_manager.osc_goals[-1]["r"][:2]
-        dpos[i] = gp - target_p
-        drot[i] = (Rotation.from_quat(gq) * target_r.inv()).as_rotvec()
-    assert np.allclose(dpos.std(axis=0), pos_sigma, rtol=0.1), dpos.std(axis=0)
-    assert np.allclose(drot.std(axis=0), rot_sigma, rtol=0.1), drot.std(axis=0)
-    assert np.abs(dpos.mean(axis=0)).max() < 4 * pos_sigma / np.sqrt(n)
-    assert np.abs(drot.mean(axis=0)).max() < 4 * rot_sigma / np.sqrt(n)
+    dpos = _noise_stats(noisy, action, lambda r: r.robot_manager.osc_goals[-1]["r"][0] - target_p)
+    drot = _noise_stats(noisy, action, lambda r: (
+        Rotation.from_quat(r.robot_manager.osc_goals[-1]["r"][1]) * target_r.inv()).as_rotvec())
+    _assert_gaussian(dpos, pos_sigma)
+    _assert_gaussian(drot, rot_sigma)
     return (f"pos std {dpos.std(axis=0).mean():.2e} (set {pos_sigma:.0e}), "
             f"rot std {drot.std(axis=0).mean():.2e} (set {rot_sigma:.0e})")
+
+
+def test_ee_delta_noise_lands_after_the_envelope():
+    """EE_DELTA: noise is added to the composed goal, after clip_delta and the
+    fudges, so a delta at the envelope bound still carries the full draw."""
+    case = make_case(np.random.default_rng(22))
+    action = ee_delta_action([1.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    clean = make_robot(case)
+    clean.send_action(dict(action))
+    goal_p = clean.robot_manager.osc_goals[-1]["r"][0].copy()
+
+    sigma = 2e-3
+    noisy = make_robot(case, noise_pos_scale=sigma)
+    dpos = _noise_stats(noisy, action, lambda r: r.robot_manager.osc_goals[-1]["r"][0] - goal_p)
+    _assert_gaussian(dpos, sigma)
+    return f"pos std {dpos.std(axis=0).mean():.2e} (set {sigma:.0e})"
+
+
+def test_joint_pos_noise_jitters_the_joint_goal():
+    """JOINT_POS: each joint of the dispatched goal is perturbed, the action is
+    not, and the gripper target is never noised."""
+    case = make_case(np.random.default_rng(23))
+    q = case["q"]
+    action = {**{f"r_joint_{i + 1}": float(q[i]) for i in range(7)},
+              "r_gripper": 0.5, "kp": 0.0, "kd": 0.0}
+    clean = make_robot(case, mode=ControlMode.JOINT_POS)
+    clean.send_action(dict(action))
+    assert np.array_equal(clean.robot_manager.joint_goals[-1]["r"][0], q)
+
+    sigma = 1e-2
+    noisy = make_robot(case, mode=ControlMode.JOINT_POS, noise_joint_scale=sigma)
+    dq = _noise_stats(noisy, action, lambda r: r.robot_manager.joint_goals[-1]["r"][0] - q)
+    _assert_gaussian(dq, sigma)
+    return f"joint std {dq.std(axis=0).mean():.2e} (set {sigma:.0e})"
 
 
 def test_publish_rate_bounds_the_ee_delta_anchor():

@@ -38,7 +38,7 @@ for _p in (str(_REPO_ROOT), str(_REPO_ROOT / "scripts")):
 import franka_config as fc  # noqa: E402
 from lerobot.robots import make_robot_from_config  # noqa: E402
 
-from lerobot_robot_bimanual_franka import ControlMode  # noqa: E402
+from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_kinematics import eef_poses_from_qpos  # noqa: E402
 from lerobot_robot_bimanual_franka.lerobot_source import EE_KEYS  # noqa: E402
 
@@ -50,8 +50,8 @@ from baselines.policy_math import (  # noqa: E402,F401  re-exported for the entr
 )
 from baselines.zmq_client import PolicyTimeout  # noqa: E402
 
-# The rig -> config-class table, and the exposed key prefix, have exactly one
-# definition in the tree; importing it costs the lerobot import we take anyway.
+# The --rig choices and the exposed key prefix have exactly one definition in
+# the tree; importing it costs the lerobot import we take anyway.
 from teleop_single_arm import _ARM_KEY as ARM_KEY, _RIGS as RIGS  # noqa: E402
 
 logger = logging.getLogger("baselines.rollout")
@@ -98,20 +98,12 @@ def build_robot(rig: str, control_mode: ControlMode, depth: bool = False):
     Both single-arm profiles declare EE_DELTA in config/rig.yaml; both baselines
     need EE_POS, so the mode is passed rather than inherited.
     """
-    if rig not in RIGS:
-        raise ValueError(f"unknown rig {rig!r}; choose from {sorted(RIGS)}")
-    arm_key = next(iter(fc.profile(rig).arms))
-    if arm_key != ARM_KEY:
-        raise ValueError(
-            f"rig {rig!r} exposes key {arm_key!r}, not {ARM_KEY!r}; the action "
-            "keys and gripper wiring assume the latter."
-        )
+    # Raises for a rig that is not single-arm under ARM_KEY.
+    cfg = SingleArmFrankaConfig(rig_profile=rig, control_mode=control_mode, depth=depth)
     # A wrong rig name here means the flag did not take and the OTHER arm moves.
     logger.info("rig %s -> physical arm %r, control mode %s",
-                rig, fc.profile(rig).arms[arm_key], control_mode.value)
-    return make_robot_from_config(
-        RIGS[rig](control_mode=control_mode, depth=depth)
-    )
+                rig, cfg.arm_name(ARM_KEY), control_mode.value)
+    return make_robot_from_config(cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -880,7 +872,7 @@ class Episode:
 
 def add_common_args(p, *, policy_name: str) -> None:
     """The argparse surface both entrypoints share, matching run_residual.py's."""
-    p.add_argument("--rig", choices=sorted(RIGS), default="single_arm_franka",
+    p.add_argument("--rig", choices=sorted(RIGS), default=fc.default_single_arm_profile(),
                    help="rig profile; which physical arm it drives is in config/rig.yaml")
     p.add_argument("--ckpt", default=None,
                    help="checkpoint path, recorded in the metrics for provenance; "

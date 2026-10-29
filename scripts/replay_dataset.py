@@ -42,7 +42,8 @@ Caveats worth knowing before trusting the output
   `obs_t` and `obs_{t+1}`. `obs_t` is the closest thing the dataset preserves.
 - **Recording noise is unrecoverable.** If the source was recorded with
   `--noise True`, the perturbation was added inside `send_action` and never
-  stored. Conversion runs noise-free; pass `--use-noise` to add fresh noise.
+  stored. Conversion is always noise-free; `--use-noise` adds fresh goal noise
+  on the arm during the replay, which the re-recorded actions do not carry.
 - **The gripper column changes meaning.** `{arm}_gripper` is now an ABSOLUTE
   normalized position; in these datasets the recorded action column is a delta.
   Replaying it verbatim would drive the gripper to whatever the number means
@@ -74,6 +75,7 @@ from lerobot.robots import make_robot_from_config  # noqa: E402
 from lerobot.utils.utils import init_logging  # noqa: E402
 
 from lerobot_robot_bimanual_franka import ControlMode, SingleArmFrankaConfig  # noqa: E402
+from lerobot_robot_bimanual_franka.action_noise import configured_scales  # noqa: E402
 from lerobot_robot_bimanual_franka.ee_goals import OSCGoalBuilder, delta_rotvec  # noqa: E402
 from lerobot_robot_bimanual_franka.franka_fk import franka_fk  # noqa: E402
 from lerobot_robot_bimanual_franka.lerobot_source import action_space  # noqa: E402
@@ -98,9 +100,6 @@ def _goal_path(cfg) -> tuple[OSCGoalBuilder, ActionSafetyScreen]:
     goals = OSCGoalBuilder(
         translation_fudge=cfg.ee_translation_fudge,
         rotation_fudge=cfg.ee_rotation_fudge,
-        use_noise=cfg.use_noise,
-        noise_pos_scale=cfg.noise_pos_scale,
-        noise_rot_scale=cfg.noise_rot_scale,
     )
     safety = ActionSafetyScreen(
         {_ARM: cfg.base_in_world(_ARM)}, {_ARM: fc.ee_sphere(cfg.arm_name(_ARM))}
@@ -226,7 +225,7 @@ def main() -> int:
     p.add_argument("--depth", action="store_true",
                    help="enable depth observations (off by default; these sources have none)")
     p.add_argument("--use-noise", action="store_true",
-                   help="add fresh EE_DELTA goal noise; see the docstring")
+                   help="add fresh goal noise on the arm during the replay; see the docstring")
     p.add_argument("--translation-fudge", type=float, default=None,
                    help="ee_pose mode ONLY: fudge used to convert deltas to goals. "
                         "Rejected in delta mode, where deltas replay as recorded.")
@@ -254,7 +253,8 @@ def main() -> int:
     fps = args.fps or meta.fps
 
     control_mode = ControlMode.EE_DELTA if args.mode == "delta" else ControlMode.EE_POS
-    cfg = SingleArmFrankaConfig(control_mode=control_mode, depth=args.depth, use_noise=args.use_noise)
+    cfg = SingleArmFrankaConfig(control_mode=control_mode, depth=args.depth,
+                                **(configured_scales() if args.use_noise else {}))
 
     # The fudges are an EE_POS-mode CONVERSION knob and nothing else. In delta mode
     # the recorded deltas are replayed untouched and the live `tuning:` block scales
@@ -285,10 +285,10 @@ def main() -> int:
     if args.mode == "delta":
         logger.info("actions replayed AS RECORDED (no rescaling); the live tuning block "
                     "scales them: translation_fudge=%.3f rotation_fudge=%.3f use_noise=%s",
-                    cfg.ee_translation_fudge, cfg.ee_rotation_fudge, cfg.use_noise)
+                    cfg.ee_translation_fudge, cfg.ee_rotation_fudge, args.use_noise)
     else:
         logger.info("conversion trims: translation_fudge=%.3f rotation_fudge=%.3f use_noise=%s",
-                    cfg.ee_translation_fudge, cfg.ee_rotation_fudge, cfg.use_noise)
+                    cfg.ee_translation_fudge, cfg.ee_rotation_fudge, args.use_noise)
     logger.info("controller: default_kp=%s cross_coupling_compensation=%s uncouple_pos_ori=%s",
                 fc.control("torque.osc.default_kp"),
                 fc.control("torque.osc.cross_coupling_compensation"),

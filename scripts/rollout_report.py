@@ -73,8 +73,11 @@ SLOTS = ("#2a78d6", "#eb6834", "#1baf7a", "#eda100",
          "#e87ba4", "#008300", "#4a3aa7", "#e34948")
 # Comparison-sheet hue per method: none is success blue or timeout orange, and
 # every bar carries its value, so the sub-3:1 green and amber are labelled.
-METHOD_HUES = {"bspline": "#4a3aa7", "sail": "#eda100", "pi05": "#1baf7a"}
-SPARE_HUES = ("#e87ba4", "#008300", "#e34948")
+METHOD_HUES = {"bspline": "#4a3aa7", "sail": "#eda100", "pi05": "#1baf7a",
+               "dp": "#e87ba4", "multifast": "#008300"}
+SPARE_HUES = ("#e34948",)
+# What a method is called on a sheet; the manifests keep the code's name.
+METHOD_NAMES = {"dp": "base dp", "multifast": "base dp + ZAP"}
 # One hue per real run (--runs), in run order: never success blue or failure orange,
 # because the same sheet still colours episodes by outcome.
 RUN_HUES = ("#4a3aa7", "#1baf7a", "#e87ba4", "#008300")
@@ -100,6 +103,8 @@ KNOBS = {
     "sail": ("exec_fps", "fast_fps", "slow_fps", "inf_delay", "execute_n_actions",
              "action_horizon", "slowdown_window_size", "precision_modulation", "eag"),
     "pi05": ("chunk_size",),
+    "dp": ("chunk_size", "execution_horizon"),
+    "multifast": ("chunk_size", "execution_horizon"),
 }
 
 
@@ -206,6 +211,12 @@ def resolve_sweep(root: Path, name: str) -> str | None:
     ids = {s for m in root.rglob("manifest.json")
            if (s := (json.loads(m.read_text()).get("run") or {}).get("sweep"))}
     return max(ids) if ids else None
+
+
+def plant_text(runs: list[dict]) -> str:
+    """`plant sysid_2026_09_16`, or the stock plant the earlier sweeps ran."""
+    plants = sorted({str(r["environment"].get("plant") or "stock") for r in runs})
+    return "stock robosuite plant" if plants == ["stock"] else f"plant {', '.join(plants)}"
 
 
 def short_task(name: str) -> str:
@@ -771,7 +782,7 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     w, h = SHEET_IN
     method = runs[0]["run"]["method"]
     knob = (runs[0].get("parameters") or {}).get("speed_up_times")
-    label = f"{method}" + (f"  {knob}x" if knob not in (None, 1.0) else "")
+    label = METHOD_NAMES.get(method, method) + (f"  {knob}x" if knob not in (None, 1.0) else "")
     oscs = {osc_text(r["environment"]) for r in runs}
     osc = oscs.pop() if len(oscs) == 1 else "mixed"
     if real:
@@ -787,7 +798,7 @@ def sweep_sheet(key: str, runs: list[dict], out: Path) -> Path:
     else:
         header(fig, f"{label} on {runs[0]['environment'].get('suite', 'libero_90')}",
                f"sweep {sweep}   ·   {st['n_tasks']} tasks   ·   {st['n_eps']} episodes   ·   "
-               f"stock robosuite plant   ·   OSC {osc or 'not recorded'}   ·   "
+               f"{plant_text(runs)}   ·   OSC {osc or 'not recorded'}   ·   "
                f"time in simulated seconds")
     # One key for every panel: they all draw success/timeout and median/mean alike.
     fig.legend(handles=outcome_key(bad), loc="upper right", ncol=4, frameon=False,
@@ -963,7 +974,7 @@ def column_labels(sweeps: dict[str, list[dict]]) -> list[str]:
         return list(sweeps)   # real runs carry the operator's own labels
     labels = []
     for runs in sweeps.values():
-        method = runs[0]["run"]["method"]
+        method = METHOD_NAMES.get(runs[0]["run"]["method"], runs[0]["run"]["method"])
         speed = (runs[0].get("parameters") or {}).get("speed_up_times")
         labels.append(f"{method} {speed:g}x" if speed is not None else method)
     for i, runs in enumerate(sweeps.values()):
@@ -1092,7 +1103,8 @@ def comparison_sheet(sweeps: dict[str, list[dict]], out: Path,
     w, h = SHEET_IN
     shapes = [f"{sts[k]['n_tasks']}x{len(sts[k]['runs'][0]['_episodes'])}" for k in keys]
     tail = ("   ·   real FR3   ·   time in wall-clock seconds" if is_real(sts[keys[0]]["runs"][0])
-            else "   ·   stock plant   ·   time in simulated seconds")
+            else f"   ·   {plant_text([r for k in keys for r in sts[k]['runs']])}"
+                 "   ·   time in simulated seconds")
     sub = "  ·  ".join(f"{k} ({s})" for k, s in zip(keys, shapes))
     # Too many ids for one line: the column names say which is which.
     if text_width(fig, [sub + tail], FS_SHEET_SUB) > w - 2 * EDGE:

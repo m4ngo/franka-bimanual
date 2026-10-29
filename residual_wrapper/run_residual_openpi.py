@@ -236,7 +236,8 @@ def main() -> None:
             if recorder is not None and len(recorder) > 0:
                 viz_path = os.path.join(args.viz_dir, "episode.html")
                 print(f"saving visualization to {viz_path}...")
-                _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps)
+                _save_viz(recorder, viz_path, residual, "episode (free run)", args.viz_stride, args.fps,
+                          controller.config.rig_profile)
             controller.disconnect()
         return
 
@@ -279,7 +280,8 @@ def main() -> None:
                     if recorder is not None and len(recorder) > 0:
                         viz_path = os.path.join(args.viz_dir, f"episode_{ep_idx:03d}.html")
                         print(f"saving visualization to {viz_path}...")
-                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps)
+                        _save_viz(recorder, viz_path, residual, f"episode {ep_idx} — {args.task}", args.viz_stride, args.fps,
+                                  controller.config.rig_profile)
                 dataset.save_episode()
                 print(f"episode {dataset.num_episodes - 1} saved")
 
